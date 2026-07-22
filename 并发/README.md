@@ -2,6 +2,11 @@
 
 > 本文由内部知识库文档整理为 GitHub 可直接阅读的 Markdown。已移除原始内部链接、账号、组织域名等公司相关信息。
 
+## 相关文档
+
+- [ReentrantLock 源码解析](./ReentrantLock源码解析.md)
+- [AQS 使用文档](./AQS使用文档.md)
+
 ## 目录
 
 - [一、Java 语义层：`synchronized` 是什么](#一java-语义层synchronized-是什么)
