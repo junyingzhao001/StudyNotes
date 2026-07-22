@@ -684,6 +684,692 @@ jstack <pid>
 
 Demo：
 
-> 内部截图/附件已移除。
+```kotlin
+      
+package com.example.myapplication
 
-> 内部截图/附件已移除。
+import android.util.Log
+import java.util.concurrent.locks.AbstractQueuedSynchronizer
+
+/**
+ * 自定义锁实现 - 基于 AQS
+ * 
+ * 这是一个简单的互斥锁实现，支持可重入特性
+ */
+class CustomLock {
+    private val sync = Sync()
+    
+    companion object {
+        private const val TAG = "CustomLock"
+    }
+    
+    /**
+     * 内部同步器，继承自 AQS
+     * 使用 state 表示锁的状态：
+     * - state = 0: 锁未被占用
+     * - state > 0: 锁被占用，值表示重入次数
+     */
+    private class Sync : AbstractQueuedSynchronizer() {
+        
+        /**
+         * 尝试获取锁（非公平方式）
+         * @param acquires 请求的锁数量（通常为 1）
+         * @return true 如果成功获取锁，false 否则
+         */
+        override fun tryAcquire(acquires: Int): Boolean {
+            val current = Thread.currentThread()
+            val state = state
+            
+            // 情况1：锁未被占用（state == 0）
+            if (state == 0) {
+                // 使用 CAS 尝试获取锁
+                if (compareAndSetState(0, acquires)) {
+                    setExclusiveOwnerThread(current)  // 设置独占线程
+                    Log.d(TAG, "线程 ${current.name} 获取锁成功")
+                    return true
+                }
+            }
+            // 情况2：锁已被当前线程占用（可重入）
+            else if (current == exclusiveOwnerThread) {
+                val nextState = state + acquires
+                if (nextState < 0) {  // 溢出检查
+                    throw Error("Maximum lock count exceeded")
+                }
+                setState(nextState)  // 增加重入次数
+                Log.d(TAG, "线程 ${current.name} 重入锁，重入次数: $nextState")
+                return true
+            }
+            
+            return false  // 获取锁失败
+        }
+        
+        /**
+         * 尝试释放锁
+         * @param releases 释放的锁数量（通常为 1）
+         * @return true 如果锁完全释放（state == 0），false 否则
+         */
+        override fun tryRelease(releases: Int): Boolean {
+            val current = Thread.currentThread()
+            
+            // 检查是否是锁的持有者
+            if (current != exclusiveOwnerThread) {
+                throw IllegalMonitorStateException("当前线程不是锁的持有者")
+            }
+            
+            val state = this.state - releases  // 减少重入次数
+            val free = state == 0
+            
+            if (free) {
+                // 完全释放锁
+                setExclusiveOwnerThread(null)
+                Log.d(TAG, "线程 ${current.name} 完全释放锁")
+            } else {
+                Log.d(TAG, "线程 ${current.name} 释放锁，剩余重入次数: $state")
+            }
+            
+            setState(state)  // 更新状态
+            return free
+        }
+        
+        /**
+         * 判断当前线程是否独占锁
+         */
+        override fun isHeldExclusively(): Boolean {
+            return exclusiveOwnerThread == Thread.currentThread()
+        }
+        
+        /**
+         * 获取当前持有锁的线程
+         */
+        fun getOwner(): Thread? {
+            return exclusiveOwnerThread
+        }
+        
+        /**
+         * 获取重入次数
+         */
+        fun getHoldCount(): Int {
+            return if (isHeldExclusively()) state else 0
+        }
+        
+        /**
+         * 公共方法：尝试获取锁（供外部类调用）
+         */
+        fun tryLock(): Boolean {
+            return tryAcquire(1)
+        }
+        
+        /**
+         * 公共方法：获取状态（供外部类调用）
+         */
+        fun getStateValue(): Int {
+            return state
+        }
+        
+        /**
+         * 公共方法：判断当前线程是否持有锁（供外部类调用）
+         */
+        fun isHeldByCurrentThread(): Boolean {
+            return isHeldExclusively()
+        }
+    }
+    
+    /**
+     * 获取锁（阻塞直到获取成功）
+     */
+    fun lock() {
+        sync.acquire(1)
+    }
+    
+    /**
+     * 尝试获取锁（非阻塞）
+     * @return true 如果成功获取锁，false 否则
+     */
+    fun tryLock(): Boolean {
+        return sync.tryLock()
+    }
+    
+    /**
+     * 释放锁
+     */
+    fun unlock() {
+        sync.release(1)
+    }
+    
+    /**
+     * 判断锁是否被占用
+     */
+    fun isLocked(): Boolean {
+        return sync.getStateValue() != 0
+    }
+    
+    /**
+     * 判断当前线程是否持有锁
+     */
+    fun isHeldByCurrentThread(): Boolean {
+        return sync.isHeldByCurrentThread()
+    }
+    
+    /**
+     * 获取当前持有锁的线程
+     */
+    fun getOwner(): Thread? {
+        return sync.getOwner()
+    }
+    
+    /**
+     * 获取当前线程的重入次数
+     */
+    fun getHoldCount(): Int {
+        return sync.getHoldCount()
+    }
+}
+
+/**
+ * 公平锁实现 - 基于 AQS
+ * 
+ * 公平锁保证按照线程请求锁的顺序获取锁（FIFO）
+ */
+class FairLock {
+    private val sync = FairSync()
+    
+    companion object {
+        private const val TAG = "FairLock"
+    }
+    
+    /**
+     * 公平锁同步器
+     */
+    private class FairSync : AbstractQueuedSynchronizer() {
+        
+        override fun tryAcquire(acquires: Int): Boolean {
+            val current = Thread.currentThread()
+            val state = state
+            
+            if (state == 0) {
+                // 关键区别：检查队列中是否有等待的线程
+                // 如果有，不能"插队"，必须排队
+                if (!hasQueuedPredecessors() && compareAndSetState(0, acquires)) {
+                    setExclusiveOwnerThread(current)
+                    Log.d(TAG, "线程 ${current.name} 公平获取锁成功")
+                    return true
+                }
+            } else if (current == exclusiveOwnerThread) {
+                // 可重入
+                val nextState = state + acquires
+                if (nextState < 0) {
+                    throw Error("Maximum lock count exceeded")
+                }
+                setState(nextState)
+                Log.d(TAG, "线程 ${current.name} 公平重入锁，重入次数: $nextState")
+                return true
+            }
+            
+            return false
+        }
+        
+        override fun tryRelease(releases: Int): Boolean {
+            val current = Thread.currentThread()
+            if (current != exclusiveOwnerThread) {
+                throw IllegalMonitorStateException()
+            }
+            
+            val state = this.state - releases
+            val free = state == 0
+            
+            if (free) {
+                setExclusiveOwnerThread(null)
+                Log.d(TAG, "线程 ${current.name} 公平释放锁")
+            }
+            
+            setState(state)
+            return free
+        }
+        
+        override fun isHeldExclusively(): Boolean {
+            return exclusiveOwnerThread == Thread.currentThread()
+        }
+        
+        /**
+         * 公共方法：尝试获取锁（供外部类调用）
+         */
+        fun tryLock(): Boolean {
+            return tryAcquire(1)
+        }
+        
+        /**
+         * 公共方法：获取状态（供外部类调用）
+         */
+        fun getStateValue(): Int {
+            return state
+        }
+    }
+    
+    fun lock() {
+        sync.acquire(1)
+    }
+    
+    fun unlock() {
+        sync.release(1)
+    }
+    
+    fun tryLock(): Boolean {
+        return sync.tryLock()
+    }
+    
+    fun isLocked(): Boolean {
+        return sync.getStateValue() != 0
+    }
+}
+
+/**
+ * 读写锁实现 - 基于 AQS
+ * 
+ * 支持多个读线程同时访问，但写线程独占访问
+ */
+class CustomReadWriteLock {
+    private val readLock = ReadLock()
+    private val writeLock = WriteLock()
+    
+    // 读写锁常量（移到外部，因为 inner class 不能有 companion object）
+    companion object {
+        private const val SHARED_SHIFT = 16
+        private const val SHARED_UNIT = (1 shl SHARED_SHIFT)
+        private const val MAX_COUNT = (1 shl SHARED_SHIFT) - 1
+        private const val EXCLUSIVE_MASK = (1 shl SHARED_SHIFT) - 1
+        
+        // 获取读锁数量
+        fun sharedCount(c: Int): Int = c ushr SHARED_SHIFT
+        
+        // 获取写锁状态
+        fun exclusiveCount(c: Int): Int = c and EXCLUSIVE_MASK
+    }
+    
+    /**
+     * 读写锁同步器
+     * state 的高 16 位表示读锁数量，低 16 位表示写锁状态
+     */
+    private inner class Sync : AbstractQueuedSynchronizer() {
+        
+        // 尝试获取读锁
+        override fun tryAcquireShared(acquires: Int): Int {
+            val current = Thread.currentThread()
+            var c = state
+            
+            // 如果有写锁且不是当前线程持有，获取失败
+            if (CustomReadWriteLock.exclusiveCount(c) != 0 && exclusiveOwnerThread != current) {
+                return -1
+            }
+            
+            val r = CustomReadWriteLock.sharedCount(c)
+            if (r < MAX_COUNT && compareAndSetState(c, c + SHARED_UNIT)) {
+                return 1  // 成功
+            }
+            
+            return -1  // 失败
+        }
+        
+        // 释放读锁
+        override fun tryReleaseShared(releases: Int): Boolean {
+            var c = state
+            while (!compareAndSetState(c, c - SHARED_UNIT)) {
+                c = state
+            }
+            return true
+        }
+        
+        // 尝试获取写锁
+        override fun tryAcquire(acquires: Int): Boolean {
+            val current = Thread.currentThread()
+            val c = state
+            
+            // 如果有读锁或写锁，获取失败
+            if (c != 0) {
+                if (exclusiveOwnerThread != current) {
+                    return false
+                }
+                // 可重入
+                if (CustomReadWriteLock.exclusiveCount(c) + acquires > MAX_COUNT) {
+                    throw Error("Maximum lock count exceeded")
+                }
+                setState(c + acquires)
+                return true
+            }
+            
+            // 尝试获取写锁
+            if (compareAndSetState(0, acquires)) {
+                setExclusiveOwnerThread(current)
+                return true
+            }
+            
+            return false
+        }
+        
+        // 释放写锁
+        override fun tryRelease(releases: Int): Boolean {
+            val current = Thread.currentThread()
+            if (current != exclusiveOwnerThread) {
+                throw IllegalMonitorStateException()
+            }
+            
+            val c = state - releases
+            val free = CustomReadWriteLock.exclusiveCount(c) == 0
+            
+            if (free) {
+                setExclusiveOwnerThread(null)
+            }
+            
+            setState(c)
+            return free
+        }
+        
+        override fun isHeldExclusively(): Boolean {
+            return exclusiveOwnerThread == Thread.currentThread()
+        }
+    }
+    
+    /**
+     * 读写锁同步器实例（共享）
+     */
+    private val sync = Sync()
+    
+    /**
+     * 读锁
+     */
+    inner class ReadLock {
+        fun lock() {
+            sync.acquireShared(1)
+        }
+        
+        fun unlock() {
+            sync.releaseShared(1)
+        }
+    }
+    
+    /**
+     * 写锁
+     */
+    inner class WriteLock {
+        fun lock() {
+            sync.acquire(1)
+        }
+        
+        fun unlock() {
+            sync.release(1)
+        }
+    }
+    
+    fun readLock() = readLock
+    fun writeLock() = writeLock
+}
+```
+
+```kotlin
+      
+package com.example.myapplication
+
+import android.content.res.Configuration
+import android.os.Bundle
+import android.util.Log
+import android.widget.Button
+import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
+
+class MainActivity : AppCompatActivity() {
+    private val TAG = "MyApplication"
+    
+    private lateinit var btnTestCustomLock: Button
+    private lateinit var btnTestFairLock: Button
+    private lateinit var btnTestReadWriteLock: Button
+    private lateinit var tvLog: TextView
+    
+    // 测试用的锁实例
+    private val customLock = CustomLock()
+    private val fairLock = FairLock()
+    private val readWriteLock = CustomReadWriteLock()
+    
+    // 共享资源
+    private var counter = 0
+    
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+        Log.i(TAG,"MainActivity onCreate.....................")
+        
+        initViews()
+    }
+    
+    private fun initViews() {
+        btnTestCustomLock = findViewById(R.id.btnTestCustomLock)
+        btnTestFairLock = findViewById(R.id.btnTestFairLock)
+        btnTestReadWriteLock = findViewById(R.id.btnTestReadWriteLock)
+        tvLog = findViewById(R.id.tvLog)
+        
+        btnTestCustomLock.setOnClickListener {
+            testCustomLock()
+        }
+        
+        btnTestFairLock.setOnClickListener {
+            testFairLock()
+        }
+        
+        btnTestReadWriteLock.setOnClickListener {
+            testReadWriteLock()
+        }
+    }
+    
+    /**
+     * 测试自定义锁
+     */
+    private fun testCustomLock() {
+        appendLog("========== 测试自定义锁 ==========")
+        counter = 0
+        
+        // 创建多个线程竞争锁
+        val threads = mutableListOf<Thread>()
+        
+        for (i in 1..5) {
+            val thread = Thread {
+                customLock.lock()
+                try {
+                    appendLog("线程 $i 获取锁，开始操作")
+                    val oldValue = counter
+                    Thread.sleep(100)  // 模拟业务操作
+                    counter = oldValue + 1
+                    appendLog("线程 $i 完成操作，counter = $counter")
+                } finally {
+                    customLock.unlock()
+                    appendLog("线程 $i 释放锁")
+                }
+            }
+            thread.name = "Thread-$i"
+            threads.add(thread)
+        }
+        
+        threads.forEach { it.start() }
+        
+        // 等待所有线程完成
+        Thread {
+            threads.forEach { it.join() }
+            runOnUiThread {
+                appendLog("所有线程完成，最终 counter = $counter")
+                appendLog("=====================================\n")
+            }
+        }.start()
+    }
+    
+    /**
+     * 测试可重入锁
+     */
+    private fun testReentrantLock() {
+        appendLog("========== 测试可重入锁 ==========")
+        
+        Thread {
+            customLock.lock()
+            try {
+                appendLog("外层获取锁")
+                customLock.lock()  // 重入
+                try {
+                    appendLog("内层获取锁（重入）")
+                    appendLog("重入次数: ${customLock.getHoldCount()}")
+                } finally {
+                    customLock.unlock()
+                    appendLog("内层释放锁")
+                }
+            } finally {
+                customLock.unlock()
+                appendLog("外层释放锁")
+            }
+            appendLog("=====================================\n")
+        }.start()
+    }
+    
+    /**
+     * 测试公平锁
+     */
+    private fun testFairLock() {
+        appendLog("========== 测试公平锁 ==========")
+        
+        val threads = mutableListOf<Thread>()
+        
+        for (i in 1..5) {
+            val thread = Thread {
+                fairLock.lock()
+                try {
+                    appendLog("线程 $i 获取公平锁")
+                    Thread.sleep(50)
+                } finally {
+                    fairLock.unlock()
+                }
+            }
+            thread.name = "FairThread-$i"
+            threads.add(thread)
+        }
+        
+        // 按顺序启动，公平锁应该按顺序获取
+        threads.forEach {
+            it.start()
+            Thread.sleep(10)  // 稍微延迟，确保按顺序请求
+        }
+        
+        Thread {
+            threads.forEach { it.join() }
+            runOnUiThread {
+                appendLog("公平锁测试完成")
+                appendLog("=====================================\n")
+            }
+        }.start()
+    }
+    
+    /**
+     * 测试读写锁
+     */
+    private fun testReadWriteLock() {
+        appendLog("========== 测试读写锁 ==========")
+        
+        var readValue = 0
+        
+        // 创建多个读线程
+        val readThreads = mutableListOf<Thread>()
+        for (i in 1..3) {
+            val thread = Thread {
+                readWriteLock.readLock().lock()
+                try {
+                    appendLog("读线程 $i 开始读取，值: $readValue")
+                    Thread.sleep(200)  // 模拟读取操作
+                    appendLog("读线程 $i 读取完成")
+                } finally {
+                    readWriteLock.readLock().unlock()
+                }
+            }
+            thread.name = "ReadThread-$i"
+            readThreads.add(thread)
+        }
+        
+        // 创建写线程
+        val writeThread = Thread {
+            readWriteLock.writeLock().lock()
+            try {
+                appendLog("写线程开始写入")
+                Thread.sleep(100)
+                readValue = 100
+                appendLog("写线程写入完成，新值: $readValue")
+            } finally {
+                readWriteLock.writeLock().unlock()
+            }
+        }
+        writeThread.name = "WriteThread"
+        
+        // 启动所有线程
+        readThreads.forEach { it.start() }
+        Thread.sleep(50)  // 让读线程先启动
+        writeThread.start()
+        
+        Thread {
+            readThreads.forEach { it.join() }
+            writeThread.join()
+            runOnUiThread {
+                appendLog("读写锁测试完成，最终值: $readValue")
+                appendLog("=====================================\n")
+            }
+        }.start()
+    }
+    
+    private fun appendLog(message: String) {
+        runOnUiThread {
+            val logMessage = "${System.currentTimeMillis() % 100000}: $message\n"
+            tvLog.append(logMessage)
+            Log.i(TAG, message)
+        }
+    }
+//    onCreate -> onStart -> onResume-> onPostResume
+
+    override fun onStart() {
+        super.onStart()
+        Log.i(TAG,"MainActivity onStart.....................")
+    }
+
+    override fun onResume() {
+        super.onResume()
+        Log.i(TAG,"MainActivity onResume.....................")
+    }
+
+    override fun onRestart() {
+        super.onRestart()
+        Log.i(TAG,"MainActivity onRestart.....................")
+    }
+
+    override fun onPause() {
+        super.onPause()
+        Log.i(TAG,"MainActivity onPause.....................")
+    }
+
+    override fun onStop() {
+        super.onStop()
+        Log.i(TAG,"MainActivity onStop.....................")
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        Log.i(TAG,"MainActivity onDestroy.....................")
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        Log.i(TAG,"MainActivity onSaveInstanceState.....................")
+    }
+
+    override fun onRestoreInstanceState(savedInstanceState: Bundle) {
+        super.onRestoreInstanceState(savedInstanceState)
+        Log.i(TAG,"MainActivity onRestoreInstanceState.....................")
+    }
+
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        Log.i(TAG,"MainActivity onConfigurationChanged.....................")
+    }
+
+
+}
+```
