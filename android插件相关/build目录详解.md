@@ -1337,8 +1337,23 @@ kotlin/ksp/kapt Kotlin 和注解处理相关状态/生成物
 更直观一点：
 
 
-> [!NOTE]
-> 原文此处为只读绘图/流程图块；当前文档导出接口未返回可还原内容，已保留此位置。
+```mermaid
+flowchart TB
+  Build["build/ 目录"] --> Generated["generated/
+编译前自动生成的源码/资源"]
+  Build --> Intermediates["intermediates/
+编译过程中的中间结果"]
+  Build --> Outputs["outputs/
+最终可交付产物"]
+  Build --> Tmp["tmp/
+临时文件"]
+  Build --> Reports["reports/
+分析/诊断报告"]
+  Build --> Kotlin["kotlin / ksp / kapt
+Kotlin 与注解处理状态/生成物"]
+  Build --> Gradle[".gradle/
+Gradle 本地状态与缓存"]
+```
 
 
 ## 22、实战建议

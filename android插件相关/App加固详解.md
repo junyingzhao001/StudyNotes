@@ -121,8 +121,16 @@ protected.apk
 图：
 
 
-> [!NOTE]
-> 原文此处为只读绘图/流程图块；当前文档导出接口未返回可还原内容，已保留此位置。
+```mermaid
+flowchart LR
+  Original["原 APK
+classes.dex + res + so"] --> Reinforce["加固工具处理"]
+  Reinforce --> Shell["壳 dex / 壳 so"]
+  Reinforce --> Payload["加密后的原 dex / so / 资源"]
+  Shell --> NewAPK["加固后 APK"]
+  Payload --> NewAPK
+  NewAPK --> Runtime["运行时由壳恢复原 App"]
+```
 
 
 ## 4、加固最核心的技术：壳
@@ -199,8 +207,15 @@ so 解密
 运行流程大概是：
 
 
-> [!NOTE]
-> 原文此处为只读绘图/流程图块；当前文档导出接口未返回可还原内容，已保留此位置。
+```mermaid
+flowchart TB
+  Install["安装加固 APK"] --> Start["系统启动壳 Application"]
+  Start --> Check["环境检测 / 完整性校验"]
+  Check --> Decrypt["解密原 dex / so / 资源"]
+  Decrypt --> Load["加载原业务代码"]
+  Load --> Delegate["代理原 Application 生命周期"]
+  Delegate --> Business["进入原业务逻辑"]
+```
 
 
 关键点：
@@ -236,8 +251,15 @@ Android Framework -> 壳 Application -> 解密加载 -> 原 Application -> 原�
 图：
 
 
-> [!NOTE]
-> 原文此处为只读绘图/流程图块；当前文档导出接口未返回可还原内容，已保留此位置。
+```mermaid
+flowchart LR
+  subgraph Original["原 App"]
+    OF["Android Framework"] --> OA["原 Application"] --> OB["原业务代码"]
+  end
+  subgraph Reinforced["加固 App"]
+    RF["Android Framework"] --> SA["壳 Application"] --> Dec["解密 / 加载"] --> RA["原 Application"] --> RB["原业务代码"]
+  end
+```
 
 
 最终业务路径仍然是：
@@ -318,8 +340,15 @@ Real DexClassLoader -> 解密后的原 dex
 简化模型：
 
 
-> [!NOTE]
-> 原文此处为只读绘图/流程图块；当前文档导出接口未返回可还原内容，已保留此位置。
+```mermaid
+flowchart TB
+  System["Android 系统"] --> ShellLoader["Shell ClassLoader
+加载壳 dex"]
+  ShellLoader --> DecryptDex["解密原 dex"]
+  DecryptDex --> RealLoader["Real DexClassLoader
+加载原业务 dex"]
+  RealLoader --> Components["Activity / Service / Receiver 等原组件"]
+```
 
 
 所以 Activity、Service 等还是能正常启动。
@@ -398,8 +427,16 @@ assets/payload.bin = 加密后的原 dex
 流程：
 
 
-> [!NOTE]
-> 原文此处为只读绘图/流程图块；当前文档导出接口未返回可还原内容，已保留此位置。
+```mermaid
+flowchart LR
+  APK["加固 APK"] --> ShellDex["classes.dex：壳代码"]
+  APK --> Payload["assets/payload.bin：加密原 dex"]
+  ShellDex --> Read["读取 payload"]
+  Read --> Verify["环境与完整性校验"]
+  Verify --> Decrypt["解密 dex"]
+  Decrypt --> Load["DexClassLoader / InMemoryDexClassLoader 加载"]
+  Load --> Run["执行原代码"]
+```
 
 
 ### 8.2 Method 级别加密 / 抽取
@@ -512,8 +549,15 @@ System.load(...)
 流程：
 
 
-> [!NOTE]
-> 原文此处为只读绘图/流程图块；当前文档导出接口未返回可还原内容，已保留此位置。
+```mermaid
+flowchart LR
+  EncSo["加密 so
+assets/libbusiness_arm64.enc"] --> ShellSo["壳 so"]
+  ShellSo --> Decrypt["解密 libbusiness.so"]
+  Decrypt --> Store["写入私有目录或内存映射"]
+  Store --> Load["System.load(...)"]
+  Load --> JNI["JNI / native 业务逻辑可用"]
+```
 
 
 ### 8.5 资源加密
@@ -576,8 +620,15 @@ APK 打包完成后的内容
 正确流程：
 
 
-> [!NOTE]
-> 原文此处为只读绘图/流程图块；当前文档导出接口未返回可还原内容，已保留此位置。
+```mermaid
+flowchart LR
+  Source["原始 APK"] --> Reinforce["加固：修改 dex / so / 资源"]
+  Reinforce --> Align["zipalign"]
+  Align --> Sign["重新签名"]
+  Sign --> Verify["apksigner verify"]
+  Verify --> Release["发布 APK"]
+  Wrong["先签名再加固"] -.会导致签名失效.-> Reinforce
+```
 
 
 如果你：
@@ -604,8 +655,28 @@ APK 打包完成后的内容
 一个完整加固方案通常包括这些模块：
 
 
-> [!NOTE]
-> 原文此处为只读绘图/流程图块；当前文档导出接口未返回可还原内容，已保留此位置。
+```mermaid
+mindmap
+  root((加固核心模块))
+    Dex 保护
+      加密
+      方法抽取
+      字符串加密
+      控制流混淆
+    Native 保护
+      so 加密
+      反调试
+      环境检测
+    资源保护
+      assets 加密
+      配置加密
+    完整性校验
+      签名校验
+      hash 校验
+    运行时防护
+      Root/模拟器检测
+      Hook 检测
+```
 
 
 ### 10.1 Dex 保护
@@ -932,8 +1003,20 @@ so 被改
 图：
 
 
-> [!NOTE]
-> 原文此处为只读绘图/流程图块；当前文档导出接口未返回可还原内容，已保留此位置。
+```mermaid
+flowchart TB
+  Start["App 启动"] --> Cert["校验签名证书"]
+  Cert --> DexHash["校验 dex hash"]
+  DexHash --> SoHash["校验 so hash"]
+  SoHash --> Payload["校验 payload 可解密"]
+  Payload --> Package["校验包名 / 环境"]
+  Package -->|全部通过| Run["继续运行"]
+  Cert -->|失败| Block["退出 / 崩溃 / 上报 / 限制功能"]
+  DexHash -->|失败| Block
+  SoHash -->|失败| Block
+  Payload -->|失败| Block
+  Package -->|失败| Block
+```
 
 
 ## 14、为什么加固能防静态分析？
@@ -1030,8 +1113,17 @@ Hook ClassLoader
 推荐组合：
 
 
-> [!NOTE]
-> 原文此处为只读绘图/流程图块；当前文档导出接口未返回可还原内容，已保留此位置。
+```mermaid
+flowchart LR
+  Client["客户端加固
+反调试 / 签名校验 / 环境检测 / 接口签名"] --> Request["请求携带设备、版本、签名、时间戳等信息"]
+  Request --> Server["服务端风控"]
+  Server --> Token["token 校验"]
+  Server --> Replay["重放保护"]
+  Server --> Risk["设备风险评分"]
+  Server --> Rate["异常频率控制"]
+  Server --> Decision["放行 / 限制 / 拦截"]
+```
 
 
 客户端做：
@@ -1066,8 +1158,14 @@ token 校验
 完整工程流程通常是：
 
 
-> [!NOTE]
-> 原文此处为只读绘图/流程图块；当前文档导出接口未返回可还原内容，已保留此位置。
+```mermaid
+flowchart LR
+  Assemble["assembleRelease"] --> Reinforce["reinforce 加固"]
+  Reinforce --> Zipalign["zipalign"]
+  Zipalign --> Sign["apksigner 签名"]
+  Sign --> Verify["verify 校验"]
+  Verify --> Upload["上传/发布"]
+```
 
 
 实际 CI 里一般是：
@@ -1237,8 +1335,16 @@ RETURN
 图：
 
 
-> [!NOTE]
-> 原文此处为只读绘图/流程图块；当前文档导出接口未返回可还原内容，已保留此位置。
+```mermaid
+flowchart TB
+  JavaMethod["原 Java 方法
+return a + b"] --> Extract["抽取/转换方法体"]
+  Extract --> VMCode["VM 指令
+LOAD a / LOAD b / ADD / RETURN"]
+  VMCode --> ShellVM["壳内置虚拟机解释执行"]
+  ShellVM --> Result["返回原业务结果"]
+  JavaMethod -.静态分析看到的只是.-> Stub["壳调用 / 桩代码"]
+```
 
 
 优点：

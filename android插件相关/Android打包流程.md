@@ -18,8 +18,16 @@
 Gradle 负责“任务调度”和“依赖解析”，AGP 负责注册 Android 专属任务，例如资源编译、Manifest 合并、Dex 生成、APK 打包、签名等。官方文档也说明，Android build system 会编译 app 的资源和源码，并打包成 APK 或 AAB；Gradle 使用 task-based 方式组织这些命令，插件负责定义任务和配置。(developer.android.com)
 
 
-> [!NOTE]
-> 原文此处为只读绘图/流程图块；当前文档导出接口未返回可还原内容，已保留此位置。
+```mermaid
+flowchart LR
+  Dev["开发者 / Android Studio"] --> Gradle["Gradle：任务调度、依赖解析"]
+  Gradle --> AGP["Android Gradle Plugin：注册 Android 构建任务"]
+  AGP --> Res["资源编译 / Manifest 合并"]
+  AGP --> Code["Java/Kotlin 编译 / Dex 生成"]
+  AGP --> Package["APK/AAB 打包"]
+  Package --> Sign["签名 / 对齐 / 校验"]
+  Sign --> Out["构建产物"]
+```
 
 
 ## 2、启动阶段：./gradlew assembleDebug
@@ -1501,15 +1509,38 @@ Release 构建一般：
 ### AAR 处理流程
 
 
-> [!NOTE]
-> 原文此处为只读绘图/流程图块；当前文档导出接口未返回可还原内容，已保留此位置。
+```mermaid
+flowchart TB
+  AAR["AAR 依赖"] --> Unzip["解压 AAR"]
+  Unzip --> Classes["classes.jar"]
+  Unzip --> Res["res/ 资源"]
+  Unzip --> Manifest["AndroidManifest.xml"]
+  Unzip --> Assets["assets / jniLibs / consumer rules"]
+  Classes --> Compile["参与 Java/Kotlin classpath"]
+  Res --> MergeRes["资源合并与编译"]
+  Manifest --> MergeManifest["Manifest 合并"]
+  Assets --> Package["打包进 APK/AAB"]
+  Compile --> D8["D8/R8"]
+  MergeRes --> Package
+  MergeManifest --> Package
+  D8 --> Package
+```
 
 
 ### JAR 处理流程  
 
 
-> [!NOTE]
-> 原文此处为只读绘图/流程图块；当前文档导出接口未返回可还原内容，已保留此位置。
+```mermaid
+flowchart TB
+  JAR["JAR 依赖"] --> Classes[".class 字节码"]
+  JAR --> Resources["Java resources"]
+  Classes --> Compile["参与编译 classpath"]
+  Classes --> D8["D8/R8 转换为 dex"]
+  Resources --> Package["合并到 APK Java resources"]
+  D8 --> Package
+  Package --> APK["APK/AAB"]
+  Note["不包含 Android res / Manifest / assets / so"] -.-> JAR
+```
 
 
 ### 核心区别
