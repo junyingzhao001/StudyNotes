@@ -19,14 +19,23 @@ Gradle 负责“任务调度”和“依赖解析”，AGP 负责注册 Android 
 
 
 ```mermaid
-flowchart LR
-  Dev["开发者 / Android Studio"] --> Gradle["Gradle：任务调度、依赖解析"]
-  Gradle --> AGP["Android Gradle Plugin：注册 Android 构建任务"]
-  AGP --> Res["资源编译 / Manifest 合并"]
-  AGP --> Code["Java/Kotlin 编译 / Dex 生成"]
-  AGP --> Package["APK/AAB 打包"]
-  Package --> Sign["签名 / 对齐 / 校验"]
-  Sign --> Out["构建产物"]
+flowchart TD
+    A["Gradle Wrapper ./gradlew"] --> B["Gradle 初始化"]
+    B --> C["解析 settings.gradle / build.gradle"]
+    C --> D["AGP 创建 Variant"]
+    D --> E["解析依赖 AAR/JAR/源码模块"]
+    E --> F["Manifest 合并"]
+    E --> G["资源编译 AAPT2"]
+    E --> H["Kotlin/Java 编译"]
+    H --> I["字节码处理 / KSP / KAPT / ASM"]
+    I --> J["D8 / R8 生成 DEX"]
+    F --> K["APK 打包"]
+    G --> K
+    J --> K
+    E --> K
+    K --> L["zipalign"]
+    L --> M["APK 签名"]
+    M --> N["最终 APK"]
 ```
 
 
@@ -1510,20 +1519,23 @@ Release 构建一般：
 
 
 ```mermaid
-flowchart TB
-  AAR["AAR 依赖"] --> Unzip["解压 AAR"]
-  Unzip --> Classes["classes.jar"]
-  Unzip --> Res["res/ 资源"]
-  Unzip --> Manifest["AndroidManifest.xml"]
-  Unzip --> Assets["assets / jniLibs / consumer rules"]
-  Classes --> Compile["参与 Java/Kotlin classpath"]
-  Res --> MergeRes["资源合并与编译"]
-  Manifest --> MergeManifest["Manifest 合并"]
-  Assets --> Package["打包进 APK/AAB"]
-  Compile --> D8["D8/R8"]
-  MergeRes --> Package
-  MergeManifest --> Package
-  D8 --> Package
+flowchart TD
+    A["依赖 AAR"] --> B["Gradle 解析依赖"]
+    B --> C["AGP 解包 AAR"]
+    C --> D["AndroidManifest.xml"]
+    C --> E["res/"]
+    C --> F["classes.jar"]
+    C --> G["libs/*.jar"]
+    C --> H["assets/"]
+    C --> I["jni/*.so"]
+    C --> J["consumer rules"]
+    D --> K["Manifest Merge"]
+    E --> L["AAPT2 Resource Merge/Link"]
+    F --> M["Compile Classpath / D8/R8"]
+    G --> M
+    H --> N["APK assets"]
+    I --> O["APK lib/abi"]
+    J --> P["R8 Rules"]
 ```
 
 
@@ -1531,15 +1543,15 @@ flowchart TB
 
 
 ```mermaid
-flowchart TB
-  JAR["JAR 依赖"] --> Classes[".class 字节码"]
-  JAR --> Resources["Java resources"]
-  Classes --> Compile["参与编译 classpath"]
-  Classes --> D8["D8/R8 转换为 dex"]
-  Resources --> Package["合并到 APK Java resources"]
-  D8 --> Package
-  Package --> APK["APK/AAB"]
-  Note["不包含 Android res / Manifest / assets / so"] -.-> JAR
+flowchart TD
+    A["依赖 JAR"] --> B["Gradle 解析"]
+    B --> C["compileClasspath"]
+    B --> D["runtimeClasspath"]
+    C --> E["Java/Kotlin 编译可引用"]
+    D --> F["D8/R8 转 dex"]
+    D --> G["Java resources 合并"]
+    F --> H["classes.dex"]
+    G --> I["APK packaging"]
 ```
 
 

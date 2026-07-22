@@ -123,13 +123,14 @@ protected.apk
 
 ```mermaid
 flowchart LR
-  Original["原 APK
-classes.dex + res + so"] --> Reinforce["加固工具处理"]
-  Reinforce --> Shell["壳 dex / 壳 so"]
-  Reinforce --> Payload["加密后的原 dex / so / 资源"]
-  Shell --> NewAPK["加固后 APK"]
-  Payload --> NewAPK
-  NewAPK --> Runtime["运行时由壳恢复原 App"]
+    A["原 APK"] --> B["提取 classes.dex / so / assets"]
+    B --> C["加密 / 压缩 / 混淆"]
+    C --> D["生成 encrypted payload"]
+    D --> E["插入壳 dex / 壳 so"]
+    E --> F["修改 Manifest 入口"]
+    F --> G["重新打包"]
+    G --> H["重新签名"]
+    H --> I["加固 APK"]
 ```
 
 
@@ -208,13 +209,24 @@ so 解密
 
 
 ```mermaid
-flowchart TB
-  Install["安装加固 APK"] --> Start["系统启动壳 Application"]
-  Start --> Check["环境检测 / 完整性校验"]
-  Check --> Decrypt["解密原 dex / so / 资源"]
-  Decrypt --> Load["加载原业务代码"]
-  Load --> Delegate["代理原 Application 生命周期"]
-  Delegate --> Business["进入原业务逻辑"]
+sequenceDiagram
+    participant Android as Android Framework
+    participant ShellApp as ShellApplication
+    participant ShellSo as 壳 Native so
+    participant Payload as 加密 Payload
+    participant Loader as ClassLoader
+    participant RealApp as 原 Application
+
+    Android->>ShellApp: attachBaseContext()
+    ShellApp->>ShellSo: System.loadLibrary("shell")
+    ShellSo->>Payload: 读取加密 dex/so
+    ShellSo->>ShellSo: 环境检测 / 完整性校验
+    ShellSo->>Payload: 解密 payload
+    ShellApp->>Loader: 创建 DexClassLoader / InMemoryDexClassLoader
+    ShellApp->>Android: 替换 LoadedApk.mClassLoader
+    ShellApp->>RealApp: 反射创建原 Application
+    Android->>ShellApp: onCreate()
+    ShellApp->>RealApp: realApplication.onCreate()
 ```
 
 
@@ -252,13 +264,15 @@ Android Framework -> 壳 Application -> 解密加载 -> 原 Application -> 原�
 
 
 ```mermaid
-flowchart LR
-  subgraph Original["原 App"]
-    OF["Android Framework"] --> OA["原 Application"] --> OB["原业务代码"]
-  end
-  subgraph Reinforced["加固 App"]
-    RF["Android Framework"] --> SA["壳 Application"] --> Dec["解密 / 加载"] --> RA["原 Application"] --> RB["原业务代码"]
-  end
+flowchart TD
+    A["Android Framework"] --> B1["未加固: 原 Application"]
+    B1 --> C1["业务 Activity / Service / Receiver"]
+
+    A --> B2["加固: ShellApplication"]
+    B2 --> C2["解密原 dex / so"]
+    C2 --> D2["替换 ClassLoader"]
+    D2 --> E2["启动原 Application"]
+    E2 --> F2["业务 Activity / Service / Receiver"]
 ```
 
 
@@ -341,13 +355,12 @@ Real DexClassLoader -> 解密后的原 dex
 
 
 ```mermaid
-flowchart TB
-  System["Android 系统"] --> ShellLoader["Shell ClassLoader
-加载壳 dex"]
-  ShellLoader --> DecryptDex["解密原 dex"]
-  DecryptDex --> RealLoader["Real DexClassLoader
-加载原业务 dex"]
-  RealLoader --> Components["Activity / Service / Receiver 等原组件"]
+flowchart TD
+    A["系统要加载 MainActivity"] --> B["当前 ClassLoader"]
+    B --> C{"能否找到 MainActivity?"}
+    C -->|"壳 dex 找不到"| D["继续查原 dex"]
+    D --> E["找到原 MainActivity"]
+    E --> F["正常创建 Activity"]
 ```
 
 
@@ -429,13 +442,12 @@ assets/payload.bin = 加密后的原 dex
 
 ```mermaid
 flowchart LR
-  APK["加固 APK"] --> ShellDex["classes.dex：壳代码"]
-  APK --> Payload["assets/payload.bin：加密原 dex"]
-  ShellDex --> Read["读取 payload"]
-  Read --> Verify["环境与完整性校验"]
-  Verify --> Decrypt["解密 dex"]
-  Decrypt --> Load["DexClassLoader / InMemoryDexClassLoader 加载"]
-  Load --> Run["执行原代码"]
+    A["原 classes.dex"] --> B["压缩"]
+    B --> C["AES/自定义算法加密"]
+    C --> D["encrypted_payload.bin"]
+    D --> E["放入 assets 或 raw"]
+    E --> F["运行时解密"]
+    F --> G["DexClassLoader / InMemoryDexClassLoader"]
 ```
 
 
@@ -550,13 +562,13 @@ System.load(...)
 
 
 ```mermaid
-flowchart LR
-  EncSo["加密 so
-assets/libbusiness_arm64.enc"] --> ShellSo["壳 so"]
-  ShellSo --> Decrypt["解密 libbusiness.so"]
-  Decrypt --> Store["写入私有目录或内存映射"]
-  Store --> Load["System.load(...)"]
-  Load --> JNI["JNI / native 业务逻辑可用"]
+flowchart TD
+    A["libbusiness.so"] --> B["加密"]
+    B --> C["libbusiness.enc"]
+    C --> D["APK assets"]
+    D --> E["运行时根据 ABI 解密"]
+    E --> F["加载 so"]
+    F --> G["JNI 方法正常调用"]
 ```
 
 
@@ -622,12 +634,11 @@ APK 打包完成后的内容
 
 ```mermaid
 flowchart LR
-  Source["原始 APK"] --> Reinforce["加固：修改 dex / so / 资源"]
-  Reinforce --> Align["zipalign"]
-  Align --> Sign["重新签名"]
-  Sign --> Verify["apksigner verify"]
-  Verify --> Release["发布 APK"]
-  Wrong["先签名再加固"] -.会导致签名失效.-> Reinforce
+    A["原始 unsigned APK 或已构建 APK"] --> B["加固处理"]
+    B --> C["重新打包"]
+    C --> D["zipalign"]
+    D --> E["重新签名 v1/v2/v3"]
+    E --> F["最终发布 APK"]
 ```
 
 
@@ -656,26 +667,17 @@ flowchart LR
 
 
 ```mermaid
-mindmap
-  root((加固核心模块))
-    Dex 保护
-      加密
-      方法抽取
-      字符串加密
-      控制流混淆
-    Native 保护
-      so 加密
-      反调试
-      环境检测
-    资源保护
-      assets 加密
-      配置加密
-    完整性校验
-      签名校验
-      hash 校验
-    运行时防护
-      Root/模拟器检测
-      Hook 检测
+flowchart TD
+    A["App 加固"] --> B["Dex 保护"]
+    A --> C["Native so 保护"]
+    A --> D["资源保护"]
+    A --> E["完整性校验"]
+    A --> F["反调试"]
+    A --> G["反 Hook"]
+    A --> H["反模拟器 / Root"]
+    A --> I["运行时自保护 RASP"]
+    A --> J["防二次打包"]
+    A --> K["崩溃与兼容处理"]
 ```
 
 
@@ -1004,18 +1006,17 @@ so 被改
 
 
 ```mermaid
-flowchart TB
-  Start["App 启动"] --> Cert["校验签名证书"]
-  Cert --> DexHash["校验 dex hash"]
-  DexHash --> SoHash["校验 so hash"]
-  SoHash --> Payload["校验 payload 可解密"]
-  Payload --> Package["校验包名 / 环境"]
-  Package -->|全部通过| Run["继续运行"]
-  Cert -->|失败| Block["退出 / 崩溃 / 上报 / 限制功能"]
-  DexHash -->|失败| Block
-  SoHash -->|失败| Block
-  Payload -->|失败| Block
-  Package -->|失败| Block
+flowchart TD
+    A["App 启动"] --> B["壳初始化"]
+    B --> C["读取当前 APK 信息"]
+    C --> D["校验证书指纹"]
+    C --> E["校验 dex / so / payload hash"]
+    C --> F["校验包名 / 安装来源"]
+    D --> G{"是否可信？"}
+    E --> G
+    F --> G
+    G -->|"可信"| H["解密加载原 App"]
+    G -->|"不可信"| I["阻断 / 退出 / 上报"]
 ```
 
 
@@ -1114,15 +1115,13 @@ Hook ClassLoader
 
 
 ```mermaid
-flowchart LR
-  Client["客户端加固
-反调试 / 签名校验 / 环境检测 / 接口签名"] --> Request["请求携带设备、版本、签名、时间戳等信息"]
-  Request --> Server["服务端风控"]
-  Server --> Token["token 校验"]
-  Server --> Replay["重放保护"]
-  Server --> Risk["设备风险评分"]
-  Server --> Rate["异常频率控制"]
-  Server --> Decision["放行 / 限制 / 拦截"]
+flowchart TD
+    A["客户端加固"] --> E["综合安全"]
+    B["证书绑定 / TLS Pinning"] --> E
+    C["接口签名 / nonce / timestamp"] --> E
+    D["服务端风控"] --> E
+    F["设备指纹 / 风险评分"] --> E
+    G["Play Integrity / SafetyNet 类能力"] --> E
 ```
 
 
@@ -1159,12 +1158,20 @@ token 校验
 
 
 ```mermaid
-flowchart LR
-  Assemble["assembleRelease"] --> Reinforce["reinforce 加固"]
-  Reinforce --> Zipalign["zipalign"]
-  Zipalign --> Sign["apksigner 签名"]
-  Sign --> Verify["verify 校验"]
-  Verify --> Upload["上传/发布"]
+flowchart TD
+    A["源码"] --> B["正常 Gradle 编译"]
+    B --> C["生成 unsigned 或 signed APK"]
+    C --> D["上传/调用加固工具"]
+    D --> E["解包 APK"]
+    E --> F["提取 dex / so / assets"]
+    F --> G["加密 / 混淆 / 插壳"]
+    G --> H["修改 Manifest Application"]
+    H --> I["重新打包 APK"]
+    I --> J["zipalign"]
+    J --> K["正式签名"]
+    K --> L["apksigner verify"]
+    L --> M["发布 / 灰度"]
+
 ```
 
 
@@ -1336,14 +1343,10 @@ RETURN
 
 
 ```mermaid
-flowchart TB
-  JavaMethod["原 Java 方法
-return a + b"] --> Extract["抽取/转换方法体"]
-  Extract --> VMCode["VM 指令
-LOAD a / LOAD b / ADD / RETURN"]
-  VMCode --> ShellVM["壳内置虚拟机解释执行"]
-  ShellVM --> Result["返回原业务结果"]
-  JavaMethod -.静态分析看到的只是.-> Stub["壳调用 / 桩代码"]
+flowchart LR
+    A["原方法字节码"] --> B["转换为自定义 VM 指令"]
+    B --> C["加密 VM 指令"]
+    C --> D["运行时 VM 解释器执行"]
 ```
 
 
