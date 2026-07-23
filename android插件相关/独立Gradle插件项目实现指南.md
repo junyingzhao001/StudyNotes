@@ -236,8 +236,8 @@ apply plugin: 'com.example.coverage'
 **好处**：
 
 - 不需要发布到 Maven
-- 代码改动后立即生效（和 buildSrc 一样）
-- 但编译是增量的（比 buildSrc 快）
+- 代码改动可由复合构建直接参与下一次构建，无需先发布到 Maven
+- 独立构建边界更清晰，通常更利于隔离、缓存和扩展；实际速度仍取决于项目结构与缓存命中，不能保证每次都比 buildSrc 快
 - 未来想发布到 Maven 时，只需要加 `maven-publish` 配置
 
 ## 八、三种方案选择指南
@@ -247,7 +247,8 @@ apply plugin: 'com.example.coverage'
 
 | 场景 | 推荐方案 |
 | --- | --- |
-| 只在这个项目用，快速迭代 | buildSrc（当前） |
+| 小型项目、只在当前构建使用、希望最低接入成本 | buildSrc |
+| 中大型多模块工程、希望更清晰的构建边界 | `build-logic` included build |
 | 想独立出来但不想搞 Maven | includeBuild |
 | 多个项目复用，有 Nexus | 独立插件 + Maven |
 | 开源发布给社区 | 独立插件 + Gradle Plugin Portal |

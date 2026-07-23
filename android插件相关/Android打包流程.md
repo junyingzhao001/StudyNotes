@@ -1120,14 +1120,16 @@ android {
 
 如果依赖中有 .so：
 
-```java
-src/main/jniLibs/arm64-v8a/libxxx.soAAR/jni/arm64-v8a/libxxx.so
+```text
+src/main/jniLibs/arm64-v8a/libxxx.so
+AAR 内的 jni/arm64-v8a/libxxx.so
 ```
 
 最终会被打到 APK：
 
-```java
-lib/arm64-v8a/libxxx.solib/armeabi-v7a/libxxx.so
+```text
+lib/arm64-v8a/libxxx.so
+lib/armeabi-v7a/libxxx.so
 ```
 
 ### 怎么干涉？

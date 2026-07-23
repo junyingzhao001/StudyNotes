@@ -53,7 +53,7 @@ buildSrc/
 ```javascript
 // buildSrc/build.gradle.kts
 plugins {
-    `kotlin-dsl`  // 必须启用，提供 Kotlin DSL 支持
+    `kotlin-dsl`  // 本文用 Kotlin 编写插件，所以启用 Kotlin DSL 支持
 }
 
 repositories {
@@ -63,7 +63,7 @@ repositories {
 
 dependencies {
     // 如果要操作 Android 构建流程，必须依赖 AGP
-    implementation("com.android.tools.build:gradle:8.6.0")
+    implementation("com.android.tools.build:gradle:<与主工程兼容的版本>")
     // 其他需要的库...
     implementation("org.jacoco:org.jacoco.core:0.8.11")
 }
@@ -90,7 +90,7 @@ class IncrementalCoveragePlugin : Plugin<Project> {
 
 创建文件 src/main/resources/META-INF/gradle-plugins/<插件ID>.properties：
 
-```kotlin
+```properties
 ## com.example.coverage.properties
 ## 文件名 = 插件ID，在 build.gradle 中用 apply plugin: 'com.example.coverage' 引用
 implementation-class=com.example.coverage.IncrementalCoveragePlugin
@@ -99,12 +99,16 @@ implementation-class=com.example.coverage.IncrementalCoveragePlugin
 
 ### 3.4 在模块中使用
 
-```kotlin
+```groovy
 // app/build.gradle
 apply plugin: 'com.example.coverage'   // 插件ID = properties文件名
 ```
 
 **就这三步，插件就生效了。不需要发布、不需要版本号、不需要额外配置 classpath。**
+
+这里的“不需要额外配置 classpath”仅指消费方脚本：`buildSrc` 会自动加入主构建的脚本
+classpath。`buildSrc` 自己仍要声明编译插件源码所需的依赖，而且 AGP、Gradle、JDK/Kotlin
+版本必须与主工程兼容。示例中的版本不要机械照抄，应以项目的版本矩阵为准。
 
 ## 四、插件的能力
 

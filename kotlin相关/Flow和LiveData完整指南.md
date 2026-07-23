@@ -101,23 +101,32 @@ fun main() = runBlocking {
 Hot Flow（热流）
 
 ```kotlin
-fun hotFlow(): Flow<Int> = flow {
-    println("Flow 开始执行")
-    for (i in 1..3) {
-        emit(i)
-    }
-}.shareIn(
-    scope = CoroutineScope(Dispatchers.Default),
-    started = SharingStarted.WhileSubscribed(),
-    replay = 1
-)
-
 fun main() = runBlocking {
-    hotFlow().collect { println("收集1: $it") }
-    hotFlow().collect { println("收集2: $it") }
-    // 只输出一次 "Flow 开始执行"
+    val hotFlow = flow {
+        println("上游开始执行")
+        for (i in 1..3) {
+            delay(100)
+            emit(i)
+        }
+    }.shareIn(
+        scope = this,
+        started = SharingStarted.Eagerly,
+        replay = 1
+    )
+
+    // collect 是挂起且通常不会主动结束的操作，多个收集者要并发启动。
+    val collector1 = launch {
+        hotFlow.take(3).collect { println("收集1: $it") }
+    }
+    val collector2 = launch {
+        hotFlow.take(3).collect { println("收集2: $it") }
+    }
+    joinAll(collector1, collector2)
 }
 ```
+
+这里的“热”表示上游由共享协程驱动，而不是每个收集者各执行一遍。实际能收到几个值还受
+`started` 策略、订阅时机和 `replay` 影响，不能简单理解成“热流永远只执行一次”。
 
 ### 1.4 Flow 操作符
 
@@ -360,19 +369,20 @@ StateFlow
 
 fun stateFlowExample() = runBlocking {
     val stateFlow = MutableStateFlow(0)
-    
-    // 设置值
-    stateFlow.value = 1
-    stateFlow.tryEmit(2)
-    
-    // 收集
-    stateFlow.collect { value ->
-        println("StateFlow 值: $value")
+
+    val collector = launch {
+        stateFlow.take(3).collect { value ->
+            println("StateFlow 值: $value")
+        }
     }
-    
-    // 比较值
-    stateFlow.value = 2  // 不会发射，因为值相同
-    stateFlow.value = 3  // 会发射
+
+    yield() // 让收集者先订阅并收到初始值 0
+    stateFlow.value = 1
+    yield() // StateFlow 会合并过快的更新，让收集者有机会处理 1
+    stateFlow.value = 1 // 与当前值相等，不会再次发射
+    stateFlow.value = 2
+
+    collector.join()
 }
 ```
 
@@ -383,7 +393,7 @@ SharedFlow
 // 1. 可以有或没有初始值
 // 2. 可以保存多个值（通过 replay）
 // 3. 新订阅者可以收到历史值（replay > 0）
-// 4. 可以使用自定义相等比较
+// 4. 默认不会像 StateFlow 那样按 equals 自动去重
 
 fun sharedFlowExample() = runBlocking {
     val sharedFlow = MutableSharedFlow<Int>(
@@ -431,17 +441,19 @@ class UserViewModel : ViewModel() {
 class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
+
         lifecycleScope.launch {
-            viewModel.users.collect { users ->
-                updateUI(users)
-            }
-        }
-        
-        lifecycleScope.launch {
-            viewModel.events.collect { event ->
-                when (event) {
-                    is Event.Error -> showError(event.message)
+            // STARTED 以下会取消内部收集，重新 STARTED 时再次启动。
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                launch {
+                    viewModel.users.collect(::updateUI)
+                }
+                launch {
+                    viewModel.events.collect { event ->
+                        when (event) {
+                            is Event.Error -> showError(event.message)
+                        }
+                    }
                 }
             }
         }
@@ -894,17 +906,15 @@ fun main() = runBlocking {
 
 **实现原理：**
 
-Flow 不存储数据，只存储如何产生数据的逻辑
-
-**collect** 时，创建一个新的协程来执行 Flow 块
-
-每次 **collect** 都会创建新的执行实例
+- `flow { ... }` 描述的是一段可挂起的生产逻辑，本身不保存“历史发射值”。
+- 每次 `collect` 都会重新执行这段上游逻辑；执行发生在收集者所在协程中，并不必然“额外创建一个新协程”。
+- `flowOn`、`buffer`、`channelFlow`、`shareIn` 等操作符可能引入额外协程或 Channel，因此不能把所有 Flow 都理解成同一条同步调用链。
 
 **Flow 的状态机实现**
 
 ```kotlin
 // 原始代码
-suspend fun flowExample(): Flow<Int> = flow {
+fun flowExample(): Flow<Int> = flow {
     emit(1)
     delay(100)
     emit(2)
@@ -912,60 +922,30 @@ suspend fun flowExample(): Flow<Int> = flow {
     emit(3)
 }
 
-// 编译后的伪代码（简化）
-class FlowExampleContinuation : Continuation<FlowCollector<Int>> {
-    var label = 0var result: Any? = nulloverride fun resumeWith(result: Result<FlowCollector<Int>>) {
-        when (label) {
-            0 -> {
-                result.getOrThrow().emit(1)
-                label = 1
-                delay(100, this)
-            }
-            1 -> {
-                result.getOrThrow().emit(2)
-                label = 2
-                delay(100, this)
-            }
-            2 -> {
-                result.getOrThrow().emit(3)
-                return
-            }
-        }
+// 编译后的概念模型（不是可直接编译的反编译结果）
+// 每个可能挂起的位置对应一个 label；局部变量会按需保存到状态机字段。
+when (label) {
+    0 -> {
+        collector.emit(1)
+        label = 1
+        // delay 若真正挂起，则返回 COROUTINE_SUSPENDED
     }
+    1 -> {
+        collector.emit(2)
+        label = 2
+    }
+    2 -> collector.emit(3)
 }
 ```
+
+要点不是记住伪代码长相，而是理解：`emit` 和 `delay` 都可能挂起；恢复后从对应
+`label` 继续，而不是从函数第一行重新运行。
 
 **StateFlow 的实现原理**
 
-```kotlin
-// StateFlow 内部实现（简化版）
-class StateFlowImpl<T>(
-    private var value: T,
-    private val capacity: Int = 0
-) : StateFlow<T>, MutableStateFlow<T> {
-    private val subscribers = CopyOnWriteArrayList<Subscriber<T>>()
-    
-    override var value: T
-        get() = synchronized(this) { value }
-        set(newValue) {
-            synchronized(this) {
-                if (value == newValue) return  // 值相同不更新
-                value = newValue
-                subscribers.forEach { it.onValue(newValue) }
-            }
-        }
-    
-    override fun collect(collector: FlowCollector<T>): Nothing {
-        val subscriber = Subscriber(collector)
-        synchronized(this) {
-            subscribers.add(subscriber)
-            // 立即发送当前值
-            collector.emit(value)
-        }
-        // 等待取消...
-    }
-}
-```
+可以把 StateFlow **概念化**为“一个当前值 + 一组订阅槽位”，但不要用
+`CopyOnWriteArrayList` 之类的示意代码冒充真实实现。真实实现会随
+`kotlinx.coroutines` 版本演进，并使用专门的 slot、原子更新和恢复机制。
 
 **关键点：**
 
@@ -973,46 +953,18 @@ class StateFlowImpl<T>(
 
 **立即订阅**：新订阅者立即收到当前值
 
-**线程安全**：使用锁保护内部状态
+**线程安全**：公开更新 API 是线程安全的；复合更新优先使用 `update { ... }`，避免“先读后写”竞争
 
-**内存管理**：订阅者列表使用 CopyOnWriteArrayList
+**永不正常完成**：`StateFlow.collect` 通常一直挂起，直到收集协程被取消
 
 **SharedFlow 的实现原理**
 
-```kotlin
-// SharedFlow 内部实现（简化版）
-class SharedFlowImpl<T>(
-    replay: Int = 0,
-    extraBufferCapacity: Int = 0,
-    onBufferOverflow: BufferOverflow = BufferOverflow.SUSPEND
-) : SharedFlow<T>, MutableSharedFlow<T> {
-    private val buffer = ArrayDeque<T>(replay + extraBufferCapacity)
-    private val subscribers = CopyOnWriteArrayList<Subscriber<T>>()
-    
-    override fun emit(value: T) {
-        synchronized(this) {
-            buffer.addLast(value)
-            if (buffer.size > replay + extraBufferCapacity) {
-                when (onBufferOverflow) {
-                    BufferOverflow.DROP_OLDEST -> buffer.removeFirst()
-                    BufferOverflow.DROP_LATEST -> buffer.removeLast()
-                    BufferOverflow.SUSPEND -> // 挂起等待
-                }
-            }
-            subscribers.forEach { it.onValue(value) }
-        }
-    }
-    
-    override fun collect(collector: FlowCollector<T>): Nothing {
-        val subscriber = Subscriber(collector)
-        synchronized(this) {
-            subscribers.add(subscriber)
-            // 发送 replay 个历史值
-            buffer.takeLast(replay).forEach { collector.emit(it) }
-        }
-    }
-}
-```
+SharedFlow 可以概念化为“replay cache + 额外缓冲 + 订阅槽位”。需要特别注意：
+
+- `replay` 决定新订阅者能补收多少个历史值。
+- `extraBufferCapacity` 主要用于已有慢订阅者时吸收突发数据，不会扩大新订阅者的历史回放数量。
+- 没有订阅者时只保留 `replay` 个值，发射者不会因为 `BufferOverflow.SUSPEND` 而等待。
+- `emit` 可能挂起，`tryEmit` 只会立即返回成功或失败；二者不能无条件互换。
 
 **关键点：**
 
@@ -1033,7 +985,8 @@ class SharedFlowImpl<T>(
 class LiveData<T> {
     private val observers = SafeIterableMap<Observer<T>, ObserverWrapper>()
     
-    @MainThreadfun observe(owner: LifecycleOwner, observer: Observer<T>) {
+    @MainThread
+    fun observe(owner: LifecycleOwner, observer: Observer<T>) {
         // 包装观察者
         val wrapper = LifecycleBoundObserver(owner, observer)
         observers.put(observer, wrapper)
@@ -1047,19 +1000,14 @@ class LiveData<T> {
         val observer: Observer<T>
     ) : LifecycleObserver {
         
-        @OnLifecycleEvent(Lifecycle.Event.ON_START)fun onStart() {
-            // 开始观察
-            activeStateChanged(true)
-        }
-        
-        @OnLifecycleEvent(Lifecycle.Event.ON_STOP)fun onStop() {
-            // 停止观察
-            activeStateChanged(false)
-        }
-        
-        @OnLifecycleEvent(Lifecycle.Event.ON_DESTROY)fun onDestroy() {
-            // 自动移除观察者
-            removeObserver(observer)
+        fun onStateChanged() {
+            if (owner.lifecycle.currentState == Lifecycle.State.DESTROYED) {
+                removeObserver(observer)
+            } else {
+                activeStateChanged(
+                    owner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+                )
+            }
         }
     }
 }
@@ -1080,7 +1028,11 @@ class LiveData<T> {
 ```kotlin
 // LiveData 的值更新（简化版）
 class LiveData<T> {
-    private var version = 0private var data: T? = null@MainThreadfun setValue(value: T) {
+    private var version = -1
+    private var data: T? = null
+
+    @MainThread
+    fun setValue(value: T) {
         version++
         data = value
         // 通知所有活跃的观察者
@@ -1089,7 +1041,7 @@ class LiveData<T> {
     
     // 从任意线程设置值
     fun postValue(value: T) {
-        // 使用 Handler 切换到主线程
+        // 概念示意：真实实现会合并尚未派发的 pending 值
         val postTask = Runnable {
             setValue(value)
         }
@@ -1114,7 +1066,7 @@ class LiveData<T> {
 
 **活跃状态**：只通知处于活跃状态的观察者
 
-**线程安全**：使用锁保护内部状态
+**连续 postValue 的合并**：主线程处理任务前多次调用 `postValue`，中间值可能被后一个值覆盖
 
 **Transformations 的实现原理**
 
@@ -1160,11 +1112,11 @@ class Transformations {
 
 **MediatorLiveData**：用于组合多个 LiveData
 
-**惰性转换**：只在值变化时转换
+**惰性激活**：结果 LiveData 有活跃观察者时才监听上游；上游每次派发都会执行转换，并不自动按值去重
 
 **自动清理**：switchMap 自动移除旧的源
 
-**内存安全**：使用弱引用避免内存泄漏
+**生命周期清理**：生命周期观察者会在 `DESTROYED` 后移除；`observeForever` 仍需手动移除
 
 ### **5.3 性能对比**
 
@@ -1174,7 +1126,7 @@ class Transformations {
 | --- | --- | --- |
 | **冷流存储** | 不存储数据，只存储逻辑 | 存储当前值 |
 | **热流存储** | StateFlow: 1个值  <br/>SharedFlow: replay个值 | 1个值 |
-| **观察者列表** | 每次 collect 创建新协程 | CopyOnWriteArrayList |
+| **观察者/收集者管理** | 由协程与具体 Flow 实现管理 | 内部映射保存 ObserverWrapper |
 
 **执行效率**
 
@@ -1182,7 +1134,7 @@ class Transformations {
 | --- | --- | --- |
 | **创建** | 很快（只是函数引用） | 很快（对象创建） |
 | **发射值** | 快（直接传递） | 快（版本号检查） |
-| **观察者通知** | 协程调度开销 | Handler 主线程切换 |
+| **观察者通知** | 可能同协程直接调用，也可能经过调度/缓冲 | `setValue` 主线程直接派发；`postValue` 切到主线程 |
 | **线程切换** | 协程调度器 | Handler |
 
 ---
@@ -1248,14 +1200,7 @@ fun fastFlow(): Flow<Int> = flow {
 **4. 生命周期管理**
 
 ```kotlin
-// ✅ 正确：使用 lifecycleScope
-lifecycleScope.launch {
-    flow.collect { value ->
-        updateUI(value)
-    }
-}
-
-// ✅ 正确：使用 repeatOnLifecycle（避免配置变化时重复订阅）
+// ✅ UI 收集推荐使用 repeatOnLifecycle
 lifecycleScope.launch {
     repeatOnLifecycle(Lifecycle.State.STARTED) {
         flow.collect { value ->
@@ -1309,10 +1254,11 @@ class ViewModel {
 **2. 避免在 LiveData 中执行耗时操作**
 
 ```kotlin
-// ❌ 错误：在主线程执行耗时操作
+// ❌ 错误：仅仅进入 viewModelScope 不等于切到后台线程；
+// 如果 repository.getData() 是阻塞调用，仍会卡住主线程。
 fun loadData() {
     viewModelScope.launch {
-        val data = repository.getData()  // 在协程中执行
+        val data = repository.getData()
         _data.value = data
     }
 }
@@ -1450,14 +1396,7 @@ viewModel.users.observe(this) { users ->
     updateUI(users)
 }
 
-// 之后：StateFlow
-lifecycleScope.launch {
-    viewModel.users.collect { users ->
-        updateUI(users)
-    }
-}
-
-// 或使用 repeatOnLifecycle
+// 之后：StateFlow。UI 层推荐按生命周期重复收集。
 lifecycleScope.launch {
     repeatOnLifecycle(Lifecycle.State.STARTED) {
         viewModel.users.collect { users ->
@@ -1501,10 +1440,14 @@ val isLoading = MutableStateFlow<Boolean>(false)
 private val _event = MutableLiveData<Event>()
 val event: LiveData<Event> = _event
 
-// SharedFlow（更优雅）
+// SharedFlow：适合“在线订阅者消费”的事件
 private val _event = MutableSharedFlow<Event>()
 val event: SharedFlow<Event> = _event.asSharedFlow()
 ```
+
+`MutableSharedFlow(replay = 0)` 在没有订阅者时不会保存事件。若“页面暂时停止收集也绝不能丢”
+是业务要求，应先明确事件语义，再考虑状态建模、持久队列或 Channel；不要仅因它叫
+SharedFlow 就默认一次性事件一定可靠送达。
 
 **场景3：列表数据**
 
@@ -1524,7 +1467,7 @@ val users = MutableStateFlow<List<User>>(emptyList())
 
 | **操作** | **Flow** | **LiveData** |
 | --- | --- | --- |
-| **类型** | 冷流（默认） | 热流（始终） |
+| **类型** | `flow {}` 默认是冷流；StateFlow/SharedFlow 是热流 | 热数据持有者 |
 | **生命周期感知** | 需要配合 Lifecycle | 内置 |
 | **操作符** | 丰富的操作符链 | Transformations |
 | **异常处理** | catch、retry | try-catch |
@@ -1572,7 +1515,7 @@ UI 层：根据情况选择
 
 **StateFlow ≈ MutableLiveData，但有初始值要求**
 
-**SharedFlow 适合一次性事件**
+**SharedFlow 可用于一次性事件，但要先设计清楚无订阅者、缓冲和丢失策略**
 
 **LiveData 生命周期感知更方便**
 

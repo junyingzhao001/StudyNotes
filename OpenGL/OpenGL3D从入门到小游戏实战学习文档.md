@@ -68,7 +68,7 @@ OpenGL ES 是移动端/嵌入式版本
 你不是在“画图片”，你是在“描述一个世界，再让相机去看它”。
 ```
 
-句话很关键。
+这句话很关键。
 
 2D UI 开发时，我们常常想的是：
 - 这里放个 View
@@ -129,8 +129,8 @@ Shader 是运行在 GPU 上的小程序。
 
 最常见的两种：
 
-- Vertex Shader处理每个顶点决定顶点最终出现在屏幕什么位置
-- Fragment Shader处理每个像素决定这个像素最终显示什么颜色
+- Vertex Shader：处理每个顶点，输出裁剪空间位置及需要插值的数据
+- Fragment Shader：处理光栅化产生的片段，计算颜色；片段还可能被深度、模板等测试丢弃，因此不等同于“最终屏幕像素”
 
 可以把它们理解成：
 
@@ -419,8 +419,14 @@ class MyGLSurfaceView(context: Context) : GLSurfaceView(context) {
                     val dx = event.x - lastX
                     val dy = event.y - lastY
 
-                    renderer.angleY += dx * 0.3f
-                    renderer.angleX += dy * 0.3f
+                    // GLSurfaceView 默认在独立 GL 线程回调 Renderer。
+                    // 通过 queueEvent 修改渲染状态，避免 UI 线程与 GL 线程直接竞争。
+                    queueEvent {
+                        renderer.rotateBy(
+                            horizontalDelta = dx * 0.3f,
+                            verticalDelta = dy * 0.3f
+                        )
+                    }
 
                     lastX = event.x
                     lastY = event.y
@@ -452,8 +458,13 @@ class SimpleRenderer : GLSurfaceView.Renderer {
     private val tempMatrix = FloatArray(16)
     private val mvpMatrix = FloatArray(16)
 
-    var angleX = 20f
-    var angleY = 30f
+    private var angleX = 20f
+    private var angleY = 30f
+
+    fun rotateBy(horizontalDelta: Float, verticalDelta: Float) {
+        angleY += horizontalDelta
+        angleX = (angleX + verticalDelta).coerceIn(-90f, 90f)
+    }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES30.glClearColor(0.08f, 0.08f, 0.12f, 1f)
@@ -462,6 +473,7 @@ class SimpleRenderer : GLSurfaceView.Renderer {
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
+        if (width <= 0 || height <= 0) return
         GLES30.glViewport(0, 0, width, height)
         val ratio = width.toFloat() / height.toFloat()
         Matrix.perspectiveM(projMatrix, 0, 60f, ratio, 0.1f, 100f)
@@ -634,6 +646,10 @@ object ShaderUtils {
 - 相机 lookAt
 - 透视投影
 - 一个 3D 模型
+
+还要特别注意线程模型：Activity 的触摸、生命周期回调通常在主线程，而
+`Renderer` 的三个回调运行在 GLSurfaceView 的 GL 线程。UI 状态传给渲染器时，应使用
+`queueEvent`、线程安全队列或清晰的同步策略；不要默认两边读写普通字段一定安全。
 
 为了保证这是最小学习版本，忽略了这些东西：
 

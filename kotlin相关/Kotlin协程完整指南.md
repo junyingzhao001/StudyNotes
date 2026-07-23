@@ -491,15 +491,21 @@ IO 线程拿到了 `result`。
 
 **为什么能接着跑？** 因为协程把还没执行完的代码封装成了 `case 1, case 2...`，并把当前的变量（如 `user`）存成了状态机的成员变量。
 
-**`Continuation` 是什么？** 它就是那个状态机对象。`suspend` 函数反编译后，参数列表最后都会多出一个 `Continuation` 参数，这就像是一个“回执单”，告诉异步任务：“干完活，按这张单子上的地址（`resumeWith`）叫醒我”。
+**`Continuation` 是什么？** 它是“后续计算”的接口，保存协程上下文，并通过
+`resumeWith` 接收成功或失败结果。编译器生成的挂起 lambda / 挂起函数状态机通常会实现或继承
+Continuation 相关类型，但不能简单断言“任意 Continuation 就是状态机”；它也可能是调度器包装后的续体。
 
 #### 3.4.3、 `withContext` 做了什么？
 
-在反编译层面，`withContext(Dispatchers.IO)` 实际上做了两次“拦截”：
+从概念上看，`withContext(Dispatchers.IO)` 做了两件事：
 
 **切走**：它会把当前状态机封装成一个 Task，提交给 IO 线程。
 
-**切回**：它会给状态机再包一层，确保 `resumeWith` 被调用时，必须通过 `MainDispatcher.dispatch` 把任务发回主线程队列。
+**切回**：代码块完成后，恢复调用方原来的协程上下文。若调用方在
+`Dispatchers.Main`，后续通常回到主线程。
+
+这是便于理解的模型，不是每次都必然发生“两次线程切换”。当新旧上下文使用同一调度器，
+或者调度器判断当前线程无需再次派发时，库可以走更快的执行路径。
 
 #### 3.4.4、Continuation 的本质
 
@@ -522,7 +528,7 @@ interface Continuation<in T> {
 
 #### 3.4.6、拦截器的“套娃”过程
 
-这就是为什么 `withContext(Dispatchers.IO)` 能切走又能切回来的原因：
+这就是为什么 `withContext(Dispatchers.IO)` 通常能切走又切回来：
 
 **挂起时**：`withContext` 获取当前的 `Continuation`（状态机），并把它交给 `Dispatchers.IO`。
 
@@ -530,11 +536,12 @@ interface Continuation<in T> {
 
 **恢复时（关键点）**：
 
-在 IO 线程任务结束时，它会调用状态机的 `resumeWith`。
+在 IO 任务结束时，结果会沿续体链恢复。
 
 但是！状态机外层包裹着 **父协程的拦截器**（也就是 `Dispatchers.Main`）。
 
-这个拦截器会再次介入，通过 `Handler.post`（在 Android 中）或其他消息机制，把恢复指令发回到主线程的消息队列。
+如果父协程上下文是 Android 主线程调度器，并且当前不在可直接执行的主线程位置，
+拦截器会通过主线程消息机制安排恢复。若父上下文不是 Main，就会回到父上下文对应的执行器。
 
 ## 四、异常传递机制
 

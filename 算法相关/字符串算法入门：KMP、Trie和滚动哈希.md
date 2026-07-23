@@ -60,6 +60,17 @@ pattern = "abab"
 
 长度是 2。
 
+注意“真前后缀”不能等于字符串本身。以 `pattern = "ababaca"` 为例：
+
+```text
+字符:  a b a b a c a
+下标:  0 1 2 3 4 5 6
+next:  0 0 1 2 3 0 1
+```
+
+构建时的 `j` 既表示“当前已匹配前缀长度”，也表示下一次要比较的模式串下标。
+失配后执行 `j = next[j - 1]`，相当于尝试更短的可复用前后缀；这个回退可能连续发生多次。
+
 ---
 
 ## 3. KMP 构建 next
@@ -151,6 +162,9 @@ class Trie {
         Node cur = root;
         for (char c : word.toCharArray()) {
             int index = c - 'a';
+            if (index < 0 || index >= 26) {
+                throw new IllegalArgumentException("示例 Trie 只支持 a-z");
+            }
             if (cur.children[index] == null) {
                 cur.children[index] = new Node();
             }
@@ -172,6 +186,9 @@ class Trie {
         Node cur = root;
         for (char c : s.toCharArray()) {
             int index = c - 'a';
+            if (index < 0 || index >= 26) {
+                throw new IllegalArgumentException("示例 Trie 只支持 a-z");
+            }
             if (cur.children[index] == null) {
                 return null;
             }
@@ -201,7 +218,48 @@ class Trie {
 hash("abc") = a * base^2 + b * base + c
 ```
 
-子串哈希可以用前缀差出来。
+定义：
+
+```text
+prefix[i + 1] = prefix[i] * base + value(s[i])
+power[i + 1]  = power[i] * base
+```
+
+那么半开区间 `[left, right)` 的哈希为：
+
+```text
+hash(left, right) = prefix[right] - prefix[left] * power[right - left]
+```
+
+Java 示例（利用 `long` 的自然溢出作为模 `2^64` 运算）：
+
+```java
+class RollingHash {
+    private static final long BASE = 911382323L;
+    private final long[] prefix;
+    private final long[] power;
+
+    RollingHash(String s) {
+        int n = s.length();
+        prefix = new long[n + 1];
+        power = new long[n + 1];
+        power[0] = 1;
+
+        for (int i = 0; i < n; i++) {
+            prefix[i + 1] = prefix[i] * BASE + (s.charAt(i) + 1L);
+            power[i + 1] = power[i] * BASE;
+        }
+    }
+
+    // 返回 s[left, right) 的哈希
+    long hash(int left, int right) {
+        if (left < 0 || left > right || right >= prefix.length) {
+            throw new IndexOutOfBoundsException();
+        }
+        return prefix[right] - prefix[left] * power[right - left];
+    }
+}
+```
 
 滚动哈希适合：
 
@@ -211,7 +269,16 @@ hash("abc") = a * base^2 + b * base + c
 快速比较两个子串是否相等
 ```
 
-注意：哈希可能冲突，严谨场景需要双哈希或最终字符串校验。
+注意：哈希相等只表示“很可能相等”，并不是数学上的充分条件。需要绝对正确时，应在哈希命中后
+再逐字符校验；双哈希只能进一步降低冲突概率，不能把概率降为零。
+
+复杂度对比：
+
+| 算法 | 预处理 | 单次查询/匹配 | 额外空间 |
+|---|---:|---:|---:|
+| KMP | `O(m)` | 文本匹配 `O(n)` | `O(m)` |
+| Trie | 插入总字符数 `O(S)` | 查询 `O(L)` | `O(S × 字符集开销)` |
+| 滚动哈希 | `O(n)` | 子串哈希 `O(1)` | `O(n)` |
 
 ---
 
