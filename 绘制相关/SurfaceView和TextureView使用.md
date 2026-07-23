@@ -126,11 +126,9 @@ Hardware Composer
 
 ```mermaid
 flowchart LR
-  A["Canvas / MediaCodec / MediaPlayer / Camera / OpenGL ES / Vulkan"] --> B["Surface：图像缓冲区入口"]
-  B --> C["BufferQueue"]
-  C --> D["SurfaceFlinger / 系统合成器"]
-  D --> E["GPU / Hardware Composer"]
-  E --> F["屏幕显示"]
+    A["生产者: Camera / MediaCodec / OpenGL / Canvas"] --> B["Surface / BufferQueue"]
+    B --> C["SurfaceFlinger"]
+    C --> D["屏幕显示"]
 ```
 
 
@@ -151,14 +149,15 @@ SurfaceView：自己单独拥有一个 Surface，由系统单独合成
 
 
 ```mermaid
-flowchart TB
-  subgraph W["应用 Window"]
-    V["普通 View 树"] --> WS["Window Surface"]
-    SV["SurfaceView 控件"] --> SS["独立 Surface"]
-  end
-  WS --> SF["SurfaceFlinger 合成"]
-  SS --> SF
-  SF --> Screen["屏幕"]
+flowchart TD
+    A["Activity Window"] --> B["DecorView / ViewRootImpl"]
+    B --> C["普通 View 树"]
+    C --> D["TextView / Button / ImageView"]
+
+    A --> E["SurfaceView"]
+    E --> F["独立 Surface"]
+    F --> G["SurfaceFlinger 合成"]
+
 ```
 
 
@@ -210,9 +209,9 @@ OpenGL 直接渲染到 Surface
 
 ```mermaid
 flowchart LR
-  A["MediaPlayer / MediaCodec / Camera / 渲染线程"] --> B["SurfaceView 持有的 Surface"]
-  B --> C["SurfaceFlinger"]
-  C --> D["屏幕"]
+    A["视频解码器 MediaCodec"] --> B["SurfaceView Surface"]
+    B --> C["SurfaceFlinger"]
+    C --> D["屏幕"]
 ```
 
 
@@ -250,14 +249,14 @@ TextureView 是普通 View 树的一部分，它内部使用 SurfaceTexture 接�
 
 
 ```mermaid
-flowchart LR
-  A["MediaPlayer / Camera / OpenGL"] --> B["SurfaceTexture"]
-  B --> C["GL Texture"]
-  C --> D["TextureView"]
-  D --> E["普通 View 树"]
-  E --> F["Window Surface"]
-  F --> G["SurfaceFlinger"]
-  G --> H["屏幕"]
+flowchart TD
+    A["Camera / MediaCodec / OpenGL"] --> B["Surface"]
+    B --> C["SurfaceTexture"]
+    C --> D["TextureView"]
+    D --> E["普通 View 树绘制"]
+    E --> F["Window Surface"]
+    F --> G["SurfaceFlinger"]
+    G --> H["屏幕"]
 ```
 
 
@@ -1016,11 +1015,16 @@ TextureView 参与 View 合成
 
 
 ```mermaid
-flowchart TB
-  subgraph SurfaceView["SurfaceView 性能路径"]
-    S1["生产者"] --> S2["Surface buffer"] --> S3["SurfaceFlinger 合成"] --> S4["屏幕"]
-  end
-  subgraph TextureView["TextureView 性能路径"]
-    T1["生产者"] --> T2["SurfaceTexture"] --> T3["GL Texture"] --> T4["View 树合成"] --> T5["Window Surface"] --> T6["SurfaceFlinger 合成"] --> T7["屏幕"]
-  end
+
+flowchart TD
+    A["SurfaceView"] --> A1["Decoder/Camera -> Surface buffer"]
+    A1 --> A2["SurfaceFlinger 合成"]
+    A2 --> A3["屏幕"]
+
+    B["TextureView"] --> B1["Decoder/Camera -> SurfaceTexture"]
+    B1 --> B2["作为纹理进入 View 树"]
+    B2 --> B3["Window Surface"]
+    B3 --> B4["SurfaceFlinger 合成"]
+    B4 --> B5["屏幕"]
+
 ```
