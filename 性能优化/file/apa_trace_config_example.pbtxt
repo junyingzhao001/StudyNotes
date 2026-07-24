@@ -1,0 +1,60 @@
+# Android Performance Analyzer / Perfetto 自定义 TraceConfig 示例
+# 使用前请将 com.example.app 替换成目标应用包名。
+# 不同 Android/Perfetto 版本支持的数据源可能不同。
+
+buffers {
+  size_kb: 65536
+  fill_policy: RING_BUFFER
+}
+
+duration_ms: 10000
+
+data_sources {
+  config {
+    name: "linux.ftrace"
+    target_buffer: 0
+    ftrace_config {
+      ftrace_events: "sched/sched_switch"
+      ftrace_events: "sched/sched_wakeup"
+      ftrace_events: "sched/sched_waking"
+      ftrace_events: "power/cpu_frequency"
+      ftrace_events: "power/cpu_idle"
+
+      atrace_categories: "am"
+      atrace_categories: "binder_driver"
+      atrace_categories: "dalvik"
+      atrace_categories: "freq"
+      atrace_categories: "gfx"
+      atrace_categories: "idle"
+      atrace_categories: "input"
+      atrace_categories: "res"
+      atrace_categories: "sched"
+      atrace_categories: "view"
+      atrace_categories: "wm"
+
+      atrace_apps: "com.example.app"
+      symbolize_ksyms: true
+    }
+  }
+}
+
+data_sources {
+  config {
+    name: "linux.process_stats"
+    target_buffer: 0
+    process_stats_config {
+      scan_all_processes_on_start: true
+    }
+  }
+}
+
+data_sources {
+  config {
+    name: "android.packages_list"
+    target_buffer: 0
+  }
+}
+
+write_into_file: false
+flush_period_ms: 5000
+

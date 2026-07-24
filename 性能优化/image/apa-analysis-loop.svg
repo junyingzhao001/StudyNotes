@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="500" viewBox="0 0 1280 500">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f7f9ff"/>
+      <stop offset="1" stop-color="#eef7f4"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="5" stdDeviation="7" flood-color="#263238" flood-opacity="0.14"/>
+    </filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#50617a"/>
+    </marker>
+    <style>
+      .title { font: 700 30px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; fill:#183153; }
+      .boxTitle { font: 700 22px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; fill:#183153; }
+      .desc { font: 400 16px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; fill:#50617a; }
+      .num { font: 700 18px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; fill:white; }
+    </style>
+  </defs>
+  <rect width="1280" height="500" rx="26" fill="url(#bg)"/>
+  <text x="640" y="62" text-anchor="middle" class="title">Android Performance Analyzer 性能优化闭环</text>
+
+  <g filter="url(#shadow)">
+    <rect x="55" y="145" width="200" height="190" rx="20" fill="#ffffff" stroke="#94b5ff" stroke-width="2"/>
+    <circle cx="90" cy="180" r="20" fill="#4776e6"/>
+    <text x="90" y="186" text-anchor="middle" class="num">1</text>
+    <text x="155" y="222" text-anchor="middle" class="boxTitle">建立基线</text>
+    <text x="155" y="257" text-anchor="middle" class="desc">统一设备与场景</text>
+    <text x="155" y="284" text-anchor="middle" class="desc">Macrobenchmark 量化</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="300" y="145" width="200" height="190" rx="20" fill="#ffffff" stroke="#71d0b3" stroke-width="2"/>
+    <circle cx="335" cy="180" r="20" fill="#24a77a"/>
+    <text x="335" y="186" text-anchor="middle" class="num">2</text>
+    <text x="400" y="222" text-anchor="middle" class="boxTitle">采集 Trace</text>
+    <text x="400" y="257" text-anchor="middle" class="desc">控制变量、短时录制</text>
+    <text x="400" y="284" text-anchor="middle" class="desc">覆盖目标问题窗口</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="545" y="145" width="200" height="190" rx="20" fill="#ffffff" stroke="#f5ba63" stroke-width="2"/>
+    <circle cx="580" cy="180" r="20" fill="#e59221"/>
+    <text x="580" y="186" text-anchor="middle" class="num">3</text>
+    <text x="645" y="222" text-anchor="middle" class="boxTitle">定位根因</text>
+    <text x="645" y="257" text-anchor="middle" class="desc">时间线 + 调度状态</text>
+    <text x="645" y="284" text-anchor="middle" class="desc">PerfettoSQL 量化</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="790" y="145" width="200" height="190" rx="20" fill="#ffffff" stroke="#dd9ced" stroke-width="2"/>
+    <circle cx="825" cy="180" r="20" fill="#a64cc2"/>
+    <text x="825" y="186" text-anchor="middle" class="num">4</text>
+    <text x="890" y="222" text-anchor="middle" class="boxTitle">实施优化</text>
+    <text x="890" y="257" text-anchor="middle" class="desc">减少、推迟、并行</text>
+    <text x="890" y="284" text-anchor="middle" class="desc">避免主线程阻塞</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1035" y="145" width="200" height="190" rx="20" fill="#ffffff" stroke="#ff9a9a" stroke-width="2"/>
+    <circle cx="1070" cy="180" r="20" fill="#df5252"/>
+    <text x="1070" y="186" text-anchor="middle" class="num">5</text>
+    <text x="1135" y="222" text-anchor="middle" class="boxTitle">验证防劣化</text>
+    <text x="1135" y="257" text-anchor="middle" class="desc">APA 多 Trace 对比</text>
+    <text x="1135" y="284" text-anchor="middle" class="desc">CI 性能门禁</text>
+  </g>
+
+  <path d="M255 240 L292 240" stroke="#50617a" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M500 240 L537 240" stroke="#50617a" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M745 240 L782 240" stroke="#50617a" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M990 240 L1027 240" stroke="#50617a" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M1135 350 C1135 440,155 440,155 350" fill="none" stroke="#50617a" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#arrow)"/>
+  <text x="640" y="420" text-anchor="middle" class="desc">性能优化不是一次性的“抓 Trace”，而是可重复、可量化、可回归的工程流程</text>
+</svg>
+
