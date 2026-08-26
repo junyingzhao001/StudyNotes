@@ -68,11 +68,11 @@ flowchart TB
 | `hardware/libhardware_legacy/uevent.c` | uevent netlink socket 封装 |
 | `system/core/libcutils/uevent.cpp` | libcutils uevent 收发封装 |
 | `system/core/init/ueventd.cpp` | ueventd 设备节点创建/权限配置路径 |
-| `frameworks/base/services/java/.../SystemServer.java` | 启动 Framework system services |
+| `frameworks/base/services/java/com/android/server/SystemServer.java` | 启动 Framework system services |
 | `frameworks/base/services/core/jni/onload.cpp` | services JNI 方法统一注册入口 |
 | `frameworks/base/services/core/java/com/android/server/VibratorService.java` | Java 系统服务、权限/策略/状态 |
 | `frameworks/base/services/core/jni/com_android_server_VibratorService.cpp` | Java 到 vibrator HAL 的 JNI 桥 |
-| `hardware/interfaces/vibrator/1.x` | Android 11 HIDL Vibrator HAL contract |
+| `hardware/interfaces/vibrator/1.0`—`1.3` | Android 11 各版 HIDL Vibrator HAL contract |
 | `hardware/interfaces/vibrator/1.0/default` | HIDL 包装 legacy vibrator HAL 的示例 |
 | `hardware/libhardware/modules/vibrator/vibrator.c` | 直接写 vibrator sysfs 的 legacy 示例 |
 

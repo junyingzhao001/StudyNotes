@@ -1,5 +1,7 @@
 # 08 Activity 启动流程（一）：客户端如何发出请求
 
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`；本章在 macOS 上只读本地源码，不要求编译。
+
 ## 本章边界
 
 Activity 启动链很长，本套笔记拆成三章：
@@ -114,7 +116,7 @@ Framework 复用同一条内部管线。`requestCode` 的语义是：
 
 | requestCode | 含义 |
 |---:|---|
-| `>= 0` | 调用方请求结果，目标结束时要把结果关联回来 |
+| `>= 0` | 调用方请求结果；若有有效 source Activity 且其未 finishing，系统才建立结果关系 |
 | `< 0` | 普通启动，不建立 Activity result 关系 |
 
 因此：
@@ -129,7 +131,7 @@ startActivity(intent)
 startActivityForResult(intent, -1, options)
 ```
 
-这不表示普通 `startActivity()` 真的等待结果；它只是复用支持结果参数的统一实现。
+这不表示普通 `startActivity()` 真的等待结果；它只是复用支持结果参数的统一实现。即使 `requestCode >= 0`，`startActivityForResult()` 本身也不是阻塞等到目标 finish：结果在后续生命周期中异步回传。
 
 现代 AndroidX 的 Activity Result API 在应用层提供更安全的注册与分发方式，但底层仍要向系统表达启动者、目标和结果关联。
 
@@ -644,7 +646,9 @@ checkStartActivityResult(result, intent);
 | Intent 无法解析/类不存在 | `ActivityNotFoundException` |
 | 权限拒绝 | `SecurityException` |
 | 参数组合错误 | `IllegalArgumentException` 或运行时异常 |
-| 启动取消 | `AndroidRuntimeException` |
+| `START_CANCELED` 启动取消 | `AndroidRuntimeException` |
+
+只有 `ActivityManager.isStartResultFatalError(result)` 为 true 时，`checkStartActivityResult()` 才进入 switch 抛异常。像 `START_ABORTED` 这类非致命结果可能被系统策略拦下，但客户端不一定因此抛出异常。这是“方法没抛异常”不能证明目标 Activity 已启动的另一个原因。
 
 所以 `ActivityNotFoundException` 并不是 App 进程自己扫描 Manifest 得出的；通常是 system_server 解析失败后通过结果码返回，再由 Instrumentation 转译。
 
@@ -684,7 +688,7 @@ activity.startActivity(intent);
 applicationContext.startActivity(intent);
 ```
 
-会进入 `ContextImpl.startActivity()`，没有当前 Activity token。Android 11 对常规目标版本通常要求：
+会进入 `ContextImpl.startActivity()`，没有当前 Activity token。Android 11 中，当 Intent 没有 `FLAG_ACTIVITY_NEW_TASK`、options 也没有指定 `launchTaskId` 时，对 `targetSdk < N` 或 `targetSdk >= P` 的调用会明确要求：
 
 ```java
 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -737,7 +741,7 @@ mMainThread.getInstrumentation().execStartActivity(
 
 `FLAG_ACTIVITY_NEW_TASK` 明确要求系统从 Task 级别寻找或创建合适任务，而不是默认依附当前 Activity。
 
-这是语义要求，不只是 API 人为限制。
+这是 Task 归属语义，不只是 API 人为限制。但 r48 源码为 target N—O_MR1 的历史兼容 bug 保留了例外，options 明确给出 launch task id 时也例外。所以最稳妥的开发规则仍是：非 Activity Context 要么加 `NEW_TASK`，要么通过受支持的 Task 选项明确归属；不要依赖旧 targetSdk 兼容漏洞。
 
 ## 27. 从 View 点击到启动请求
 

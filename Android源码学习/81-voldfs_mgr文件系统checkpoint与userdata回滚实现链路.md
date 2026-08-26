@@ -72,7 +72,7 @@ BEGIN
 | `system/vold/vdc.cpp` | init/shell 到 vold 的命令行桥 |
 | `system/core/fs_mgr/fs_mgr_fstab.cpp` | 解析 `checkpoint=fs/block` |
 | `system/core/fs_mgr/fs_mgr.cpp` | 挂载时建立 F2FS checkpoint 或 dm-bow |
-| `system/core/fs_mgr/libdm/.../dm_target.h` | dm-bow target 描述 |
+| `system/core/fs_mgr/libdm/include/libdm/dm_target.h` | dm-bow target 描述 |
 | `system/core/rootdir/init.rc` | markBootAttempt、prepareCheckpoint 的启动时序 |
 | `system/vold/MetadataCrypt.cpp` | metadata encryption 与 checkpoint 设备栈 |
 | `system/vold/KeyStorage.cpp` | checkpoint 期间延迟销毁旧 Keymaster key |
@@ -83,6 +83,22 @@ BEGIN
 ## 4. 从 Java 到 native 的调用链
 
 以 `startCheckpoint(2)` 为例：
+
+```mermaid
+flowchart TD
+    ST["StagingManager"] --> SMS["StorageManagerService"]
+    SMS --> VNS["VoldNativeService"]
+    VNS --> CP["Checkpoint.cpp 控制状态"]
+    CP --> META["/metadata/vold/checkpoint"]
+    CP --> FS{"fstab checkpoint 模式"}
+    FS -->|"checkpoint=fs"| F2FS["F2FS checkpoint disable/enable"]
+    FS -->|"checkpoint=block"| BOW["dm-bow backup/restore"]
+    CP --> BOOT["BootControl slot success"]
+    CP --> KEY["KeyStorage 延迟删除旧 key"]
+```
+
+先沿上半段理解“谁决定开始/提交/放弃”，再沿两个分支理解“旧数据怎样被保留”。图中的控制协议与数据保护层
+彼此协作，但不是同一个状态文件或同一种快照实现。
 
 ```text
 StagingManager

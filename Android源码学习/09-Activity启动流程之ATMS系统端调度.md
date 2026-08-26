@@ -1,5 +1,7 @@
 # 09 Activity 启动流程（二）：ATMS 系统端调度
 
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`；本章在 macOS 上只读本地源码，不要求编译。
+
 ## 本章边界
 
 上一章停在：
@@ -291,7 +293,7 @@ try {
 
 ## 11. `execute()` 的全局锁边界
 
-解析之后：
+解析之后（以常规 `execute()` 路径为例）：
 
 ```java
 synchronized (mService.mGlobalLock) {
@@ -304,6 +306,8 @@ synchronized (mService.mGlobalLock) {
 ```
 
 Activity/Task/Window 层级是高度共享的系统状态，多个 Binder 线程可能同时发起启动、结束、旋转、窗口变化等操作。全局锁保证关键结构变更一致。
+
+实际 r48 实现将 `restoreCallingIdentity(origId)` 放在 `finally` 中，这是本系列后文读身份切换的必要检查点：只看到 clear 不能继续向下跳，必须找到所有退出路径的 restore。
 
 但全局锁也意味着：
 
@@ -717,7 +721,7 @@ B 启动 A: A → B → A（A 不在顶部，创建新实例）
 
 ### singleTask
 
-系统寻找适合的已有 Task/目标实例。若找到目标，通常清除其上方 Activity，并把新 Intent 投递给已有实例；若没有则创建。
+系统寻找适合的已有 Task/目标实例。若找到目标，通常清除其上方 Activity，并把新 Intent 投递给已有实例；若没有则创建。“single”的查找范围与实际唯一性要以当前 user/display/task 规则为准，不要把它背成跨用户、跨显示、全设备永远只有一个 Java 对象。
 
 ```text
 原 Task: A → B → C
@@ -729,7 +733,7 @@ B 启动 A: A → B → A（A 不在顶部，创建新实例）
 
 ### singleInstance
 
-目标实例具有更强的全局唯一/独占 Task 语义；该 Activity 独占自己的 Task，其他 Activity 不与它放在同一 Task。它启动别的 Activity 时，别的 Activity 进入其他 Task。
+目标实例具有比 singleTask 更强的独占 Task 语义；该 Activity 独占自己的 Task，其他 Activity 不与它放在同一 Task。它启动别的 Activity 时，别的 Activity 进入其他 Task。与 singleTask 一样，“全局唯一”只是帮助建立直觉的简写，不能用它代替多用户/多显示的 r48 实际搜索范围。
 
 ## 31. launchMode 与 flags 不是一一对应
 
@@ -909,13 +913,17 @@ Activity 启动结果可能包括：
 | `START_INTENT_NOT_RESOLVED` | Intent 无匹配组件 |
 | `START_CLASS_NOT_FOUND` | 目标 ActivityInfo 不存在 |
 | `START_PERMISSION_DENIED` | 权限/调用身份不允许 |
-| `START_ABORTED` | 被策略阻止，但可能对调用方伪装为已处理 |
+| `START_ABORTED` | 内部被策略阻止；`startActivityUnchecked()` 的对外结果会把它转成 `START_SUCCESS` |
 
 “成功类结果”不一定表示创建了新实例。例如 DELIVERED_TO_TOP 是复用。
 
 ## 41. 为什么某些策略阻止却返回得像成功
 
-源码在部分 abort 场景写道：对调用者假装已启动，同时 result 场景返回取消。
+源码在部分 abort 场景写道：对调用者假装已启动，同时 result 场景返回取消。r48 的关键收口是：
+
+```java
+return result != START_ABORTED ? result : START_SUCCESS;
+```
 
 这可避免恶意或后台调用方通过精确错误差异探测系统状态，也能保持某些 API 兼容语义。系统安全策略的“实际动作”与外部返回值不一定一一暴露。
 

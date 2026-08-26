@@ -8,23 +8,15 @@
 
 ## 1. 四层模型：先把“监控”和“执行”拆开
 
-```text
-【采集层】
-CPU/GPU/电池/机身等温度传感器
-→ kernel thermal zones / vendor firmware
-
-【设备策略层】
-thermal governor / vendor power HAL / cooling devices
-→ CPU/GPU 限频、核下线、充电限流、风扇、硬件保护
-
-【HAL 汇报层】
-Thermal HAL 1.0 / 1.1 / 2.0
-→ Temperature、CoolingDevice、throttling callback
-
-【Framework 协调层】
-ThermalManagerService
-→ 缓存、聚合 overall status、监听器、headroom、热关机
-→ PowerManager API 供 App 自适应降载
+```mermaid
+flowchart TD
+    A["采集层：温度传感器<br/>→ kernel thermal zones / vendor firmware"]
+    B["设备策略层：thermal governor / cooling devices<br/>→ 限频、限流、风扇、硬件保护"]
+    C["HAL 汇报层：Thermal HAL 1.0 / 1.1 / 2.0<br/>→ Temperature、CoolingDevice、callback"]
+    D["Framework 协调层：ThermalManagerService<br/>→ 缓存、overall status、监听器、headroom、热关机"]
+    E["PowerManager API<br/>→ App 根据热状态自主降载"]
+    A --> B
+    A --> C --> D --> E
 ```
 
 最重要的边界：
@@ -579,6 +571,15 @@ HAL 是否支持/ready
 ---
 
 ## 22. macOS 只读练习
+
+先用下列命令定位 HAL 回退、状态聚合和 headroom 三条主线：
+
+```bash
+rg -n "onActivityManagerReady|ThermalHal20Wrapper|ThermalHal11Wrapper|ThermalHal10Wrapper" frameworks/base/services/core/java/com/android/server/power/ThermalManagerService.java
+rg -n "onTemperatureChanged|notifyEventListenersLocked|notifyStatusListenersLocked|shutdownIfNeeded" frameworks/base/services/core/java/com/android/server/power/ThermalManagerService.java
+rg -n "class TemperatureWatcher|updateSevereThresholds|getForecast|MINIMUM_SAMPLE_COUNT" frameworks/base/services/core/java/com/android/server/power/ThermalManagerService.java
+rg -n "getCurrentThermalStatus|addThermalStatusListener|getThermalHeadroom|MINIMUM_HEADROOM_TIME_MILLIS" frameworks/base/core/java/android/os/PowerManager.java
+```
 
 1. 阅读 `onActivityManagerReady()`，画出 HAL 2.0→1.1→1.0 回退。
 2. 对照 Temperature type/status，解释 CPU 温度与 skin status 的区别。

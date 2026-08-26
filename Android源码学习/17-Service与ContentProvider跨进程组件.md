@@ -601,7 +601,7 @@ service.onRebind(intent);
 
 这时不会重新调用 `onBind()` 来产生新 Binder，而是继续使用之前发布的 Binder。
 
-如果 `onUnbind()` 返回 false，之后需要绑定时可按状态重新请求 `onBind()`。
+如果 `onUnbind()` 返回 false，Framework 就不承诺下次调 `onRebind()`。只要这个 Service 实例仍因 started 状态等理由存活，r48 可继续使用 `IntentBindRecord` 中已发布的 Binder，也不会因为又来一个客户端就必然再调 `onBind()`。只有 Service 已被销毁并后来重新创建，或绑定记录因运行状态重建，才会重新走 `onBind()` 获取 Binder。
 
 `onServiceDisconnected()` 也不是正常 `unbindService()` 的对称完成回调；它主要表示 Service 进程意外死亡/连接丢失。正常 unbind 后客户端不应等待它。
 
@@ -1191,13 +1191,13 @@ CONTENT_PROVIDER_READY_TIMEOUT_MILLIS   = 20 秒
 
 ### publish timeout
 
-AMS 启动 Provider 进程后，等待它 attach 并 publish。超时消息绑定 ProcessRecord，用于处理进程未及时发布 Provider。
+它不是从最初的“请求 Zygote 启动进程”时刻起算。r48 在 Provider 进程已调用 `attachApplication` 且 AMS 准备通过 `bindApplication` 交付 Provider 列表时，才按 ProcessRecord 安排 10 秒 `CONTENT_PROVIDER_PUBLISH_TIMEOUT_MSG`。它监控的是“已 attach 的进程没有及时 publish”；进程连 attach 都没完成时，还另有 process-start timeout 路径。
 
 ### ready timeout
 
 具体 `getContentProviderImpl()` 调用者等待 `cpr.provider` 可用的最长时间。达到期限后返回失败/超时处理，避免 Binder 调用无限挂起。
 
-这里的 10 秒与 20 秒是本工程 Android 11 源码中的默认值：ready timeout 在 publish timeout 基础上额外留出 10 秒。不过不要把它当作所有 Android 版本和厂商设备永远不变的契约；分析其他源码版本时，应重新查看 `ContentResolver` 常量和 AMS 消息安排。调试器、system provider 和设备定制也可能改变实际处理。
+这里的 10 秒与 20 秒是本工程 Android 11 源码中的默认值；`READY_TIMEOUT` 在常量定义上确实是 `PUBLISH_TIMEOUT + 10s`，但两个倒计时的起点不同，不能画成同一起点的“10 秒后处理进程、20 秒后处理客户端”。ready 等待从该次 `getContentProviderImpl()` 进入等待前计时；publish timeout 则是进程 attach 后才安排。不要把这些值当作所有 Android 版本和厂商设备永远不变的契约；分析其他版本时，应重新查看 `ContentResolver` 常量和 AMS 消息安排。
 
 Provider.onCreate 太慢、Application/Provider 初始化死锁、主线程阻塞或进程 attach 失败都可能表现为 Provider 获取超时。
 
@@ -1675,4 +1675,4 @@ ContentResolver + authority
 4. Provider 可在 Application.onCreate 前初始化，业务调用通常发生在 Binder 线程池。
 5. AMS 负责解析、启动和连接生命周期；Binder 发布后，业务调用通常直接跨进程。
 
-下一章进入 ANR 与系统诊断：把 Input、Broadcast、Service、Provider 和 ContentProvider publish timeout 等多种“系统等不到完成”的路径统一起来。
+下一章进入 ANR 与系统诊断：统一比较 Input、Broadcast 与 Service 的 ANR，再把 Provider 的“发布/就绪等待失败”和“已经拿到 Provider 后调用长期无响应”分开。二者都可能表现为“卡在 Provider”，但触发点、证据和处置路径并不相同。

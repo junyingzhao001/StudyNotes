@@ -272,7 +272,7 @@ installd 准备“这个包在这个用户下的数据目录正确”
 安装/用户启动相关流程中：
 
 ```text
-PMS / AppDataHelper
+PMS 的 prepareAppData... 流程
  → Installer.createAppData(...)
  → IInstalld.createAppData
  → InstalldNativeService.createAppData
@@ -944,7 +944,7 @@ Binder thread
 
 ## 53. Cursor 生命周期
 
-Cursor 持有 query/session/driver/CursorWindow 等资源，应及时 close：
+Cursor 持有 query/driver/CursorWindow 等资源，应及时 close：
 
 ```java
 try (Cursor c = db.query(...)) {
@@ -952,7 +952,7 @@ try (Cursor c = db.query(...)) {
 }
 ```
 
-未关闭可能长期占 Window/statement/connection，形成 pool 饥饿或 native 内存泄漏。
+未关闭会长期占用 CursorWindow、query/driver 等 Java/native 资源；某些事务或正在填充窗口的调用还会连带占用 connection。需要注意：普通 Cursor 并不必然从创建到关闭一直独占一条连接，`SQLiteSession` 通常会在一次 fill/execute 结束后释放非事务连接。因此看到连接池等待时，要同时检查未结束事务、慢查询和 Cursor 的实际填充调用，不能只凭“有一个 Cursor 未关”就断定它始终扣着 connection。
 
 不要返回一个依赖已关闭数据库/事务的 Cursor 给异步生命周期未知的调用方。
 

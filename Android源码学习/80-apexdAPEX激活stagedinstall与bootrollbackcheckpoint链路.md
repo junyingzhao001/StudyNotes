@@ -34,13 +34,20 @@ APEX 是可以在启动早期验证并挂载的文件系统容器。`apexd` 是 
 ```text
 外层：zip/APK 容器
   ├─ AndroidManifest.xml
-  ├─ apex_manifest.json
+  ├─ apex_manifest.pb
+  ├─ apex_manifest.json（可选的人类可读副本）
   ├─ apex_pubkey
   └─ apex_payload.img
        └─ ext4 文件系统镜像 + AVB/dm-verity
 ```
 
 APEX 文件在外层兼容 APK 工具和分发设施，但核心内容不是像 APK 那样解压到普通目录，而是把 `apex_payload.img` 通过 loop/device-mapper 挂载到 `/apex`。
+
+这里要特别保留 Android 11 r48 的实现边界：`ApexFile::Open()` 查找并解析的是
+`apex_manifest.pb`，找不到就直接失败；`apex_manifest.json` 可以由构建工具附带，便于人阅读，
+但不能把它写成 apexd 的唯一运行时清单入口。仓库里的 `system/apex/docs/README.md`
+较早段落仍用“四个文件”和 JSON 讲概念，读实现时应以
+`system/apex/apexd/apex_file.cpp` 的 `kManifestFilenamePb` 为准。
 
 ---
 
@@ -56,12 +63,15 @@ APEX 文件在外层兼容 APK 工具和分发设施，但核心内容不是像 
 | `system/apex/apexd/apexd_verity.cpp` | dm-verity 建立与校验 |
 | `system/apex/apexd/apexd_loop.cpp` | loop device 管理 |
 | `system/apex/apexd/apexd_session.cpp` | apexd session 状态持久化 |
+| `system/apex/proto/session_state.proto` | VERIFIED/STAGED/ACTIVATED/SUCCESS/REVERTED 等持久状态定义 |
 | `system/apex/apexd/apexd_checkpoint_vold.cpp` | 与 vold checkpoint 交互 |
 | `system/apex/apexd/apexservice.cpp` | `IApexService` Binder 实现 |
+| `system/vold/Checkpoint.cpp` | checkpoint 尝试计数、commit/abort/restore 实现 |
+| `system/core/rootdir/init.rc` | apexd 启动、状态等待、snapshotde 与 `markBootAttempt` 时序 |
 | `frameworks/base/services/core/java/com/android/server/pm/ApexManager.java` | system_server 对 apexservice 的封装 |
 | `frameworks/base/services/core/java/com/android/server/pm/StagingManager.java` | staged session 验证、重启前后协调 |
-| `PackageInstallerSession.java` | PackageInstaller staged session 状态 |
-| `RollbackManagerServiceImpl.java` | 上章 rollback 数据与 staged rollback 衔接 |
+| `frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java` | PackageInstaller staged session 状态 |
+| `frameworks/base/services/core/java/com/android/server/rollback/RollbackManagerServiceImpl.java` | 上章 rollback 数据与 staged rollback 衔接 |
 
 ---
 
@@ -104,7 +114,7 @@ APEX 有两层签名：
 
 ---
 
-## 6. 为什么 APEX 更新通常必须 staged
+## 6. 为什么 Android 11 的 APEX 安装必须 staged
 
 APEX 中的库/可执行文件可能已被 init、linker、Zygote 或 native 服务加载。运行中直接把挂载点切到新版本会造成同一启动周期内的版本撕裂：
 
@@ -114,6 +124,10 @@ APEX 中的库/可执行文件可能已被 init、linker、Zygote 或 native 服
 配置和服务端又来自另一版本
   → 整机处于不可验证的混合状态
 ```
+
+在 Android 11 r48 的 `PackageInstallerSession.handleInstall()` 中，非 staged 的 APEX
+会直接以 `INSTALL_FAILED_INTERNAL_ERROR` 失败，并提示 APEX 只能通过 staged session 安装。
+这里不是“多数更新通常如此”，而是本版本这条 PackageInstaller 路径的硬约束。
 
 staged install 把“验证”和“应用”拆到重启两侧：
 
@@ -139,6 +153,19 @@ staged install 把“验证”和“应用”拆到重启两侧：
 
 两边各有 session 状态，名字相近但不是同一个对象。排障必须同时看 PackageInstaller SessionInfo 和 `ApexSessionInfo`。
 
+线程和进程也要分开：
+
+| 所在位置 | 执行上下文 | 主要职责 |
+|---|---|---|
+| `system_server` | `StagingManager.PreRebootVerificationHandler` 使用 `BackgroundThread` 的 Looper | 重启前串联 rollback、APEX、APK 和 checkpoint 验证 |
+| `system_server` | 启动恢复及 `PHASE_BOOT_COMPLETED` 回调 | 对账 activated/applied，并最终标记 successful |
+| `apexd` native 进程 | Binder 线程池 + 启动主线程 | 验证、session 持久化、早期激活与故障回退 |
+| `apexd-snapshotde` 一次性进程 | init 在 DE 用户数据可用后执行 | 处理 DE_user snapshot/restore，成功后写 `apexd.status=ready` |
+| `vold` native 进程 | checkpoint Binder/启动挂载链 | 维护 checkpoint 计数并提交或恢复受保护文件系统 |
+
+因此 `StagingManager` 调 `ApexManager` 不是普通 Java 函数一路跑到底：它会跨 Binder 进入
+`apexd`；checkpoint 又跨 Binder 进入 vold。
+
 ---
 
 ## 8. staged session 的重启前总流程
@@ -155,17 +182,20 @@ staged install 把“验证”和“应用”拆到重启两侧：
 ```text
 PackageInstaller commit staged session
   → StagingManager 保存 session
+  → 若 enable rollback：同步通知 RollbackManager 准备旧代码/数据元数据
   → APEX：submitStagedSession 到 apexservice
   → Framework 再校验 container signature/版本/降级规则
   → APK：创建临时 session 做 dry-run install
-  → 若 enable rollback：准备旧代码/数据
   → 若支持 checkpoint：startCheckpoint(2)
   → Framework session 先标 ready
   → apexd markStagedSessionReady
   → 等待用户/系统重启
 ```
 
-任何一环失败都应在重启前把 session 标 failed，避免把明显有问题的更新带入启动早期。
+签名、APEX/APK 验证、checkpoint 或 ready 转换失败时，session 会在重启前被标 failed，
+避免把明显有问题的更新带入启动早期。唯一要单独记忆的是 rollback 准备：源码为了与普通
+非 staged 安装保持一致，`notifyStagedSession()` 失败只记录错误，不会让整个更新失败；结果是
+“更新仍可继续，但这次可能没有可用 rollback”，不能笼统说所有环节都是 fail-closed。
 
 ---
 
@@ -243,7 +273,15 @@ if (storageManager.supportsCheckpoint()) {
 }
 ```
 
-参数 2 表示允许有限次启动尝试。checkpoint 的目标不是只备份 APEX 文件，而是保护更新启动期间 `/data` 的整体一致性。
+参数 2 是传给 `StorageManagerService`/vold 的“允许尝试次数”。r48 的
+`cp_startCheckpoint(2)` 会在 metadata 计数文件中写入 `3`；init 每次启动通过
+`vdc checkpoint markBootAttempt` 先递减一次，因此第一次尝试期间看到的是 `2`。AOSP 测试
+也把外部语义称为“checkpointing retry count should be 2”。排障时不要只看文件初始值 3
+就误报为允许三次失败，也要确认当前启动是否已经执行 `markBootAttempt`。
+
+checkpoint 的目标不是只备份 APEX 文件，而是保护 fstab 中声明
+`checkpoint=fs` 或 `checkpoint=block` 的文件系统（典型是 userdata）在更新启动期间的一致性，
+并不等于无条件复制整个 `/data` 目录。
 
 概念模型：
 
@@ -291,7 +329,8 @@ Android 11 同时支持无 filesystem checkpoint 的设备。apexd 会在 submit
 5. 注册 `apexservice` Binder；
 6. 设置 `apexd.status=activated`；
 7. 等待启动结果；
-8. snapshotde 阶段完成后设置 `apexd.status=ready`。
+8. `onStart()` 先处理 DE_sys；稍后的 `apexd-snapshotde --snapshotde` 再处理
+   DE_user，成功后设置 `apexd.status=ready`。
 
 APEX 内容可能被早期服务依赖，所以这发生在 Java PackageManager 完整启动之前。
 
@@ -332,6 +371,10 @@ starting → activated → ready
   → snapshot/restore DE_sys data
 ```
 
+随后 init 等待 `apexd.status=activated`，完成 APEX 配置和 user 0 DE 初始化，再执行
+`apexd-snapshotde` 处理 DE_user，最后才得到 `ready`。这也解释了为什么 activated 与 ready
+之间不是一个无意义的同义状态。
+
 每个 APEX 大致经历：
 
 ```text
@@ -356,7 +399,7 @@ starting → activated → ready
 | device mapper | 在块设备之上建立映射层 |
 | dm-verity | 依据已签名 hash tree 校验读取块 |
 | mount | 把 ext4 payload 变成目录树 |
-| bind/symlink/current path | 让消费者通过稳定路径访问 active 版本 |
+| bind mount/current path | r48 把版本化挂载点 bind 到 `/apex/<name>`，让消费者使用稳定路径 |
 
 类比：
 
@@ -442,7 +485,12 @@ session.setStagedSessionApplied();
 mApexManager.markStagedSessionSuccessful(sessionId)
 ```
 
-apexd 只接受 `ACTIVATED → SUCCESS`，然后清理 backup。对于 staged rollback 还会处理 DE pre-restore snapshot。若 checkpoint commit 抛异常，AMS 会请求重启，而不是继续把 apexd session 粉饰成成功。
+apexd 只接受 `ACTIVATED → SUCCESS`，然后清理 backup。对于 staged rollback 还会处理 DE pre-restore snapshot。若 checkpoint commit 抛异常，AMS 会请求重启。
+
+要注意源码在 `pm.reboot(...)` 调用后没有显式 `return`；正常设备应很快进入重启流程，
+但阅读 Java 控制流时不要声称“后续 `PHASE_BOOT_COMPLETED` 在语法上绝不可能执行”。
+排障应同时检查 checkpoint 提交日志、reboot reason 和 apexd session，而不是只根据一条异常
+反推最终状态。
 
 “系统已经显示桌面”也不必然等于 apexd session success；应以 session 状态、boot phase 和日志为证据。
 
@@ -454,22 +502,39 @@ apexd 只接受 `ACTIVATED → SUCCESS`，然后清理 backup。对于 staged ro
 
 ### 22.1 vold checkpoint 重试耗尽
 
-apexd 启动时查询 `NeedsRollback()`。超过允许启动尝试次数后：
+init 在每次 boot 的 `post-fs` 阶段执行 `vdc checkpoint markBootAttempt`；当 metadata
+计数降为 0 时，vold 的 `needsRollback()` 返回 true。fs_mgr/vold 负责把受保护文件系统
+恢复到安全视图，apexd 启动后则把活动 APEX session 对账为 reverted：
 
 ```text
-vold 表示 needs rollback
-  → apexd revertActiveSessions
-  → checkpoint 回退 /data
-  → 重启回安全状态
+启动尝试耗尽，checkpoint metadata 计数为 0
+  → fs_mgr/vold 在启动挂载链恢复 checkpoint 数据视图
+  → apexd onStart 查询 NeedsRollback=true
+  → revertActiveSessions：将 APEX session 标 REVERTED
+  → 不从 /data/apex/backup 手工恢复 APEX（checkpoint 模式）
 ```
 
-### 22.2 APEX 扫描、验证或激活失败
+`onStart()` 这一分支调用的是 `revertActiveSessions()`，本身没有紧接着调用
+`revertActiveSessionsAndReboot()`；不能把文件系统恢复、APEX session 对账和另一次重启
+错误压成 apexd 内的一条函数调用。
 
-`ActivateApexPackages()` 失败时，apexd 尝试 `revertActiveSessionsAndReboot()`。
+### 22.2 APEX staging 或挂载激活失败
+
+重启时若 `scanStagedSessionsDirAndStage()` 的单个 session 校验、postinstall 或
+`stagePackages()` 失败，该 session 会被标为 `ACTIVATION_FAILED`，之后由 Framework 对账并
+进入失败处理。若后续扫描 `/data/apex/active` 失败，或
+`ActivateApexPackages(data_apex)` 挂载激活失败，`onStart()` 才直接尝试
+`revertActiveSessionsAndReboot()`。这两种失败都发生在 apexd 启动期，但不是同一个立即重启
+分支。
 
 ### 22.3 启动中的 native 进程反复崩溃
 
-apexd 等待 boot status 的路径可收到 crashing native process，记录原因并 revert active sessions 后重启。
+init 将非 critical 的 updatable native 进程识别为“启动完成前累计退出超过 4 次”，或
+“启动完成后 4 分钟内退出超过 4 次”时，设置
+`sys.init.updatable_crashing=1` 和进程名。apexd 的 `waitForBootStatus()` 每次最多等待该属性
+30 秒，并在循环间检查 `sys.boot_completed`；命中后记录进程名，revert active sessions 并
+重启。这里不是一次 native crash 就立即触发，也不要与第 79 章 PackageWatchdog 启动后
+30 秒轮询、最多 10 次的策略混在一起。
 
 ### 22.4 Framework 后续 APK/数据安装失败
 
@@ -488,7 +553,7 @@ apexd 等待 boot status 的路径可收到 crashing native process，记录原�
 
 apexd 源码明确区分：
 
-### checkpoint 模式
+### 支持 filesystem checkpoint 的设备路径
 
 ```text
 标记/推进 session revert
@@ -496,7 +561,8 @@ apexd 源码明确区分：
   → 依靠 filesystem checkpoint 恢复一致数据视图
 ```
 
-源码日志会提示：
+这里分支条件实际是 `gSupportsFsCheckpoints`，不是只看某一刻
+`gInFsCheckpointMode` 的布尔值。源码日志会提示：
 
 ```text
 Not restoring active packages in checkpoint mode.
@@ -548,7 +614,7 @@ Not restoring active packages in checkpoint mode.
 | Framework PackageInstaller | apexd ApexSession | 解释 |
 |---|---|---|
 | committed/verifying | VERIFIED | apexd 验证过，Framework 其他验证可能未完成 |
-| READY | STAGED | 允许下次启动激活 |
+| READY | 短暂仍可能是 VERIFIED，随后为 STAGED | Framework 先 READY，再调用 apexd 标 STAGED；允许下次启动激活 |
 | READY，重启中 | STAGED，随后尝试转为 ACTIVATED 或 ACTIVATION_FAILED | apexd 启动早期处理；Android 11 没有名为 ACTIVATION_PENDING 的持久状态 |
 | APPLIED | ACTIVATED | APEX 已挂载，Framework train 后续也完成 |
 | APPLIED/成功确认 | SUCCESS | boot 观察完成，清理 backup |
@@ -591,6 +657,15 @@ rg -n "submitStagedSession|markStagedSessionReady|markStagedSessionSuccessful|re
 - loop/dm-verity/mount 错误。
 
 ### 27.3 存储和启动
+
+可直接从 r48 源码追到计数与 init 时序：
+
+```bash
+rg -n "cp_startCheckpoint|cp_markBootAttempt|cp_needsRollback|cp_commitChanges|cp_abortChanges" \
+  system/vold/Checkpoint.cpp
+rg -n "markBootAttempt|prepareCheckpoint|apexd.status|apexd-snapshotde" \
+  system/core/rootdir/init.rc
+```
 
 关注：
 
@@ -643,7 +718,10 @@ rg -n "submitStagedSession|markStagedSessionReady|markStagedSessionSuccessful|re
 
 ```bash
 sed -n '1,180p' system/apex/docs/README.md
-rg -n "CreateLoopDevice|CreateVerityDevice|mount\("   system/apex/apexd/apexd.cpp   system/apex/apexd/apexd_loop.cpp   system/apex/apexd/apexd_verity.cpp
+rg -n "createLoopDevice|createVerityTable|mount\(" \
+  system/apex/apexd/apexd.cpp \
+  system/apex/apexd/apexd_loop.cpp \
+  system/apex/apexd/apexd_verity.cpp
 ```
 
 ### 第二轮：追 pre-reboot verification
@@ -658,7 +736,10 @@ sed -n '1450,1590p'   frameworks/base/services/core/java/com/android/server/pm/S
 
 ```bash
 sed -n '1940,2065p' system/apex/apexd/apexd.cpp
-rg -n "enum class SessionState|UpdateStateAndCommit"   system/apex/apexd/apexd_session.*
+sed -n '18,48p' system/apex/proto/session_state.proto
+rg -n "UpdateStateAndCommit" \
+  system/apex/apexd/apexd_session.cpp \
+  system/apex/apexd/apexd_session.h
 ```
 
 ### 第四轮：追启动激活
@@ -711,45 +792,28 @@ sed -n '1690,1775p' system/apex/apexd/apexd.cpp
 
 ## 31. 初学者最终总图
 
-```text
-重启前：
-PackageInstaller staged session
-  → StagingManager
-  → apexd submit：验证 APEX，session=VERIFIED
-  → Framework 校验签名/版本 + APK dry-run
-  → 准备 Rollback 数据（若启用）
-  → vold startCheckpoint（若支持）
-  → Framework READY
-  → apexd STAGED
-  → reboot
-
-启动早期：
-init 启动 apexd
-  → 查询 vold needsRollback
-  → 扫描 STAGED session
-  → 选择 /data 更新 APEX 或 built-in APEX
-  → loop + dm-verity + mount
-  → apexd.status=activated
-  → DE snapshot/restore
-  → apexd.status=ready
-
-system_server 恢复：
-StagingManager 查询 ApexSessionInfo
-  → 校验 activated
-  → 处理 APK-in-APEX/数据
-  → 安装同 train staged APK
-  → Framework APPLIED
-  → checkpoint 设备等待启动成功点
-  → AMS 先 commit filesystem checkpoint
-  → PHASE_BOOT_COMPLETED 中 apexd session 标 SUCCESS、清理保护材料
-
-失败：
-验证失败 → 重启前 FAILED
-激活/后续安装失败
-  → apexd revertActiveSessions
-  → vold abortChanges（若 checkpoint）
-  → reboot
-  → 旧 APEX + 安全 /data 状态
+```mermaid
+flowchart TD
+    A["PackageInstaller staged session"] --> B["system_server / StagingManager"]
+    B --> C["RollbackManager：若启用则先准备 rollback"]
+    C --> D["Binder → apexd submit：VERIFIED"]
+    D --> E["Framework：容器签名、版本、APK dry-run"]
+    E --> F["Binder → vold startCheckpoint(2)，若支持"]
+    F --> G["Framework READY"]
+    G --> H["apexd STAGED"]
+    H --> I["reboot / init 早期启动 apexd"]
+    I --> J{"vold NeedsRollback？"}
+    J -->|"否"| K["stage + loop + dm-verity + mount"]
+    J -->|"是"| R["checkpoint 恢复安全视图；apexd 将 session 标 REVERTED"]
+    K --> L["apexd ACTIVATED / status=activated"]
+    L --> M["DE_sys，再由 snapshotde 处理 DE_user"]
+    M --> N["apexd.status=ready"]
+    N --> O["StagingManager：校验 APEX、处理数据、安装同 train APK"]
+    O --> P["Framework APPLIED"]
+    P --> Q["AMS commit checkpoint → PHASE_BOOT_COMPLETED → apexd SUCCESS"]
+    E -->|"验证失败"| X["Framework FAILED"]
+    K -->|"激活失败"| Y["revert APEX / abort checkpoint / reboot"]
+    O -->|"APK 或数据失败"| Y
 ```
 
 ---

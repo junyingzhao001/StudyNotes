@@ -114,10 +114,10 @@ JobInfo 描述目标 Service、约束、时限、周期、backoff、extras 等�
 <service
     android:name=".SyncJobService"
     android:permission="android.permission.BIND_JOB_SERVICE"
-    android:exported="true" />
+    android:exported="false" />
 ```
 
-system_server 需要绑定它；signature 级 `BIND_JOB_SERVICE` 防止普通 App 随意绑定。服务 component 必须属于调度者的 package（特殊 system API 除外）。
+`JobSchedulerService.enforceValidJobRequest()` 真正校验的是：Service 存在、它的 application UID 等于调度 UID，并且 Service 宣言的 permission 正是 signature 级 `BIND_JOB_SERVICE`。`android:exported` 不是这个校验方法的条件；因此不应把 `exported="true"` 记成 JobService 的固定必需配置。Framework 以 system UID 持有该 signature 权限发起绑定，普通 App 无法借此随意调用 Service。
 
 ---
 
@@ -536,7 +536,7 @@ JobServiceContext 对 bind、start acknowledgement、running、stop acknowledgem
 
 ## 44. WakeLock
 
-系统在 execution context 生命周期内持有适当 wakelock，保证 Job 调度/回调期间 CPU 不随意睡眠。App 不应因此假定任意后台线程在 jobFinished 后仍被保持。
+更精确地说，`JobServiceContext` 在 `onServiceConnected()` 中创建并获取 non-reference-counted `PARTIAL_WAKE_LOCK`，在最终 `unbindService()`/清理时释放。因此 bind 请求已发出但 Service 还未 connected 的窗口，不能简化为“从刚开始 bind 就已经由这把 Job wakelock 覆盖”。Service 连接后的 start/run/stop 回调期间 CPU 有这把锁保障；App 仍不应假定任意后台线程在 `jobFinished()` 或清理后继续被保持。
 
 一旦 finish/stop，业务必须已结束或自行采用合规机制。
 

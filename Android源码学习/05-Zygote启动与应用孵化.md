@@ -1,5 +1,7 @@
 # 05 Zygote 启动与应用孵化
 
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`；本章在 macOS 上只读本地源码，不要求编译。
+
 ## 本章目标
 
 读完本章，你应该能够解释：
@@ -125,7 +127,7 @@ env->CallStaticVoidMethod(startClass, startMeth, strArray);
 /Users/ninebot/androidSource/frameworks/base/core/java/com/android/internal/os/ZygoteInit.java
 ```
 
-Android 11 的主流程为：
+Android 11 的主流程为（普通非 lazy preload 配置）：
 
 ```text
 禁止创建线程
@@ -166,7 +168,7 @@ caller = zygoteServer.runSelectLoop(abiList);
 
 > 要作为稳定进程模板，fork 时的状态必须尽量简单、确定。
 
-这也是看到 `startZygoteNoThreadCreation()` 和 `stopZygoteNoThreadCreation()` 的原因。
+这也是看到 `startZygoteNoThreadCreation()` 和 `stopZygoteNoThreadCreation()` 的原因。但不要扩大成“Zygote 永远只有一个线程”：这里的约束是为了建立安全的 fork 窗口，Native 代码还会在 fork 前后做 runtime hooks 和线程相关协调。
 
 ## 6. preload：先付一次成本
 
@@ -236,6 +238,8 @@ final boolean isPrimaryZygote =
 
 只有收到 `start-system-server` 参数的主 Zygote 执行 `forkSystemServer()`。副 Zygote 不会再创建一个 system_server。
 
+不过副 Zygote 与 system_server 的启动时序仍有一处关联：在同时提供两种 ABI 的配置上，主 Zygote fork 出来的 **system_server 子进程**会先调 `hasSecondZygote()` / `waitForSecondaryZygote()`，等待副 Zygote 的 socket 就绪，然后才关闭自己继承的 Zygote server socket 并进入 SystemServer。是子进程在等，不是父 Zygote 停止接收孵化请求；这也不表示副 Zygote 会创建第二个 system_server。
+
 ## 8. `forkSystemServer()` 的参数
 
 方法先构造 system_server 的启动参数：
@@ -260,7 +264,7 @@ String args[] = {
 - nice name：进程显示名为 `system_server`。
 - 入口类：`com.android.server.SystemServer`。
 
-这体现了最小权限思想：Zygote 从 root 身份启动，但 fork 的子进程会根据目标用途收紧身份、权限和能力。
+这体现了收紧权限的思想：Zygote 从 root 身份启动，system_server 子进程改为 UID/GID 1000，并仅保留列出的 Linux capabilities。但 system_server 仍是 Android 中高权限的核心进程，“最小权限”不应被误读成“它只有普通 App 级别权限”。
 
 ## 9. Java 怎样真正调用 Linux fork
 
@@ -271,7 +275,8 @@ ZygoteInit.forkSystemServer()
  → Zygote.forkSystemServer()
  → nativeForkSystemServer()
  → com_android_internal_os_Zygote_nativeForkSystemServer()
- → fork()
+ → ForkCommon()
+ → zygote fork 封装 / fork()
 ```
 
 关键文件：
@@ -305,6 +310,9 @@ Android 代码据此分流：
 pid = Zygote.forkSystemServer(...);
 
 if (pid == 0) {
+    if (hasSecondZygote(abiList)) {
+        waitForSecondaryZygote(socketName);
+    }
     zygoteServer.closeServerSocket();
     return handleSystemServerProcess(parsedArgs);
 }
@@ -319,7 +327,10 @@ flowchart TD
     P --> N["forkSystemServer 返回 null"]
     N --> L["runSelectLoop 等待新请求"]
     F -->|"子进程 pid == 0"| C["已经是 system_server"]
-    C --> CS["关闭继承的 Zygote server socket"]
+    C --> W{"hasSecondZygote?"}
+    W -->|"是"| WS["子进程等待 secondary Zygote socket 就绪"]
+    W -->|"否"| CS["关闭继承的 Zygote server socket"]
+    WS --> CS
     CS --> H["handleSystemServerProcess"]
     H --> SM["SystemServer.main()"]
 ```
@@ -338,7 +349,7 @@ if (r != null) {
 }
 ```
 
-它让新进程在完成必要的 fork 后清理、运行时初始化后，再进入目标 Java `main()`，同时减少额外栈帧和难以控制的流程嵌套。
+它让新进程在完成必要的 fork 后清理、运行时初始化后，再进入目标 Java `main()`。源码还通过 `ZygoteInit.zygoteInit()`/`RuntimeInit.applicationInit()` 与 `findStaticMain()` 等步骤构造这个入口任务；“减少栈帧”是这种返回式调用链的目的之一，不是 Runnable 自身的通用语义。
 
 现阶段可以把它理解成：已经准备好的“目标入口任务”。父进程得到 `null`；子进程得到通向 `SystemServer.main()` 的 Runnable。
 
@@ -390,7 +401,7 @@ system_server 请求创建应用进程
 1. 创建 Linux/ART 应用进程。
 2. 在该进程中创建并执行 Activity。
 
-Zygote 负责第一件事。进程创建后，`ActivityThread.main()` 建立应用主线程环境并向系统服务报告；随后 ATMS/AMS 才调度 Activity 生命周期，最终调用 `Activity.onCreate()`。
+Zygote 负责第一件事的孵化/specialize 部分；“是否需要进程”与进程参数则是 AMS/ATMS 一侧的调度决策。进程创建后，`ActivityThread.main()` 建立应用主线程环境并通过 `attach()` 向 AMS 报到；随后 ATMS/AMS 借助 ClientTransaction 调度 Activity 生命周期，最终才到 `Activity.onCreate()`。
 
 因此后面的 Activity 启动章节会再次遇到 Zygote，但还会继续经过 ActivityThread 和 Binder 调度。
 
@@ -414,6 +425,8 @@ sequenceDiagram
     Native-->>ZI: 父进程返回 pid > 0
     Native-->>SS: 子进程返回 pid == 0
     ZI->>ZI: runSelectLoop()
+    SS->>SS: 如有副 Zygote，等待其 socket 就绪
+    SS->>SS: 关闭继承的 Zygote server socket
     SS->>SS: handleSystemServerProcess()
     SS->>SS: SystemServer.main()
 ```
@@ -518,4 +531,3 @@ init rc
 ```
 
 尤其要准确说出 fork 后父子进程的不同道路。完成后进入第 06 章：SystemServer 如何启动 AMS、ATMS、PMS、WMS 等系统服务。
-

@@ -293,8 +293,12 @@ ART 有 switch interpreter、mterp/汇编优化路径等版本实现，并使用
 
 ```text
 art/runtime/interpreter/
-art/runtime/mterp/
+art/runtime/interpreter/interpreter.cc
+art/runtime/interpreter/interpreter_switch_impl-inl.h
+art/runtime/interpreter/mterp/
 ```
+
+在 r48，`interpreter.cc` 会在编译期选择 switch-based 或 mterp 汇编实现；mterp 遇到不支持的指令、调试/访问检查等情形还会回落到 switch interpreter。`nterp` 的代码也已经位于同一子目录，但不能仅看见文件名就推断目标设备一定启用了它，具体还受 ISA、构建宏和运行时条件影响。
 
 ---
 
@@ -883,7 +887,9 @@ art/runtime/class_linker.cc
 
 ```text
 art/runtime/interpreter/
-art/runtime/mterp/
+art/runtime/interpreter/interpreter.cc
+art/runtime/interpreter/interpreter_switch_impl-inl.h
+art/runtime/interpreter/mterp/
 art/runtime/art_method.cc
 art/runtime/jit/jit.cc
 art/runtime/jit/jit_code_cache.cc

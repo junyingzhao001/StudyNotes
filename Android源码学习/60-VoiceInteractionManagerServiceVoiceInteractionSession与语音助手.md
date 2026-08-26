@@ -106,8 +106,8 @@ frameworks/base/core/java/android/service/voice/
 frameworks/base/core/java/android/app/VoiceInteractor.java
 frameworks/base/core/java/android/app/Activity.java
 frameworks/base/core/java/android/app/ActivityThread.java
-frameworks/base/core/java/android/app/AssistStructure.java
-frameworks/base/core/java/android/app/AssistContent.java
+frameworks/base/core/java/android/app/assist/AssistStructure.java
+frameworks/base/core/java/android/app/assist/AssistContent.java
 ```
 
 ### Binder 总接口

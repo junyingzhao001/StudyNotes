@@ -1,4 +1,4 @@
-# 72-BatteryStatsService、BatteryStatsImpl 与 UID 耗电记账链路
+# 72 BatteryStatsService、BatteryStatsImpl 与 UID 耗电记账链路
 
 > 源码基线：Android 11（`android-11.0.0_r48`）  
 > 本章目标：弄清 Android 怎样把“谁做了什么、做了多久”记录下来，并估算成设置页里的 UID/应用耗电。  
@@ -37,6 +37,22 @@
                               UID/系统组件耗电与百分比
 ```
 
+把上图压缩成可跟踪的因果关系：
+
+```mermaid
+flowchart TD
+    A["Framework 主动 note 事件"]
+    B["内核 UID CPU / WakeLock 等累计值"]
+    C["Wi-Fi / Bluetooth / Modem<br/>控制器活动与能量"]
+    D["BatteryStatsImpl<br/>记录活动量、TimeBase 和 History"]
+    E["PowerCalculator + PowerProfile<br/>测量值、模型与分摊 → 估计 mAh"]
+    F["BatteryStatsHelper<br/>→ BatterySipper<br/>→ UID/系统项与百分比"]
+    A --> D
+    B --> D
+    C --> D
+    D --> E --> F
+```
+
 所以需要牢牢记住：
 
 > BatteryStats 的核心是“统计与归因”，不是逐应用实时电流测量。
@@ -54,7 +70,7 @@
 | `frameworks/base/services/core/java/com/android/server/am/BatteryExternalStatsWorker.java` | 单线程抓取外部累计统计 | `scheduleSync()`、`updateExternalStatsLocked()` |
 | `frameworks/base/core/java/android/os/BatteryStats.java` | 对外抽象和统计数据结构 | `Uid`、`Timer`、`Counter`、`HistoryItem` |
 | `frameworks/base/core/java/com/android/internal/os/PowerProfile.java` | 读取设备功耗模型 | CPU、屏幕、无线控制器平均电流 |
-| `frameworks/base/core/java/com/android/internal/os/*PowerCalculator.java` | 各硬件模块的估算器 | CPU、Wi-Fi、蜂窝、WakeLock、传感器等 |
+| `frameworks/base/core/java/com/android/internal/os/CpuPowerCalculator.java`、`WifiPowerCalculator.java`、`WakelockPowerCalculator.java` 等 | 各硬件模块的估算器 | CPU、Wi-Fi、蜂窝、WakeLock、传感器等 |
 | `frameworks/base/core/java/com/android/internal/os/BatteryStatsHelper.java` | 汇总耗电项目 | 创建 `BatterySipper`、计算总量和占比 |
 | `frameworks/base/core/java/com/android/internal/os/BatterySipper.java` | 一项耗电结果 | UID 或 Screen、Cell、Idle 等系统项 |
 | `frameworks/base/core/java/com/android/internal/app/IBatteryStats.aidl` | Binder 接口 | 调用边界与可用操作 |
@@ -178,21 +194,25 @@ system_server 中的位置服务实际操作 GNSS
 
 ## 5. 最关键的边界：为什么插拔电时必须先同步外部统计
 
-`BatteryStatsService.setBatteryState()` 的核心代码如下：
+`BatteryStatsService.setBatteryState()` 的核心结构如下。注意最外层也先把判断放进 worker，因为它不能让底层 `BatteryService` 同步等待 Wi-Fi 等外部统计：
 
 ```java
-final boolean onBattery = BatteryStatsImpl.isOnBattery(plugType, status);
-if (mStats.isOnBattery() == onBattery) {
-    mStats.setBatteryStateLocked(...);
-    return;
-}
-
-mWorker.scheduleSync("battery-state",
-        BatteryExternalStatsWorker.UPDATE_ALL);
 mWorker.scheduleRunnable(() -> {
     synchronized (mStats) {
-        mStats.setBatteryStateLocked(...);
+        final boolean onBattery = BatteryStatsImpl.isOnBattery(plugType, status);
+        if (mStats.isOnBattery() == onBattery) {
+            mStats.setBatteryStateLocked(...);
+            return;
+        }
     }
+
+    mWorker.scheduleSync("battery-state",
+            BatteryExternalStatsWorker.UPDATE_ALL);
+    mWorker.scheduleRunnable(() -> {
+        synchronized (mStats) {
+            mStats.setBatteryStateLocked(...);
+        }
+    });
 });
 ```
 
@@ -908,4 +928,3 @@ BatteryService 提供插电/电量边界
 4. **功耗估算**：活动量怎样通过测量值或模型换算成 mAh。
 
 下一章将继续阅读 Android 的系统遥测链路：`statsd`、`StatsCompanionService`、Atom 上报、pull/push 数据与统计配置，理解 BatteryStats 之外系统如何进行结构化指标采集。
-

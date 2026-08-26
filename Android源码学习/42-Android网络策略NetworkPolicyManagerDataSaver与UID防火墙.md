@@ -33,7 +33,7 @@ flowchart TB
     NSS["NetworkStatsService\nusage history"]
     NMS["NetworkManagementService"]
     NETD["netd\nTraffic/Firewall/Bandwidth controller"]
-    K["kernel BPF / iptables / qdisc\nUID rules + counters"]
+    K["kernel eBPF maps/programs or iptables owner rules\nUID rules + counters"]
     APP["App UID socket"]
     NET["metered/unmetered Network"]
 
@@ -301,11 +301,11 @@ NPMS 根据 rule transition 调用：
 
 ```text
 NetworkManagementService.setUidMeteredNetworkBlacklist(uid, enable)
- → netd bandwidth/traffic controller
- → kernel UID-owner/BPF rule
+ → INetd.bandwidthAddNaughtyApp / bandwidthRemoveNaughtyApp
+ → Android 11 BandwidthController 的 bw_data_saver/naughty-nice iptables 规则
 ```
 
-允许名单走相应 whitelist API。Android 11 内部实现正处于 iptables 与 eBPF 迁移阶段，设备能力可能决定具体后端。
+允许名单相应调用 `bandwidthAddNiceApp()` / `bandwidthRemoveNiceApp()`。不要把 Android 11 里所有网络约束都概括成“BPF rule”：Data Saver 这条 metered naughty/nice 链在本分支的 `BandwidthController` 中仍明确生成 iptables 规则；Doze/Standby/Powersave 这类 owner firewall chain 才由 `FirewallController.mUseBpfOwnerMatch` 选择 eBPF `TrafficController` 或 iptables owner-match 后端。
 
 ---
 
@@ -371,11 +371,12 @@ Battery Saver 相关限制可使用 `FIREWALL_CHAIN_POWERSAVE`，结合 UID 前�
 ```text
 NPMS.setUidFirewallRule(s)
  → NetworkManagementService.setFirewallUidRule(s)
- → netd firewall/traffic controller
- → kernel owner/BPF map/chains
+ → netd FirewallController
+ → eBPF 开启时 TrafficController UID-owner map
+    否则 iptables owner-match chain
 ```
 
-批量更新可减少逐 UID IPC 和中间不一致，但仍要处理 chain type、旧规则清理与失败恢复。
+这里的“二选一”可直接从 `FirewallController::setUidRule()` 和 `replaceUidChain()` 中看到。批量更新可减少逐 UID IPC 和中间不一致，但仍要处理 chain type、旧规则清理与失败恢复。
 
 ---
 

@@ -1,4 +1,4 @@
-# 73-statsd、StatsCompanionService 与 Atom 系统遥测链路
+# 73 statsd、StatsCompanionService 与 Atom 系统遥测链路
 
 > 源码基线：Android 11（`android-11.0.0_r48`）  
 > 本章目标：理解 Android 如何把分散在各模块的结构化事件变成可配置、可聚合、可拉取的系统指标。  
@@ -78,15 +78,15 @@ statsd ──按计划触发 pull──> Framework/系统服务回调返回当�
 | `frameworks/base/apex/statsd/framework/java/android/util/StatsLog.java` | Java 写事件入口 | JNI 与 `StatsEvent` |
 | `system/core/libstats/` | Native 写事件库 | `statsdw` socket |
 | `frameworks/base/cmds/statsd/src/main.cpp` | statsd 进程入口 | Binder、Looper、事件队列、socket listener |
-| `.../socket/StatsSocketListener.cpp` | 接收 pushed Atom | 调用者凭据、解析、入队 |
-| `.../StatsLogProcessor.cpp` | 事件处理核心 | 配置路由、UID 映射、报告与持久化 |
-| `.../metrics/*MetricProducer.cpp` | 指标计算器 | event/count/duration/value/gauge |
-| `.../external/StatsPullerManager.cpp` | pull 调度 | 缓存、超时、回调 |
-| `.../config/ConfigManager.cpp` | 配置管理 | 加载、更新、删除 |
-| `.../packages/UidMap.cpp` | UID 与包版本映射 | 多用户、升级、isolated UID |
-| `frameworks/base/apex/statsd/service/.../StatsCompanionService.java` | Java 世界助手 | Alarm、UID/包信息、生命周期 |
-| `.../StatsManagerService.java` | `StatsManager` Binder 后端 | 权限、配置、pull callback、重连缓存 |
-| `.../android/app/StatsManager.java` | System API 客户端 | 加配置、取报告、注册 puller |
+| `frameworks/base/cmds/statsd/src/socket/StatsSocketListener.cpp` | 接收 pushed Atom | 调用者凭据、解析、入队 |
+| `frameworks/base/cmds/statsd/src/StatsLogProcessor.cpp` | 事件处理核心 | 配置路由、UID 映射、报告与持久化 |
+| `frameworks/base/cmds/statsd/src/metrics/EventMetricProducer.cpp`、`CountMetricProducer.cpp`、`DurationMetricProducer.cpp`、`ValueMetricProducer.cpp`、`GaugeMetricProducer.cpp` | 各类指标计算器；这些文件都位于左侧写出的完整目录 | event/count/duration/value/gauge |
+| `frameworks/base/cmds/statsd/src/external/StatsPullerManager.cpp` | pull 调度 | 缓存、超时、回调 |
+| `frameworks/base/cmds/statsd/src/config/ConfigManager.cpp` | 配置管理 | 加载、更新、删除 |
+| `frameworks/base/cmds/statsd/src/packages/UidMap.cpp` | UID 与包版本映射 | 多用户、升级、isolated UID |
+| `frameworks/base/apex/statsd/service/java/com/android/server/stats/StatsCompanionService.java` | Java 世界助手 | Alarm、UID/包信息、生命周期 |
+| `frameworks/base/apex/statsd/service/java/com/android/server/stats/StatsManagerService.java` | `StatsManager` Binder 后端 | 权限、配置、pull callback、重连缓存 |
+| `frameworks/base/apex/statsd/framework/java/android/app/StatsManager.java` | System API 客户端 | 加配置、取报告、注册 puller |
 
 ### 3.1 两个主要进程
 
@@ -960,4 +960,3 @@ atoms.proto 定义稳定结构
 6. statsd 与 BatteryStats、logcat 的职责边界。
 
 下一章将学习 `UsageStatsService、AppStandbyController 与应用使用/待机分桶链路`，继续理解系统如何依据前后台行为形成应用活跃度记录，并把它用于后台资源限制。
-

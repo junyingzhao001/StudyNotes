@@ -488,7 +488,7 @@ Android 11 构造链：
 InputReader → InputClassifier → InputDispatcher
 ```
 
-Classifier 可与 input classifier HAL/算法协作，为 MotionEvent 提供诸如 ambiguous gesture、deep press 等 classification。
+Classifier 可与 input classifier HAL/算法协作，为 MotionEvent 提供诸如 ambiguous gesture、deep press 等 classification。r48 的 HAL 调用不会让 InputReader 在每个 MOVE 上同步等结果：`MotionClassifier.classify()` 把事件加入一个有界队列，专用 `InputClassifier` 线程调 HIDL HAL，本次向下游返回的是该设备当前缓存 classification。因此 HAL 的新判定可能在后续样本才体现；新 gesture 已开始时，属于旧 gesture 的迟到结果会被丢弃。队列满也会触发 reset，而不是无限堆积。
 
 若 classifier 未启用或不支持，事件仍可直接向下转发。它不是选择目标窗口的组件，也不是 View 的 GestureDetector。
 
@@ -622,7 +622,7 @@ dispatchingTimeout
 trusted overlay 等安全属性
 ```
 
-通过 SurfaceControl transaction 的 input window info 与 InputManager 同步到 native InputDispatcher。
+通过 SurfaceControl transaction 的 input window info 与 layer 几何一起提交；SurfaceFlinger 按实际 layer Z-order 汇总 `InputWindowInfo`，再经 InputFlinger 调 `InputDispatcher.setInputWindows()`。这条中转链让触摸命中使用的 transform/crop/层级尽量与用户真正看到的 layer 状态同步。
 
 Dispatcher 不读 App View 树，也不知道按钮范围；它只在“窗口级”选目标。窗口内部 View 命中由 App 完成。
 
@@ -722,8 +722,8 @@ View focus：App 窗口内哪个 View 收键/IME
 添加可接收输入的窗口时，WMS/WindowState 打开一对 InputChannel：
 
 ```text
-server channel：注册给 InputDispatcher，持有 InputPublisher
-client channel：返回 App，持有 InputConsumer
+server channel：注册给 InputDispatcher，Dispatcher 为它建 `Connection` 并包装 `InputPublisher`
+client channel：返回 App，`NativeInputEventReceiver` 为它包装 `InputConsumer`
 ```
 
 底层使用 Unix domain socket pair 风格的双向传输：

@@ -743,6 +743,10 @@ system/gatekeeper/gatekeeper.cpp
 system/gatekeeper/include/gatekeeper/password_handle.h
 ```
 
+这里同样要区分接口源文件和构建生成物：Android 11 r48 的 HIDL 契约源码是
+`IGatekeeper.hal` 与 `types.hal`。调用侧可能 include 生成的 `IGatekeeper.h`，但生成头文件
+不是仓库中定义 enroll/verify 契约的源码入口。
+
 ### FBE/vold
 
 ```text

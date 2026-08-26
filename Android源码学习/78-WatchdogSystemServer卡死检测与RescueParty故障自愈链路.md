@@ -22,10 +22,13 @@ Android 11 用两组容易被名字混淆的机制处理它们：
 
 先记住：
 
-```text
-Watchdog：这一次 system_server 已经卡死，先保存现场，再重启进程。
-
-RescueParty：设备反复失败，怀疑持久配置有毒，逐级撤销配置。
+```mermaid
+flowchart TD
+    A["单次 system_server 卡死"] --> B["Watchdog<br/>半程/超时取证"]
+    B --> C["条件允许时 kill system_server<br/>运行时重启"]
+    C --> D["若同样故障反复发生<br/>PackageWatchdog 累计启动/失败窗口"]
+    D --> E["RescueParty<br/>逐级重置 DeviceConfig / Settings"]
+    E --> F["最后一级才请求恢复出厂"]
 ```
 
 它们可以前后发生，但不是同一个类，也不是同一套超时状态机。
@@ -42,7 +45,7 @@ RescueParty：设备反复失败，怀疑持久配置有毒，逐级撤销配置
 | `frameworks/base/services/core/java/com/android/server/RescueParty.java` | 分级配置重置与恢复出厂 |
 | `frameworks/base/services/java/com/android/server/SystemServer.java` | 启动 Watchdog、注册 RescueParty、记录本次启动 |
 | `frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java` | SettingsProvider 就绪通知、允许/禁止 Watchdog 重启 |
-| `frameworks/base/services/core/java/com/android/server/SettingsToPropertiesMapper.java` | DeviceConfig 到 native property 及 native reset 反馈 |
+| `frameworks/base/services/core/java/com/android/server/am/SettingsToPropertiesMapper.java` | DeviceConfig 到 native property 及 native reset 反馈 |
 | `frameworks/base/core/java/android/provider/Settings.java` | Settings/Config reset 接口和 monitor callback |
 | `frameworks/base/services/core/java/com/android/server/am/AppErrors.java` | App crash/ANR 进入 PackageWatchdog 的入口之一 |
 
@@ -243,7 +246,7 @@ OVERDUE 后 Watchdog 不立即杀进程，而是先尽量留现场：
 5. 触发内核 SysRq `w`，打印阻塞任务；
 6. 触发 SysRq `l`，打印各 CPU backtrace；
 7. 尝试写入 DropBox，标签为 `watchdog`；
-8. 调用 `WatchdogDiagnostics.diagnoseCheckers()`；
+8. 若最终确实要杀进程，在 kill 分支调用 `WatchdogDiagnostics.diagnoseCheckers()`；
 9. 条件允许时杀死自身。
 
 感兴趣的 native 进程包括 `surfaceflinger`、`netd`、`vold`、音视频服务、statsd，以及若干 HAL PID。这不表示 Watchdog 会杀掉它们，而是因为 system_server 可能正同步等待它们，需要一起取证。

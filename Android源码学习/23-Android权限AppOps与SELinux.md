@@ -389,7 +389,9 @@ try {
  → finally restore
 ```
 
-若先 clear 再做 `enforceCallingPermission()`，检查到的可能是 system_server 自己，产生权限提升漏洞。若异常路径没有 restore，Binder 线程池复用线程时还会污染后续工作。
+若先 clear 再做 `enforceCallingPermission()`，检查到的可能是 system_server 自己，产生权限提升漏洞。若异常路径没有 restore，那么**当前这次 Binder 方法剩余的代码**以及它发起的嵌套调用，都会继续以服务进程身份做检查，足以造成权限提升或错误归因。
+
+这里还要避免另一个过度推论：native `IPCThreadState` 在一次入站 transaction 分发结束时，会把分发前保存的 calling pid/uid 恢复回来，所以不能简单说“忘记 restore 会永久污染 Binder 池线程上以后的所有独立请求”。业务代码仍必须使用 `finally`，因为框架方法返回之前可能有大量敏感工作、回调或嵌套 Binder 调用；而且依赖底层 transaction 退栈来兜底，会让身份作用域完全失控。
 
 ---
 

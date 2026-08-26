@@ -465,13 +465,15 @@ Camera3Device 内 RequestThread：
 ```text
 从 repeating/one-shot request list 取下一批
  → 处理 triggers/session parameters
- → 为目标 streams 获取 output buffers
+ → 为目标 streams 准备 output buffer 描述
  → 注册 inflight request/frame number
  → HalInterface.processBatchCaptureRequests
  → ICameraDeviceSession.processCaptureRequest_3_x
 ```
 
 这是持续流水线，不是 App 每 capture 一次就新建一个 native thread。
+
+“准备 buffer”有版本分支。传统 Framework-managed 路径会在送 request 前由 `Camera3OutputStream` 从 BufferQueue dequeue；若设备启用了 HAL 3.5 buffer management API，request 中可以先不给实际 buffer，HAL 需要时再通过 `ICameraDeviceCallback.requestStreamBuffers()` 向 cameraserver 请求，并通过 `returnStreamBuffers()` 或 capture result 归还。两条路最终都受 stream 的 buffer 上限、fence 和 inflight 状态约束。
 
 ---
 
@@ -561,7 +563,7 @@ sequenceDiagram
     participant BQ as Surface BufferQueue
 
     APP->>C3: CaptureRequest targets preview+JPEG
-    C3->>BQ: dequeue/acquire output buffers
+    C3->>BQ: framework-managed 路径预取 output buffers
     C3->>HAL: processCaptureRequest(frame N)
     HAL-->>C3: notify SHUTTER(N,timestamp)
     HAL-->>C3: partial metadata(N)
@@ -590,15 +592,16 @@ frameworks/native/libs/gui/Surface.cpp
 Camera3OutputStream 包装目标 Surface producer：
 
 ```text
-HAL 请求 buffer
- → dequeueBuffer / wait acquire fence
+Framework-managed：Camera3OutputStream dequeueBuffer
+或 HAL-managed：HAL 回调 requestStreamBuffers 后由 cameraserver dequeue
+ → 等待 acquire fence
  → HAL/ISP 写入
  → return buffer + release fence
  → queueBuffer
  → consumer 获取
 ```
 
-具体 HAL buffer management 版本可改变谁何时请求 buffer，但 producer/consumer 和 fence 模型仍是核心。
+因此不要把“每一帧一定在 `processCaptureRequest()` 之前就附带真实 output buffer”当成 Android 11 的统一合同；具体分支由 HAL 版本和 `ANDROID_INFO_SUPPORTED_BUFFER_MANAGEMENT_VERSION` 能力协商。producer/consumer、buffer 所有权和 fence 模型仍是共同核心。
 
 ---
 

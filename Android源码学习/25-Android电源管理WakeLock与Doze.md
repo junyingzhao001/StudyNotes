@@ -309,7 +309,7 @@ ACQUIRE_CAUSES_WAKEUP
 ON_AFTER_RELEASE
 ```
 
-不要把 `ACQUIRE_CAUSES_WAKEUP` 与 PARTIAL 随意组合；源码和 API 文档有合法组合校验。
+API 文档明确说 `ACQUIRE_CAUSES_WAKEUP` 不能与 `PARTIAL_WAKE_LOCK` 搭配；Android 11 的 `PowerManager.validateWakeLockParameters()` 却只校验 level 是否属于合法集合，并不会因这个 flag 组合直接抛异常。服务端 `applyWakeLockFlagsOnAcquireLocked()` 还要满足 `isScreenLock(wakeLock)` 才真正执行 wake-up，所以把该 flag 塞给 PARTIAL 在这一版不会获得“持 CPU 锁同时点亮屏幕”的效果。这里应以 API 合同选择正确的屏幕/通知方案，不能把“构造时没报错”误读为受支持组合。
 
 ---
 

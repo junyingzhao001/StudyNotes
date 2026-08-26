@@ -1,5 +1,7 @@
 # 04 init 进程与 rc 脚本
 
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`；本章在 macOS 上只读本地源码，不要求编译。
+
 ## 本章目标
 
 读完本章，你应该能够：
@@ -50,6 +52,9 @@ int main(int argc, char** argv) {
     }
 
     if (argc > 1) {
+        if (!strcmp(argv[1], "subcontext")) {
+            ...
+        }
         if (!strcmp(argv[1], "selinux_setup")) {
             return SetupSelinux(argv);
         }
@@ -70,6 +75,7 @@ flowchart TD
     M -->|"argv[0] 是 ueventd"| U["ueventd_main()"]
     M -->|"参数 selinux_setup"| SE["SetupSelinux()"]
     M -->|"参数 second_stage"| SS["SecondStageMain()"]
+    M -->|"参数 subcontext"| SC["SubcontextMain()"]
     M -->|"默认"| FS["FirstStageMain()"]
 ```
 
@@ -101,7 +107,7 @@ flowchart TD
 int SecondStageMain(int argc, char** argv)
 ```
 
-它会初始化属性系统、日志、信号处理、SELinux context、epoll，并解析 rc 配置。后续大部分“Android 服务启动”讨论都发生在第二阶段。
+它会初始化属性系统、日志、信号处理、SELinux/subcontext 状态、epoll，并解析 rc 配置。后续大部分“Android 服务启动”讨论都发生在第二阶段。
 
 这里不需要马上读懂第一阶段的挂载和 SELinux 细节。先记住：分阶段是因为启动环境逐步变得完整。
 
@@ -176,7 +182,7 @@ import /system/etc/init/hw/init.${ro.zygote}.rc
 
 `${ro.hardware}` 和 `${ro.zygote}` 是属性展开。这样同一套基础 init.rc 就能加载不同设备和不同 Zygote 架构的配置。
 
-Android 11 的 `LoadBootScripts()` 不只解析主 rc，还会扫描这些目录：
+Android 11 的 `LoadBootScripts()` 不只解析主 rc：若存在 `ro.boot.init_rc`，它会按该属性指定文件启动；通常路径则解析 `/system/etc/init/hw/init.rc`，并扫描这些目录：
 
 ```text
 /system/etc/init
@@ -266,7 +272,7 @@ service zygote /system/bin/app_process64 -Xzygote /system/bin \
 | `--start-system-server` | 要创建 system_server |
 | `class main` | 属于 main 服务类别 |
 | `user/group` | 进程启动身份和附加组 |
-| `socket zygote ...` | 由 init 创建并交给该服务的 socket |
+| `socket zygote ...` | 由 init 创建服务 socket，其 fd 通过约定环境传给子进程 |
 | `onrestart` | 服务退出并重启时额外执行的命令 |
 
 因此，“init 启动 Zygote”更准确的含义是：init 解析 Zygote 的 service 声明，在对应触发条件到来时执行 `app_process64`，并持续管理这个进程。
@@ -328,7 +334,7 @@ sequenceDiagram
     Init->>AM: QueueEventTrigger("late-init")
     AM->>AM: 匹配触发条件并执行命令
     AM->>SL: class_start / start 服务
-    SL->>OS: fork + exec 可执行文件
+    SL->>OS: fork 子进程，子进程 exec 可执行文件
     OS-->>Init: 子进程退出信号
     Init->>SL: 回收并按配置决定是否重启
 ```
@@ -419,4 +425,3 @@ SecondStageMain
 ```
 
 并能在源码中找到 Zygote 的 service 声明。达到后可把本章标为“已完成”，下一章进入 `app_process → AndroidRuntime → ZygoteInit → forkSystemServer`。
-

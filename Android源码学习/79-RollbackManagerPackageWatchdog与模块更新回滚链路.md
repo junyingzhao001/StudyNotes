@@ -51,14 +51,15 @@ Android 系统组件更新后，如果新版本频繁崩溃，仅仅重启进程
 | `frameworks/base/core/java/android/content/rollback/RollbackInfo.java` | 一组原子回滚的公开信息 |
 | `frameworks/base/core/java/android/content/rollback/PackageRollbackInfo.java` | 单个包的新旧版本、APEX、数据策略 |
 | `frameworks/base/services/core/java/com/android/server/rollback/RollbackManagerService.java` | SystemService 外壳与 Binder 发布 |
-| `RollbackManagerServiceImpl.java` | 回滚准备、可用化、提交、过期、启动恢复 |
-| `Rollback.java` | 单个 rollback 的状态机和 commit 实现 |
-| `RollbackStore.java` | `/data/rollback` 元数据与旧代码保存 |
-| `AppDataRollbackHelper.java` | 通过 installd/ApexManager 快照、恢复或清理数据 |
-| `RollbackPackageHealthObserver.java` | PackageWatchdog 观察者，自动选择并提交回滚 |
-| `WatchdogRollbackLogger.java` | 模块名映射和 statsd 日志 |
-| `PackageWatchdog.java` | crash/ANR/native crash 健康事件与观察者仲裁 |
-| `PackageInstallerService/PackageInstallerSession` | 新版本安装和回滚降级安装的 session 执行层 |
+| `frameworks/base/services/core/java/com/android/server/rollback/RollbackManagerServiceImpl.java` | 回滚准备、可用化、提交、过期、启动恢复 |
+| `frameworks/base/services/core/java/com/android/server/rollback/Rollback.java` | 单个 rollback 的状态机和 commit 实现 |
+| `frameworks/base/services/core/java/com/android/server/rollback/RollbackStore.java` | `/data/rollback` 元数据与旧代码保存 |
+| `frameworks/base/services/core/java/com/android/server/rollback/AppDataRollbackHelper.java` | 通过 installd/ApexManager 快照、恢复或清理数据 |
+| `frameworks/base/services/core/java/com/android/server/rollback/RollbackPackageHealthObserver.java` | PackageWatchdog 观察者，自动选择并提交回滚 |
+| `frameworks/base/services/core/java/com/android/server/rollback/WatchdogRollbackLogger.java` | 模块名映射和 statsd 日志 |
+| `frameworks/base/services/core/java/com/android/server/PackageWatchdog.java` | crash/ANR/native crash 健康事件与观察者仲裁 |
+| `frameworks/base/services/core/java/com/android/server/pm/PackageInstallerService.java` | 创建、查询和持久化 PackageInstaller session |
+| `frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java` | 新版本安装和回滚降级安装的 session 执行层 |
 
 ---
 
@@ -81,7 +82,21 @@ publishBinderService(Context.ROLLBACK_SERVICE, mService);
 
 它给自身 Handler 的 Watchdog 超时是 10 分钟，不是默认 60 秒。这条线程可能执行备份、PackageInstaller 交互等长任务，但仍不能无限卡死。
 
-Binder 入口通常只做权限/身份校验，再 `post` 到专用 Handler，避免在 Binder 线程内直接串行执行重工作。
+这里实际有两条专用线程，不要把它们混成一条：
+
+| 线程 | 主要工作 |
+|---|---|
+| `RollbackManagerServiceHandler` | enable、commit、过期、包替换和用户解锁后的快照补处理 |
+| `RollbackPackageHealthObserver` 自己的 HandlerThread | PackageWatchdog 触发后的提交、staged session 监听与重启衔接 |
+
+修改状态的 Binder 入口通常在权限/身份校验后 `post` 到
+`RollbackManagerServiceHandler`。但这不是所有接口的统一模板：
+
+- `getAvailableRollbacks()`、`getRecentlyCommittedRollbacks()` 直接在 Binder 线程持有
+  `mLock` 复制当前信息；
+- `notifyStagedSession()` 把工作投递给 Handler 后，会在 Binder 线程通过队列等待
+  rollbackId，因为 PackageInstaller 的 staged 流程需要同步拿到结果；
+- `commitRollback()` 则只投递任务，最终结果通过 `IntentSender` 异步返回。
 
 ---
 
@@ -124,6 +139,17 @@ sessionParams.setEnableRollback(true);
 
 设置 `INSTALL_ENABLE_ROLLBACK`。PackageManager 在安装提交过程中发送 `ACTION_PACKAGE_ENABLE_ROLLBACK`，RollbackManager 根据 sessionId 做准备。
 
+上面这句对应普通 APK 安装，以及 staged train 在重启后安装 APK 部分时走的 PMS
+安装链。纯 staged/APEX 的重启前准备入口不同：`StagingManager` 在
+`PreRebootVerificationHandler` 的起始阶段同步调用
+`IRollbackManager.notifyStagedSession(sessionId)`。两条入口最终都会进入
+`enableRollbackForPackageSession()`，但触发者、线程以及是否同步等待结果并不相同。
+
+普通 APK 的有序广播还有一个工程边界：PMS 默认最多等 10 秒（DeviceConfig
+`rollback/enable_rollback_timeout` 可调整）。超时后安装会继续，并发送
+`ACTION_CANCEL_ENABLE_ROLLBACK` 清理仍在 ENABLING 的对象。因此“请求了 enable”不等于
+“安装一定拥有回滚保险”；排障要确认 RollbackManager 是否在超时前返回成功。
+
 为什么必须在安装前？
 
 ```text
@@ -153,7 +179,10 @@ sessionParams.setEnableRollback(true);
 
 Android 11 源码明确写着“目前只允许模块或测试”。普通第三方应用不能把系统当成任意版本降级器。
 
-提交、查询最近回滚等 API 同样受 `MANAGE_ROLLBACKS` 或对应测试权限保护，并用 AppOps `checkPackage(uid, callerPackageName)` 校验包名与 UID，防止伪造调用方名称。
+提交、查询最近回滚等 API 同样受 `MANAGE_ROLLBACKS` 或对应测试权限保护。
+其中 `commitRollback()` 还接收 `callerPackageName`，所以额外用 AppOps
+`checkPackage(uid, callerPackageName)` 校验包名与 UID；查询接口没有调用方包名参数，
+不会执行这一步。不要把“权限检查”和“commit 专有的包名归属检查”混为一谈。
 
 ---
 
@@ -426,11 +455,25 @@ if (isStaged()) parentParams.setStaged();
 
 ## 18. 提交失败与成功的状态处理
 
-真正调用 `parentSession.commit()` 前，状态先变为 COMMITTED，并记录 committedSessionId、开始数据恢复标志。这样状态能够随提交请求一起持久化，但也意味着此刻尚没有异步安装结果。
+真正调用 `parentSession.commit()` 前，状态先在**内存中**变为 COMMITTED，并记录
+committedSessionId、开始数据恢复标志；此刻尚没有异步安装结果，也没有在这一行之后立刻
+调用 `RollbackStore.saveRollback()`：
+
+```java
+mState = ROLLBACK_STATE_COMMITTED;
+info.setCommittedSessionId(parentSessionId);
+mRestoreUserDataInProgress = true;
+parentSession.commit(receiver.getIntentSender());
+```
+
+因此要再分清“内存状态”和“磁盘状态”：此前 AVAILABLE 状态已经保存到
+`rollback.json`；PackageInstaller 成功回调中才会补写 causePackages、删除已不再需要的旧代码
+副本，并保存 COMMITTED 状态。原文若把这理解成“提交请求一发出就已把 COMMITTED 落盘”，
+会误判 system_server 在异步回调前异常退出时的恢复依据。
 
 若 PackageInstaller 安装失败：
 
-- 状态恢复 AVAILABLE；
+- 内存状态恢复 AVAILABLE；磁盘上此前保存的状态本来就是 AVAILABLE；
 - 清除 restore-in-progress；
 - committedSessionId 重置；
 - 返回 STATUS_FAILURE_INSTALL；
@@ -464,7 +507,13 @@ failed VersionedPackage
 
 PackageWatchdog 会与 RescueParty 等观察者的影响等级比较，选择非 NONE 且用户影响最小的方案。
 
-第 78 章中 RescueParty 的低级配置 reset 可能报告 LOW，而 rollback observer 报 MEDIUM。因此若两者都愿意处理，框架会优先选择影响更低者。不能看到 PackageWatchdog 就断言“一定回滚 APK”。
+这里还要补上“何时才进入仲裁”：对普通 app crash/ANR，PackageWatchdog 默认要求同一包在
+1 分钟窗口内失败 5 次，达到阈值后才询问观察者；这两个值可由 `rollback` namespace 下的
+DeviceConfig 键 `watchdog_trigger_failure_duration_millis` 与
+`watchdog_trigger_failure_count` 调整。native crash 和 explicit health check 属于立即处理路径，
+不会套用这个普通失败计数。
+
+第 78 章中 RescueParty 的低级配置 reset 可能报告 LOW，而 rollback observer 报 MEDIUM。因此若两者都愿意处理，框架会优先选择影响更低者。不能看到 PackageWatchdog 就断言“一定回滚 APK”。随着 RescueParty level 升高，它可能报告 HIGH，此时 MEDIUM 的代码回滚反而会先被选中；这不是一个固定的“永远先 reset”顺序。
 
 ---
 
@@ -609,7 +658,7 @@ RESTORE 策略能恢复快照，但快照失败、CE pending 或外部共享数�
 
 ### 误解三：发生一次崩溃就自动回滚
 
-错误。普通 crash/ANR 先经过 PackageWatchdog 的观察窗口和阈值；还要有匹配版本的 available rollback，并赢得 observer 影响等级仲裁。
+错误。普通 crash/ANR 默认先经过 PackageWatchdog 的“1 分钟内 5 次”阈值（可由 DeviceConfig 调整）；还要有匹配版本的 available rollback，并赢得 observer 影响等级仲裁。native crash/explicit health check 则是立即处理路径，不能把两类失败混成同一阈值。
 
 ### 误解四：APK-in-APEX 可以单独回滚
 
@@ -706,38 +755,26 @@ sed -n '530,610p'   frameworks/base/services/core/java/com/android/server/rollba
 
 ## 29. 初学者最后应画出的总图
 
-```text
-更新准备：
-PackageInstaller SessionParams(enableRollback)
-  → PMS 通知 RollbackManager
-  → 校验安装器/模块资格
-  → 记录 from(new)/to(old)
-  → 备份旧 APK/APEX 代码
-  → 快照 DE/CE 数据
-  → ENABLING
-
-更新生效：
-非 staged 安装成功 ─────────┐
-staged 安装重启并 applied ──┤
-                            ▼
-                         AVAILABLE
-                            │
-         PackageWatchdog 观察包健康（默认最多保留 14 天）
-                            │
-              crash/ANR/native crash 达到条件
-                            ▼
-        RollbackPackageHealthObserver 参与影响等级仲裁
-                            │
-                     commitRollback
-                            ▼
-  创建 downgrade multi-package session，写入旧代码并提交
-           │                              │
-       普通 APK                       staged/APEX
-           │                              │
-     安装后生效                  等 ready → reboot → applied
-           └──────────→ COMMITTED ←───────┘
-                            │
-                按 data policy 恢复/擦除/保留数据
+```mermaid
+flowchart TD
+    A["PackageInstaller：enableRollback"] --> B["RollbackManagerServiceHandler：校验安装器与模块资格"]
+    B --> C["Rollback：记录 from(new) / to(old)"]
+    C --> D["RollbackStore：备份旧 APK/APEX 代码"]
+    C --> E["installd / apexd：按策略准备数据快照"]
+    D --> F["ENABLING"]
+    E --> F
+    F --> G{"新安装是哪一种？"}
+    G -->|"普通 APK 安装成功"| H["AVAILABLE，写 rollback.json"]
+    G -->|"staged 安装重启后 applied"| H
+    H --> I["PackageWatchdog：在生命周期内观察健康"]
+    I --> J["观察者按用户影响等级仲裁"]
+    J --> K["RollbackPackageHealthObserver.commitRollback()"]
+    K --> L["PackageInstaller：downgrade multi-package session"]
+    L --> M["内存先记 COMMITTED；异步成功后再持久化"]
+    M --> N{"回滚是否 staged？"}
+    N -->|"普通 APK"| O["安装完成并按 data policy 恢复/擦除数据"]
+    N -->|"APEX / staged"| P["等待全部 session ready/failed"]
+    P --> Q["reboot 后检查 applied"]
 ```
 
 ---

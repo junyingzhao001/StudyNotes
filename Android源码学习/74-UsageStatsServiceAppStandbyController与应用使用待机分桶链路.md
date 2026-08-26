@@ -1,4 +1,4 @@
-# 74-UsageStatsService、AppStandbyController 与应用使用/待机分桶链路
+# 74 UsageStatsService、AppStandbyController 与应用使用/待机分桶链路
 
 > 源码基线：Android 11（`android-11.0.0_r48`）  
 > 本章目标：理解系统如何记录应用使用历史，并根据使用信号把应用放入不同 standby bucket，进而约束后台资源。  
@@ -53,15 +53,15 @@ Activity/通知/系统交互等事件
 | 文件 | 作用 | 重点 |
 |---|---|---|
 | `frameworks/base/services/usage/java/com/android/server/usage/UsageStatsService.java` | 系统服务总入口 | 生命周期、事件排队、查询权限、Binder/LocalService |
-| `.../UserUsageStatsService.java` | 单用户统计逻辑 | 时间转换、四级 interval、查询与 rollover |
-| `.../UsageStatsDatabase.java` | 使用统计数据库 | 文件索引、读写、升级、裁剪、备份恢复 |
-| `.../IntervalStats.java` | 一个时间区间的数据 | package stats、events、configuration stats |
+| `frameworks/base/services/usage/java/com/android/server/usage/UserUsageStatsService.java` | 单用户统计逻辑 | 时间转换、四级 interval、查询与 rollover |
+| `frameworks/base/services/usage/java/com/android/server/usage/UsageStatsDatabase.java` | 使用统计数据库 | 文件索引、读写、升级、裁剪、备份恢复 |
+| `frameworks/base/services/usage/java/com/android/server/usage/IntervalStats.java` | 一个时间区间的数据 | package stats、events、configuration stats |
 | `frameworks/base/core/java/android/app/usage/UsageStatsManager.java` | 客户端 API 和常量 | query、bucket、reason |
 | `frameworks/base/core/java/android/app/usage/UsageEvents.java` | 事件模型 | event type、迭代与字符串池 |
 | `frameworks/base/apex/jobscheduler/service/java/com/android/server/usage/AppStandbyController.java` | 待机分桶策略 | usage signal、阈值、豁免、预测、监听器 |
-| `.../AppIdleHistory.java` | bucket 历史持久化 | 当前 bucket、reason、时间轴 |
-| `.../AppStandbyInternal.java` | system_server 内部接口 | Job/Alarm 等消费者接入 |
-| `.../job/controllers/QuotaController.java` | Job 配额执行 | 根据 bucket 选择配额 |
+| `frameworks/base/apex/jobscheduler/service/java/com/android/server/usage/AppIdleHistory.java` | bucket 历史持久化 | 当前 bucket、reason、时间轴 |
+| `frameworks/base/apex/jobscheduler/framework/java/com/android/server/usage/AppStandbyInternal.java` | system_server 内部接口 | Job/Alarm 等消费者接入 |
+| `frameworks/base/apex/jobscheduler/service/java/com/android/server/job/controllers/QuotaController.java` | Job 配额执行 | 根据 bucket 选择配额 |
 | `frameworks/base/services/core/java/com/android/server/AlarmManagerService.java` | Alarm 延迟策略 | 根据 bucket 选择最小间隔 |
 
 ### 2.1 一个版本位置陷阱
@@ -987,4 +987,3 @@ ATMS/通知/系统组件报告可信 usage event
 6. 分类状态与 Job/Alarm 实际执行的边界。
 
 下一章将学习 `AppTimeLimitController、UsageObserver 与 Digital Wellbeing 使用时长限制链路`，继续沿 UsageStats 体系理解应用计时观察者、session、回调和跨重启状态管理。
-

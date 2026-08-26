@@ -28,7 +28,7 @@ flowchart TB
     WS["system_server\nWifiServiceImpl"]
     AMW["ActiveModeWarden\nClientModeManager"]
     CMI["ClientModeImpl"]
-    SEL["ConnectivityManager\nNetworkSelector/ConfigManager"]
+    SEL["WifiConnectivityManager\nNetworkSelector/ConfigManager"]
     NAT["WifiNative"]
     WC["wificond\nscan/nl80211"]
     SUP["wpa_supplicant\n802.1X/WPA"]
@@ -633,7 +633,9 @@ WifiConfiguration 可保存 StaticIpConfiguration：IP/prefix、gateway、DNS。
 
 ## 41. IPv6
 
-IPv6 通常通过 Router Advertisement、SLAAC/DHCPv6 相关机制配置。一个网络可：
+Android 11 的普通 Wi‑Fi 主线主要依据 Router Advertisement，通过 SLAAC 配置地址，
+并从 RA 的 RDNSS 等选项取得 DNS；AOSP `IpClient` 在这里不是依靠一个与
+`DhcpClient` 对称的 DHCPv6 客户端来完成地址配置。一个网络可：
 
 - IPv4 only。
 - IPv6 only。
@@ -708,7 +710,7 @@ Wi‑Fi connected 但无互联网时，默认网络可能仍是 cellular；绑�
 | NETWORK_CONNECTION_EVENT | L2 已连接/authorized | 有 IP |
 | Provisioning success | 有可用 LinkProperties | 公网可达 |
 | NetworkAgent registered | Connectivity 看见该 Network | 它是默认网络 |
-| VALIDATED | 系统探测认为互联网可用 | 所有业务域名一定可达 |
+| VALIDATED | 系统探测认为互联网可用 | 所有业务域名都可达 |
 
 排障先确定卡在哪个完成点。
 

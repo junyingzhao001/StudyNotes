@@ -8,23 +8,18 @@
 
 ## 1. 先建立三条链
 
-```text
-【当前状态链】
-电池/充电 IC → kernel/healthd/vendor Health HAL
-→ HealthInfo callback → BatteryService
-→ 当前电量、插电、温度、健康状态
-
-【系统分发链】
-BatteryService.processValuesLocked
-→ sticky BATTERY_CHANGED
-→ POWER_CONNECTED/DISCONNECTED
-→ BATTERY_LOW/OKAY
-→ SystemUI、PMS、JobScheduler、App
-
-【历史记账链】
-BatteryService → BatteryStatsService.setBatteryState
-→ BatteryStatsImpl
-→ 充放电周期、UID 耗电、历史事件、batterystats
+```mermaid
+flowchart LR
+    A["电池/充电 IC<br/>→ kernel、healthd 或 vendor Health HAL"]
+    B["HealthInfo callback<br/>→ BatteryService"]
+    C["当前事实<br/>电量、插电、温度、健康"]
+    D["状态分发<br/>BATTERY_CHANGED、POWER_*、BATTERY_LOW/OKAY"]
+    E["SystemUI、PMS、JobScheduler、App"]
+    F["BatteryStatsService<br/>→ BatteryStatsImpl"]
+    G["历史记账<br/>充放电周期、UID 归因、batterystats"]
+    A --> B --> C
+    B --> D --> E
+    B --> F --> G
 ```
 
 一句话：
@@ -115,14 +110,14 @@ BatteryManagerInternal → system_server 内部快速访问/回调
 
 ## 5. HealthServiceWrapper 为什么存在
 
-它负责发现和替换 `IHealth` 实例：
+它负责在启动时选择 `IHealth` 实例，并跟踪该实例后续的重新注册：
 
 ```text
 优先 "default" vendor instance
-→ 不可用时 "backup" healthd instance
-→ 保存 mLastService
-→ 向 hwservicemanager 注册 service notification
-→ 新实例出现时切换并回调 BatteryService
+→ 启动时不可用才选 "backup" healthd instance
+→ 保存 mLastService 和已选的 mInstanceName
+→ 只为该 instance 向 hwservicemanager 注册 notification
+→ 同名服务重新注册时替换引用并回调 BatteryService
 ```
 
 实例优先级：
@@ -130,6 +125,8 @@ BatteryManagerInternal → system_server 内部快速访问/回调
 ```java
 ["default", "backup"]
 ```
+
+这个顺序是**初始选择**，不是每次回调都重新在两个 instance 之间抢占。`mInstanceName` 在 `init()` 后固定，notification 也会忽略其他 instance 名称。
 
 ### 5.1 新 HAL 注册时
 
@@ -537,7 +534,7 @@ charger online 属性改变
 
 ## 22. 常见误解修正
 
-1. BatteryService 不直接读取 `/sys`；Android 11 主链通过 Health HAL callback。
+1. Android 11 的电量、温度、充电状态主链通过 Health HAL callback，BatteryService 不会自己轮询一组 battery sysfs 节点；但 r48 仍有一个狭义例外：构造函数检查 `/sys/devices/virtual/switch/invalid_charger/state` 是否存在，并通过 `UEventObserver` 接收无效充电器开关事件。
 2. plugType 不是充电状态，插电可能 NOT_CHARGING。
 3. battery health 不是容量健康百分比。
 4. BATTERY_CHANGED 是 sticky 且 registered-only，不会按普通广播拉起所有 App。
@@ -590,6 +587,15 @@ Health HAL 是否 callback
 ---
 
 ## 24. macOS 只读练习
+
+先用下列命令定位三条链：
+
+```bash
+rg -n "registerHealthCallback|class HealthServiceWrapper|class HealthHalCallback|onRegistration" frameworks/base/services/core/java/com/android/server/BatteryService.java
+rg -n "processValuesLocked|shouldSendBatteryLowLocked|shouldShutdownLocked|shutdownIfOverTempLocked" frameworks/base/services/core/java/com/android/server/BatteryService.java
+rg -n "sendBatteryChangedIntentLocked|sendBatteryLevelChangedIntentLocked|ACTION_POWER_CONNECTED|ACTION_BATTERY_LOW" frameworks/base/services/core/java/com/android/server/BatteryService.java
+rg -n "class BatteryPropertiesRegistrar|getProperty|scheduleUpdate" frameworks/base/services/core/java/com/android/server/BatteryService.java
+```
 
 1. 从 `registerHealthCallback()` 追 default/backup IHealth 选择与首次等待。
 2. 追新 Health HAL 注册后的 unregister/register/update。

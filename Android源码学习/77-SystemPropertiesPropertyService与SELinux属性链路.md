@@ -1,4 +1,4 @@
-# 77-SystemProperties、property_service 与 SELinux 属性链路
+# 77 SystemProperties、property_service 与 SELinux 属性链路
 
 > 源码基线：Android 11（`android-11.0.0_r48`）  
 > 本章目标：理解 Android 属性的共享内存读取、init 写入服务、SELinux 权限、持久化和 property trigger。  
@@ -202,7 +202,7 @@ callback 读取能正确处理同步和较长只读值。旧固定 buffer API �
 
 ## 7. 读权限：能 mmap 不等于能读所有属性
 
-属性名通过 property info 映射到 SELinux target context。读取模型类似：
+属性名通过 property info 映射到 SELinux target context。init 在校验 rc 子上下文能否使用属性 trigger 时，可以直接表达为：
 
 ```cpp
 property_info_area->GetPropertyInfo(name, &target_context, ...);
@@ -210,7 +210,7 @@ selinux_check_access(source_context, target_context,
         "file", "read", ...);
 ```
 
-不同 property context 拥有不同区域/访问策略。普通应用能读取部分公开 `ro.*`，并不表示能读取所有 vendor 或敏感属性。
+普通 bionic `get` 不会每次读属性都 RPC 到 init 再调一次 `selinux_check_access()`。它会按 context 找到 `/dev/__properties__` 下对应的带 SELinux 标签文件，并尝试只读打开/映射；文件打开权限在这一步落地。所以“所有进程都可以读取同一大块属性内存”是过时简化：不同 context 对应不同 prop area 和访问策略。普通应用能读部分公开 `ro.*`，并不表示能读所有 vendor 或敏感属性。
 
 ---
 
@@ -395,6 +395,8 @@ Android 11 使用 protobuf 汇总文件，写入过程包括：
 
 ## 14. `ctl.*`：外观像属性，本质是控制命令
 
+> 下列命令只用于解释协议，**不是本章的 macOS 练习**。它们会改变 Android 设备服务状态；当前只读学习不要执行。
+
 ```bash
 setprop ctl.start logd
 setprop ctl.stop some_service
@@ -506,7 +508,20 @@ Android 11 已有分区化的属性加载规则。不要照搬早期 Android 只
 SystemProperties.addChangeCallback(runnable);
 ```
 
-第一次注册时 JNI 安装 native callback。属性发生变化后 Java `callChangeCallbacks()` 复制 callback 列表，再逐个执行。
+第一次注册时 JNI 安装一个**进程内** native callback。但 Android 11 r48 中要特别区分两件事：
+
+```text
+__system_property_set()
+  → 更新属性区和 global serial
+  ≠ 自动在所有 Java 进程调用 Runnable
+
+SystemProperties.reportSyspropChanged()
+或 Binder SYSPROPS_TRANSACTION
+  → libutils report_sysprop_change()
+  → 当前进程 Java callChangeCallbacks()
+```
+
+AMS 在收到 `SYSPROPS_TRANSACTION` 时还会把它 one-way 转发给应用进程。因此这套 callback 是一条需要显式“报告 sysprop 变化”的粗粒度通知机制，不是 bionic 在后台为每个 key 建立全局 observer。若只需等待某个属性的 serial/value 变化，native 代码还有 `__system_property_wait()` 这类更直接的机制。
 
 ### 18.1 不提供具体 key
 
@@ -514,7 +529,7 @@ Runnable 没有参数。消费者需要重新读取自己关心的属性并与�
 
 ### 18.2 不保证主线程
 
-回调来自当前进程的 native sysprop change 通知路径。业务代码不应假定主线程；需要线程亲和性时应 post 到自己的 Handler/Executor。
+回调在哪条线程执行，取决于当前进程从哪条路径收到/调用了 `reportSyspropChanged`（常见是 Binder 事务线程）。业务代码不应假定它一定是主线程；需要线程亲和性时应 post 到自己的 Handler/Executor。
 
 ### 18.3 为什么复制后锁外执行
 
@@ -672,11 +687,15 @@ rg -n "PropertyChanged|QueuePropertyChange|HandleControlMessage|ctl\\." \
 
 不对。它是无参数 Runnable，需要重新读取关心 key。
 
-### 误区 9：set 成功意味着 rc action 已执行完
+### 误区 9：任意 `setprop` 成功都会自动唤起所有 Java ChangeCallback
+
+不对。属性区 serial 会变，但 Java Runnable 通知还需要 `reportSyspropChanged()`/`SYSPROPS_TRANSACTION` 等显式传播路径。
+
+### 误区 10：set 成功意味着 rc action 已执行完
 
 不对。action 在 init 主循环排队执行。
 
-### 误区 10：硬编码名字就是稳定跨模块 API
+### 误区 11：硬编码名字就是稳定跨模块 API
 
 不对。正式跨边界依赖应使用 `*.sysprop`。
 
@@ -809,4 +828,3 @@ ctl.* → 不存储，直接进入 init Service control handler
 6. 私有硬编码 property 与正式 `*.sysprop` API。
 
 下一章将学习 `Watchdog、SystemServer 卡死检测与 RescueParty 故障自愈链路`，把本章 property/config reset 与 system_server 线程卡死、重启和配置回滚联系起来。
-

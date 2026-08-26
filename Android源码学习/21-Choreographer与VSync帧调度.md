@@ -31,6 +31,8 @@
 
 ## 2. 一帧是一条流水线
 
+下面先画 Android 11 中最常见的**硬件加速 View 窗口**路径。软件绘制窗口不会按同样方式经过 RenderThread/GPU；它通常由应用线程把像素画进 Surface，但之后仍会进入 BufferQueue、SurfaceFlinger 和显示设备这半条流水线。
+
 ```mermaid
 flowchart LR
     VS["App VSync"] --> UI["UI thread<br/>input/animation/traversal"]
@@ -207,6 +209,8 @@ SurfaceFlinger Scheduler/EventThread
 ```
 
 这不是每次 VSync 都通过 Java Binder 同步调用。App 通常 one-shot 请求下一次 VSync，有后续工作时再请求。
+
+Android 11 r48 的 `FrameDisplayEventReceiver.onVsync(...)` 还明确忽略了传入的 `physicalDisplayId`，源码注释给出的前提是这里只接收内置显示事件。因此不要仅凭这个回调参数，就推断这一版的单个 `Choreographer` 已经对每块物理屏分别调度；多显示器与后续版本需要另按对应分支核对。
 
 ---
 
@@ -442,7 +446,7 @@ ThreadedRenderer.draw
 
 ## 29. UI 与 RenderThread 并非完全互不等待
 
-syncAndDrawFrame 包含同步阶段：
+`syncAndDrawFrame()` 会把 `DrawFrameTask` 投递到 RenderThread，并等待它发出解锁信号。这个等待至少覆盖 `makeCurrent()`、图层更新与 `prepareTree()` 等同步/准备工作：
 
 - 同步 RenderNode/property。
 - RT prepareTree 判断绘制。
@@ -450,6 +454,8 @@ syncAndDrawFrame 包含同步阶段：
 - RT 结果可能要求 UI relayout/redraw。
 
 RT、GPU 或 BufferQueue 持续拥塞，最终可反压 UI thread。ThreadedRenderer 不表示“主线程发请求后永不等待”。
+
+但也不要把这个等待理解为“UI thread 每帧都等到屏幕真正显示”。`DrawFrameTask::run()` 在条件允许时会先 `unblockUiThread()`，然后才继续 `CanvasContext.draw()`；GPU 执行、SurfaceFlinger 合成和 HWC present 更在其后。只有准备纹理等条件不允许提前解锁时，UI thread 才会等到该次 RT draw/waitOnFences 之后。也就是说，这里是一个会受下游压力影响的同步点，却不是物理 present 的完成通知。
 
 ---
 

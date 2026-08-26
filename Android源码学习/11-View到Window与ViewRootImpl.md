@@ -1,5 +1,7 @@
 # 11 View 到 Window：DecorView、WindowManager 与 ViewRootImpl
 
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`；本章在 macOS 上只读本地源码，不要求编译。
+
 ## 本章边界
 
 第 10 章已经到达：
@@ -577,7 +579,7 @@ Activity Window 的 LayoutParams 携带 token。WMS 用它找到对应 ActivityR
 
 窗口不仅要显示，还要接收触摸和按键。WMS/InputDispatcher 需要知道窗口 frame、可触摸区域、焦点和客户端输入通道。
 
-ViewRootImpl 创建客户端 InputChannel，WMS 建立并注册配对通道。输入事件到达 App 后，由 ViewRootImpl 的 InputEventReceiver 进入 View 分发链。
+ViewRootImpl 先创建一个空的 `InputChannel` 作为 Binder out 参数容器；WMS 一侧在 addWindow 过程中建立 socketpair/配对端，将客户端 channel 信息写回这个对象，并把服务端通道注册给 InputDispatcher。所以不应把“`new InputChannel()`”读成 App 单方就创建了整条可用输入通道。输入事件到达 App 后，由 ViewRootImpl 的 InputEventReceiver 进入 View 分发链。
 
 所以 ViewRootImpl 同时是：
 
@@ -853,9 +855,9 @@ flowchart LR
 
 本章详细到 traversal；第 12 章从 Surface/BufferQueue 继续。
 
-## 42. 为什么 WindowManager.addView 必须主线程调用
+## 42. 为什么 Activity 主窗口的 WindowManager.addView 必须在主线程
 
-ViewRootImpl 在构造时记录当前线程，并创建依赖该 Looper 的 Handler、Choreographer、InputEventReceiver。
+ViewRootImpl 在构造时记录当前线程，并创建依赖该 Looper 的 Handler、Choreographer、InputEventReceiver。严格说 ViewRootImpl 要求后续操作回到“创建它的线程”，并非 `WindowManager.addView()` API 在所有自定义环境中都硬编码检查 `Looper.getMainLooper()`。Activity Framework 的主窗口由 `ActivityThread.handleResumeActivity()` 在 App 主线程添加，因此它的 owner thread 就是主线程。
 
 如果在错误线程创建窗口：
 
@@ -863,7 +865,7 @@ ViewRootImpl 在构造时记录当前线程，并创建依赖该 Looper 的 Hand
 - 输入、帧回调、Handler 会绑定错误 Looper。
 - 后续 View 更新触发线程检查异常。
 
-Activity 主窗口由 ActivityThread 主线程在 resume 流程添加，因此正常路径天然满足约束。
+Activity 主窗口由 ActivityThread 主线程在 resume 流程添加，因此正常路径天然满足约束。这也是为什么简写成“View 只能在主线程”对 App UI 很实用，但阅读 Framework 实现时仍要知道真正的校验条件是 ViewRootImpl owner thread。
 
 ## 43. Dialog 为什么需要 Activity Context
 

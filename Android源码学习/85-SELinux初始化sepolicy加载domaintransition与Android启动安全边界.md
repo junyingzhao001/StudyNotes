@@ -14,7 +14,10 @@
 execv("/system/bin/init", {"/system/bin/init", "selinux_setup", nullptr});
 ```
 
-此时 system/vendor/product 已经挂载，但 SELinux policy 尚未正式装入内核，init 仍处于 kernel initial domain。接下来要完成：
+此时 first-stage fstab 要求的早期分区已经挂载，但不能笼统假定所有设备上的
+`system_ext/product` 都已在 first stage 挂好：Android 11 的 `SetupSelinux()` 还会先调用
+`MountMissingSystemPartitions()`，专门兼容 R system image 搭配旧 vendor image 的布局。
+SELinux policy 尚未正式装入内核，init 仍处于 kernel initial domain。接下来要完成：
 
 ```text
 找出本机应使用的 platform + vendor policy

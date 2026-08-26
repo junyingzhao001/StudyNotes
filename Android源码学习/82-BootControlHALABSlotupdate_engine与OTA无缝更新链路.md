@@ -57,14 +57,18 @@ vbmeta_a    vbmeta_b
 | `system/update_engine/update_attempter_android.cc` | ApplyPayload、InstallPlan、Action 流水线和状态 |
 | `system/update_engine/payload_consumer/download_action.cc` | 下载/读取 payload 并交给 DeltaPerformer |
 | `system/update_engine/payload_consumer/delta_performer.cc` | 解析 manifest、校验并执行分区 operation |
-| `filesystem_verifier_action.cc` | 更新后分区 hash 验证 |
-| `postinstall_runner_action.cc` | 挂载目标分区、运行 postinstall、切 active slot |
-| `boot_control_android.cc` | update_engine 对 BootControl HAL 的封装 |
+| `system/update_engine/payload_consumer/filesystem_verifier_action.cc` | 更新后分区 hash 验证 |
+| `system/update_engine/payload_consumer/postinstall_runner_action.cc` | 挂载目标分区、运行 postinstall、切 active slot |
+| `system/update_engine/boot_control_android.cc` | update_engine 对 BootControl HAL 的封装 |
 | `hardware/interfaces/boot/1.0/IBootControl.hal` | slot 查询与 bootable/successful API |
 | `hardware/interfaces/boot/1.1/types.hal` | Virtual A/B snapshot merge 状态 |
 | `hardware/interfaces/boot/1.1/default/boot_control/libboot_control.cpp` | misc 中 bootloader_control 参考实现 |
 | `system/update_engine/dynamic_partition_control_android.cc` | dynamic partition/Virtual A/B 协调 |
 | `system/core/fs_mgr/libsnapshot` | Virtual A/B snapshot 创建、映射和 merge |
+
+这里列出的 `IBootControl.hal` 与 `types.hal` 才是仓库中的 HIDL 接口源文件。代码里常见的
+`android/hardware/boot/1.x/IBootControl.h`、`types.h` 等 C++ 头文件由 HIDL 构建规则生成，
+不能把它们当成可在当前源码树中直接打开的手写源文件路径。
 
 ---
 
@@ -586,14 +590,18 @@ Virtual A/B 仍保留 slot/BootControl 语义，但“target slot”不再等于
 
 ## 24. Virtual A/B 更新状态
 
-`libsnapshot` 的高层状态：
+`libsnapshot` 的 **UpdateState** 高层状态不只四种。正常成功主线可先记为：
 
 ```text
 Initiated
   → Unverified
   → Merging
+  → MergeNeedsReboot（仅在清理需要重启时出现）
   → MergeCompleted
 ```
+
+完整枚举还包含 `None`、`MergeFailed` 与 `Cancelled`。不要把上面的成功主线误当成完整状态集合；另外，
+每个分区的 `SnapshotState` 又是 `NONE/CREATED/MERGING/MERGE_COMPLETED`，与全局 UpdateState 不是同一个 enum。
 
 BootControl 1.1 还有 merge status：
 

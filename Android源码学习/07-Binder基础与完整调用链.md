@@ -1,5 +1,7 @@
 # 07 Binder 基础与完整调用链
 
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`；本章在 macOS 上只读本地源码，不要求编译。
+
 ## 本章目标
 
 Binder 是后续 Activity、Service、PMS、WMS 等源码的共同骨架。本章会比前几章更细。读完后，你应该能够：
@@ -244,7 +246,7 @@ Parcel 是针对 Binder IPC 优化的二进制序列化容器，可以写入：
 
 ### Parcelable 不等于 Serializable
 
-Parcelable 显式控制字段写入和读取，更适合 Android IPC 的性能与格式要求。发送对象时不是把对方进程里的 Java 引用直接传过去，而是将数据重建到对方进程。
+Parcelable 显式控制字段写入和读取，更适合 Android IPC 的性能与格式要求。发送对象时不是把本进程里的 Java 引用直接传过去，而是根据 `writeToParcel()`/`CREATOR` 约定在接收进程重建数据对象。对象身份（`==`）、内部锁和非序列化状态都不会因此共享。
 
 ### Binder 引用是特殊情况
 
@@ -459,7 +461,7 @@ AIDL 方法可声明：
 oneway void notifyChanged(int value);
 ```
 
-客户端不等待业务返回值，服务端异步接收。oneway 方法不能依赖普通返回值来确认业务已执行完。
+客户端不等待业务返回值，服务端异步接收。`oneway` 方法不能声明普通业务返回值或 `out/inout` 参数，因此不能靠调用返回确认服务端已执行完。若业务需要完成确认，应另行设计回调/状态查询，并处理远端死亡。
 
 重要：oneway 不是“开启一个客户端新线程”，也不是“绝对不会阻塞”。发送仍有序列化、驱动队列和缓冲区成本；队列拥塞等情况仍可能造成延迟。
 
@@ -600,7 +602,9 @@ try {
 }
 ```
 
-必须在 `finally` 恢复。忘记恢复会污染同一 Binder 线程后续任务的身份语义，造成权限问题。
+必须在 `finally` 恢复。忘记恢复会让当前 Binder 方法剩余代码、回调和嵌套调用继续看到错误身份，造成权限问题。native Binder 在这次入站 transaction 整体分发返回时还会恢复分发前保存的身份，因此不要把风险误说成“必然永久污染此线程以后的所有独立请求”；业务代码仍不能依赖这个退栈时的兜底。
+
+`clearCallingIdentity()` 清除的是当前 Binder 调用链保存的远端身份，使 `getCallingUid/Pid()` 视为本进程身份；它不会调用 Linux `setuid()`，也不会把 system_server 变成 root。非 Binder 入口的本地调用中，`getCallingUid()` 本来就是本进程 UID，不能把它无条件解读成“远端 App UID”。
 
 同时不能为了“方便”随意清除身份；这会形成 confused deputy（代理人权限滥用）风险。正确顺序通常是先基于调用者身份完成权限校验，再在严格限定范围内清除身份。
 
@@ -638,7 +642,7 @@ binder.linkToDeath(() -> {
 - 移除失效回调。
 - 标记服务断开并尝试重新获取。
 
-`DeathRecipient` 通知的是 Binder 实体死亡，不等于某个业务请求失败回调。还要用 `unlinkToDeath()` 解除不再需要的监听，避免资源长期关联。
+`DeathRecipient` 通知的是远端 Binder 实体所在进程死亡，不等于某个业务请求失败回调，也不说明某一个服务对象主动调用了销毁方法。回调上下文应按 Binder 线程处理，需要 UI/串行状态时再切 Handler。还要用 `unlinkToDeath()` 解除不再需要的监听，避免资源长期关联。
 
 服务端也常对客户端传入的回调 Binder 注册死亡通知，这样客户端崩溃后可清理 session、窗口、媒体资源等。
 
@@ -940,4 +944,3 @@ Manager/API
 ```
 
 能准确标出进程、线程、同步等待点和 Parcel 的方向，就可以进入第 08 章：Activity 启动流程的客户端请求。
-

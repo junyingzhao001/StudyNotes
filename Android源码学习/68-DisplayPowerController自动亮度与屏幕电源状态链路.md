@@ -8,20 +8,15 @@
 
 ## 1. 五层模型
 
-```text
-【意图层】PowerManagerService
-wakefulness + 用户活动 + WakeLock + Dream/Doze + 设置
-                ↓ DisplayPowerRequest
-【决策层】DisplayPowerController
-policy → screen state；亮度优先级；proximity 覆盖
-                ↓
-【执行层】DisplayPowerState
-screenState + brightness + colorFadeLevel
-                ↓
-【平滑层】RampAnimator / ColorFade / WMS blocker
-                ↓
-【设备层】DisplayBlanker → DMS → LocalDisplayDevice
-→ SurfaceFlinger/HWC/面板
+```mermaid
+flowchart TD
+    A["意图层：PowerManagerService<br/>wakefulness、用户活动、WakeLock、Dream/Doze、设置"]
+    B["决策层：DisplayPowerController<br/>policy → state，proximity 覆盖，选择亮度"]
+    C["执行层：DisplayPowerState<br/>screenState、brightness、colorFadeLevel"]
+    D["平滑/握手：RampAnimator、ColorFade、WMS blocker"]
+    E["设备层：DisplayBlanker → DMS → LocalDisplayDevice<br/>→ SurfaceFlinger/HWC/面板"]
+    A -->|"DisplayPowerRequest"| B
+    B --> C --> D --> E
 ```
 
 一句话：**PMS 决定系统想要什么，DPC 决定怎样达到目标，DisplayPowerState 驱动当前值，显示设备层落实到硬件。**
@@ -174,21 +169,24 @@ policy 想 ON + 当前仍 near + waitingForNegative
 
 ## 8. 亮度来源的决策顺序
 
-可用以下近似优先级阅读 `updatePowerState()`：
+`updatePowerState()` 不是一个纯粹的“第一个命中就返回”优先级表，而是**先写入、再覆盖、最后回退**的顺序过程。Android 11 r48 的实际顺序是：
 
 ```text
-屏幕 OFF                           → off brightness
-VR                                 → VR brightness
-窗口/系统 screenBrightnessOverride → override
-临时亮度                           → temporary
-brightness boost                   → maximum
-自动亮度                           → ambient lux 映射结果
-Doze 默认亮度                      → doze config
-手动亮度                           → Settings 当前值
-最后叠加 DIM、低电量比例和范围 clamp
+1. 实际 state == OFF → OFF 亮度
+2. 实际 state == VR  → VR 亮度
+3. 若 brightness 仍为 NaN 且 screenBrightnessOverride 有效 → OVERRIDE
+4. 此时计算 autoBrightnessEnabled
+5. mTemporaryScreenBrightness 有效 → 直接写入 TEMPORARY
+6. boost 打开且当前值不是 OFF → 直接写入最大亮度
+7. 若 brightness 仍为 NaN → 尝试自动亮度
+8. 仍为 NaN 且处于 Doze state → Doze 默认亮度
+9. 仍为 NaN → 手动亮度
+10. 最后叠加 DIM、低电量比例和范围 clamp
 ```
 
-源码用 `Float.NaN` 表示“亮度还没有被前面条件决定”，这是状态机哨兵，不是计算错误。
+最容易误读的是第 5 步：虽然源码注释写着“没有 override 时使用 temporary”，但 r48 这段代码并没有再检查 `Float.isNaN(brightnessState)`，有效的临时亮度会覆写前面已选的数值。这里应以当前版本代码为准，不要只凭注释画优先级表。
+
+源码用 `Float.NaN` 表示“亮度尚未由某个来源决定”，这是选择过程的哨兵，不是一次亮度计算得到了非法结果。
 
 ### 8.1 BrightnessReason
 
@@ -495,6 +493,16 @@ PMS wakefulness/policy
 ---
 
 ## 23. macOS 只读练习
+
+先在 Android 源码根目录执行下面的导航命令；它们只读文件，不需要编译：
+
+```bash
+rg -n "getDesiredScreenPolicyLocked|updateDisplayPowerStateLocked" frameworks/base/services/core/java/com/android/server/power/PowerManagerService.java
+rg -n "requestPowerState|updatePowerState|mTemporaryScreenBrightness|boostScreenBrightness" frameworks/base/services/core/java/com/android/server/display/DisplayPowerController.java
+rg -n "updateAmbientLux|calculateAmbientLux|addUserDataPoint|resetShortTermModel" frameworks/base/services/core/java/com/android/server/display/AutomaticBrightnessController.java
+rg -n "animateTo" frameworks/base/services/core/java/com/android/server/display/RampAnimator.java
+rg -n "setScreenState|requestDisplayState" frameworks/base/services/core/java/com/android/server/display/DisplayPowerState.java frameworks/base/services/core/java/com/android/server/display/DisplayManagerService.java frameworks/base/services/core/java/com/android/server/display/LocalDisplayAdapter.java
+```
 
 1. 阅读 `getDesiredScreenPolicyLocked()`，为五个 policy 各写一个场景。
 2. 在 `updateDisplayPowerStateLocked()` 标出 DisplayPowerRequest 各字段来源。

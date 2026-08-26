@@ -49,7 +49,7 @@ flowchart TB
 - `SmsController`、Dispatcher、InboundSmsHandler：`com.android.phone`。
 - Radio HAL：vendor service 进程。
 - modem/baseband：独立固件/处理器。
-- TelephonyProvider：系统 provider 进程配置决定，负责 SMS/MMS 数据库。
+- TelephonyProvider：在本章 r48 Manifest 中随应用运行于 `com.android.phone` 进程，负责 SMS/MMS 数据库；不要因此把 Provider 对象和调用方当成同一进程对象。
 - 默认短信应用：其自身进程。
 
 短信 PDU 不会从 modem 直接广播给所有 App；Telephony 先完成协议和安全处理。
@@ -711,8 +711,12 @@ InboundSmsHandler 调 `BlockChecker`/BlockedNumberContract 判断 originating ad
 CarrierMessagingService 可参与入站过滤和出站发送：
 
 - carrier app 有特权时先处理。
-- 可允许、丢弃或下载到应用。
+- 入站过滤结果可要求丢弃，或在凭据加密存储不可用时跳过系统提示；未要求丢弃才继续后续交付。
 - 有超时/fallback，避免服务不响应卡死。
+
+这里的“过滤”不是让 Carrier App 随意指定任意接收应用。Android 11 的
+`CarrierMessagingService` 入站结果本质上是一组 `RECEIVE_OPTIONS_*` 位；真正的
+默认短信应用投递、权限检查和广播对象仍由 Telephony/Framework 决定。
 
 厂商/默认 App 还可有自己的 spam 分类，但不能把所有过滤都归于 InboundSmsHandler。
 

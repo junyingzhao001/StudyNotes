@@ -1,5 +1,7 @@
 # 06 SystemServer 与系统服务
 
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`；本章在 macOS 上只读本地源码，不要求编译。
+
 ## 本章目标
 
 读完后，你应该能够：
@@ -260,7 +262,7 @@ Android 11 的典型阶段：
 | 520 | `PHASE_DEVICE_SPECIFIC_SERVICES_READY` | 设备特有服务准备好 |
 | 550 | `PHASE_ACTIVITY_MANAGER_READY` | 可发送广播等 |
 | 600 | `PHASE_THIRD_PARTY_APPS_CAN_START` | 可启动/绑定第三方应用 |
-| 1000 | `PHASE_BOOT_COMPLETED` | Home 已启动，可与用户交互 |
+| 1000 | `PHASE_BOOT_COMPLETED` | SystemService 的最后 boot phase；按基类契约，服务可在此后允许用户交互 |
 
 `SystemServiceManager.startBootPhase()` 会遍历当时已经登记的服务：
 
@@ -271,6 +273,14 @@ for (int i = 0; i < mServices.size(); i++) {
 ```
 
 阶段必须递增，不能从 600 倒退回 500。这使依赖关系成为明确的单向启动过程。
+
+`PHASE_BOOT_COMPLETED` 的名字很容易被误当成“开机的唯一硬完成证据”。r48 中它由 AMS `finishBooting()` 推进，首先表示 SystemService 收到了这个回调阶段。它不等同于：
+
+- `sys.boot_completed=1` 已经写入（r48 在该 phase 之后才写此 property）。
+- 某个用户的 `LOCKED_BOOT_COMPLETED` / `BOOT_COMPLETED` 所有 Receiver 已全部执行完。
+- Launcher 的首帧已经由 SurfaceFlinger present 到显示器。
+
+因此诊断开机要分别观察 boot phase、system property、用户解锁/广播和显示首帧，不能用一个 1000 覆盖全部时序。
 
 ## 10. Binder Service 与 Local Service
 
@@ -341,7 +351,7 @@ mPackageManagerService = PackageManagerService.main(
         mOnlyCore);
 ```
 
-PMS 启动工作很重，包括读取配置、扫描系统包和数据分区应用、建立包与权限信息等。因此源码用 Watchdog 暂停对当前长任务的常规监测包裹它。
+PMS 启动工作很重，包括读取配置、扫描系统包和数据分区应用、建立包与权限信息等。因此源码在 `try/finally` 中临时调用 `Watchdog.pauseWatchingCurrentThread("packagemanagermain")`，并在返回或抛异常后 `resumeWatchingCurrentThread()`。这是明确的启动期特例，不是 PMS 永远不受 Watchdog 监控。
 
 PMS 后面还会调用：
 
@@ -420,7 +430,9 @@ mActivityManagerService.systemReady(() -> {
 });
 ```
 
-这表达了一个重要原则：只有关键依赖、包数据和权限环境准备好之后，系统才允许第三方代码启动。
+这表达了一个重要原则：只有关键依赖、包数据和权限环境准备好之后，系统才进入允许第三方服务被 start/bind 的 boot phase。这是对 SystemService 的生命周期许可信号，并不代表此时所有第三方 App 都会立即创建进程。
+
+`startSystemUi()` 出现在 `PHASE_ACTIVITY_MANAGER_READY` 附近，SystemUI 是受信任的系统应用，不是“第三方 App”的例子。`PHASE_BOOT_COMPLETED` 则在 AMS `finishBooting()` 后续发出，不是这个 lambda 一进入就立即发出。
 
 ## 16. SystemServer 为什么进入 `Looper.loop()`
 
@@ -457,7 +469,7 @@ flowchart TD
     OTHER --> IMS["InputManager"]
     OTHER --> WMS["WMS"]
     WMS --> READY["Boot Phases / systemReady"]
-    READY --> APP["允许 SystemUI / 第三方 App"]
+    READY --> APP["启动 SystemUI；后续进入可 start/bind 第三方 App 阶段"]
     APP --> LOOP["Looper.loop"]
 ```
 
@@ -559,4 +571,3 @@ SystemServer.main
 ```
 
 并能说明 SystemServiceManager 与 Binder ServiceManager 的区别。完成后进入第 07 章：Binder 如何让 App 调用 system_server 中的服务。
-

@@ -814,6 +814,10 @@ hardware/interfaces/keymaster/4.1/IKeymasterDevice.hal
 hardware/interfaces/keymaster/4.1/support/
 ```
 
+这里的源码契约入口是 `.hal` 文件。构建系统会据此生成 C++/Java Binder/HIDL 接口，
+所以编译产物或调用代码里可能看到 `IKeymasterDevice.h`；那个 `.h` 是生成头文件，
+不是本仓库中应当替代上述 `.hal` 阅读的手写源码入口。
+
 ---
 
 ## 38. 推荐的实际阅读顺序

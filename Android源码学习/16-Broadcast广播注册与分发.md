@@ -575,7 +575,7 @@ Manifest Receiver 不是像 Activity 一样长期保存在组件栈中。Activit
 
 ### Restricted Context
 
-`onReceive()` 得到 receiver-restricted Context，某些操作受到限制。例如不能在 Receiver 执行期间同步注册某些组件行为。设计上希望 `onReceive()` 短小、明确并尽快返回。
+`onReceive()` 得到 receiver-restricted Context，某些操作受到明确限制。r48 的 `ReceiverRestrictedContext` 会拒绝用非空 Receiver 再调 `registerReceiver()`，也会拒绝 `bindService()`；但仍允许以 `receiver=null` 查询 sticky 状态。这些限制和超时机制都在强调：`onReceive()` 应短小、明确并尽快返回。
 
 ---
 
@@ -632,15 +632,18 @@ onReceive 返回
 
 ### 无序动态 parallel Receiver 是例外
 
-它也会获得 PendingResult，统一处理 sendingUser、sticky hint、异常和 API 形态；但其类型是 `TYPE_UNREGISTERED`，且 `orderedHint=false` 时，`PendingResult.finish()` 不会调用 AMS `finishReceiver()`。system_server 在投递 Binder 回调后已经继续处理其他 parallel 目标。
+它也会获得 PendingResult，统一处理 sendingUser、sticky hint、异常和 API 形态。普通动态注册对象的类型仍是 `TYPE_REGISTERED`，不会因“这次广播无序”就变成 `TYPE_UNREGISTERED`。关键是这次回调的 `orderedHint=false`：`PendingResult.finish()` 既不走 `TYPE_COMPONENT` 分支，也不满足“有序的已注册 Receiver”分支，所以不会调用 AMS `finishReceiver()`。system_server 在投递 Binder 回调后已经继续处理其他 parallel 目标。
+
+`TYPE_UNREGISTERED` 指 `ReceiverDispatcher` 不是通过 `registerReceiver()` 保存的订阅对象；r48 中的典型例子是 `sendOrderedBroadcast()` 的最终 `resultReceiver`。它是“未注册的一次性回调”，不是“收到无序广播的动态 Receiver”。
 
 可从 `BroadcastReceiver.PendingResult.finish()` 看到三种差异：
 
 | 接收类型 | finish 是否通知 AMS | 原因 |
 |---|---|---|
 | Manifest component，即使广播本身无序 | 是 | AMS 需要知道组件执行结束并撤销 Receiver 状态 |
-| 有序动态 Receiver | 是 | 队列需要结果并推进下一目标 |
-| 无序动态 Receiver | 否 | parallel 队列不等待该回调完成 |
+| 有序动态 Receiver（`TYPE_REGISTERED` + ordered） | 是 | 队列需要结果并推进下一目标 |
+| 无序动态 Receiver（`TYPE_REGISTERED` + unordered） | 否 | parallel 队列不等待该回调完成 |
+| 一次性 `TYPE_UNREGISTERED` 结果回调 | 否 | 它就是有序链尾的最终回调，后面已没有 Receiver 需等它通知 AMS 推进 |
 
 因此不能笼统说“所有 onReceive 返回都会通过 Binder 调用 finishReceiver”。
 
@@ -711,7 +714,7 @@ foreground queue：约 10 秒
 background/offload queue：约 60 秒
 ```
 
-调试器、系统未 ready、timeoutExempt、CPU 时间判断和队列重排等会影响实际处理。API 文档中的概括时间与源码队列配置也可能使用不同措辞；阅读具体版本时以当前执行路径为准。
+r48 中，系统尚未 ready 或 `timeoutExempt` 会让超时处理返回；如果目标进程正在调试，队列仍会收尾并继续，但不会把该停顿当成普通 ANR。队列还会复用一条 timeout message；前一个 Receiver 早已完成时，消息触发后会依据当前 `receiverTime + TIMEOUT` 判断是否需延后。API 文档中的概括时间与源码队列配置也可能使用不同措辞；阅读具体版本时以当前执行路径为准。
 
 ---
 
@@ -1267,7 +1270,7 @@ App 分发类：
 
 ### 练习五：追 goAsync
 
-从 `BroadcastReceiver.goAsync()` 追 `PendingResult.finish()`，分别验证 TYPE_COMPONENT、有序 TYPE_REGISTERED、无序 TYPE_UNREGISTERED 是否继续调用 `IActivityManager.finishReceiver()`。
+从 `BroadcastReceiver.goAsync()` 追 `PendingResult.finish()`，分别验证 TYPE_COMPONENT、有序 TYPE_REGISTERED、无序 TYPE_REGISTERED，以及一次性 TYPE_UNREGISTERED 结果回调是否继续调用 `IActivityManager.finishReceiver()`。
 
 解释忘记 finish 的三个后果。
 

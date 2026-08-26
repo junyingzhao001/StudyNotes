@@ -103,18 +103,29 @@ Android 11 的 resolver 已模块化到 `packages/modules/DnsResolver`；旧文�
 
 ## 6. InetAddress 主链
 
-简化理解：
+这条同步链有 **两层缓存**，这是阅读时最容易被一句“resolver cache”掩盖的边界：
 
 ```text
 InetAddress.getAllByName
- → libcore/native bridge
- → android_getaddrinfofornet(context)
- → resolver proxy/module
- → cache or network query
+ → Inet6AddressImpl.lookupAllHostAddr(host, netId)
+ → 先查调用进程内的 AddressCache(host, netId)
+ → miss 时经 Libcore.os.android_getaddrinfo / JNI
+ → android_getaddrinfofornet(..., netId, ...)
+ → dnsproxyd socket 进入 DnsProxyListener
+ → 再查 DnsResolver 模块的 per-net cache，必要时发网络查询
  → addrinfo → InetAddress[]
 ```
 
-同步 API 会阻塞调用线程，不能在主线程进行不确定时长的网络解析。
+`Inet6AddressImpl` 的 Java `AddressCache` 也以 `host + netId` 为键，同时缓存成功和失败；它是每个进程自己的缓存。`packages/modules/DnsResolver/res_cache.cpp` 管理的则是 resolver 服务数据面的按网络缓存。公开的异步 `DnsResolver.query()` 直接使用 `resNetworkQuery()`，不经过 `Inet6AddressImpl` 这一层 Java `AddressCache`。
+
+同步 API 会阻塞调用线程，不应在主线程做耗时不可控的网络解析。可用以下只读命令确认两层边界：
+
+```bash
+rg -n "AddressCache|android_getaddrinfo" \
+  libcore/ojluni/src/main/java/java/net/Inet6AddressImpl.java
+rg -n "resNetworkQuery|FLAG_NO_CACHE" \
+  frameworks/base/core/java/android/net/DnsResolver.java
+```
 
 ---
 
@@ -277,7 +288,14 @@ mDnsResolver.setResolverConfiguration(paramsParcel);
 
 ## 19. 缓存
 
-resolver 按 netId 缓存正向和负向结果，并遵循 TTL/策略。缓存命中可不发网络包。
+Android 11 的普通 `InetAddress` 链至少要区分两层：
+
+| 层 | 位置 | 关键维度 |
+|---|---|---|
+| Java 地址缓存 | 每个调用进程的 `Inet6AddressImpl.addressCache` | `host + netId` |
+| native resolver 缓存 | `DnsResolver/res_cache.cpp` | per-network/netId 的 DNS 结果 |
+
+两层都可以让抓包里看不到新查询。此外还可能命中 hosts、应用自己的内存/磁盘缓存，或应用自带 resolver。
 
 因此抓包没看到查询，不证明 App 没做解析；可能命中缓存、hosts、应用缓存或自带 resolver。
 
@@ -288,7 +306,7 @@ resolver 按 netId 缓存正向和负向结果，并遵循 TTL/策略。缓存�
 - 正缓存：域名 → A/AAAA 等结果。
 - 负缓存：NXDOMAIN 或无记录状态，依据 DNS SOA/策略保存。
 
-修复 DNS server 后仍短暂失败，可能是负缓存未过期。重启 App 不一定清除 system resolver cache。
+修复 DNS server 后仍短暂失败，可能是负缓存未过期。杀死并重启 App 会丢失该进程的 Java/业务内存缓存，但不等于清除独立 resolver 服务的 per-net cache；不要用“重启 App 后仍失败”否定缓存可能性。
 
 ---
 
@@ -509,7 +527,7 @@ ResolverController/DnsStats 记录成功、错误、超时和延迟样本，辅�
 
 ## 43. 缓存旁路 flags
 
-`DnsResolver` flags 可请求不查缓存或不写缓存等行为，具体常量与权限/实现以源码为准。NetworkMonitor 探测可能故意绕缓存获得新证据。
+Android 11 的 `DnsResolver` 定义了 `FLAG_NO_CACHE_LOOKUP`、`FLAG_NO_CACHE_STORE` 和 `FLAG_NO_RETRY`。其中 NO_CACHE_LOOKUP 是不用旧结果但仍可将新结果写入 native resolver cache；NO_CACHE_STORE 在当前 `res_cache.cpp` 中也会跳过旧 cache lookup，且不保存新结果。它们控制的是这条异步 native query 的 resolver cache，不是清理所有 App 业务缓存。NetworkMonitor 探测可能故意绕缓存获得新证据。
 
 普通 App 反复查询却总命中旧答案，与测试工具显式 no-cache 的结果可能不同。
 

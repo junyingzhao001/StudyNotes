@@ -789,10 +789,13 @@ Android 11 设备的具体编码可能不同。
 关键不是背目录名，而是理解：
 
 ```text
-调用者可写的 Session stage
+获得安装管线授权的调用者向 Session stage 写入
  → 校验完成
- → 原子地进入 PMS 管理的最终 code path
+ → 由安装事务完成 copy/rename、扫描、reconcile 与 commit，进入 PMS 管理的最终 code path
 ```
+
+这里的“安装事务”是 Framework 的整体提交语义，不能仅凭一次文件 `rename` 就推断 APK、包设置、权限和
+应用数据在文件系统层组成一个不可分割的原子操作；失败清理和重启恢复仍是安装管线的一部分。
 
 应用不能自行往 `/data/app` 放一个文件就让 PMS承认它。目录权限、SELinux、Settings、签名、appId、组件索引和数据目录都必须一致。
 
@@ -800,7 +803,7 @@ Android 11 设备的具体编码可能不同。
 
 ## 22. installd 做什么、不做什么
 
-PMS 通过 Java `Installer` 客户端调用 installd Binder 服务。
+PMS 通过 Java `Installer` SystemService 包装层调用 `installd` Binder 服务。`Installer.connect()` 用 `ServiceManager.getService("installd")` 取得 `IInstalld`；Native daemon 由 `frameworks/native/cmds/installd/installd.rc` 的 init service 启动。这是 system_server → installd 独立进程的 Binder IPC，不是同进程 LocalServices 调用。
 
 典型工作：
 
@@ -1391,4 +1394,4 @@ PackageInstaller Session
 4. packageName、appId、userId、uid 与 processName 是不同维度。
 5. PMS 为 Activity 启动、权限、Launcher 和系统服务提供组件目录与身份基础。
 
-下一章进入综合实践：选择一条已经学过的链路做小范围源码修改，编译对应模块，部署到模拟器或测试设备，并用日志、dumpsys 或 Perfetto 验证结果。
+下一章进入综合实践：先在当前 macOS 上选择一条已经学过的链路，完成只读定位、概念补丁与验证证据设计；编译模块、部署到 userdebug 模拟器以及用日志、dumpsys 或 Perfetto 做动态验证，作为以后具备合适 Linux 实验环境时的扩展方案。

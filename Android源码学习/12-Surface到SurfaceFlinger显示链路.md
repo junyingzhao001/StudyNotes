@@ -1,5 +1,8 @@
 # 12 Surface 到 SurfaceFlinger：一帧像素如何显示到屏幕
 
+> 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
+> 当前学习方式：macOS 只读源码；本章不要求编译、刷机或连接设备。
+
 ## 本章边界
 
 第 11 章停在 `ViewRootImpl.draw()`：View 树已经完成 measure、layout，并开始 draw。
@@ -435,6 +438,28 @@ android.graphics.BLASTBufferQueue
 mBlastBufferQueue
 ```
 
+### 先确认：代码存在不等于所有窗口默认走 BLAST
+
+r48 的 WMS 构造时读：
+
+```java
+mUseBLAST = DeviceConfig.getBoolean(
+        DeviceConfig.NAMESPACE_WINDOW_MANAGER_NATIVE_BOOT,
+        "wm_use_blast_adapter",
+        false);
+```
+
+默认值是 `false`。同时服务端创建窗口 Surface 时的实际条件是：
+
+```java
+useBLAST = mService.mUseBLAST
+        && (privateFlags & PRIVATE_FLAG_USE_BLAST) != 0;
+```
+
+`ViewRootImpl.setView()` 会为这条客户端路径加上 `PRIVATE_FLAG_USE_BLAST`，但这仍只是条件之一；WMS 全局 DeviceConfig 开关还必须开启。开启时，WMS 在 addWindow 结果中返回 `ADD_FLAG_USE_BLAST`，ViewRootImpl 才设 `mUseBLASTAdapter = true`。
+
+因此本节讲的是**Android 11 r48 已具备、且开关与窗口 flag 都满足时的 BLAST 路径**。不能把它写成“Android 11 所有 App 窗口必经 BLAST”，具体设备还可被 DeviceConfig/厂商配置改变。
+
 Native 实现位于：
 
 ```text
@@ -697,7 +722,7 @@ Consumer 使用完成后返回 release fence，告诉 Producer：
 
 ### present fence
 
-present fence 表示该显示提交何时完成呈现，可用于帧时间统计、背压和后续同步。
+present fence 表示 HWC 上一次 `present` 提交何时 retire/显示完成，在 r48 `HWComposer` 中也可看到“signals when the last set op retires”的注释。它可用于帧时间统计、背压和后续同步，但不应过度解读为“人眼已看到某个像素”的应用层回调。
 
 用“禁止动作”再检查一次，比背术语更可靠：
 
@@ -706,7 +731,7 @@ present fence 表示该显示提交何时完成呈现，可用于帧时间统计
 | Producer dequeue 得到的 fence | 准备重写 buffer 的 Producer | 不能覆盖仍被上一消费者使用的内容 |
 | buffer 入队携带的 acquire fence | 准备读取新 buffer 的 Consumer | 不能读取 GPU 尚未写完的内容 |
 | Layer release fence | 准备复用该 buffer 的 Producer | 不能提前重新写入 |
-| display present fence | 关心本次显示完成状态的调度/统计逻辑 | 不能把未完成的 present 当成已完成 |
+| display present fence | 关心本次显示 retire/完成状态的调度/统计逻辑 | 不能把未 retire 的 HWC present 当成已完成 |
 
 这里的命名取决于“站在谁的接口上看”。例如 Producer 上一轮收到的 release 同步条件，在下一次取得 buffer 时会成为它开始写之前要等待的条件。源码变量名不总能替代所有权分析。
 

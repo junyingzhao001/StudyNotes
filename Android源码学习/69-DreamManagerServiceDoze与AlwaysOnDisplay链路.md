@@ -23,25 +23,21 @@
 
 ## 2. 总体架构
 
-```text
-PowerManagerService
-  wakefulness=DREAMING/DOZING
-          ↓ DreamManagerInternal.startDream(doze)
-DreamManagerService
-  选择普通 dream 或 ambient display component
-          ↓
-DreamController
-  bindServiceAsUser + timeout + death cleanup
-          ↓ IDreamService.attach(token, canDoze,...)
-DreamService
-  普通屏保：自己的窗口和内容
-  DozeService：组装 SystemUI DozeMachine
-          ↓ startDozing(state, brightness)
-DreamManagerService
-          ↓ setDozeOverrideFromDreamManager
-PowerManagerService.DisplayPowerRequest
-          ↓
-DisplayPowerController → DOZE/DOZE_SUSPEND/ON + brightness
+```mermaid
+flowchart TD
+    A["PowerManagerService<br/>wakefulness = DREAMING / DOZING"]
+    B["DreamManagerService<br/>选择普通 Dream 或 ambient display component"]
+    C["DreamController<br/>bind、timeout、Binder death 清理"]
+    D["DreamService<br/>普通屏保或 SystemUI DozeService"]
+    E["DozeMachine<br/>AOD、近距暂停、pulse 状态"]
+    F["DreamManagerService<br/>setDozeOverrideFromDreamManager"]
+    G["PMS DisplayPowerRequest<br/>→ DisplayPowerController"]
+    A -->|"DreamManagerInternal.startDream(doze)"| B
+    B --> C
+    C -->|"IDreamService.attach(token, canDoze, …)"| D
+    D --> E
+    E -->|"startDozing(state, brightness)"| F
+    F --> G
 ```
 
 这是一条控制链。AOD 图层的实际绘制仍经过 SystemUI、WMS、SurfaceFlinger。
@@ -433,7 +429,7 @@ dozeScreenBrightness = override
 
 这里存在两类 WakeLock：
 
-- DreamManagerService 的 Doze WakeLock：表示当前 Dream 正在 dozing，参与 PMS doze 流程；
+- DreamManagerService 的 `PowerManager.DOZE_WAKE_LOCK`：这是受限的系统级 WakeLock。PMS 在 `WAKEFULNESS_DOZING` 中会等它出现后才结束这次 wakefulness 切换，并用它选出 `POLICY_DOZE`；它不是普通 App 用来“强制 CPU 一直运行”的 `PARTIAL_WAKE_LOCK`；
 - SystemUI DozeMachine WakeLock：仅在状态转换或 pulse 等必须运行阶段保持 CPU。
 
 不要把它们当成同一把锁。
@@ -521,7 +517,9 @@ proximity far
 - 释放启动 WakeLock；
 - 发送 dreaming stopped；
 - 清除 token/name/canDoze；
-- 若正在 dozing，释放 Doze WakeLock 并清除 PMS override。
+- 若正在 dozing，`cleanupDreamLocked()` 会释放 Doze WakeLock，并把服务内的 doze state/brightness 字段重置。
+
+注意 Android 11 r48 的一个细节：显式 `DreamService.stopDozing()` 路径会调用 `setDozeOverrideFromDreamManager(STATE_UNKNOWN, BRIGHTNESS_DEFAULT)`；而通用的 `cleanupDreamLocked()` 本身没有再调这个方法。Dream 结束后 PMS 会离开相应的 DOZING/显示策略，旧 override 因而不再参与当前显示请求；但不应把通用 cleanup 写成“显式清除 PMS override”。
 
 温和退出不是无限等待，Dream 组件卡住不能阻塞系统唤醒。
 
@@ -633,6 +631,16 @@ ambient display component 是否正确
 ---
 
 ## 25. macOS 只读源码练习
+
+先用下列只读命令定位主干：
+
+```bash
+rg -n "handleSandman|canDreamLocked|canDozeLocked|startDream" frameworks/base/services/core/java/com/android/server/power/PowerManagerService.java
+rg -n "chooseDreamForUser|startDreamLocked|startDozingInternal|stopDozingInternal|cleanupDreamLocked" frameworks/base/services/core/java/com/android/server/dreams/DreamManagerService.java
+rg -n "bindServiceAsUser|attach|DREAM_CONNECTION_TIMEOUT|DREAM_FINISH_TIMEOUT" frameworks/base/services/core/java/com/android/server/dreams/DreamController.java
+rg -n "startDozing|stopDozing|finish" frameworks/base/core/java/android/service/dreams/DreamService.java
+rg -n "enum State|requestState|transitionTo|screenState" frameworks/base/packages/SystemUI/src/com/android/systemui/doze/DozeMachine.java frameworks/base/packages/SystemUI/src/com/android/systemui/doze/DozeScreenState.java
+```
 
 1. 从 `requestDreamInternal()` 追到 PMS `nap()`，解释为什么不直接绑定。
 2. 在 PMS sandman 路径找 `canDreamLocked/canDozeLocked/startDream`。

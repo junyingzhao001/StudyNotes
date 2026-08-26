@@ -102,7 +102,11 @@ API 返回配置已受理，不等于该接口已经重新 provision 成功。
 
 系统/特权客户端通过它查询接口、监听 availability、读取或设置 `IpConfiguration`。Android 11 许多 Ethernet 管理 API 仍是隐藏或系统 API，普通第三方 App 权限有限。
 
-listener 的 “available” 更接近 Framework 是否有可管理/可提供网络的接口状态，不能替代 ConnectivityManager 的 validation/default callback。
+在 Android 11 这份实现里，client-mode 接口的 listener `available` 通知来自
+`EthernetTracker.updateInterfaceState()`：只有已跟踪接口的 link 状态真正发生变化，
+并被 `EthernetNetworkFactory.updateInterfaceLinkState()` 接受后，才回调对应的
+`onAvailabilityChanged(iface, up)`。因此它更接近“该接口的链路 up/down”，仍不能证明
+DHCP、NetworkAgent、validation 或默认网络选择已经完成。
 
 ---
 
@@ -146,13 +150,18 @@ sequenceDiagram
     F->>I: create state holder
     K-->>T: linkStateChanged(up)
     T->>F: updateInterfaceLinkState
-    F->>I: start if requested/usable
+    F->>I: link-up 触发 updateLinkState(true) → start
     I->>P: makeIpClient + startProvisioning
     P-->>I: success(LinkProperties)
     I->>C: NetworkAgent connected
 ```
 
-实际是否立即 start 还与 NetworkRequest 和 factory score/模式有关。
+这里有一个很值得对照源码的版本细节：对 client-mode 接口，r48 的
+`NetworkInterfaceState.updateLinkState(true)` 会直接调用 `start()` 创建 IpClient 并开始
+provisioning；它不必等到随后出现一个新的 `NetworkRequest`。NetworkFactory 的
+`needNetworkFor()` 也可能请求启动，但 `start()` 会用 `mIpClient != null` 防止重复。
+若接口被切为 Ethernet tethering 的 server mode，则不进入这条 client provisioning
+链，而是交给下游共享流程。
 
 ---
 

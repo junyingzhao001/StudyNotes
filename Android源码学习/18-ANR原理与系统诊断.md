@@ -29,7 +29,7 @@
 
 学完后应能：
 
-1. 区分 Input、Broadcast、Service、Provider 等 ANR 来源。
+1. 区分 Input、Broadcast、Service 和显式 Provider-不响应检测等 ANR 来源，不把 Provider 发布/就绪超时误归为 ANR。
 2. 解释“超时发现者”和“最终被报告进程”为什么可能不同。
 3. 解释 InputDispatcher 的 `waitQueue` 与事件完成确认。
 4. 从 Reason 判断应该先追哪条源码链。
@@ -77,14 +77,14 @@ ANR 是系统观察到的结果，不直接等价于根因。根因可能是：
 | Input | native InputDispatcher | 普通应用常见 5 秒 | 已投递输入被窗口消费并 finish；或焦点窗口出现 | input dispatching timed out / no focused window |
 | Broadcast | BroadcastQueue | 前台队列 10 秒、后台队列 60 秒 | Receiver `finishReceiver`，包括 `goAsync()` 后完成 | Broadcast of Intent |
 | Service | ActiveServices | 前台执行 20 秒、后台执行 200 秒 | create/start/bind/unbind/destroy 执行完成后 `serviceDoneExecuting` | executing service ... |
-| Provider | AMS/客户端协作 | 获取/发布有独立期限；长业务调用也可主动上报 | Provider 发布，或客户端判定 Provider 调用卡死 | ContentProvider not responding |
+| Provider 业务调用 | 启用了检测的系统/特权客户端 | 由调用者配置；某些 Framework 路径有专用值 | 已发布 Provider 的 Binder 业务调用未返回，检测 Runnable 主动上报 | ContentProvider not responding |
 
 这些是本工程 Android 11 默认值，不是跨版本 API 契约。还要注意：
 
 - Input 的窗口可由 Activity/窗口配置决定，instrumentation 也可能使用更长值。
 - Broadcast timeout 与“Receiver 一定可运行这么久”不是一回事。
 - Service 的 `execServicesFg` 不等于已经显示通知的 foreground service。
-- Provider publish/ready timeout 与 Provider 业务方法卡住是两类问题。
+- Provider publish/ready timeout 与 Provider 业务方法卡住是两类问题；前者本身不自动进入 ANR 统一处理。
 
 ---
 
@@ -95,7 +95,7 @@ flowchart TD
     INPUT["InputDispatcher<br/>native"] --> POLICY["InputManagerCallback / WMS"]
     BQ["BroadcastQueue"] --> HELPER["AnrHelper"]
     AS["ActiveServices"] --> HELPER
-    PROVIDER["Provider 获取或调用方"] --> AMS["AMS"]
+    PROVIDER["已发布 Provider 的调用超时检测方"] --> AMS["AMS"]
     POLICY --> AMS
     AMS --> HELPER
     HELPER --> PR["ProcessRecord.appNotResponding"]
@@ -396,9 +396,9 @@ SERVICE_START_FOREGROUND_TIMEOUT = 10 秒
 
 ---
 
-## 14. ContentProvider 相关 ANR 要拆成两类
+## 14. ContentProvider 相关卡顿要拆成“获取失败”与“真正 ANR”
 
-### 14.1 Provider 尚未发布
+### 14.1 Provider 尚未发布：有超时，但不是自动 ANR
 
 客户端通过 authority 获取 Provider，若目标进程不存在：
 
@@ -416,9 +416,9 @@ CONTENT_PROVIDER_PUBLISH_TIMEOUT_MILLIS = 10 秒
 CONTENT_PROVIDER_READY_TIMEOUT_MILLIS = 20 秒
 ```
 
-这类问题重点看进程 attach、Application/Provider 初始化和发布锁。
+这类问题重点看进程 attach、Application/Provider 初始化和发布锁。但不要因为常量名里有 `TIMEOUT` 就把它归为 ANR：r48 的 publish timeout 调 `processContentProviderPublishTimedOutLocked()`，按“初始化失败”清理/终止未及时发布的宿主进程；ready timeout 则记录警告并让本次 `getContentProviderImpl()` 返回失败。这两条都不直接调 `AnrHelper.appNotResponding()`。
 
-### 14.2 Provider 业务调用卡住
+### 14.2 已发布 Provider 业务调用卡住：显式检测才上报 ANR
 
 客户端已取得 `IContentProvider`，调用 query/insert/call 等时卡住。这里必须注意：**普通 ContentResolver 业务调用并不是一律到固定秒数就自动 ANR**。系统/特权调用方显式使用 `ContentProviderClient.setDetectNotResponding(timeoutMillis)` 时，客户端会安排检测 Runnable；到期后经 `ContentResolver.appNotRespondingViaProvider()`、`ActivityThread.appNotRespondingViaProvider()`，使用 Provider connection 告诉 AMS：宿主 Provider 进程长期无响应。这个 API 在 Android 11 是受 `REMOVE_TASKS` 权限约束的 System/Test API，不是普通第三方 App 可随意用于“杀 Provider”的公共接口。部分 Framework 自己的 Provider 调用也会安排专用检测，例如 AMS 获取 MIME type 时的保护逻辑。
 
@@ -443,7 +443,7 @@ ContentProviderClient.setDetectNotResponding(timeout)
 - stable/unstable connection 是否仍有效。
 - 谁启用了超时检测，以及它配置的 `timeoutMillis`。
 
-不要把“Provider 获取超时”和“query 太慢”当作同一条链。
+不要把“Provider 获取超时”和“query 太慢”当作同一条链；更不要认为任意慢 query 都有 Framework 固定秒数的自动 ANR 保护。
 
 ---
 
@@ -1105,9 +1105,17 @@ frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.
 
 记录 create/start/bind 前如何加入，完成后如何移除，20/200 秒怎样选择。
 
-### 练习五：拆 Provider 两类超时
+### 练习五：拆 Provider 三种结果
 
-分别画“冷启动等待发布”和“已发布 Provider 业务调用卡住”。
+分别画：
+
+```text
+进程 attach 后 publish timeout → 初始化失败清理
+getContentProvider ready timeout → 获取返回失败
+已发布 Provider 业务调用 + 显式检测到期 → Provider ANR
+```
+
+在每条路径后写出是否调用 `AnrHelper`。
 
 ### 练习六：标注 ANR 采集阶段
 
@@ -1163,7 +1171,7 @@ CPU/PSI/GC 旁证：
 5. 持有 PendingResult 的异步代码必须调用 `finish()`。
 6. ActiveServices 对进程 executingServices 的执行上下文使用前台或后台窗口；不简单等于通知状态。
 7. 10 秒检查是否及时 `startForeground()`；20/200 秒监控生命周期执行是否完成。
-8. 前者等待进程安装并 publish，后者已取得 Binder 后业务调用无响应。
+8. 前者等待进程安装并 publish，publish/ready 超时本身不走 AnrHelper；后者是已取得 Binder 后的业务调用无响应，只有调用方启用了显式检测才上报 Provider ANR。
 9. dump 很重；异步队列避免堵塞触发者并限制并发采集压力。
 10. trace 是 timeout 后的采样，阻塞可能已结束或责任原本就在异步线程。
 11. 找 monitor 的持有者，并继续追它正在等待谁。

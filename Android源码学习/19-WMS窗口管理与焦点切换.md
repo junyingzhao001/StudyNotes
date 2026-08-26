@@ -86,7 +86,9 @@ flowchart LR
     TOKEN --> DC["DisplayContent tree"]
     WMS --> SC["SurfaceControl.Transaction"]
     SC --> SF["SurfaceFlinger"]
-    WMS --> IM["InputManager/InputDispatcher"]
+    WMS --> IMETA["SurfaceControl.Transaction<br/>setInputWindowInfo"]
+    IMETA --> SF2["SurfaceFlinger 按 Layer 汇总 input info"]
+    SF2 --> IM["InputFlinger / InputDispatcher"]
 ```
 
 两条 Binder 方向：
@@ -836,8 +838,12 @@ DisplayContent.updateFocusedWindowLocked
  → InputMonitor.mInputFocus = newFocus
  → 遍历窗口并令对应 InputWindowHandle.hasFocus = true
  → SurfaceControl.Transaction.setInputWindowInfo
- → native InputDispatcher 获得窗口列表和窗口焦点
+ → SurfaceFlinger 按当前 Layer 反向 Z-order 汇总 InputWindowInfo
+ → InputFlinger.setInputWindows
+ → InputDispatcher 获得按 display 分组的窗口列表和窗口焦点
 ```
+
+这个 SurfaceFlinger 中转不只是实现细节。input info 绑在 Surface/Layer 上，SurfaceFlinger 用实际合成层级汇总顺序，才能使 InputDispatcher 的触摸命中与屏幕上的 layer 变换、crop 和 Z-order 保持一致。`InputManagerService.registerInputChannel()` 负责注册通信通道，`setInputWindows()` 则负责“哪些窗口在哪里、谁有焦点”的快照，两者也不是同一步。
 
 与此同时，focused application 走另一条通路：
 
@@ -848,7 +854,7 @@ DisplayContent.setFocusedApp(ActivityRecord)
  → InputDispatcher.setFocusedApplication
 ```
 
-这两条信息用途不同：focused application 表达 Activity 级候选/等待上下文，也是“有 focused app 但没有 focused window”ANR 的基础；focused window 表达当前真正接收定向输入的窗口。不要把 `setFocusedApplication()` 误认为已经选中了某个 WindowState。
+这两条信息的路径和用途都不同：focused application 由 InputManagerService 直接传给 InputDispatcher，表达 Activity 级候选/等待上下文，也是“有 focused app 但没有 focused window”ANR 的基础；focused window 是 input-window metadata 的一部分，经 SurfaceFlinger/InputFlinger 到达 InputDispatcher，表达当前真正接收定向输入的窗口。不要把 `setFocusedApplication()` 误认为已经选中了某个 WindowState。
 
 Android 11 的 InputMonitor 会遍历潜在输入窗口，把窗口的：
 

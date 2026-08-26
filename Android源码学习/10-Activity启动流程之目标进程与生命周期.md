@@ -1,5 +1,7 @@
 # 10 Activity 启动流程（三）：目标进程与生命周期
 
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`；本章在 macOS 上只读本地源码，不要求编译。
+
 ## 本章边界
 
 第 09 章停在：
@@ -42,18 +44,18 @@ flowchart TD
     PROC["AMS / ProcessList 启动进程"]
     Z["Zygote fork"]
     MAIN["ActivityThread.main"]
-    ATT["attachApplication / bindApplication"]
-    APP["创建 Application<br/>Application.onCreate"]
-    BACK["ATMS attachApplication"]
+    ATT["App attachApplication<br/>AMS 发出 bindApplication"]
+    BACK["AMS 立即调 ATMS attachApplication<br/>不同步等 Application.onCreate"]
     TX["ClientTransaction"]
-    H["App Handler<br/>EXECUTE_TRANSACTION"]
+    H["App 主线程先 BIND_APPLICATION<br/>创建 Application / onCreate"]
+    HT["App 主线程再<br/>EXECUTE_TRANSACTION"]
     LAUNCH["LaunchActivityItem.execute"]
     PERF["ActivityThread.performLaunchActivity"]
     CREATE["Activity.onCreate"]
     RES --> TOP --> SPEC --> CHECK
     CHECK -->|"是，暖进程"| REAL
-    CHECK -->|"否，冷启动"| PROC --> Z --> MAIN --> ATT --> APP --> BACK --> REAL
-    REAL --> TX --> H --> LAUNCH --> PERF --> CREATE
+    CHECK -->|"否，冷启动"| PROC --> Z --> MAIN --> ATT --> BACK --> REAL
+    REAL --> TX --> H --> HT --> LAUNCH --> PERF --> CREATE
 ```
 
 冷启动比暖进程多出的核心部分是：创建 Linux/ART 进程、绑定 Application、进程向 system_server attach。
@@ -204,12 +206,12 @@ sequenceDiagram
     App->>App: ActivityThread.main()
     App->>AMS: attachApplication(IApplicationThread)
     AMS->>App: bindApplication(...)
-    App->>App: 创建 Application / onCreate
-    AMS->>RWC: attachApplication(process)
+    AMS->>RWC: attachApplication(process)（发出 bind 后立即继续）
+    App->>App: 主线程稍后创建 Application / onCreate
     RWC->>App: realStartActivityLocked → ClientTransaction
 ```
 
-顺序上要注意：`IApplicationThread` 整个 AIDL 接口声明为 `oneway`。因此 `bindApplication()` 是 system_server 发出的异步 Binder 调度；AMS 发出它后，不会同步等待 App 的 `Application.onCreate()` 完成，就可以继续匹配等待该进程的 Activity 并发送 launch transaction。
+顺序上要注意：`IApplicationThread` 整个 AIDL 接口声明为 `oneway`。因此 `bindApplication()` 是 system_server 发出的异步 Binder 调度；AMS 发出它后，不会同步等待 App 的 `Application.onCreate()` 完成，就在 `attachApplicationLocked()` 同一系统端流程里调用 `mAtmInternal.attachApplication(...)`，匹配等待该进程的 Activity 并发送 launch transaction。
 
 但“system_server 发出顺序”和“App 主线程执行完成顺序”是两件事。对同一 ApplicationThread Binder 的这些 oneway 调度会按 Binder/客户端消息投递顺序到达，`bindApplication()` 先投递 `BIND_APPLICATION`，后续 `scheduleTransaction()` 再投递 `EXECUTE_TRANSACTION`。App 主线程先处理绑定应用，建立 Application 环境，然后处理 Activity launch。
 
@@ -1229,7 +1231,7 @@ system_server 调用 scheduleTransaction 返回
 3. ProcessRecord 与 WindowProcessController 有何区别？
 4. 新进程为什么主动调用 attachApplication？
 5. bindApplication 与 attachApplication 的方向分别是什么？
-6. Application.onCreate 与 Activity.onCreate 的先后是什么？
+6. Application.onCreate 与 Activity.onCreate 的客户端执行先后是什么？system_server 发出两个调度时又是什么关系？
 7. ClientTransaction 的 callback 与 final lifecycle request 分别做什么？
 8. 为什么生命周期必须从 Binder 线程切到主线程？
 9. ActivityRecord 和 ActivityClientRecord 如何关联？

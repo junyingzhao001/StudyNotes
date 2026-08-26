@@ -327,7 +327,10 @@ local-only 模式允许设备间通信，不承诺互联网共享。它仍需要
 
 典型候选包括 cellular、Wi-Fi、Ethernet。配置可以表达优先顺序、DUN requirement、legacy type 等。
 
-网络 `available` 不等于适合作 upstream：还要看能力、LinkProperties、interface、计量/运营商策略和 entitlement。
+网络 `available` 不等于适合作 upstream：还要看能力、LinkProperties、interface、
+运营商策略和 entitlement。尤其不要把 `VALIDATED` 当成 Android 11 这段选择器的
+统一硬门槛：默认网络请求和移动网络请求主要依靠 `INTERNET`/`DUN` 等能力以及
+配置优先级，后续才可把验证状态作为“公网是否真的好用”的独立证据。
 
 ---
 
@@ -522,7 +525,11 @@ offload 启动失败通常应回退软件转发，而不是让热点完全没网
 
 ## 39. BPF coordinator
 
-Android 11 代码包含 `BpfCoordinator`，用于协调 BPF tethering data path、规则和统计。BPF/offload 与传统 netfilter 路径可能并存或按能力选择。
+Android 11 代码包含 `BpfCoordinator`，主要协调 BPF tethering offload 的
+IPv6 邻居转发规则、配额和统计；IPv4 NAT/forwarding 主线仍由 netd 的
+`tetherAddForward`、`ipfwdAddInterfaceForward` 等建立。硬件 offload、BPF IPv6
+offload 与传统内核转发可能按能力并存，不能把 BpfCoordinator 概括成所有协议的
+通用 NAT 数据面。
 
 诊断时必须先确认实际激活的数据路径，否则只查看 iptables 可能漏掉 BPF/offload 状态。
 

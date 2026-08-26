@@ -652,8 +652,12 @@ AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED
 AVB_VBMETA_IMAGE_FLAGS_VERIFICATION_DISABLED
 ```
 
-- hashtree disabled：关闭 hashtree/dm-verity 路径；
-- verification disabled：关闭验证且 descriptors 不再解析。
+- hashtree disabled：顶层 `vbmeta` 仍会验签、descriptors 仍会处理，但生成的启动参数会把
+  hashtree 校验模式置为 disabled，系统不再建立正常的 dm-verity 校验路径；
+- verification disabled：并不是“连顶层 `vbmeta` 都不读”。`avb_slot_verify()` 仍验证顶层
+  `vbmeta` 结构并识别这个 flag，随后不再处理 descriptors，而是直接装载调用者请求的分区。
+  若该位由 `avbctl disable-verification` 设置，libavb 文档还明确说明返回值会是
+  `AVB_SLOT_VERIFY_RESULT_ERROR_VERIFICATION`，是否继续启动取决于调用方/设备解锁策略。
 
 这些顶层标志会影响启动参数与 fs_mgr。正常 LOCKED 生产设备不应随意接受关闭验证的镜像。本计划只读源码，不在真实设备尝试 `disable-verity`、写 vbmeta 或重锁 bootloader。
 

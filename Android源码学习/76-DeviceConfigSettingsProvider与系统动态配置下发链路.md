@@ -1,4 +1,4 @@
-# 76-DeviceConfig、SettingsProvider 与系统动态配置下发链路
+# 76 DeviceConfig、SettingsProvider 与系统动态配置下发链路
 
 > 源码基线：Android 11（`android-11.0.0_r48`）  
 > 本章目标：理解 Android 的系统设置和动态 feature flag 如何读取、缓存、持久化、通知，并影响正在运行的系统服务。  
@@ -80,12 +80,12 @@ int value = Settings.Global.getInt(
 |---|---|---|
 | `frameworks/base/core/java/android/provider/Settings.java` | Settings API | `NameValueCache`、System/Secure/Global/Config |
 | `frameworks/base/core/java/android/provider/DeviceConfig.java` | DeviceConfig API | typed getter、Properties、listener |
-| `frameworks/base/packages/SettingsProvider/src/.../SettingsProvider.java` | Provider 服务端 | `call()`、权限、用户路由、notify、generation |
-| `.../SettingsState.java` | 单表状态与文件 | current/default、异步写、AtomicFile |
-| `.../GenerationRegistry.java` | 缓存版本协调 | generation memory、increment |
-| `.../DeviceConfigService.java` | shell service | list/get/put/delete/reset 命令入口 |
+| `frameworks/base/packages/SettingsProvider/src/com/android/providers/settings/SettingsProvider.java` | Provider 服务端 | `call()`、权限、用户路由、notify、generation |
+| `frameworks/base/packages/SettingsProvider/src/com/android/providers/settings/SettingsState.java` | 单表状态与文件 | current/default、异步写、AtomicFile |
+| `frameworks/base/packages/SettingsProvider/src/com/android/providers/settings/GenerationRegistry.java` | 缓存版本协调 | generation memory、increment |
+| `frameworks/base/packages/SettingsProvider/src/com/android/providers/settings/DeviceConfigService.java` | shell service | list/get/put/delete/reset 命令入口 |
 | `frameworks/base/services/core/java/com/android/server/am/SettingsToPropertiesMapper.java` | native bridge | DeviceConfig → `persist.device_config.*` |
-| `.../ActivityManagerConstants.java` | 典型消费端 | listener、默认值、更新成员变量 |
+| `frameworks/base/services/core/java/com/android/server/am/ActivityManagerConstants.java` | 典型消费端 | listener、默认值、更新成员变量 |
 
 ---
 
@@ -906,4 +906,3 @@ Settings.System/Secure/Global 或 DeviceConfig API
 6. 配置存储更新与业务真正应用。
 
 下一章将学习 `SystemProperties、property_service、SELinux property_contexts 与启动属性链路`，继续追踪 Java/native 配置如何进入底层共享属性区、触发 init property action，并理解 `ro.*`、`persist.*` 等属性的生命周期。
-

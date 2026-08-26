@@ -1,5 +1,7 @@
 # 02 AOSP 工程目录介绍
 
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`；本章在 macOS 上只读本地源码，不要求编译。
+
 ## 本章目标
 
 看到一个问题时，能判断第一步应去哪一个顶层目录找代码。这里不追求记住所有目录，只建立导航能力。
@@ -18,6 +20,8 @@
 PLATFORM_VERSION_LAST_STABLE := 11
 PLATFORM_SDK_VERSION := 30
 ```
+
+这两行能证明平台版本和 SDK 级别，但不单独证明 manifest 切到了哪个 tag。`android-11.0.0_r48` 还应由 repo manifest/各 Git 项目的 revision 确认。本地已有 `.repo`，所以可在不访网的前提下用 `./.tools/repo manifest -r` 查当前修订。
 
 ## 2. 顶层目录地图
 
@@ -50,6 +54,21 @@ flowchart LR
 | `services/java/com/android/server` | SystemServer 入口 | `SystemServer.java` |
 | `cmds` | Framework 相关命令和 Native 程序 | `app_process` |
 | `packages` | Framework 自带包和资源 | SystemUI 等 |
+
+其中最容易走错的是 `services` 内部路径：
+
+```text
+frameworks/base/services/java/com/android/server/SystemServer.java
+    → system_server 的 Java 入口
+
+frameworks/base/services/core/java/com/android/server/am/
+    → AMS、进程、Service、Broadcast 等
+
+frameworks/base/services/core/java/com/android/server/wm/
+    → ATMS、Activity/Task、WMS、Window 等
+```
+
+Android 11 里 ATMS 位于 `wm` 包，因为 Activity/Task 与窗口容器模型紧密整合；不要根据“ActivityManager”这个历史名称就只在 `am` 目录搜索。
 
 一个常见误区是只在 `core/java/android` 搜索。这里经常只有给客户端用的 API，真正实现可能位于 `services/core`。
 
@@ -85,15 +104,17 @@ flowchart LR
 
 ### `hardware/interfaces` 与 `hardware/libhardware`
 
-前者主要放 HAL 接口定义，后者包含传统 HAL 相关头文件和实现框架。研究相机、音频、传感器时会进入这里，然后继续追踪厂商实现。
+前者主要放 HIDL HAL 接口定义和部分默认实现，后者包含传统 HAL 相关头文件和实现框架。但 Android 11 已是 HIDL 向 Stable AIDL HAL 演进的时期，某个子系统也可能在 `frameworks/hardware/interfaces`、`system/*`、`packages/modules/*` 或设备仓库有接口与实现。目录图是“第一站”，不是唯一答案。
 
 ### `device`
 
-每种产品的 BoardConfig、产品包、属性和资源配置。当前源码包含 Google Pixel、Cuttlefish、通用 x86/x86_64 等设备配置。
+每种产品的 BoardConfig、产品包、属性和资源配置。当前源码包含 Google Pixel、Cuttlefish 等设备配置；通用 x86/x86_64 配置也可位于 `build/target`、`device/generic` 等位置，不必全部集中在一个设备目录。
 
 ### `build`
 
 包含构建系统、产品组合、版本定义等。常用入口是：
+
+> 下面只是帮助你识别构建术语；当前 macOS 学习不执行这些命令。
 
 ```bash
 source build/envsetup.sh
@@ -141,24 +162,48 @@ rg --files frameworks/base | rg "IActivityTaskManager\.aidl$"
 ### 找模块定义
 
 ```bash
-find frameworks/base -name Android.bp
+find frameworks/base -name Android.bp -print
 rg 'name: "framework"' frameworks/base -g Android.bp
 ```
 
 ### 跨 repo 搜索
 
-AOSP 是许多 Git 仓库组成的 repo 工程，顶层本身不一定是一个 Git 仓库。因此顶层执行 `git status` 可能失败；可以使用：
+AOSP 是许多 Git 仓库组成的 repo 工程，顶层本身不一定是一个 Git 仓库。因此顶层执行 `git status` 可能失败；本地 repo launcher 放在 `.tools/repo`，可以使用：
 
 ```bash
 ./.tools/repo status
 ./.tools/repo grep "目标文本"
 ```
 
-## 6. 从问题反推目录
+`repo grep` 会遍历 manifest 管理的 Git 项目；`rg` 直接遍历工作树文件。本系列优先用 `rg`，因为速度快、语法简单，并且能搜到未被 Git 跟踪的本地文件。
+
+## 6. 别把目录树当成运行时拓扑
+
+文件在哪里，与代码最终在哪个进程/分区运行，是两个不同问题。
+
+```mermaid
+flowchart LR
+    S["源码目录<br/>frameworks/base/services"]
+    B["Soong 模块<br/>Android.bp"]
+    A["编译产物<br/>JAR/APK/可执行文件"]
+    I["产品安装配置<br/>system/product/vendor..."]
+    R["运行时进程<br/>system_server/App/native daemon"]
+    S --> B --> A --> I --> R
+```
+
+例如：
+
+- `frameworks/base/services/core/java/com/android/server/` 及 `frameworks/base/services/<模块>/java/` 中很多 Java 类被编入 services 相关 JAR，最终由 `system_server` 加载。
+- `frameworks/base/packages/SystemUI` 位于 Framework 源码树，但它是独立 APK/进程，不在 `system_server` 内。
+- `frameworks/native/services/surfaceflinger` 产出 Native 服务，由 init rc 启动成独立进程。
+
+所以定位问题时最好同时写出“源码路径 → 模块 → 产物 → 进程”。
+
+## 7. 从问题反推目录
 
 | 问题 | 第一站 | 之后可能去 |
 |---|---|---|
-| Activity 为什么启动失败？ | `frameworks/base/services/.../wm` | Binder、PMS、应用端 ActivityThread |
+| Activity 为什么启动失败？ | `frameworks/base/services/core/java/com/android/server/wm/` | Binder、PMS、应用端 ActivityThread |
 | APK 怎么安装？ | PMS 所在的 `frameworks/base/services` | installer、system、ART |
 | 点击事件怎么到 View？ | `frameworks/base/core` | inputflinger、内核驱动 |
 | 画面怎样显示？ | `frameworks/base/core` | `frameworks/native`、HAL |
@@ -166,7 +211,7 @@ AOSP 是许多 Git 仓库组成的 repo 工程，顶层本身不一定是一个 
 | 开机服务谁启动的？ | `system/core/init` | `init.rc`、设备 rc |
 | 相机怎样访问硬件？ | Framework Camera API | CameraService、Camera HAL |
 
-## 7. 不建议直接导入整个工程
+## 8. 不建议直接导入整个工程
 
 完整 AOSP 规模很大，IDE 全量索引成本很高。初期更推荐：
 
@@ -174,6 +219,55 @@ AOSP 是许多 Git 仓库组成的 repo 工程，顶层本身不一定是一个 
 2. 只在编辑器中打开当前链路涉及的目录。
 3. 每读到跨进程或 Java/Native 边界就在笔记中标记。
 4. 等明确研究专题后，再为局部源码建立 IDE 工程。
+
+## 9. 一次完整的只读定位示例：Activity 管理
+
+### 第一步：找公开门面
+
+```bash
+rg --files frameworks/base | rg '/Activity(Task)?Manager\.java$'
+```
+
+### 第二步：找 IPC 合同
+
+```bash
+rg --files frameworks/base | rg '/IActivity(Task)?Manager\.aidl$'
+```
+
+### 第三步：找服务实现
+
+```bash
+rg --files frameworks/base/services | \
+  rg '/ActivityManagerService\.java$|/ActivityTaskManagerService\.java$'
+```
+
+本地 r48 的结果会告诉你：AMS 在 `com/android/server/am`，ATMS 在 `com/android/server/wm`。这就是“先搜证据，再画地图”的例子。
+
+### 第四步：找启动与注册点
+
+```bash
+rg -n 'ActivityManagerService\.Lifecycle|ActivityTaskManagerService\.Lifecycle' \
+  frameworks/base/services/java frameworks/base/services/core
+```
+
+要特别防止一个误区：“找到 Service 类”不等于“已经知道谁创建了它”。启动点、注册名、启动阶段与依赖顺序都要继续追。
+
+## 10. 路径漂移时怎么办
+
+读其他版本文章时，不要直接把路径不存在解释为“本地代码不完整”。先做三步：
+
+```bash
+# 1. 忽略路径，按文件名找
+rg --files | rg '/ConnectivityService\.java$'
+
+# 2. 按类声明找，防止文件重命名
+rg -n 'class ConnectivityService\b' frameworks packages system
+
+# 3. 按方法/字段找，判断职责是否已拆分
+rg -n 'registerNetworkAgent\(' frameworks packages system
+```
+
+若类在但方法不在，往往是职责拆到了 helper/controller；若整个项目不在，再检查 manifest 是否包含对应 repo。
 
 ## 本章练习
 
@@ -185,5 +279,14 @@ AOSP 是许多 Git 仓库组成的 repo 工程，顶层本身不一定是一个 
 4. `init.rc` 在哪里？
 5. Settings 应用在哪里？
 
-能在两分钟内找到它们，就足以进入源码启动流程。
+可以用下面的只读命令自查：
 
+```bash
+cd /Users/ninebot/androidSource
+rg --files | rg '/SystemServer\.java$|/ActivityManagerService\.java$'
+find frameworks/native/services -maxdepth 1 -type d -name surfaceflinger -print
+rg --files system/core/rootdir | rg '/init\.rc$'
+find packages/apps -maxdepth 1 -type d -name Settings -print
+```
+
+答案不只要有路径，再补两列：“它是入口/API/实现中的哪一种”以及“运行在哪个进程”。能在两分钟内找到且说清这两点，才是进入源码启动流程的完成标准。

@@ -1,4 +1,4 @@
-# 75-AppTimeLimitController、UsageObserver 与 Digital Wellbeing 使用时长限制链路
+# 75 AppTimeLimitController、UsageObserver 与 Digital Wellbeing 使用时长限制链路
 
 > 源码基线：Android 11（`android-11.0.0_r48`）  
 > 本章目标：理解系统如何观察一组应用/功能的前台使用时间、触发限额回调，并明确“计时通知”与“真正限制应用”的边界。  
@@ -20,16 +20,12 @@ Android 11 源码不是这样。它的主要职责是：
 4. 对 session observer，在一段不活跃时间后再通知 session 结束；
 5. 为 supervision/数字健康类组件提供剩余额度查询。
 
-```text
-AppTimeLimitController
-     “计时 + 到点通知”
-              │
-              ▼
-观察者（例如系统数字健康/家长监督组件）
-     “决定展示警告、暂停包、拦截启动或更新策略”
-              │
-              ▼
-PackageManager / Launcher / ActivityTaskManager 等执行机制
+```mermaid
+flowchart TD
+    A["AppTimeLimitController<br/>检测：计时 + 到点 PendingIntent"]
+    B["数字健康/家长监督组件<br/>决策：警告、奖励时间或限制策略"]
+    C["PackageManager / Launcher / ActivityTaskManager 等<br/>执行：暂停包、图标置灰或拦截启动"]
+    A --> B --> C
 ```
 
 所以本章必须始终区分：
@@ -48,8 +44,8 @@ Google Digital Wellbeing 的完整应用实现并不等同于这份 AOSP Framewo
 | `frameworks/base/services/usage/java/com/android/server/usage/UsageStatsService.java` | 事件与 Binder 接入 | Activity 前后台、observer 注册、PendingIntent 发送 |
 | `frameworks/base/core/java/android/app/usage/UsageStatsManager.java` | System API | 三类 observer、usage token、回调 extras |
 | `frameworks/base/core/java/android/app/usage/IUsageStatsManager.aidl` | Binder 协议 | 注册/注销、reportUsageStart/Stop |
-| `frameworks/base/core/java/android/app/usage/UsageStatsManagerInternal.java` | system_server 内部模型 | `AppUsageLimitData` |
-| `frameworks/base/services/tests/servicestests/.../AppTimeLimitControllerTests.java` | 行为测试 | 嵌套、重叠、session、阈值边界 |
+| `frameworks/base/services/core/java/android/app/usage/UsageStatsManagerInternal.java` | system_server 内部模型 | `AppUsageLimitData` |
+| `frameworks/base/services/tests/servicestests/src/com/android/server/usage/AppTimeLimitControllerTests.java` | 行为测试 | 嵌套、重叠、session、阈值边界 |
 
 ### 2.1 运行位置
 
@@ -354,7 +350,7 @@ registerAppUsageLimitObserver(
 
 ### 11.2 选择哪个 group 返回
 
-一个 package 可能属于多个 AppUsageLimitGroup。查询时源码寻找 total time limit 最小的相关 group，返回该 group 的总额度和剩余时间。它表达当前最严格的适用额度，而不是把多个额度相加。
+一个 package 可能属于多个 AppUsageLimitGroup。查询时源码逐个比较 `getUsageRemaining()`，选择**剩余时间最少**的 group，然后一起返回它的总额度和剩余时间。不是选“总 time limit 最小”：例如 30 分钟额度还剩 20 分钟，60 分钟额度却只剩 5 分钟，后者才是当前更严格的限制。多个额度不会相加。
 
 ---
 

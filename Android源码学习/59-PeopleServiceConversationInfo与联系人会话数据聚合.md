@@ -81,7 +81,7 @@ PeopleService 本身很薄，复杂工作集中在 `DataManager` 和 `data/`、`
 
 ```text
 frameworks/base/services/people/java/com/android/server/people/PeopleService.java
-frameworks/base/services/people/java/com/android/server/people/PeopleServiceInternal.java
+frameworks/base/services/core/java/com/android/server/people/PeopleServiceInternal.java
 ```
 
 ### 数据聚合层

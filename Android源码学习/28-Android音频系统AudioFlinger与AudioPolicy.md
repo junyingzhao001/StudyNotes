@@ -185,22 +185,22 @@ frameworks/av/media/libaudioclient/IAudioFlinger.cpp
 sequenceDiagram
     participant J as AudioTrack Java
     participant N as native AudioTrack
-    participant AP as AudioPolicyService
     participant AF as AudioFlinger
+    participant AP as AudioPolicyService
     participant T as PlaybackThread
 
     J->>N: native_setup(attributes, format, buffer)
-    N->>AP: getOutputForAttr / select output
+    N->>AF: IAudioFlinger.createTrack(input)
+    AF->>AP: AudioSystem.getOutputForAttr / select output
     AP->>AP: strategy, device, flags, format, uid
-    AP-->>N: output handle + port/session info
-    N->>AF: createTrack(input)
+    AP-->>AF: output handle + port/session info
     AF->>T: createTrack_l on selected output thread
     T-->>AF: Track + shared memory/cblk
     AF-->>N: IAudioTrack + descriptors
     N-->>J: initialized state/sessionId
 ```
 
-源码实际封装版本会通过 AudioFlinger/AudioSystem 协调 policy；重点是“先选输出，再在对应 PlaybackThread 建 Track”。
+这里的顺序很容易被旧版调用图带偏：r48 的 native client 并不是先单独调用 AudioPolicyService、再调用 AudioFlinger。它先 Binder 调 `AudioFlinger::createTrack()`；AudioFlinger 在服务端通过 `AudioSystem::getOutputForAttr()` 询问策略，拿到 output handle 后，才在对应 PlaybackThread 创建 Track。逻辑上仍是“先选输出，再建 Track”，但跨进程调用者与身份检查位置不能画反。
 
 ---
 

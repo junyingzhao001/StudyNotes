@@ -94,7 +94,7 @@ frameworks/base/services/core/java/com/android/server/media/
 ```text
 frameworks/base/core/java/android/app/Notification.java       MediaStyle
 frameworks/base/services/core/java/com/android/server/audio/  AudioFocus/音量
-packages/SystemUI/                                            媒体通知/锁屏 UI
+frameworks/base/packages/SystemUI/                            媒体通知/锁屏 UI
 packages/apps/Bluetooth/                                      AVRCP 等控制端
 ```
 
