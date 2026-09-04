@@ -1,152 +1,137 @@
-# 100 新增可观测、可恢复的 Framework SystemService 综合实战
+# 100 新增 Framework SystemService：怎样让“请求已受理”在重启和故障后仍说得清？
 
-> 源码版本：Android 11（`android-11.0.0_r48`）  
-> 本章目标：用一个完整但不直接写入 AOSP 的教学服务，把 SystemServer、SystemServiceManager、AIDL、ServiceManager、SystemServiceRegistry、Binder 线程、Handler 状态机、多用户、SELinux、死亡恢复、可观测性和测试串成一条工程链。  
-> 环境：macOS 只读源码；不要求编译、刷机或连接设备。
+一个新的系统诊断服务在演示机上运行得很好：系统 App 调 `startDiagnosis()`，服务返回 `taskId=42`，稍后 callback 报告成功。
+
+到了真实环境，问题接连出现：
+
+- App 被杀后 callback 丢了，重启后不知道任务是否完成；
+- 后端 daemon 重连后，旧连接的完成回调把新任务误写成成功；
+- 用户切换后，用户 10 看到了用户 0 的状态；
+- `system_server` 重启后，只存在内存里的 `taskId=42` 消失；
+- 出问题时 `dumpsys` 只有一句“busy”，无法判断卡在排队、后端还是写盘。
+
+先记住本章结论：
+
+> **一个 SystemService 的完成标准不是“Binder 方法能调用”。可靠服务必须同时定义：谁有权调用、请求在哪个线程被接受、谁拥有可变状态、callback 丢失后从哪里查询、什么事实需要持久化、后端与 `system_server` 重启后怎样收敛，以及现场怎样证明卡在哪一步。**
+
+本章继续使用虚构的 `MowerDiagnosticsService` 做教学设计。它不是 r48 仓库中已有服务，也不是可直接编译的补丁；所有平台机制都用 Android 11 / `android-11.0.0_r48` 的真实类和源码模式校准。
+
+读完后，你应该能：
+
+1. 区分 Binder 发布、Manager 注册和 `LocalServices` 三条注册链。
+2. 设计“快速受理 + 可查询状态 + oneway 通知”的 AIDL。
+3. 用 Handler 单线程 owner 和状态机避免 Binder 并发破坏状态。
+4. 用 generation、幂等键和持久化恢复处理迟到回调与进程重启。
+5. 分清 Framework permission、跨用户检查、SELinux `find/add/call` 的层次。
+6. 设计不会泄密、不会把系统再次卡住的 `dumpsys` 与指标。
+
+macOS 上只做静态阅读和设计推演，不编译、刷机或声称完成了设备验证。
 
 ---
 
-## 1. 先说明：本章示例不是仓库中已有服务
+## 1. 先把需求写成“可验证的完成边界”
 
-本章设计一个虚构的 `MowerDiagnosticsService`：系统组件可以提交一次割草机诊断任务，查询状态，并接收完成回调。
+假设产品真正需要的是：系统 App 发起一次割草机诊断，任务可跨 App 重启查询；后端断开后可以明确失败或恢复；每个 Android 用户只能看到自己的任务。
 
-它是**教学设计**，不是当前 AOSP 中真实存在的类，也不是可以整段复制后立刻编译的补丁。示例省略了 import、API 审核、构建文件和部分异常处理。真实模式则来自 Android 11 的：
+先不要写类，先回答七个问题：
+
+| 问题 | 本章选择 | 为什么 |
+|---|---|---|
+| 谁能发起？ | 持有签名级业务权限的受信 App | 诊断可能控制硬件并读取敏感状态 |
+| 调用要等多久？ | 只等校验、生成 taskId 和内存受理 | Binder 线程不等待真正诊断 |
+| 结果从哪取？ | callback 做通知，`getStatus(taskId)` 做权威查询 | callback 会随客户端死亡而丢失 |
+| 谁拥有状态？ | 专用 HandlerThread | Binder 线程池会并发进入 |
+| 用户如何隔离？ | key 至少包含 `userId + taskId` | taskId 单独使用会跨用户串数据 |
+| 什么要落盘？ | 恢复必须知道的任务身份、终态和后端关联信息 | 内存不能跨 `system_server` 重启 |
+| 怎样诊断？ | 阶段、队列等待、执行时长、generation、最近失败 | “busy=true”不能定位 |
+
+### 一次任务至少有七个“完成”
 
 ```text
-SystemServer / SystemServiceManager / SystemService
-SystemConfigService / SystemConfigManager
-SystemServiceRegistry / ServiceManager / LocalServices
-RemoteCallbackList / AtomicFile / dumpsys / SELinux policy
+Binder transact 到达
+→ 权限与参数校验通过
+→ 任务写入内存权威状态并返回 taskId
+→ 后端接受请求
+→ 后端产生结果
+→ 结果持久化并可查询
+→ callback 通知客户端
 ```
 
-区分这两类内容很重要：真实源码告诉我们平台机制，教学代码负责把机制组合起来。
+最后两步故意没有强行说成同一个原子事务。写盘成功后 callback 可能因客户端死亡而失败；callback 到达也不应证明结果已经可靠落盘。设计时必须选定哪个状态是事实，哪个只是通知。
+
+本章把“结果写入权威状态并完成要求的持久化”定义为服务端成功；callback 只是让在线客户端更快知道。App 收到通知后仍可按 taskId 查询确认。
 
 ---
 
-## 2. 需求先于代码
+## 2. 一个 SystemService 为什么需要三条注册链？
 
-假设产品需求如下：
-
-1. 只有持有签名权限的系统应用可以发起诊断。
-2. 每个 Android 用户拥有独立任务视图。
-3. 同一用户同时最多运行一个任务。
-4. 发起接口必须快速返回，耗时工作不能占住 Binder 线程。
-5. 调用方进程死亡后，服务仍能完成任务；无效 callback 要自动清理。
-6. `system_server` 重启后，可以读回上次已经持久化的最终结果。
-7. `dumpsys` 能解释当前状态、最近失败和队列延迟，但不得泄漏敏感数据。
-8. 启动路径、请求数量、失败原因和耗时都可观察。
-
-这里已经隐含了安全、线程、生命周期、存储、恢复和遥测设计。先写 Java 类再补这些，通常会造成返工。
-
----
-
-## 3. 一张总架构图
+可以把三条注册链类比成一家医院：
 
 ```text
-系统 App
-  Context.getSystemService(MowerDiagnosticsManager.class)
-        │ SystemServiceRegistry 创建/缓存 Manager
-        ▼
-MowerDiagnosticsManager
-        │ IMowerDiagnosticsService Proxy
-        │ Binder IPC
-        ▼
-ServiceManager 名字：mower_diagnostics
-        ▼
-MowerDiagnosticsService.BinderService（system_server Binder 线程）
-        │ 权限、UID/userId、参数、调用身份检查
-        │ 复制不可变请求，post
-        ▼
-专用 HandlerThread（唯一可变状态 owner）
-        ├── UserState / TaskRecord
-        ├── AtomicFile 持久化最终状态
-        ├── RemoteCallbackList 通知
-        ├── LocalService 供 system_server 内部调用
-        └── 可选 native daemon/HAL（本章不展开数据面）
+ServiceManager        = 总机号码簿：服务名映射到 Binder
+SystemServiceRegistry = App 端前台：Context 名字/类型映射到 Manager 工厂
+LocalServices         = 医院内部专线：只供 system_server 内对象调用
 ```
 
-关键点：Manager、BinderService、业务状态机不是同一个对象承担的三个名字，而是三个责任层。
+它们不是同一件事的三种写法。
 
----
-
-## 4. 先画出文件地图
-
-若真正接入，可能涉及。下面凡标有“教学拟新增”的路径，在当前
-`android-11.0.0_r48` 源码树中都**不存在**；它们是为了说明一次真实接入需要新增哪些文件，不能当成
-可直接打开的源码入口：
-
-```text
-frameworks/base/core/java/android/content/Context.java
-frameworks/base/core/java/android/app/SystemServiceRegistry.java
-frameworks/base/core/java/android/os/IMowerDiagnosticsService.aidl       # 教学拟新增；当前树不存在
-frameworks/base/core/java/android/os/IMowerDiagnosticsCallback.aidl      # 教学拟新增；当前树不存在
-frameworks/base/core/java/android/os/MowerDiagnosticsManager.java         # 教学拟新增；当前树不存在
-frameworks/base/services/core/java/com/android/server/mower/              # 教学拟新增目录；当前树不存在
-    MowerDiagnosticsService.java                                          # 教学拟新增
-    MowerDiagnosticsInternal.java                                         # 教学拟新增
-frameworks/base/services/java/com/android/server/SystemServer.java
-frameworks/base/core/res/AndroidManifest.xml
-system/sepolicy/private/service_contexts
-system/sepolicy/private/service.te
-system/sepolicy/private/system_server.te
-system/sepolicy/public/ 或 private/ 中的客户端策略
-frameworks/base/services/tests/servicestests/src/                        # 可放服务端单元测试
-```
-
-还可能修改 `Android.bp`、API signature 文件、stats Atom 定义。具体位置取决于接口是公开 API、`@SystemApi`、`@hide`，还是仅设备私有代码。
-
----
-
-## 5. 三条注册链必须分开
-
-| 注册 | 注册什么 | 谁能取到 | 是否 IPC |
+| 注册动作 | 注册内容 | 调用范围 | 是否跨进程 |
 |---|---|---|---|
-| `publishBinderService()` | 名字 → Binder 对象 | 获得 `find` 权限的进程 | 是 |
-| `SystemServiceRegistry.registerService()` | Context 名字/类型 → Manager 工厂 | App/Framework Java 调用方 | 工厂本身不是 IPC |
-| `publishLocalService()` | Java Class → 普通对象 | 同一 `system_server` 进程 | 否 |
+| `publishBinderService(name, binder)` | 服务名 → Binder Stub | 能找到服务的进程 | 是 |
+| `SystemServiceRegistry.registerService(...)` | Context 名字/Manager 类型 → 客户端工厂 | Framework Java 调用方 | 工厂本身不是 IPC |
+| `publishLocalService(Class, object)` | Class → 普通 Java 对象 | 同一 `system_server` | 否 |
 
-只发布 Binder，`ServiceManager.getService()` 可以找到，但 `Context.getSystemService()` 不会凭空认识 Manager。
+只发布 Binder，`ServiceManager.getService()` 可以拿到它，但 `Context.getSystemService(MowerDiagnosticsManager.class)` 不会凭空出现。
 
-只注册 Manager，而服务端没发布 Binder，Manager 构造时会找不到远端服务。
+只注册 Manager 而不发布 Binder，Manager 创建时找不到远端服务。
 
-`LocalServices` 不是“更快的 Binder”。它是进程内普通 Java 调用，不切线程，也没有 Binder UID 身份和 Parcel 隔离。
+`LocalServices` 是进程内直接调用：没有 Parcel 隔离，不自动切线程，也没有远端 Binder UID 身份。不能因为它“快”就绕过本该存在的线程和权限边界。
 
----
+### 用 r48 真实源码校准骨架
 
-## 6. 用真实 `SystemConfigService` 校准最小服务形态
-
-真实文件：
-
-```text
-frameworks/base/services/java/com/android/server/SystemConfigService.java
-```
-
-核心结构可简化为：
+`SystemConfigService` 是一个很小的真实 `SystemService`：
 
 ```java
 public class SystemConfigService extends SystemService {
-    private final ISystemConfig.Stub mInterface = new ISystemConfig.Stub() {
-        @Override
-        public List<String> query() {
-            mContext.enforceCallingOrSelfPermission(...);
-            return ...;
-        }
-    };
+    private final ISystemConfig.Stub mInterface =
+            new ISystemConfig.Stub() { /* 权限检查与查询 */ };
 
     @Override
     public void onStart() {
-        publishBinderService(Context.SYSTEM_CONFIG_SERVICE, mInterface);
+        publishBinderService(
+                Context.SYSTEM_CONFIG_SERVICE, mInterface);
     }
 }
 ```
 
-真实代码说明了三个基本事实：服务继承 `SystemService`；Binder Stub 可以作为成员；`onStart()` 发布服务。复杂服务只是在这副骨架上增加线程、状态和生命周期。
+它证明“继承 `SystemService`、持有 Binder Stub、在 `onStart()` 发布”的最小形态。复杂服务只是在这副骨架上增加线程、状态、生命周期与恢复。
+
+Manager 注册可对照 `SystemServiceRegistry` 中真实的 `SystemUpdateManager` 模式：`CachedServiceFetcher` 通过 `ServiceManager.getServiceOrThrow()` 取 Binder，再构造 Manager。
+
+### 教学服务可能涉及哪些文件？
+
+以下带 `Mower` 的路径都是拟新增，不是当前仓库已有源码：
+
+```text
+frameworks/base/core/java/android/content/Context.java
+frameworks/base/core/java/android/app/SystemServiceRegistry.java
+frameworks/base/core/java/android/os/IMowerDiagnosticsService.aidl     # 拟新增
+frameworks/base/core/java/android/os/IMowerDiagnosticsCallback.aidl    # 拟新增
+frameworks/base/core/java/android/os/MowerDiagnosticsManager.java       # 拟新增
+frameworks/base/services/core/java/com/android/server/mower/            # 拟新增
+frameworks/base/services/java/com/android/server/SystemServer.java
+frameworks/base/core/res/AndroidManifest.xml
+system/sepolicy/private/service_contexts
+system/sepolicy/private/service.te
+```
+
+真实接入还可能涉及 `Android.bp`、API signature、权限 allowlist、stats Atom 和测试。是否公开成 SDK API、`@SystemApi`、`@hide` 或设备私有接口，是兼容性决策，不是顺手加一个 Java 常量。
 
 ---
 
-## 7. AIDL 先设计语义，不急着设计字段
+## 3. AIDL 为什么要同时有 taskId、查询和 callback？
 
-教学接口：
+教学接口只保留核心语义：
 
 ```aidl
 interface IMowerDiagnosticsService {
@@ -162,1315 +147,709 @@ oneway interface IMowerDiagnosticsCallback {
 }
 ```
 
-设计理由：
+设计顺序是先问 Why：
 
-- `startDiagnosis()` 只受理，不等待诊断完成。
-- 返回 `taskId`，使任务可查询、去重、取消和恢复。
-- `getStatus()` 是 callback 丢失后的补偿通道。
-- callback 使用 `oneway`，避免服务因客户端回调处理慢而同步等待。
-- `DiagnosisRequest` 和 `DiagnosisResult` 应限制大小，不传日志大文件或大图片。
+- `startDiagnosis()` 只受理，不等诊断完成，因此 Binder 返回可控；
+- `taskId` 让任务可以查询、取消、去重和恢复；
+- `getStatus()` 是 callback 丢失后的补偿通道；
+- callback 用 `oneway`，服务发送通知时不等待客户端 reply；
+- request/result 必须有大小上限，不在 Binder 里塞完整日志和图片。
 
-`oneway` 只表示调用者不等 reply，不表示无限并发、绝不排队或可靠送达。
+### 同步 `startDiagnosis()` 不等于同步执行业务
 
----
+普通 AIDL 调用会让客户端线程等待返回，但服务端只做短事务：鉴权、复制输入、分配/恢复幂等 taskId、把“已受理”提交给状态 owner，然后返回。
 
-## 8. 为什么不能只提供 callback
+若连“已受理”都只是随手 `post()` 后立即返回，就会产生一个空窗：客户端拿到 taskId，Handler 却可能尚未建立对应状态，紧接着查询得到 NOT_FOUND。可以采用以下一种明确契约：
 
-callback 会因下列原因丢失：
+1. Binder 入口用一个短的同步交接，等 Handler 确认任务记录已建立后再返回；或
+2. 返回后允许短暂 `ACCEPTING`，且查询协议明确认识这个状态。
 
-```text
-客户端进程死亡
-Binder 引用失效
-客户端重新启动但没有旧 callback
-oneway 队列拥塞
-system_server 重启
-版本差异导致无法解释某事件
-```
+不要一边宣称“返回 taskId 就已受理”，一边让状态仍不存在。
 
-因此可靠设计通常是：
+### `oneway` 只改变等待方式，不提供可靠消息队列
+
+`oneway` callback 没有业务 reply，发送方线程不等待客户端处理。但它仍可能排队、因客户端死亡而失败，也不会替你保存通知供 App 重启后补领。
+
+所以：
 
 ```text
-callback = 及时通知
+callback = 低延迟提示
 query API = 当前权威状态
-持久化结果 = 跨进程/跨重启恢复依据
+持久化 = 跨 system_server 重启的恢复事实
 ```
 
-通知不是事实本身。任务状态才是事实。
+通知不是事实本身。
 
 ---
 
-## 9. 数据对象要有演进策略
+## 4. `onStart()` 返回后，服务到底 ready 到哪一步？
 
-即使不是 stable AIDL，也应预留兼容思路：
+r48 的 `SystemService` 文档说明：构造、`onStart()`、各个 `onBootPhase()` 和用户生命周期回调都由 SystemServer 主 Looper 线程调用。
+
+这条事实带来两个约束：
+
+1. 生命周期回调不能做无界 I/O、等待后端或长时间持锁，否则会拖慢甚至卡住 SystemServer 主线程；
+2. `onStart()` 中发布 Binder 只说明服务“可被找到”，不说明所有依赖、用户数据和后端连接都 ready。
+
+服务可显式维护 readiness：
+
+```text
+PUBLISHED          Binder 已发布，调用方可能进来
+SYSTEM_READY       必需的系统服务依赖可用
+USER_STARTED       某用户的 DE 状态可建立
+USER_UNLOCKED      该用户 CE 数据可读取
+BACKEND_CONNECTED  外部 daemon/HAL 连接可用
+```
+
+Binder API 遇到尚未 ready 时，要么返回可行动的状态码，要么将任务记为等待依赖；不能静默在 Binder 线程睡眠。
+
+### BootPhase 和用户解锁是两条轴
+
+`PHASE_SYSTEM_SERVICES_READY`、`PHASE_THIRD_PARTY_APPS_CAN_START`、`PHASE_BOOT_COMPLETED` 描述整个系统启动阶段；`onUserStarting()`、`onUserUnlocking()`、`onUserUnlocked()`、`onUserStopping()`、`onUserStopped()` 描述某个用户的生命周期。
+
+系统已经 `BOOT_COMPLETED`，不代表后来切换进来的用户已解锁；用户已 starting，也不代表其 credential-encrypted（CE）存储可用。
+
+如果最终结果需要在锁屏启动阶段查询，应考虑 device-encrypted（DE）存储及泄密风险；若内容敏感且必须放 CE，则在 `onUserUnlocked()` 后再加载，并在未解锁时返回明确状态。
+
+### SystemServer 中的启动位置由依赖决定
+
+教学服务应由 `SystemServiceManager.startService()` 启动。放在哪一段不是按名称排序，而取决于：
+
+- 构造/`onStart()` 立即需要哪些服务；
+- 哪个 BootPhase 才允许接入后端或第三方 App；
+- 是否能先发布 Binder，再以 NOT_READY 响应；
+- 哪些服务需要它的 LocalService。
+
+为了“看起来早点可用”而过早启动，通常只是把显式依赖错误变成时序竞态。
+
+---
+
+## 5. Binder 入口为什么只能做“验票、复印、交接”？
+
+Binder 线程池会并发进入 Stub。可以把入口想成车站检票口：它适合查票、核对身份、复制必要信息并把旅客送进站内队列，不适合让检票员亲自开完整段列车。
+
+一个稳健入口的顺序是：
+
+```text
+1. 检查业务 permission
+2. 读取 Binder.getCallingUid()/Pid()
+3. 解析并检查目标 userId 与跨用户权限
+4. 校验长度、数量、枚举和 FD/URI 等参数
+5. 将可变 Parcelable/Bundle 复制成服务自己的不可变请求
+6. 必要时 clearCallingIdentity，再调用系统内部能力
+7. 把请求交给 Handler 状态 owner
+8. 返回 taskId 或明确错误
+```
+
+### 为什么服务端还要检查，Manager 检查不算吗？
+
+Manager 的参数预检改善调用体验，但恶意或有 bug 的客户端可以绕过 Manager，直接拿 Binder transact。权限、UID、userId 和资源上限必须由服务端 Stub 再检查。
+
+教学入口可以写成结构示意：
 
 ```java
-public final class DiagnosisRequest implements Parcelable {
-    int version;
-    int flags;
-    String component;
-    PersistableBundle options;
+public long startDiagnosis(DiagnosisRequest request,
+        IMowerDiagnosticsCallback callback) {
+    enforceStartPermission();
+    final int callingUid = Binder.getCallingUid();
+    final int callingPid = Binder.getCallingPid();
+    final int userId = resolveAndEnforceUser(request.userId, callingUid);
+    final ImmutableRequest copy = validateAndCopy(request);
+
+    final long token = Binder.clearCallingIdentity();
+    try {
+        return acceptOnStateThread(copy, callback,
+                callingUid, callingPid, userId);
+    } finally {
+        Binder.restoreCallingIdentity(token);
+    }
 }
 ```
 
-注意：任意 `Bundle` 看似灵活，却容易形成无文档的私有协议。字段需要写明默认值、上限、未知值处理和敏感性。
+这是教学骨架，不是可直接编译的连续源码。特别是 `clearCallingIdentity()` 不能提前到鉴权之前，否则后续代码看到的是 `system_server` 身份，会把调用者边界抹掉。
 
-如果接口跨 system/vendor 分区或要求独立升级，应评估 stable AIDL 的冻结版本/hash 和 VINTF 规则；普通 platform 内部 AIDL 不应被误称为稳定跨分区 ABI。
+### 为什么必须复制请求？
+
+跨进程 AIDL 的 Parcelable 已经过反序列化，但它内部的 `Bundle`、集合或可变对象仍可能被服务自己的后续代码修改或共享。进程内 LocalService 更没有 Parcel 复制这一层。
+
+状态机应只保存经过校验的不可变值，并在入口限制：
+
+- 文本、数组、集合和 Bundle 条目数；
+- 单项长度与总序列化规模；
+- 不认识的 enum/flag；
+- URI/FD 的权限与生命周期；
+- callback 是否允许为空。
+
+“Binder 有事务大小上限”不是业务可以不设上限的理由。靠驱动在极限处报 `TransactionTooLargeException`，错误既晚又不可行动。
+
+### 不要持锁或占 Binder 线程调用外部系统
+
+后端 daemon、HAL、磁盘、callback 和其他 Binder 服务都可能阻塞或反向调用。如果在全局锁内调用它们，容易形成：
+
+```text
+本服务持锁 → 等后端 Binder
+后端回调本服务 → 等同一把锁
+```
+
+正确方向是先在 owner 线程内生成要执行的动作和不可变快照，锁外/状态线程外做外部调用，再把结果携带 generation 投回 owner 线程提交。
 
 ---
 
-## 10. Manager 是面向调用者的稳定门面
+## 6. 为什么 Handler 单线程 owner 比“到处 synchronized”更容易证明正确？
 
-教学代码：
+如果 Binder 线程、后端回调线程、用户生命周期主线程和写盘线程都能直接修改 `TaskRecord`，每个字段都可能处在不同代际。
+
+本章选择一条专用 HandlerThread 作为唯一可变状态 owner：
+
+```mermaid
+flowchart LR
+    B["Binder 入口<br/>鉴权/复制"] --> H["State Handler<br/>唯一修改 TaskRecord"]
+    U["用户生命周期<br/>SystemServer main"] --> H
+    D["daemon death/callback<br/>Binder thread"] --> H
+    IO["I/O worker<br/>写盘结果"] -->|"完成结果 + generation"| H
+    H --> S["按 userId 分区的 UserState"]
+```
+
+这里的“单线程”只保证状态转换串行，不保证系统不会卡。Handler 上仍不能做长 I/O、等待后端或执行慢 callback。
+
+### 状态机比多个 boolean 更可靠
+
+教学任务可使用：
+
+```text
+ACCEPTED
+→ WAITING_BACKEND
+→ RUNNING
+→ PERSISTING
+→ SUCCEEDED
+
+任意未终态 → CANCEL_REQUESTED → CANCELLED
+任意未终态 → FAILED(code, stage)
+恢复时       → RECOVERING → RUNNING / FAILED / SUCCEEDED
+```
+
+每条边要写清楚：
+
+- 谁触发；
+- 是否允许重复；
+- 修改哪些字段；
+- 是否需要写盘；
+- 对客户端发哪个通知；
+- 外部调用失败后回到什么状态。
+
+`running=true`、`finished=true`、`failed=true` 三个布尔变量可能同时为真；一个枚举状态和显式转换表更容易审查。
+
+### generation 为什么能挡住迟到回调？
+
+假设后端连接 A 断开，服务建立连接 B 并重试 task 42。此时 A 的旧完成回调迟到。如果只按 taskId 提交，它可能覆盖 B 的新状态。
+
+为每次后端连接或执行尝试分配单调 generation：
+
+```java
+void onBackendFinished(long taskId, long callbackGeneration,
+        DiagnosisResult result) {
+    mHandler.post(() -> {
+        TaskRecord task = findTask(taskId);
+        if (task == null || task.generation != callbackGeneration) {
+            recordStaleCallback(taskId, callbackGeneration);
+            return;
+        }
+        transitionToPersisting(task, result);
+    });
+}
+```
+
+generation 不是安全凭据，而是时序版本。它证明“这条异步结果属于当前尝试”，避免旧世界污染新世界。
+
+### 幂等键解决的是重复请求，不是迟到回调
+
+客户端可能因超时没收到 `startDiagnosis()` reply 而重试。若每次都新建任务，后端可能执行两次危险操作。
+
+可让调用方提供受约束的 request id，服务以 `userId + callingUid + requestId` 查找已有任务：
+
+```text
+相同键 + 相同规范化参数 → 返回原 taskId
+相同键 + 不同参数       → 明确冲突
+没有键                  → 新建任务
+```
+
+幂等键处理“同一意图被提交多次”；generation 处理“同一任务的旧异步结果晚到”。二者不能互相替代。
+
+---
+
+## 7. callback 为什么只能当通知，不能当任务真相？
+
+客户端可能在任务完成前被 LMKD 回收，也可能旋转页面、重建进程或主动注销 callback。反过来，callback 已送出时服务也可能尚未完成持久化。
+
+所以服务端权威状态必须独立于 callback：
+
+```text
+TaskRecord / 持久化记录 = 任务事实
+RemoteCallbackList      = 当前在线的通知订阅者
+getStatus(taskId)       = 客户端重新同步事实的入口
+```
+
+`RemoteCallbackList` 是 r48 的真实基础设施。它按 callback 的底层 `IBinder` 去重，为每个 callback `linkToDeath()`，客户端进程死亡时自动移除，并允许在 `onCallbackDied()` 做额外清理。
+
+但它不会：
+
+- 保存客户端错过的通知；
+- 跨 `system_server` 重启恢复订阅；
+- 将 callback 失败自动变成业务失败；
+- 替任务状态做持久化。
+
+### 广播 callback 时不要持有业务状态锁
+
+`RemoteCallbackList.beginBroadcast()` 给出稳定的回调快照，必须与 `finishBroadcast()` 配对。教学结构可写成：
+
+```java
+List<CallbackEvent> events = buildEventsOnStateThread();
+
+int count = mCallbacks.beginBroadcast();
+try {
+    for (int i = 0; i < count; i++) {
+        try {
+            deliver(mCallbacks.getBroadcastItem(i), events);
+        } catch (RemoteException ignored) {
+            // death recipient/后续清理负责失效 callback
+        }
+    }
+} finally {
+    mCallbacks.finishBroadcast();
+}
+```
+
+实际代码还应避免在 state Handler 上连续调用大量 callback；可构造快照后交给专用通知执行器。`oneway` 只避免等待业务 reply，Binder 驱动发送和队列压力仍有成本。
+
+### callback 死亡是否应该取消任务？
+
+本章需求说“App 死亡后任务仍可完成”，所以 `onCallbackDied()` 只移除订阅，不取消任务。
+
+另一类“仅服务于当前前台客户端”的操作可能选择随 token 死亡取消。这个行为必须写进 API 语义，不能从 `linkToDeath()` 的存在自动推断。
+
+---
+
+## 8. `AtomicFile` 能保证什么，不能保证什么？
+
+r48 的 `AtomicFile` 通过 `.new` 文件完成写入、sync、close，再 rename 到正式文件；失败时删除新文件。它的目标是让读者看到完整旧文件或完整新文件，而不是半截内容。
+
+典型写法：
+
+```java
+FileOutputStream out = null;
+try {
+    out = atomicFile.startWrite();
+    writeSnapshot(out, snapshot);
+    atomicFile.finishWrite(out);
+} catch (IOException e) {
+    atomicFile.failWrite(out);
+    throw e;
+}
+```
+
+### “Atomic” 不等于整个诊断事务原子
+
+`AtomicFile` 自己的类注释明确指出：它不提供文件锁；并发读写的互斥由调用者负责。
+
+r48 的 `finishWrite()` 还是 `void`：底层 sync、close 或 rename 异常主要通过日志暴露，没有向上返回一个可组合的“持久化事务已确认”对象。因此服务除了捕获 `startWrite()/序列化` 异常，还应记录写盘阶段和最近失败；不能只因调用过 `finishWrite()` 就对外宣称后端、指标与通知也一并提交。
+
+它也不能把以下动作变成一个跨系统事务：
+
+```text
+后端硬件已经执行成功
+状态文件 rename 成功
+statsd Atom 写入成功
+callback 送达客户端
+```
+
+任何两步之间都可能重启。服务必须通过恢复协议处理“后端成功但本地还没记”“本地已记但 callback 没送到”等中间态。
+
+### 哪些事实应该持久化？
+
+不要把整个内存对象图序列化。只保存恢复所需、版本化且有边界的数据，例如：
+
+```text
+schemaVersion
+userId / taskId / idempotencyKey
+规范化请求摘要（避免保存不必要敏感原文）
+当前恢复状态与 generation
+后端稳定 operationId（若后端支持查询）
+最终 result code / failure stage
+创建、开始、完成的时间基准说明
+```
+
+若后端不支持稳定 operationId 和结果查询，`system_server` 重启后就无法证明旧操作是成功、失败还是仍在运行。此时应恢复成 `UNKNOWN_AFTER_RESTART` 或按明确策略重新执行，而不是为了界面好看随便标成功。
+
+写盘也必须有单一顺序：由 state owner 产生带版本的不可变 snapshot，交给串行 I/O writer；完成结果再携带 snapshot version 投回 state owner。否则旧快照可能在新快照之后落盘，AtomicFile 仍会“原子地写回旧状态”。
+
+### DE、CE 与用户边界
+
+每个用户单独保存，文件路径和内存 key 都包含 userId。放 DE 还是 CE 由需求决定：
+
+- 锁屏启动前必须恢复的非敏感调度信息可考虑 DE；
+- 凭据保护的敏感结果放 CE，并等 `onUserUnlocking/onUserUnlocked`；
+- `onUserStopping()` 是释放该用户资源、停止使用其 CE 数据的关键窗口；
+- `onUserStopped()` 后不应继续持有该用户 callback、打开的 FD 或后端会话。
+
+“所有文件都放 `/data/system`”不能替代多用户和加密语义设计。
+
+---
+
+## 9. 后端 daemon/HAL 死亡后，怎样恢复而不重复执行？
+
+如果服务依赖 native daemon 或 HAL，Binder death 只告诉你“能力端点死了”，不告诉你某次诊断是否已经作用于硬件。
+
+恢复链应显式建模：
+
+```mermaid
+sequenceDiagram
+    participant S as State Handler
+    participant A as Backend connection A
+    participant B as Backend connection B
+
+    S->>A: start(task=42, generation=7)
+    A--xS: binderDied
+    S->>S: task → RECOVERING
+    S->>B: reconnect
+    S->>B: query(operationId) 或按幂等协议重试
+    B-->>S: result(generation=8)
+    S->>S: 提交 generation=8
+    A-->>S: 迟到 result(generation=7)
+    S->>S: 丢弃 stale callback
+```
+
+关键问题不是“能否重连”，而是重连后如何判定旧操作：
+
+| 后端能力 | 服务恢复策略 |
+|---|---|
+| 有稳定 operationId，可查询结果 | 重连后查询并收敛 |
+| start 支持幂等 request id | 用同一 id 重试，后端返回同一操作 |
+| 操作天然幂等 | 可按明确重试预算重做 |
+| 不可查询、不可幂等且有副作用 | 标记未知并要求人工/更高层协调，不能盲重试 |
+
+### 重连也需要状态，而不是无限 while
+
+至少记录：
+
+- 当前连接 generation；
+- 连续失败次数和最近错误；
+- 下一次重试时间；
+- 是否因用户停止、服务关闭或永久错误而不再重试；
+- 正在恢复的任务数。
+
+退避、抖动和上限要按产品要求定义。本章没有真机数据，因此不虚构“最佳 1 秒/5 次”等数字。
+
+---
+
+## 10. Java permission、跨用户与 SELinux 为什么缺一不可？
+
+三者回答不同问题：
+
+```text
+Framework permission  = 这个 UID 是否有权执行这项业务操作？
+跨用户检查            = 它是否能代表目标 userId 操作？
+SELinux                = 这个进程域能否发现/调用/发布该 Binder 能力？
+```
+
+### 业务鉴权必须使用原始调用者身份
+
+Stub 入口先保存 `Binder.getCallingUid()`，检查签名权限和目标用户。只有进入受信的系统内部调用时才 `clearCallingIdentity()`，并在 `finally` 恢复。
+
+若先 clear 再 `enforceCallingPermission()`，检查到的可能是 `system_server` 自己，权限边界等于被绕过。
+
+仅比较传入 packageName 也不够；字符串包名不是身份，应从 UID/PackageManager 关系和签名/权限建立证据。
+
+### 跨用户不是把 `UserHandle.getUserId(uid)` 算出来就结束
+
+默认可把 calling UID 所属用户作为目标。若 API 允许显式 userId，需要按平台规则检查跨用户权限、特殊 UID 和 user/profile 关系，并在所有状态、文件、callback cookie 与日志 key 中保留最终解析的 userId。
+
+入口校验正确但内部用 `taskId` 单独查表，仍会在后续查询或 callback 阶段串用户。
+
+### SELinux 的三道门
+
+新增服务名通常需要在 `service_contexts` 映射到 service type，并配置最小权限：
+
+| SELinux/Framework 门 | 作用 |
+|---|---|
+| `service_manager add` | `system_server` 是否能用该名字发布服务 |
+| `service_manager find` | 客户端域是否能取得服务 handle |
+| `binder call` | 客户端域是否能向服务进程发 Binder 事务 |
+| Java permission/check | 拿到 handle 后，具体方法是否允许该 UID 调用 |
+
+“能 find”不等于“业务方法获准”；Java 权限通过也不能绕过 SELinux 的进程域强制访问控制。
+
+不要为了让 demo 通过而给所有 appdomain 广泛 `find/call`。先列出真实客户端域，再授予最小集合，并让拒绝日志能对应到具体 type。
+
+---
+
+## 11. Manager 应该隐藏 Binder，但不能伪造成功
+
+面向调用方的 Manager 负责把底层 AIDL 变成稳定、易用的 Java API：
 
 ```java
 @SystemService(Context.MOWER_DIAGNOSTICS_SERVICE)
 public final class MowerDiagnosticsManager {
-    private final Context mContext;
     private final IMowerDiagnosticsService mService;
 
-    public MowerDiagnosticsManager(Context context,
-            IMowerDiagnosticsService service) {
-        mContext = context;
-        mService = service;
-    }
-
-    public long startDiagnosis(DiagnosisRequest request, Executor executor,
-            Callback callback) {
-        // 参数预检、callback 到 Executor 的线程转换、RemoteException 映射
+    public long startDiagnosis(DiagnosisRequest request,
+            Executor executor, Callback callback) {
+        // 本地参数预检、Binder callback → Executor、异常映射
         return ...;
     }
 }
 ```
 
-Manager 的职责包括：
+省略号表示教学职责，不是可编译实现。Manager 应做：
 
-- 提供类型安全 API。
-- 把 Binder callback 转发到调用者指定 `Executor`。
-- 将 `RemoteException` 转成平台约定的异常或失败结果。
-- 做便利性参数校验，但不能代替服务端安全校验。
-- 隐藏 AIDL 和重连细节。
+- 类型安全和便利参数检查；
+- 将 Binder callback 转发到调用者指定的 `Executor`；
+- 将 `RemoteException` 按平台 API 约定重新抛出或映射；
+- 隐藏 AIDL Stub/Proxy 和线程细节；
+- 明确服务不存在、尚未 ready 与业务失败的差异。
 
-客户端检查永远不是安全边界，因为恶意调用方可以绕过 Manager 直接 transact。
+它不应捕获所有异常然后返回 `taskId=0` 或空结果。那会把“system_server/服务死亡”和“任务确实不存在”压成同一假成功。
+
+r48 中很多 Manager 对 `RemoteException` 使用 `rethrowFromSystemServer()`；具体公开 API 选择异常还是状态对象要保持一致，但都不应静默吞掉死亡事实。
+
+### `CachedServiceFetcher` 缓存的是什么？
+
+`SystemServiceRegistry.CachedServiceFetcher` 把 Manager 实例缓存在对应 `ContextImpl` 的 service cache。它缓存的不是任务结果，也不是服务端 `TaskRecord`。
+
+Manager 内持有的 Binder proxy 死亡后是否自动重新获取，要看 Manager 自己的实现；“Context 能再次返回同一个 Manager”不等于“远端能力已自动恢复”。对普通 App 而言，`system_server` 死亡常伴随更大范围的 framework 重启，不能承诺所有调用透明续接。
+
+### API 与内部实现的版本边界
+
+若接口只在同一次 platform 构建内使用，普通 framework AIDL 可以与系统一起升级；若接口跨 system/vendor、独立 Mainline 模块或需要长期兼容，则要评估 stable AIDL、冻结版本/hash 与 VINTF。
+
+在 Parcelable 里随便加 `version` 字段并不会自动得到兼容性。仍需定义：旧端遇到新字段怎么办、新端缺字段用什么默认值、未知 enum 是否拒绝、最大尺寸是多少。
 
 ---
 
-## 11. 注册到 `SystemServiceRegistry`
+## 12. `dumpsys` 怎样解释现场，又不制造第二次卡死？
 
-真实注册模式位于：
+当 task 42 卡住时，最有价值的不是一大段原始对象，而是一条阶段化证据：
 
 ```text
-frameworks/base/core/java/android/app/SystemServiceRegistry.java
+serviceReady=BACKEND_CONNECTED
+user=10 task=42 state=RUNNING generation=8
+acceptedAgo=12s queueWait=37ms backendRunning=11.9s
+backendConnected=true reconnectCount=1
+lastTransition=WAITING_BACKEND→RUNNING
+lastError=none
+pendingPersistWrites=0 callbackCount=1
 ```
 
-教学代码：
+这些数字只是字段示例，不是假装测得的性能数据。
 
-```java
-registerService(Context.MOWER_DIAGNOSTICS_SERVICE,
-        MowerDiagnosticsManager.class,
-        new CachedServiceFetcher<MowerDiagnosticsManager>() {
-    @Override
-    public MowerDiagnosticsManager createService(ContextImpl ctx)
-            throws ServiceNotFoundException {
-        IBinder binder = ServiceManager.getServiceOrThrow(
-                Context.MOWER_DIAGNOSTICS_SERVICE);
-        IMowerDiagnosticsService service =
-                IMowerDiagnosticsService.Stub.asInterface(binder);
-        return new MowerDiagnosticsManager(ctx.getOuterContext(), service);
-    }
-});
-```
+### dump 的线程和锁边界
 
-`CachedServiceFetcher` 的缓存是 `ContextImpl` 相关的 Manager 缓存，不是服务端业务状态缓存，也不是 ServiceManager 全局缓存。
+`dump()` 通常从 Binder dump 入口进入，先用 `DumpUtils.checkDumpPermission()` 检查权限。它不能持业务锁去等待后端，也不能无限等待 state Handler。
 
-必选服务可用 `getServiceOrThrow()`；设备可选功能应考虑 `getService()` 返回 null 的契约。不能随意混用。
+稳健做法是：
 
----
+1. 用有超时的方式向 state Handler 请求不可变快照；
+2. 快照只包含已脱敏、大小受限的数据；
+3. Handler 超时时打印“snapshot timeout”和已知线程/队列事实，而不是永久阻塞 dumpsys；
+4. 在 dump 调用线程格式化和输出，不边遍历边修改真实状态。
 
-## 12. Context 常量与 API 面
+若 system_server 已因状态线程卡住，`dumpsys` 再无界等待同一线程只会让现场更糟。
 
-教学常量：
+### 四类可观测工具各回答什么？
 
-```java
-public static final String MOWER_DIAGNOSTICS_SERVICE = "mower_diagnostics";
-```
+| 工具 | 适合回答 | 不适合 |
+|---|---|---|
+| `dumpsys` | 当前状态、队列、最近错误和配置 | 高频长期统计 |
+| trace/Perfetto | Binder→Handler→后端→持久化的时序与线程等待 | 充当永久业务数据库 |
+| statsd Atom | 成功率、失败阶段、耗时分布等聚合 | 输出敏感请求全文 |
+| EventLog/受限日志 | 低频关键状态变化与关联 id | 每个进度点无限刷日志 |
 
-同一个字符串需要在发布、查找、`service_contexts` 中一致。但“加一个 public 常量”不只是改 Java 文件：公开 Android API 通常涉及 API council、注解、文档、兼容性和 signature 文件更新。
-
-设备内部功能更可能保持 `@hide`，或放在厂商自身 API 层。是否公开由产品和兼容性需求决定，不由代码方便程度决定。
-
----
-
-## 13. 服务端生命周期骨架
-
-```java
-public final class MowerDiagnosticsService extends SystemService {
-    private HandlerThread mWorkerThread;
-    private Handler mHandler;
-    private final BinderService mBinderService = new BinderService();
-    private final LocalService mLocalService = new LocalService();
-
-    public MowerDiagnosticsService(Context context) {
-        super(context);
-    }
-
-    @Override
-    public void onStart() {
-        mWorkerThread = new HandlerThread("MowerDiagnostics");
-        mWorkerThread.start();
-        mHandler = new Handler(mWorkerThread.getLooper());
-        publishBinderService(Context.MOWER_DIAGNOSTICS_SERVICE,
-                mBinderService, false);
-        publishLocalService(MowerDiagnosticsInternal.class, mLocalService);
-    }
-}
-```
-
-`allowIsolated=false` 表示 isolated 进程不能按普通路径取得服务，但这不是完整授权；仍需权限、UID/user 和业务校验。
-
-生产代码还要考虑 worker 创建失败、测试注入、线程优先级和启动阶段是否真的需要立即建线程。
-
----
-
-## 14. `onStart()` 返回不等于服务完全 ready
+### 延迟要拆段，不写一个含糊的“总耗时”
 
 至少区分：
 
 ```text
-对象已构造
-onStart 已调用
-Binder 已发布
-Binder 可查找
-依赖服务已 ready
-数据已加载
-当前用户已启动
-当前用户 CE 已解锁
-外部 daemon/HAL 已连接
+Binder validation time
+Handler queue wait
+backend connect wait
+backend execution time
+persist time
+callback dispatch lag
+end-to-end time
 ```
 
-所以接口需要定义“不 ready”时行为：快速返回明确错误、排队、降级，还是暂不可见。最危险的是无界等待。
+否则 P99 变慢时无法判断是 system_server 消息积压、daemon 执行慢还是存储卡顿。本章没有真实测量，所以只定义指标，不编造提升比例。
+
+日志和 dump 只保留 taskId、状态、阶段、错误枚举和必要时间。硬件序列号、用户输入、完整请求参数与原始诊断数据要默认脱敏或仅在受控 debug 能力下输出。
 
 ---
 
-## 15. 放入 SystemServer 的位置由依赖决定
+## 13. 怎样验证这套设计不是只在成功路径上自洽？
 
-真实入口：
+先按层写测试矩阵：
 
-```text
-frameworks/base/services/java/com/android/server/SystemServer.java
-```
-
-教学启动代码可能是：
-
-```java
-t.traceBegin("StartMowerDiagnosticsService");
-mSystemServiceManager.startService(MowerDiagnosticsService.class);
-t.traceEnd();
-```
-
-不是“越早越好”。要先回答：
-
-- 构造和 `onStart()` 用到哪些服务？
-- 首次可接收请求需要哪个 boot phase？
-- 是否依赖 PackageManager、用户、存储、网络或 HAL？
-- 服务启动失败是否应拖垮整个 system_server？
-
-启动顺序是依赖图的线性展开，不是文件中的随意排列。
-
----
-
-## 16. BootPhase 只做该阶段必须做的事
-
-```java
-@Override
-public void onBootPhase(int phase) {
-    if (phase == PHASE_SYSTEM_SERVICES_READY) {
-        mHandler.post(this::connectDependencies);
-    } else if (phase == PHASE_BOOT_COMPLETED) {
-        mHandler.post(this::scheduleDeferredMaintenance);
-    }
-}
-```
-
-`SystemServiceManager` 在主线程串行分发 phase。回调里做慢 I/O 会直接增加关键路径时延。
-
-`post()` 后 phase 回调很快结束，但异步任务并未完成。如果其他服务必须依赖该结果，需要显式 readiness 状态或 Future/回调，不能把“已 post”当作“已完成”。
-
----
-
-## 17. Binder 入口的黄金结构
-
-```java
-private final class BinderService extends IMowerDiagnosticsService.Stub {
-    @Override
-    public long startDiagnosis(DiagnosisRequest request,
-            IMowerDiagnosticsCallback callback) {
-        enforceManagePermission();
-        Objects.requireNonNull(request);
-        validateRequest(request);
-
-        final int callingUid = Binder.getCallingUid();
-        final int callingUserId = UserHandle.getUserId(callingUid);
-        final DiagnosisRequest safeCopy = request.deepCopy();
-        final long taskId = nextTaskId();
-
-        final long token = Binder.clearCallingIdentity();
-        try {
-            mHandler.post(() -> handleStart(taskId, callingUid,
-                    callingUserId, safeCopy, callback));
-        } finally {
-            Binder.restoreCallingIdentity(token);
-        }
-        return taskId;
-    }
-}
-```
-
-顺序要点：
-
-1. 仍处于调用者身份时做权限与归属检查。
-2. 捕获 UID/userId，复制输入。
-3. 需要代表系统访问其他服务时才清除身份。
-4. 把慢工作交给明确的 owner 线程。
-5. 快速返回。
-
-不要在 `clearCallingIdentity()` 后再询问“调用者是谁”。那时看到的已是服务进程身份。
-
----
-
-## 18. 为什么必须复制请求
-
-AIDL Parcelable 到达服务端通常已经反序列化，但其中可能含可变集合、FD、Binder token 或由服务继续持有的引用。
-
-跨线程前应：
-
-- 校验字段和集合长度。
-- 转为服务自己的不可变模型。
-- 明确 FD 所有权和关闭时机。
-- 不把可变对象同时交给多个线程。
-- 不信任 callback 中声明的 package/user。
-
-“已经过 Parcel”不等于“业务上可信且适合长期持有”。
-
----
-
-## 19. 权限检查要分层
-
-```text
-Framework permission：能不能调用这一类能力
-AppOps：某些可审计/可动态控制操作是否允许
-UID/package 对应关系：调用者是否真的拥有所声明包名
-user/profile 规则：能操作哪个用户的数据
-对象归属：taskId 是否属于这个调用者
-SELinux Binder/service 权限：进程域能否 find/call
-```
-
-这些层不是互相替代。SELinux 允许 Binder `call`，不代表业务 API 自动授权；Java permission 通过，也不代表能跨用户读取任意 task。
-
-签名权限示意：
-
-```xml
-<permission android:name="android.permission.MANAGE_MOWER_DIAGNOSTICS"
-    android:protectionLevel="signature" />
-```
-
-真实命名、公开范围和声明位置需要平台 API/权限审核。
-
----
-
-## 20. 跨用户不是只看 `userId`
-
-客户端传入 `userId=0` 不构成授权。服务端应从 `Binder.getCallingUid()` 推导调用用户，再按需要调用标准跨用户权限检查。
-
-任务记录至少保存：
-
-```text
-ownerUid
-ownerUserId
-taskId
-createdElapsedRealtime
-state
-generation
-```
-
-查询和取消时重新比较 owner。若允许 device owner、profile owner 或 system UID 越权管理，应把例外写成明确策略，不要散落 `uid == SYSTEM_UID` 判断。
-
----
-
-## 21. Handler 作为单一状态 owner
-
-```text
-Binder线程1 ─┐
-Binder线程2 ─┼─ post Command ─→ MowerDiagnostics Handler
-BootPhase  ──┤                         │
-User事件    ──┘                         ├─ 唯一修改 UserState
-daemon回调 ───────── post Event ───────┘
-```
-
-优点：
-
-- 大多数业务状态无需多把锁。
-- 顺序更容易推理和复现。
-- dumpsys 可以通过 snapshot 获取一致视图。
-- 防止 Binder 线程池被慢诊断占满。
-
-但 Handler 并非魔法：阻塞它会让所有业务事件排队。真正重 CPU/I/O 工作还应交给受限 executor，再把结果 post 回 owner。
-
----
-
-## 22. 状态机比布尔变量可靠
-
-```text
-IDLE
-  └─ start → QUEUED
-QUEUED
-  ├─ dispatch → RUNNING
-  └─ cancel   → CANCELLED
-RUNNING
-  ├─ success  → SUCCEEDED
-  ├─ error    → FAILED
-  ├─ cancel   → CANCELLING → CANCELLED
-  └─ backend death → RETRY_WAIT / FAILED
-```
-
-每条边写清：触发事件、允许前态、状态写入、持久化点、callback、统计和超时。
-
-两个布尔量 `running`、`cancelled` 能组合出矛盾状态；枚举状态机可以禁止非法转换。
-
----
-
-## 23. generation 防止旧回调污染新连接
-
-外部 daemon 重连示例：
-
-```java
-private int mBackendGeneration;
-
-private void connectBackend() {
-    final int generation = ++mBackendGeneration;
-    backend.connect(result -> mHandler.post(() -> {
-        if (generation != mBackendGeneration) return;
-        handleBackendResult(result);
-    }));
-}
-```
-
-旧连接在超时后仍可能送达结果。只检查 taskId 有时不够，因为 task 可能重试。`generation` 把事件绑定到特定连接世代。
-
----
-
-## 24. callback 生命周期
-
-`RemoteCallbackList` 适合维护跨进程 callback：
-
-```java
-private final RemoteCallbackList<IMowerDiagnosticsCallback> mCallbacks =
-        new RemoteCallbackList<>();
-```
-
-它利用 Binder death 清理死亡客户端，但仍需设计：
-
-- callback 是按用户、按任务还是全局注册？
-- 重复注册如何处理？
-- `beginBroadcast()`/`finishBroadcast()` 必须配对。
-- 回调失败不能破坏主状态机。
-- callback 中不能携带敏感的其他用户状态。
-- 服务销毁/测试清理时是否 `kill()`。
-
-一次 `RemoteException` 是症状，不应让任务状态回滚。
-
----
-
-## 25. 不要持锁做外部调用
-
-危险模式：
-
-```java
-synchronized (mLock) {
-    callback.onFinished(...);       // 跨进程
-    packageManager.someCall(...);   // 可能 Binder
-}
-```
-
-对方可能反向调用、阻塞或等待另一把锁，形成死锁链。
-
-安全模式：锁内只复制必要快照，释放锁后 IPC。若使用单 owner Handler，仍要避免 Handler 内同步调用不可控远端服务；至少设置清楚的失败和超时边界。
-
----
-
-## 26. 同步、oneway 与 Handler 是三段队列
-
-一次 callback 可能经过：
-
-```text
-服务 Handler 等待
- → Binder oneway 发送
- → 目标进程 Binder 线程接收
- → Manager post 到 App Executor
- → App callback 执行
-```
-
-所以“服务已经调用 callback”不等于“App 已处理”。可观测性应分别记录状态提交时间和通知尝试时间，不能用 callback 返回代表端到端完成。
-
----
-
-## 27. Binder 载荷要有硬上限
-
-不推荐：
-
-```aidl
-byte[] getFullDiagnosticArchive(long taskId);
-List<LogLine> getAllLogs(long taskId);
-```
-
-更合理：
-
-- 小型状态直接 Parcelable。
-- 列表分页，并限制 page size。
-- 大结果写受控文件，通过只读 FD/URI 流式返回。
-- 服务端验证调用者并限制并发 FD 数。
-- 返回摘要、hash、长度，调用者自行流式读取。
-
-Binder buffer 是进程共享的有限资源；失败可能来自同时在途事务总量，并非单次对象一定超过某个固定 Java 常量。
-
----
-
-## 28. per-user 内存模型
-
-```java
-private final SparseArray<UserState> mUserStates = new SparseArray<>();
-
-private static final class UserState {
-    final int userId;
-    final LongSparseArray<TaskRecord> tasks = new LongSparseArray<>();
-    boolean unlocked;
-}
-```
-
-所有访问都在 owner Handler 上，就不必给 `mUserStates` 和 `tasks` 分别加锁。
-
-但 `dumpsys` 在 Binder 线程执行。可选择：
-
-1. post 一个 snapshot 请求并有限时等待；或
-2. owner 每次状态变化后更新 immutable/volatile snapshot。
-
-不要让 dumpsys 无限等待已经卡住的 Handler。
-
----
-
-## 29. 用户生命周期与 DE/CE
-
-```java
-@Override
-public void onUserStarting(TargetUser user) {
-    postUserEvent(STARTING, user.getUserIdentifier());
-}
-
-@Override
-public void onUserUnlocking(TargetUser user) {
-    postUserEvent(UNLOCKING, user.getUserIdentifier());
-}
-
-@Override
-public void onUserStopping(TargetUser user) {
-    postUserEvent(STOPPING, user.getUserIdentifier());
-}
-```
-
-设计原则：
-
-- 解锁前必需的数据放 Device Encrypted（DE）存储。
-- 敏感且仅解锁后需要的数据放 Credential Encrypted（CE）存储。
-- `PHASE_BOOT_COMPLETED` 是全局服务阶段，不等于每个用户已解锁。
-- 用户停止时取消资源、移除 callback、关闭 FD，是否保留最终结果由产品策略决定。
-
----
-
-## 30. 持久化只保存恢复真正需要的事实
-
-建议保存：
-
-```text
-最后一次最终状态
-任务创建/完成 wall time 与 elapsed time（注明时钟）
-结果摘要和错误码
-schema version
-backend generation 或恢复标记
-```
-
-不要保存活 Binder callback、线程对象或正在运行的 Future。
-
-`AtomicFile` 能改善“写一半文件损坏”，但不能自动解决 schema 兼容、跨文件事务和错误数据语义。
-
----
-
-## 31. 写盘策略
-
-每个进度百分比都同步写盘会放大 I/O。可采用：
-
-```text
-QUEUED/RUNNING：内存权威，必要时节流 checkpoint
-SUCCEEDED/FAILED/CANCELLED：提交最终状态后原子写盘
-system_server 退出：不能依赖总有优雅清理机会
-```
-
-真正重要的恢复语义必须在状态转换时提交，不能只等 `shutdown()`。
-
-敏感原始日志最好由专门受控存储管理，摘要文件不应成为新的隐私泄漏点。
-
----
-
-## 32. system_server 重启后的恢复
-
-启动加载流程：
-
-```text
-读取 schema
- → 校验 owner/user/task 字段
- → 最终态直接恢复
- → 上次 RUNNING 不能假装仍在运行
- → 标记 INTERRUPTED 或依据 backend token 查询
- → 决定安全重试还是明确失败
- → 更新 generation
-```
-
-是否自动重试取决于操作是否幂等。若重复执行可能损伤设备或重复收费，必须使用幂等 token/后端去重，或要求人工重试。
-
----
-
-## 33. 外部服务死亡恢复
-
-```text
-Binder deathRecipient
-  → 只做极少工作
-  → post BACKEND_DIED(generation)
-  → owner 校验世代
-  → 更新任务状态
-  → 指数退避重连
-  → 重连后重新查询权威状态
-```
-
-不要在 `binderDied()` 中长时间同步重连。死亡回调所在线程不是业务 owner。
-
-退避应有上限和抖动，避免多个服务同时重启形成惊群。
-
----
-
-## 34. 幂等与重复请求
-
-客户端可能因为超时而重试，但第一次请求其实已被受理。解决方式之一：
-
-```text
-clientRequestId + ownerUid + userId
-```
-
-服务在一定窗口内记录这个键，并返回同一 taskId。不要用随机 taskId 本身替代调用者幂等键。
-
-需要明确：去重窗口、持久化范围、相同 key 不同参数时的错误、用户删除后的清理。
-
----
-
-## 35. 错误模型要能行动
-
-比 `boolean success` 更有用：
-
-```text
-ERROR_PERMISSION_DENIED      # 通常直接抛 SecurityException
-ERROR_NOT_READY              # 可稍后重试
-ERROR_BUSY                   # 有 retryAfterMillis
-ERROR_INVALID_ARGUMENT       # 修改请求
-ERROR_BACKEND_DIED           # 服务将恢复或已终止
-ERROR_TIMEOUT                # 结果未知，先 query
-ERROR_CANCELLED              # 明确终态
-ERROR_INTERNAL               # 带稳定子码，不暴露敏感堆栈
-```
-
-特别注意：同步调用超时不一定表示远端操作没执行。客户端应凭幂等键或 taskId 查询。
-
----
-
-## 36. `RemoteException` 的 Manager 处理
-
-平台内部 Manager 常见模式是 `e.rethrowFromSystemServer()`，部分查询 API 会降级为空集合。选择取决于契约：
-
-- 返回空集合是否会把“服务死亡”伪装成“确实没有数据”？
-- 调用方能否安全重试？
-- 这是命令还是只读查询？
-- API 是否已经有向后兼容约定？
-
-本服务的 `startDiagnosis()` 不应在服务死亡时返回假 taskId；`getStatus()` 可以返回明确 unavailable 状态或抛契约化异常。
-
----
-
-## 37. ServiceManager 名字的 SELinux 标签
-
-概念示意：
-
-```text
-# service_contexts
-mower_diagnostics    u:object_r:mower_diagnostics_service:s0
-
-# service.te
-type mower_diagnostics_service, system_api_service, service_manager_type;
-```
-
-标签将服务名映射为 SELinux type。然后分别控制：
-
-```text
-system_server 是否可 add
-客户端 domain 是否可 find
-客户端是否可对服务 Binder call
-服务回调客户端是否需要反向 Binder 权限
-```
-
-具体宏和 type attribute 必须结合当前树规则及 neverallow 审核，不能照抄示意策略。
-
----
-
-## 38. `find`、`call` 和业务权限不是一回事
-
-```text
-find：从 servicemanager 获得 handle
-call：Binder IPC 是否被 SELinux 允许
-permission：Framework 服务方法内业务授权
-```
-
-典型排错顺序：
-
-1. `service list` 是否存在名字？
-2. logcat 是否有 `avc: denied { find }`？
-3. transact 是否出现 `{ call }` 拒绝？
-4. Java 是否抛 `SecurityException`？
-5. user/task ownership 是否拒绝？
-
-不要看到“Permission denied”就只加 Java permission 或只加 allow 规则。
-
----
-
-## 39. 最小 SELinux 权限原则
-
-不建议：让所有 appdomain 查找和调用，或把服务标成过于宽泛的 attribute。
-
-建议先列访问矩阵：
-
-| 主体 | find | call | callback | 数据文件 |
-|---|---:|---:|---:|---:|
-| system_server | add/自身对象 | 内部按需 | 是 | 读写 |
-| 特权系统 App | 是 | 是 | 被回调 | 否 |
-| 普通 App | 否 | 否 | 否 | 否 |
-| isolated App | 否 | 否 | 否 | 否 |
-| vendor daemon | 按架构决定 | 按架构决定 | 按需 | 独立最小授权 |
-
-先有矩阵，再写 policy。
-
----
-
-## 40. LocalService 的用途
-
-```java
-public abstract class MowerDiagnosticsInternal {
-    public abstract Snapshot getSnapshotForSystemServer(int userId);
-}
-```
-
-其他 system_server 服务：
-
-```java
-MowerDiagnosticsInternal service =
-        LocalServices.getService(MowerDiagnosticsInternal.class);
-```
-
-它适合可信进程内协作，避免把内部能力暴露为公共 Binder API。但调用发生在调用者当前线程，若实现会阻塞，仍要定义异步接口或线程约束。
-
-LocalService 不能依赖 Binder callingUid 做鉴权；调用双方同在 system_server，应以内部 API 最小化和代码所有权保障边界。
-
----
-
-## 41. dumpsys 是第一现场
-
-教学输出：
-
-```text
-MowerDiagnosticsService:
-  ready=true bootPhase=1000 backend=CONNECTED generation=4
-  queueDepth=1 oldestQueueAgeMs=32
-  user 0: unlocked=true tasks=3 running=1
-    #1042 RUNNING ageMs=821 progress=40 ownerUid=10032
-  recentFailures:
-    BACKEND_DIED count=2 lastElapsedMs=...
-  latencyMs: accept p50=1 p95=3; run p50=420 p95=1900
-```
-
-应避免输出：原始位置、认证 token、完整文件路径、设备唯一标识和任意用户的敏感内容。
-
-`dump()` 自身要做 `DUMP` 权限检查，并支持 `--user`、`--task`、`--proto` 等有界参数。
-
----
-
-## 42. dumpsys 不能制造第二次卡死
-
-若 owner Handler 已阻塞，Binder dump 再无限等待它，只会让取证工具也挂住。
-
-推荐：
-
-```text
-Binder dump线程
- → 检查 DUMP 权限
- → 请求 snapshot
- → 最多等待例如 2 秒
- → 超时则打印 lastKnownSnapshot + "handler unresponsive"
-```
-
-这比只打印“timeout”更有诊断价值。
-
----
-
-## 43. 启动可观测性
-
-SystemServer 启动处：
-
-```java
-t.traceBegin("StartMowerDiagnosticsService");
-mSystemServiceManager.startService(MowerDiagnosticsService.class);
-t.traceEnd();
-```
-
-服务内部还可划分：
-
-```text
-MowerDiag#LoadDeState
-MowerDiag#ConnectBackend
-MowerDiag#RegisterObservers
-```
-
-不要为了图好看把异步任务 slice 画成同步完成。跨线程异步 trace 需要可关联 cookie/taskId；同步 `traceBegin/End` 只能描述当前线程区间。
-
----
-
-## 44. 运行期指标
-
-建议最少包含：
-
-| 指标 | 维度 | 用途 |
-|---|---|---|
-| accepted count | result/调用方类别 | 入口趋势 |
-| queue delay | bucket | 是否 owner 线程拥塞 |
-| execution latency | operation/result | 后端是否变慢 |
-| backend death | backend/version | 稳定性 |
-| recovery latency | result | 自愈效果 |
-| active tasks | user 类别，不放真实 userId | 容量 |
-| payload size | bucket | Binder 风险 |
-
-避免把 UID、taskId、原始错误文本作为高基数字段写入 statsd。
-
----
-
-## 45. EventLog、statsd、trace 和 dumpsys 各管什么
-
-```text
-trace：一次问题的线程时间线和等待链
-EventLog/logcat：离散事件与工程日志
-statsd Atom：跨设备/跨时间的结构化聚合
-dumpsys：当前状态和有限历史快照
-持久化状态：业务恢复事实
-```
-
-不能用 statsd 聚合报告恢复某个 task，也不能用大量 logcat 代替结构化指标。
-
----
-
-## 46. 日志隐私与限流
-
-```java
-Slog.i(TAG, "task accepted id=" + taskId + " uid=" + callingUid);
-```
-
-即便是系统日志，也要评估 UID/taskId 是否需要散列或省略。循环故障要限流，避免每次重试打印完整堆栈导致 log buffer 被冲掉。
-
-错误码稳定，错误文本服务于人；不要让自动化依赖易变化的英文日志字符串。
-
----
-
-## 47. shell 命令是受控诊断面
-
-可设计：
-
-```text
-cmd mower_diagnostics status --user current
-cmd mower_diagnostics run-test --component motor
-cmd mower_diagnostics reset-test-state
-```
-
-其中会改变状态的命令必须限制 shell/root、debuggable build 或专用权限。测试后门不能默认向生产 App 开放。
-
-shell command 也走 Binder 线程，真正工作仍应 post，并设置明确超时。
-
----
-
-## 48. 不要默认把服务做成 lazy
-
-SystemServer 管理的 `SystemService` 通常随 system_server 启动，并不因为没有客户端就由 servicemanager 自动销毁。
-
-lazy AIDL 服务常用于独立 native 进程，涉及 init `interface aidl`、servicemanager client callback 和进程启停。把两种生命周期混在一起，会造成“为什么服务不会被停掉”的误判。
-
-本教学服务保持 system_server 内常驻，只让昂贵后端连接按需建立。
-
----
-
-## 49. 依赖 native daemon/HAL 时的边界
-
-```text
-Framework Binder API：App/系统组件调用入口
-system_server 状态机：权限、用户、策略、恢复
-HAL/daemon API：硬件能力与底层错误
-kernel driver：真实设备控制/事件
-```
-
-不要原样把 ioctl/HAL error 暴露给 App。Framework 应映射成稳定错误模型，并保留内部诊断子码。
-
-如果跨 system/vendor，必须同时考虑接口稳定性、VINTF、Binder 世界、SELinux 和升级组合。
-
----
-
-## 50. 完整请求时序
-
-```text
-App        Manager       BinderService       OwnerHandler       Backend
- | start()    |                |                   |                |
- |----------->| transact       |                   |                |
- |            |--------------->| permission       |                |
- |            |                | validate/copy     |                |
- |            |                | post START ------>|                |
- |            |<-- taskId -----|                   |                |
- |<-- taskId--|                |                   | start -------->|
- |            |                |                   |<-- progress ---|
- |            |<-- oneway callback ---------------|                |
- |<--Executor callback----------|                   |                |
- | query() -------------------->|------post/query snapshot---------->|
- |<---------------- status ----|                   |                |
-```
-
-图中 `taskId` 返回时，任务可能仍是 QUEUED。API 文档必须写清楚。
-
----
-
-## 51. 后端死亡与恢复时序
-
-```text
-Backend      DeathRecipient       OwnerHandler       Client
-   X               |                   |                |
-   |-- binderDied ->|                   |                |
-   |                |-- post(gen=7) --->|                |
-   |                |                   | mark RETRY_WAIT|
-   |                |                   | persist        |
-   |                |                   | callback ------>|
-   |                |                   | backoff         |
- new backend        |                   | connect(gen=8)  |
-   |<-----------------------------------|                |
-   |-- snapshot/result ---------------->| reconcile       |
-```
-
-恢复不是“重新 getService 就结束”，还必须把本地状态与后端权威状态对账。
-
----
-
-## 52. 启动与用户解锁时序
-
-```text
-SystemServer
-  → startService
-  → onStart：线程、Binder、LocalService
-  → PHASE_SYSTEM_SERVICES_READY：连接必要依赖
-  → user 0 STARTING：加载 DE 摘要
-  → user 0 UNLOCKING：允许读取 CE 详情
-  → PHASE_BOOT_COMPLETED：安排非关键维护
-  → user 10 STARTING/UNLOCKING：独立 UserState
-```
-
-全局 boot phase 与每用户生命周期是两条轴。不要用一个 `mBootCompleted` 布尔量代替所有 readiness。
-
----
-
-## 53. 单元测试切分
-
-尽量把业务状态机从 Android 组件中拆出：
-
-```text
-MowerDiagnosticsService：平台生命周期和 Binder 适配
-DiagnosticsController：纯状态机
-Backend：可替换接口
-StateStore：可替换持久层
-Clock：可注入时钟
-Metrics：可替换记录器
-```
-
-这样在 macOS 上即使不编译整套 AOSP，也能通过阅读测试设计验证依赖是否清晰。
-
-关键单测：合法转换、重复请求、取消竞态、旧 generation 回调、超时、写盘失败和恢复损坏文件。
-
----
-
-## 54. Binder/权限测试矩阵
-
-| 场景 | 预期 |
+| 层 | 必测问题 |
 |---|---|
-| 无签名权限调用 | `SecurityException` |
-| 有权限同用户调用 | 受理并返回 taskId |
-| 伪造 packageName | 拒绝 |
-| 查询其他 UID task | 拒绝或脱敏 |
-| 跨用户无权限 | 拒绝 |
-| isolated UID | 无法获取/调用 |
-| 超大 Parcelable | 入口校验拒绝，不拖垮进程 |
-| callback 进程死亡 | 自动清理，任务继续 |
-| 并发重复 requestId | 返回同一任务或稳定冲突 |
+| Binder/API | 无权限、跨用户、null/超长参数、未知 flag、并发重复请求 |
+| 状态机 | 每条合法转换、非法转换、cancel 与 finish 竞态、generation 过期 |
+| callback | 客户端死亡、注销、oneway 堵塞、回调抛异常、重注册后 query |
+| 后端 | 死在接受前、接受后/结果前、结果后/本地写盘前，重连失败 |
+| 持久化 | 写半截、sync/rename 失败、旧 schema、损坏文件、用户未解锁 |
+| 生命周期 | BootPhase 依赖未 ready、用户 start/unlock/stop、服务关闭 |
+| 可观测性 | dump 权限、快照超时、超多任务截断、敏感字段脱敏 |
 
-测试不仅看返回值，也看任务表、callback 数量、指标和无资源泄漏。
+### 故障注入比只测“一次成功”更有价值
+
+针对本章场景，至少推演四刀：
+
+```text
+刀 1：startDiagnosis 返回 taskId 后立刻杀客户端
+预期：任务继续；callback 自动清理；重启后 query 可取状态
+
+刀 2：后端接受任务后死亡
+预期：进入 RECOVERING；按 operationId/幂等策略收敛；不盲目重复副作用
+
+刀 3：后端结果到达后、AtomicFile 提交前重启 system_server
+预期：恢复后查询后端或标 UNKNOWN；不能凭内存假装成功
+
+刀 4：新连接 generation=8 建立后注入 generation=7 的迟到结果
+预期：记录 stale callback，不修改 task 42 当前状态
+```
+
+这些“预期”是设计验收标准，不是本机已经执行的测试结果。
 
 ---
 
-## 55. 生命周期与恢复测试矩阵
+## 14. 在 Mac 上不编译，怎样完成一次源码验证？
 
-| 注入点 | 要验证 |
+### 验证一：服务怎样启动与发布
+
+```bash
+rg -n 'StartSystemConfigService|startService\(SystemConfigService' frameworks/base/services/java/com/android/server/SystemServer.java
+
+rg -n 'class SystemConfigService|onStart|publishBinderService' frameworks/base/services/java/com/android/server/SystemConfigService.java
+```
+
+预期证明：SystemServer 通过 `SystemServiceManager` 启动服务，服务在 `onStart()` 发布 Binder。
+
+### 验证二：三条注册链确实不同
+
+```bash
+rg -n 'publishBinderService|publishLocalService' frameworks/base/services/core/java/com/android/server/SystemService.java
+
+rg -n 'SYSTEM_UPDATE_SERVICE|CachedServiceFetcher|getServiceOrThrow' frameworks/base/core/java/android/app/SystemServiceRegistry.java
+```
+
+记录 `ServiceManager.addService()`、`LocalServices.addService()` 和 `ContextImpl` Manager cache 分别出现在哪里。
+
+### 验证三：生命周期都在哪条线程被调用
+
+```bash
+rg -n 'All lifecycle methods|onBootPhase|onUserStarting|onUserUnlocking|onUserStopping|onUserStopped' frameworks/base/services/core/java/com/android/server/SystemService.java
+```
+
+预期证明：SystemService 生命周期在 SystemServer main Looper；BootPhase 与 per-user 生命周期是不同维度。
+
+### 验证四：callback death 与 AtomicFile 边界
+
+```bash
+rg -n 'linkToDeath|binderDied|beginBroadcast|finishBroadcast' frameworks/base/core/java/android/os/RemoteCallbackList.java
+
+rg -n 'does not confer any file locking|startWrite|finishWrite|failWrite' frameworks/base/core/java/android/util/AtomicFile.java
+```
+
+记录 `RemoteCallbackList` 自动清理什么，以及 `AtomicFile` 明确要求调用者负责什么互斥。
+
+### 验证五：服务名与 SELinux type 的对应
+
+```bash
+rg -n '^system_config|^system_update' system/sepolicy/private/service_contexts
+
+rg -n 'system_config_service|system_update_service' system/sepolicy/public/service.te
+```
+
+预期证明：Binder 服务名不仅是 Java 常量，还要映射到 SELinux service type。
+
+### 自检题与答案
+
+**1. `publishBinderService()` 成功后，为什么 `Context.getSystemService()` 仍可能取不到 Manager？**
+
+Binder 发布只建立 ServiceManager 的“名字→Binder”映射。Context 侧还需要 `SystemServiceRegistry` 注册 Manager 工厂和类型映射。
+
+**2. `startDiagnosis()` 为什么不是 oneway？**
+
+调用方需要明确知道鉴权/参数校验是否通过并取得 taskId。它是一个短同步“受理事务”，真正诊断异步执行。
+
+**3. callback 已经是 oneway，为什么还必须提供 `getStatus()`？**
+
+oneway 只让发送方不等 reply。客户端可死亡、通知可错过、system_server 可重启；查询接口才用于重新同步权威状态。
+
+**4. Handler 单线程 owner 能否保证服务永不卡？**
+
+不能。它只让状态转换串行。若在 Handler 上做慢 I/O、等待后端或发送大量 callback，仍会造成队列积压。
+
+**5. generation 与幂等键分别解决什么？**
+
+generation 拒绝旧连接/旧尝试的迟到异步结果；幂等键让客户端重复提交同一意图时返回同一任务或明确冲突。
+
+**6. AtomicFile 提交成功，能否证明 callback 已送达、后端事务也原子完成？**
+
+不能。它只保护单个文件的新旧版本完整性，不提供跨后端、日志、回调的分布式事务，也不提供并发文件锁。
+
+**7. 为什么不能先 `clearCallingIdentity()` 再检查权限？**
+
+那会把后续检查的调用身份变成 system_server，可能让未经授权的原始调用者借用系统身份通过检查。
+
+**8. `onBootPhase(PHASE_BOOT_COMPLETED)` 到了，能否读取所有用户 CE 数据？**
+
+不能。BootPhase 是系统启动轴，每个用户还有独立的 start/unlock/stop 轴；未解锁用户的 CE 数据仍不可用。
+
+**9. 后端死后为什么不能总是自动重试？**
+
+若操作有副作用且后端不能查询、不能用幂等 id 去重，服务无法知道旧操作是否已经执行；盲重试可能重复控制硬件。
+
+**10. dumpsys 为什么需要超时快照？**
+
+若它无界等待已卡住的状态线程，会让诊断命令本身也挂住。超时快照至少保留“取不到状态”这一现场证据。
+
+### 本章 takeaway
+
+以后评审新增 SystemService，不要先问“Stub 写完了吗”，先画这条链：
+
+```text
+[身份/用户/参数]
+        ↓
+[短同步受理 + taskId]
+        ↓
+[Handler 状态机]
+        ↓
+[后端 operationId + generation]
+        ↓
+[持久化权威状态]
+        ↓
+[callback 通知 + query 补偿]
+        ↓
+[dump / trace / metrics 可证明]
+```
+
+链上任何一步没有失败语义和恢复入口，服务就只是“正常路径能跑”，还不是可上线维护的系统能力。
+
+---
+
+## 源码定位表
+
+| 目的 | r48 文件/符号 |
 |---|---|
-| `onStart()` 前依赖不可用 | 不无界等待，状态可解释 |
-| DE 文件损坏 | 隔离坏数据，安全默认值，有指标 |
-| 用户未解锁 | 不读取 CE，API 返回明确状态 |
-| 用户停止 | 释放 per-user 资源 |
-| backend 运行中死亡 | generation 生效，任务可恢复/明确失败 |
-| system_server 重启 | RUNNING 不被误报为仍运行 |
-| 写最终态时掉电 | AtomicFile 恢复到旧或新完整版本 |
-| owner Handler 卡住 | dumpsys 有限时返回 last snapshot |
-
----
-
-## 56. 性能测试矩阵
-
-```text
-冷启动：服务 onStart 自身耗时
-首次请求：class load/连接后端成本
-稳态请求：Binder + queue + backend 各段
-并发请求：Binder pool 和 Handler queue 是否饥饿
-慢客户端 callback：oneway 队列与 RemoteCallbackList 行为
-大结果：分页/FD 流是否有背压
-长时间运行：任务表、callback、FD、线程是否泄漏
-```
-
-只报告平均值会掩盖长尾，应至少观察 p50/p95/p99、最大值和失败数，并注明样本和时钟。
-
----
-
-## 57. 故障注入优先于只测成功路径
-
-值得主动模拟：
-
-- callback 在进度 50% 时死亡。
-- backend 在命令已执行但 reply 未返回时死亡。
-- cancel 与 success 同时到达。
-- 同一 clientRequestId 参数不同。
-- 磁盘满、文件损坏、schema 过新。
-- 用户在任务运行中停止。
-- Handler 队列被一个慢任务占住。
-- 旧 generation 在重连后返回 success。
-
-每个场景都要回答最终权威状态是什么，而不仅是“有没有 crash”。
-
----
-
-## 58. macOS 只读练习一：追真实最小闭环
-
-```bash
-cd /Users/ninebot/androidSource
-
-sed -n '1,180p' \
-  frameworks/base/services/java/com/android/server/SystemConfigService.java
-
-sed -n '1,180p' \
-  frameworks/base/core/java/android/os/SystemConfigManager.java
-
-rg -n "SYSTEM_CONFIG_SERVICE|SystemConfigManager" \
-  frameworks/base/core/java/android/app/SystemServiceRegistry.java \
-  frameworks/base/core/java/android/content/Context.java \
-  frameworks/base/services/java/com/android/server/SystemServer.java
-```
-
-请手画：Context 常量 → Registry → Manager → AIDL → Service → SystemServer。某些服务的 Manager 会直接查 ServiceManager，某些由 Registry 注入 Binder，模式不必完全相同。
-
----
-
-## 59. macOS 只读练习二：追发布方法
-
-```bash
-cd /Users/ninebot/androidSource
-
-sed -n '450,525p' \
-  frameworks/base/services/core/java/com/android/server/SystemService.java
-
-sed -n '1,150p' \
-  frameworks/base/core/java/com/android/server/LocalServices.java
-
-rg -n "addService\(|getServiceOrThrow|checkService\(" \
-  frameworks/base/core/java/android/os/ServiceManager.java
-```
-
-回答：哪条路径跨进程？谁负责名字映射？LocalService 调用在哪条线程执行？
-
----
-
-## 60. macOS 只读练习三：追用户生命周期
-
-```bash
-cd /Users/ninebot/androidSource
-
-sed -n '250,365p' \
-  frameworks/base/services/core/java/com/android/server/SystemService.java
-
-rg -n "onUserStarting|onUserUnlocking|onUserStopping" \
-  frameworks/base/services/core/java/com/android/server | head -80
-```
-
-选一个真实 per-user 服务，记录它在 starting、unlocking、stopping 分别初始化和释放什么。不要仅凭方法名推测，要跟进实现。
-
----
-
-## 61. macOS 只读练习四：追权限与 dump
-
-```bash
-cd /Users/ninebot/androidSource
-
-rg -n "enforceCallingOrSelfPermission|enforceCallingPermission" \
-  frameworks/base/services/core/java/com/android/server | head -80
-
-rg -n "DumpUtils.checkDumpPermission|Manifest.permission.DUMP" \
-  frameworks/base/services/core/java/com/android/server | head -80
-
-rg -n "service_manager_type|add_service|allow.*find" \
-  system/sepolicy/public system/sepolicy/private | head -100
-```
-
-练习把一次拒绝定位到 SELinux find/call、Framework permission、跨用户或对象归属中的一层。
-
----
-
-## 62. 代码评审清单：API
-
-- [ ] 接口是 public、SystemApi、hide 还是设备私有，理由明确。
-- [ ] 同步方法保证快速、有界。
-- [ ] 长任务有 taskId、query、cancel 和幂等语义。
-- [ ] callback 丢失不影响事实恢复。
-- [ ] Parcelable 大小、集合数量和版本有上限。
-- [ ] 错误码稳定且可行动。
-- [ ] Manager callback 线程有明确 Executor。
-- [ ] 可选服务与必选服务的 null/throw 契约一致。
-
----
-
-## 63. 代码评审清单：并发与恢复
-
-- [ ] 可变状态有单一 owner 或清楚锁层级。
-- [ ] 不在锁内或关键 Handler 上做不可控 IPC/I/O。
-- [ ] Binder 身份在正确时机捕获、清除、恢复。
-- [ ] callback/death 回调先 post 到 owner。
-- [ ] generation 能淘汰旧事件。
-- [ ] cancel/success/death 竞态有唯一终态。
-- [ ] 重试有退避、上限、幂等依据。
-- [ ] 持久化只恢复可验证事实。
-
----
-
-## 64. 代码评审清单：安全与隐私
-
-- [ ] 服务端权限检查不可绕过。
-- [ ] UID/package/user/task 归属全部验证。
-- [ ] `allowIsolated` 选择有依据。
-- [ ] SELinux add/find/call 权限最小化。
-- [ ] LocalService 没有误暴露危险内部能力。
-- [ ] dumpsys/log/stats 不泄露敏感数据。
-- [ ] shell 测试入口生产环境受控。
-- [ ] 文件标签、目录权限、DE/CE 选择正确。
-
----
-
-## 65. 代码评审清单：可观测性与性能
-
-- [ ] SystemServer 启动 slice 命名清楚。
-- [ ] queue delay 与 execution latency 分开。
-- [ ] 状态提交与 callback 通知分开计时。
-- [ ] dumpsys 卡死时能有限时降级。
-- [ ] 指标避免高基数和敏感字段。
-- [ ] payload 有硬上限，大数据走流式通道。
-- [ ] Binder、Handler、executor 三类排队可区分。
-- [ ] 启动关键路径不做可延后的慢工作。
-
----
-
-## 66. 常见失败设计一：Binder Stub 直接做所有工作
-
-后果：Binder 线程被硬件 I/O 占用；多个调用者耗尽线程池；Watchdog 可能只看到线程池不可用，而根因藏在某次诊断。
-
-修正：Stub 只鉴权、校验、复制、入队；owner 管状态；受限 worker 执行重工作。
-
----
-
-## 67. 常见失败设计二：认为 `oneway` 等于不阻塞
-
-发送端不等待 reply，但事务仍需序列化、进入驱动队列、消耗 buffer，由目标进程取出。目标处理慢时，同一 Binder node 的异步事务会积压。
-
-修正：合并高频 progress、限制速率、允许客户端查询最新快照，不逐条保证进度通知。
-
----
-
-## 68. 常见失败设计三：只靠 Binder death 恢复
-
-Binder death 只告诉你连接对象死了，不告诉你最后一个命令是否已经执行。
-
-修正：命令带幂等 ID；后端提供状态查询；重连后 reconcile；不能确认时报告 UNKNOWN/INTERRUPTED，而不是武断重试。
-
----
-
-## 69. 常见失败设计四：把 boot completed 当 user unlocked
-
-设备可能完成全局启动，但次要用户未启动，主用户也可能仍处 Direct Boot 阶段。
-
-修正：分别维护全局 phase、每用户 running/unlocked、后端连接和数据 loaded 状态。
-
----
-
-## 70. 常见失败设计五：用一个大锁换“线程安全”
-
-大锁可能把 Binder、dump、用户生命周期和后端回调串成不可预测锁链。
-
-修正：状态归一到 owner Handler；跨线程只传 command/event；必须锁时规定层级，锁内不 IPC/I/O。
-
----
-
-## 71. 第二遍复读：最容易混淆的十组概念
-
-### 71.1 Binder 服务与 Manager
-
-Binder 服务是跨进程端点；Manager 是客户端 Java 门面。发布一个不自动生成另一个。
-
-### 71.2 Binder 服务与 LocalService
-
-前者有 Parcel、线程切换、UID 和 SELinux；后者是同进程 Java 直调。
-
-### 71.3 `onStart()` 与 ready
-
-`onStart()` 返回只代表该回调完成，不代表用户已解锁、数据已加载或后端已连接。
-
-### 71.4 BootPhase 与用户生命周期
-
-前者是 system_server 全局阶段；后者按 userId 多次发生。
-
-### 71.5 `oneway` 与异步业务
-
-`oneway` 是 Binder reply 语义；业务异步还需要 taskId、状态机、查询和取消。
-
-### 71.6 callback 与权威状态
-
-callback 是可能丢失的通知；服务状态/持久记录才是事实。
-
-### 71.7 Binder death 与操作失败
-
-连接死亡不等于命令未执行。结果可能未知。
-
-### 71.8 AtomicFile 与事务
-
-AtomicFile 防止单文件半写，不提供多文件数据库事务或业务幂等。
-
-### 71.9 SELinux 与 Framework permission
-
-一个管域之间最低通信能力，一个管 API 业务授权；通常两者都要过。
-
-### 71.10 Handler 串行与系统不会卡
-
-Handler 降低共享状态复杂度，但一个慢消息仍会阻塞后续全部消息。
-
----
-
-## 72. 第二遍修订：给初学者的“餐厅”类比
-
-```text
-ServiceManager 名字       = 餐厅门牌登记
-SELinux find              = 是否允许看到/取得联系电话
-Binder call               = 电话线路是否允许接通
-Framework permission      = 是否持有会员/工作证
-BinderService             = 前台接单员
-Handler owner             = 后厨调度台
-worker/backend            = 真正做菜的人和设备
-taskId                    = 取餐号
-callback                  = 叫号广播
-query                     = 主动看取餐屏
-persisted final state     = 已完成订单账本
-LocalService              = 餐厅内部员工当面协作
-```
-
-叫号没听到，不代表菜没做好；电话接通，也不代表你有权下内部订单。这两个类比能同时解释 callback/状态和 SELinux/业务权限的边界。
-
----
-
-## 73. 第二遍修订：一次请求到底在哪些线程
-
-```text
-App 调用线程
-  → system_server 某个 Binder 线程：鉴权/校验/入队
-  → 专用 HandlerThread：状态转换和调度
-  → 受限 worker 或 daemon：慢工作
-  → 专用 HandlerThread：提交结果
-  → App 某个 Binder 线程：收到 oneway callback
-  → App 指定 Executor：业务 callback
-```
-
-“服务运行在 system_server”没有回答执行线程。每个箭头都可能排队，排障时要逐段量测。
-
----
-
-## 74. 第二遍修订：完成的六个层次
-
-```text
-请求已到 Binder Stub
-请求已被 Handler 接收
-后端命令已发出
-后端工作已完成
-服务状态已提交/持久化
-客户端已经处理通知
-```
-
-API、日志和指标使用“完成”一词时必须指出是哪一层。本服务把 task 终态定义为“服务已验证后端结果并提交权威状态”；callback 处理不属于该事务的完成条件。
-
----
-
-## 75. 最终落地顺序建议
-
-若以后真做同类功能，按以下小步评审：
-
-1. 写需求、威胁模型、调用方矩阵和错误语义。
-2. 定 AIDL/Manager 契约与数据上限。
-3. 实现纯状态机和 fake backend 测试。
-4. 接 SystemService、Binder、LocalService 和用户生命周期。
-5. 加持久化、死亡恢复与故障注入。
-6. 加 permission、SELinux、文件标签和隐私审查。
-7. 加 dumpsys、trace、stats 和性能门槛。
-8. 最后决定 public/SystemApi/hidden API 表面并完成兼容性审核。
-
-每一步都能单独审查，问题比一次提交几十个文件更容易定位。
-
----
-
-## 76. 本章结论
-
-新增一个可靠 Framework SystemService，真正困难的不是写出一个 AIDL Stub，而是把以下契约同时闭合：
-
-```text
-发现契约：Context / Registry / ServiceManager 名字一致
-生命周期契约：SystemServer 顺序、BootPhase、per-user 状态明确
-线程契约：Binder 快入口、owner 状态机、受限慢工作
-安全契约：SELinux + permission + UID/user/object ownership
-可靠性契约：taskId、query、幂等、death、generation、持久化
-可观测契约：trace、metrics、dumpsys、隐私和有限时降级
-兼容契约：API 面、Parcelable 演进、跨分区稳定性
-```
-
-当你能拿这七类契约去评审一个新服务，并沿真实源码验证每个注册点、线程和状态转换，就已经从“会追源码”进入“能设计和评审 Framework 服务”的阶段。
-
-第 100 章是前一阶段的综合设计总结，不是当前学习路线的终点。第 101 章起将回到
-Android 11 r48 中真实存在的系统服务和故障链路逐层精读；当前编号路线持续到第 200 章，正文以本地源码为准，
-不会把本章的教学拟新增类冒充为 AOSP 现有实现。
+| SystemService 生命周期与发布 helper | `frameworks/base/services/core/java/com/android/server/SystemService.java` |
+| 服务启动与 BootPhase 调度 | `frameworks/base/services/core/java/com/android/server/SystemServiceManager.java` |
+| SystemServer 启动真实服务 | `frameworks/base/services/java/com/android/server/SystemServer.java` |
+| 最小真实 Binder SystemService | `frameworks/base/services/java/com/android/server/SystemConfigService.java` |
+| Context Manager 注册与缓存 | `frameworks/base/core/java/android/app/SystemServiceRegistry.java` |
+| Manager 的 RemoteException 处理示例 | `frameworks/base/core/java/android/os/SystemUpdateManager.java` |
+| 进程内服务注册 | `frameworks/base/core/java/com/android/server/LocalServices.java` |
+| callback 注册、快照广播与死亡清理 | `frameworks/base/core/java/android/os/RemoteCallbackList.java` |
+| 单文件完整写入/恢复 | `frameworks/base/core/java/android/util/AtomicFile.java` |
+| dump 权限检查示例 | `frameworks/base/services/core/java/com/android/server/UiModeManagerService.java` |
+| Binder 服务名标签 | `system/sepolicy/private/service_contexts` |
+| 服务 type 定义 | `system/sepolicy/public/service.te` |
+
+文中的 `MowerDiagnostics*`、`DiagnosisRequest`、`TaskRecord` 和状态机都是教学设计，不能用 `rg` 在 r48 找到。真实源码只用来证明平台提供了哪些生命周期、注册、回调、文件与安全机制；最终 API、SELinux 规则、恢复策略、时延预算和测试结果必须由实际产品约束决定。

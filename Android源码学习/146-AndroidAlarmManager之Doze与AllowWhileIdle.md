@@ -1,160 +1,123 @@
 # 146 Android AlarmManager：Doze 与 AllowWhileIdle
 
 > 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
-> 学习方式：macOS只读源码，不要求编译、不要求连接设备  
-> 前置章节：第25、129、142、145章
+> 学习方式：macOS 静态阅读源码，不编译、不连接设备  
+> 前置章节：第 25、129、142、145 章
 
 ---
 
-## 1. “允许在空闲时运行”不是“忽略系统”
+## 1. 本章只回答一个问题
 
-Doze期间普通Alarm会被移出主调度队列；`setAndAllowWhileIdle()`和
-`setExactAndAllowWhileIdle()`确实可以穿过这道门，但仍受每UID最小间隔、后台政策、临时白名单时长和交付能力约束。
+假设应用设置了两枚相同时间到期的 Alarm：
 
-本章要把三个经常混在一起的概念拆开：
+- A 是普通 `setExact()`；
+- B 是 `setExactAndAllowWhileIdle()`。
+
+设备随后进入 deep Doze。A 为什么会被挂起，B 为什么仍可能运行，却又可能被推迟到九分钟以后？
+
+答案不是“Doze 关闭了 Alarm”或“exact 一定准时”，而是一条完整政策链：
 
 ```text
-IDLE_UNTIL：AlarmManager进入“挂起普通Alarm”的内部标记
-WAKE_FROM_IDLE：能结束/穿过idle的特殊闹钟
-ALLOW_WHILE_IDLE：普通App可请求，但按UID严格节流的例外
+DeviceIdleController 设置 IDLE_UNTIL
+  → AlarmManagerService 将普通 Alarm 移出主调度队列
+  → AWI 例外继续留在 Batch
+  → 到期时再检查 creator UID 的最小交付间隔
+  → 成功发起交付时附加短暂白名单并建立 InFlight
+  → 所有交付完成后，AMS 反向通知 DIC 可以提前结束 maintenance
 ```
 
----
+本章要建立的核心认识是：
 
-## 2. 源码地图
+> AllowWhileIdle 不是关闭 Doze，而是穿过 idle 挂起门后，仍受频率、身份和其他后台政策约束的一条窄通道。
+
+## 2. 源码地图与四种 flag
+
+核心文件：
 
 ```text
 frameworks/base/core/java/android/app/AlarmManager.java
 frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
 frameworks/base/apex/jobscheduler/service/java/com/android/server/DeviceIdleController.java
 frameworks/base/apex/jobscheduler/framework/java/com/android/server/DeviceIdleInternal.java
-frameworks/base/core/java/android/app/BroadcastOptions.java
 ```
 
----
+先区分四个容易混淆的标记：
 
-## 3. 两个服务如何互相调用
+| 标记 | 谁能获得 | 对 idle 的意义 | 是否走普通 AWI 节流 |
+|---|---|---|---|
+| `FLAG_IDLE_UNTIL` | 仅 system UID 能保留 | 告诉 AMS 在此 Alarm 到期前挂起普通 Alarm | 否 |
+| `FLAG_WAKE_FROM_IDLE` | Binder 入口不接受调用者伪造；服务端为 AlarmClock 添加 | 表示面向用户的提前唤醒点，可拉早 idle 边界 | 否 |
+| `FLAG_ALLOW_WHILE_IDLE` | 普通应用可经 AWI API 请求 | 只允许这一枚 Alarm 在 idle 中运行，并不退出 idle | 是 |
+| `FLAG_ALLOW_WHILE_IDLE_UNRESTRICTED` | 服务端为受信任调用者添加 | 在 idle 中按普通时序运行，不受 AWI 频率门限制 | 否 |
 
-DeviceIdleController通过隐藏 `AlarmManager.setIdleUntil()`安排deep idle状态闹钟，也通过
-`getNextWakeFromIdleTime()`观察下一用户闹钟；AlarmManager则通过 `DeviceIdleInternal.setAlarmsActive()`反向报告交付是否仍在进行。
+还要分清 `wakeup` 与 `WAKE_FROM_IDLE`：
 
-```mermaid
-flowchart LR
-    DIC["DeviceIdleController"] -->|"setIdleUntil / getNextWakeFromIdleTime"| AMS["AlarmManagerService"]
-    AMS -->|"setAlarmsActive true/false"| DIC
-    APP["App allow-while-idle Alarm"] --> AMS
-    AMS --> P["idle挂起、例外、节流与恢复"]
-```
+- `RTC_WAKEUP` / `ELAPSED_REALTIME_WAKEUP` 表示 Alarm 到期时可唤醒 CPU；
+- `FLAG_WAKE_FROM_IDLE` 表示它还是 Doze 边界要优先照顾的特殊 Alarm。
 
-它们构成双向控制闭环，而不是DIC单向“关闭Alarm”。
+所以普通 `setExact(RTC_WAKEUP, ...)` 并不会自动获得 `WAKE_FROM_IDLE`。
 
----
+## 3. deep Doze 怎样在 AMS 中建立挂起门
 
-## 4. IDLE_UNTIL只有system UID能保留
-
-Binder入口会清除非system调用者的 `FLAG_IDLE_UNTIL`：
+`DeviceIdleController.stepIdleStateLocked()` 进入 `STATE_IDLE` 时，会安排下一次 deep-idle 状态 Alarm：
 
 ```java
-if (callingUid != Process.SYSTEM_UID) {
-    flags &= ~FLAG_IDLE_UNTIL;
-}
+scheduleAlarmLocked(mNextIdleDelay, true);
 ```
 
-普通App无法伪造Doze状态边界。公开SDK也没有普通应用可用的 `setIdleUntil()`。
-
----
-
-## 5. DeviceIdleController如何设置IdleUntil
-
-deep状态机调用：
+`true` 最终走到隐藏 API：
 
 ```java
 mAlarmManager.setIdleUntil(
-    ELAPSED_REALTIME_WAKEUP,
-    mNextAlarmTime,
-    "DeviceIdleController.deep",
-    mDeepAlarmListener,
-    mHandler);
+        AlarmManager.ELAPSED_REALTIME_WAKEUP,
+        mNextAlarmTime,
+        "DeviceIdleController.deep",
+        mDeepAlarmListener,
+        mHandler);
 ```
 
-这是exact、wakeup、direct listener Alarm。它既是状态机的下一步定时器，也让AMS知道当前处于Alarm idle区间。
+`AlarmManager.setIdleUntil()` 创建的是 exact、wakeup、direct-listener Alarm，并带上 `FLAG_IDLE_UNTIL`。Binder 入口会清除非 system UID 请求的这个 flag，因此普通应用不能伪造 Doze 截止点。
 
----
-
-## 6. mPendingIdleUntil是AMS的idle开关
-
-AMS把当前带IDLE_UNTIL的Alarm保存在 `mPendingIdleUntil`。其非null时：
-
-```text
-普通Alarm → mPendingWhileIdleAlarms
-ALLOW_WHILE_IDLE → 仍进主Batch
-ALLOW_WHILE_IDLE_UNRESTRICTED → 仍进主Batch
-WAKE_FROM_IDLE → 仍进主Batch
-```
-
-因此Doze不是给每个Alarm加一个“未满足bit”，而是把不同类别送往不同容器。
-
----
-
-## 7. 普通Alarm怎样被挂起
+AMS 插入这枚 Alarm 后，把它记为：
 
 ```java
-if (mPendingIdleUntil != null
-        && (flags & (ALLOW_WHILE_IDLE
-          | ALLOW_WHILE_IDLE_UNRESTRICTED
-          | WAKE_FROM_IDLE)) == 0) {
+mPendingIdleUntil = a;
+```
+
+这个非空引用是本章最重要的内部状态：它不是 PowerManager 所有 light/deep idle 状态的通用镜像，而是 AMS 当前的 deep-idle Alarm 挂起门。light idle 的阶段定时器使用普通 `set()`，不建立这道 `mPendingIdleUntil` 门。
+
+## 4. 普通 Alarm 为什么离开主 Batch
+
+`setImplLocked(Alarm)` 在 `mPendingIdleUntil != null` 时先检查例外 flag：
+
+```java
+if ((a.flags & (FLAG_ALLOW_WHILE_IDLE
+        | FLAG_ALLOW_WHILE_IDLE_UNRESTRICTED
+        | FLAG_WAKE_FROM_IDLE)) == 0) {
     mPendingWhileIdleAlarms.add(a);
     return;
 }
 ```
 
-return发生在standby调整和Batch插入之前。挂起Alarm暂时不会成为下一kernel deadline。
+由此得到容器模型：
 
----
-
-## 8. 已经在Batch里的普通Alarm怎么办
-
-设置新的IDLE_UNTIL后 `needRebatch=true`，AMS执行全量rebatch。重加每个Alarm时，普通项看到
-`mPendingIdleUntil != null`，被转移到pending-while-idle。
-
-所以idle不仅影响之后新set的Alarm，也会重分类已有主Batch。
-
----
-
-## 9. IdleUntil可能被NextWakeFromIdle拉早
-
-若已经存在更早的 `mNextWakeFromIdle`：
-
-```java
-if (idleUntil.whenElapsed > nextWake.whenElapsed) {
-    idleUntil.when = idleUntil.whenElapsed =
-        idleUntil.maxWhenElapsed = nextWake.whenElapsed;
-}
+```text
+普通 Alarm                    → mPendingWhileIdleAlarms
+ALLOW_WHILE_IDLE              → 继续进入 mAlarmBatches
+ALLOW_WHILE_IDLE_UNRESTRICTED → 继续进入 mAlarmBatches
+WAKE_FROM_IDLE                → 继续进入 mAlarmBatches
+IDLE_UNTIL                    → 进入 Batch，并成为 mPendingIdleUntil
 ```
 
-用户闹钟优先于原计划的Doze截止点。DIC不能把设备idle到越过一个应唤醒用户的AlarmClock。
+这个 `return` 发生在 App Standby 时间调整和 Batch 插入之前，挂起项暂时不会参与 kernel deadline 计算。
 
----
+建立 `IDLE_UNTIL` 后，AMS 还会执行全量 rebatch。原来已经在 Batch 中的普通 Alarm 在 `reAddAlarmLocked()` 时同样看见非空的 `mPendingIdleUntil`，于是也转入挂起列表。因此 Doze 不只影响后来新设置的 Alarm。
 
-## 10. IdleUntil还会随机提前
+这也解释了开头的 A：`setExact()` 虽然得到 `FLAG_STANDALONE`，但 standalone 只禁止与其他 Alarm 合批，不属于 idle 例外，A 仍会被挂起。
 
-AMS根据离目标的距离计算fuzz，从IDLE_UNTIL时刻随机减去一段delta。
+## 5. AlarmClock 怎样与 idle 边界协商
 
-这让大量设备不会在完全相同的理论边界集体退出idle。它是系统内部状态闹钟的抖动，不应套到普通App exact Alarm上。
-
----
-
-## 11. 为什么只有一个mPendingIdleUntil
-
-DIC状态机只应拥有一个当前deep idle边界。若新旧对象同时存在，源码会 `wtf`。
-
-全量rebatch还会验证idle-until对象未意外丢失；若丢失则恢复所有pending-while-idle Alarm，避免永远挂起。
-
----
-
-## 12. WAKE_FROM_IDLE从哪里来
-
-外部flags中的WAKE_FROM_IDLE会先被清除。服务端只在可信场景重新添加，最典型的是：
+Binder 入口先清除调用者传来的 `WAKE_FROM_IDLE`；只有可信服务端逻辑可以重新授予。最典型的入口是：
 
 ```java
 if (alarmClock != null) {
@@ -162,249 +125,155 @@ if (alarmClock != null) {
 }
 ```
 
-所以普通 `setExact(RTC_WAKEUP)` 并不自动拥有WAKE_FROM_IDLE；`setAlarmClock()`才表达面向用户的闹钟语义。
+`setAlarmClock()` 因此得到 exact、`RTC_WAKEUP`、standalone 和 `WAKE_FROM_IDLE` 四层语义。AMS 用 `mNextWakeFromIdle` 缓存最早的一枚候选。
 
----
+若 DIC 计划的 `IDLE_UNTIL` 比它更晚，AMS 会先把 idle 截止点拉到该候选时刻，再从这个时刻随机减去一段 fuzz：
 
-## 13. mNextWakeFromIdle只追最早项
+```java
+if (mNextWakeFromIdle != null
+        && idleUntil.whenElapsed > mNextWakeFromIdle.whenElapsed) {
+    idleUntil.whenElapsed = mNextWakeFromIdle.whenElapsed;
+}
+idleUntil.whenElapsed -= randomDelta;
+```
 
-AMS维护最早WAKE_FROM_IDLE Alarm引用。新增更早项会替换并触发rebatch，因为当前IDLE_UNTIL可能需要被拉早。
+所以 fuzz 的确定事实是“状态 Alarm 可能比计算出的边界更早触发”；不要把它误套到普通应用的 exact Alarm 上，也不必从代码之外猜测其产品动机。
 
-它不是所有wakeup Alarm的列表；普通RTC_WAKEUP即使能唤醒CPU，也不等于“应当终止Doze状态”的wake-from-idle。
-
----
-
-## 14. DeviceIdleController会提前避让用户闹钟
-
-DIC判断：
+DIC 还有一层主动避让：
 
 ```java
 nowElapsed + MIN_TIME_TO_ALARM >= getNextWakeFromIdleTime()
 ```
 
-若用户闹钟已经足够近，DIC不再进入deep idle，或重新变ACTIVE再走inactive流程。目的不仅是保证闹钟本身，还要给系统预热留出时间。
+如果用户闹钟已经足够近，DIC 会延后进入 idle，或先恢复 active 再重新评估。AMS 的“拉早既有边界”和 DIC 的“避免新进 idle”共同保护用户闹钟。
 
----
+AlarmClock 不是普通 AWI：它不进入 AWI 的 creator-UID 频率账本，也不因 AlarmClock 身份获得 AWI 的十秒 `BroadcastOptions`。
 
-## 15. AlarmClock不是AllowWhileIdle
+## 6. 普通 AWI 的 exact 到底保证什么
 
-AlarmClock拥有WAKE_FROM_IDLE和Standalone，绕过pending-while-idle；但它的flags不必含ALLOW_WHILE_IDLE。
+两个公开 API 都请求普通 `FLAG_ALLOW_WHILE_IDLE`，差别在初始窗口：
 
-因此它不会走普通AWI的每UID节流账本，也不会仅因AlarmClock身份使用AWI的10秒BroadcastOptions临时白名单。
+```text
+setAndAllowWhileIdle()       → WINDOW_HEURISTIC
+setExactAndAllowWhileIdle()  → WINDOW_EXACT
+```
 
----
+`WINDOW_EXACT` 让服务端设置 `FLAG_STANDALONE`，并令初始 `whenElapsed == maxWhenElapsed`。它没有绕过以下规则：
 
-## 16. 两个App API的差异
+- 非 core 调用者的 `MIN_FUTURITY`；
+- AWI 每 creator UID 最小交付间隔；
+- App Standby 配额；
+- 用户强制后台限制；
+- `PendingIntent` 失效和实际交付失败。
+
+因此 B 能穿过 `mPendingIdleUntil`，但“exact”只描述进入政策链前的单点窗口，不是硬实时承诺。`AlarmManager.java` 对 AWI 的定义也明确说：它允许这一枚 Alarm 在 idle 中执行，不会因此把设备带出 idle。
+
+还有一种受信任路径。Binder 入口会先清掉调用者传来的 unrestricted flag，然后仅在下列条件满足时由服务端重新添加：
+
+```text
+WorkSource == null
+且调用 UID 是 core、SystemUI 或用户电源白名单
+```
+
+此时普通 `ALLOW_WHILE_IDLE` 会被清除，换成 `ALLOW_WHILE_IDLE_UNRESTRICTED`。`WorkSource == null` 的要求避免特权调用者在“代表别人工作”时把自己的无限制资格一起转移出去。
+
+## 7. 到期后怎样计算 AWI 的下一次合法时间
+
+普通 AWI 已经进入 Batch，但真正的频率检查发生在 `triggerAlarmsLocked()` 取出到期 Batch 时。
+
+账本按 `alarm.creatorUid` 索引：
 
 ```java
-setAndAllowWhileIdle(...)
-    window = WINDOW_HEURISTIC
-
-setExactAndAllowWhileIdle(...)
-    window = WINDOW_EXACT
+last = mLastAllowWhileIdleDispatch.get(alarm.creatorUid, -1);
+minTime = last + getWhileIdleMinIntervalLocked(alarm.creatorUid);
 ```
 
-二者都请求 `FLAG_ALLOW_WHILE_IDLE`，差别只是原始窗口；进入idle节流时，exact也可以被重排到更晚的合法minTime。
+使用 `creatorUid` 而不是单纯使用向 AMS 发起 Binder 调用的 UID，意味着代理携带别人创建的 `PendingIntent` 时，频率仍归到真正创建者。
 
----
-
-## 17. ExactAndAllowWhileIdle的“exact”边界
-
-Exact保证进入AMS时窗口为单点、Standalone，不与普通Batch合并；它不保证绕过：
+r48 的默认常量是：
 
 ```text
-MIN_FUTURITY
-每UID allow-while-idle最小间隔
-PendingIntent失效
-进程/组件交付失败
-系统时间和设备状态变化
+ALLOW_WHILE_IDLE_SHORT_TIME       = 5 秒
+ALLOW_WHILE_IDLE_LONG_TIME        = 9 分钟
+ALLOW_WHILE_IDLE_WHITELIST_DURATION = 10 秒
 ```
 
-API名称描述请求类别，不是硬实时承诺。
+API 注释中的“大约一分钟”“例如十五分钟”是概念性或历史描述；分析这个 tag 的默认行为应以实现中的 5 秒和 9 分钟为准。
 
----
-
-## 18. AWI节流按creatorUid
-
-账本键为 `alarm.creatorUid`，不是调用AMS的uid字段。PendingIntent代理场景下，creator身份决定：
+长短间隔的选择公式是：
 
 ```text
-mLastAllowWhileIdleDispatch[creatorUid]
-mUseAllowWhileIdleShortTime[creatorUid]
+正在 deep Doze                         → long
+不在 Doze，且未 force-all-apps-standby → short
+仅 force-all-apps-standby：UID 近期前台 → short
+仅 force-all-apps-standby：其他 UID     → long
 ```
 
-这避免代理调度轻易替目标应用绕过每UID频率限制。
+没有历史记录时 `last == -1`，第一枚 AWI 通过频率门。这里的“第一枚”只是当前 system_server 内存账本中没有一次成功发起的交付，不是应用安装以来永久第一次。
 
----
-
-## 19. 默认短间隔是5秒
-
-r48常量：
-
-```text
-ALLOW_WHILE_IDLE_SHORT_TIME = MIN_FUTURITY = 5秒
-ALLOW_WHILE_IDLE_LONG_TIME  = 9分钟
-WHITELIST_DURATION          = 10秒
-```
-
-Android API注释写“about every minute”和“such as 15 minutes”，是概念性/历史描述；当前源码默认值应以5秒和9分钟为准。
-
----
-
-## 20. 什么时候用short
-
-`getWhileIdleMinIntervalLocked(uid)`：
-
-```text
-不Doze且未force-all-apps-standby → short
-正在Doze → long
-仅force-all-apps-standby：UID最近前台 → short，否则long
-```
-
-Doze优先选择long，即使UID此前在前台记录为short，也不能把deep idle频率降到5秒。
-
----
-
-## 21. mUseAllowWhileIdleShortTime怎样更新
-
-AWI成功进入in-flight时查看creator UID当前是否前台；前台写true，后台写false。AppStateTracker通知UID进入前台时也主动写true。
-
-UID移除时两张AWI账本都删除，避免UID复用继承旧节流历史。
-
----
-
-## 22. 第一枚AWI总能通过频率门
-
-若 `mLastAllowWhileIdleDispatch`没有该UID，返回-1，代码不做间隔限制。
-
-“第一枚”是当前内存账本中尚无成功交付记录，不等于应用安装以来永久第一枚。
-
----
-
-## 23. 节流发生在到期取出时
-
-Alarm可以已经进入Batch并到达start，`triggerAlarmsLocked()`才计算：
+若 `nowElapsed < minTime`，Alarm 不会被丢弃，而会被重排：
 
 ```java
-minTime = lastDispatch + getWhileIdleMinIntervalLocked(uid);
-if (now < minTime) {
-    whenElapsed = minTime;
-    maxWhenElapsed = max(maxWhenElapsed, minTime);
-    setImplLocked(alarm, rebatching=true);
-    continue;
+alarm.expectedWhenElapsed = alarm.whenElapsed = minTime;
+if (alarm.maxWhenElapsed < minTime) {
+    alarm.maxWhenElapsed = minTime;
 }
+alarm.expectedMaxWhenElapsed = alarm.maxWhenElapsed;
+setImplLocked(alarm, true, false);
 ```
 
-因此dump可能看到exact Alarm的实际时间已被推后。
+原 exact Alarm 的 `maxWhenElapsed` 等于旧时间；推迟 `whenElapsed` 时必须至少同步抬高 max，才能保持合法窗口。这就是 B 可能被推迟到上次成功交付后九分钟的直接证据。
 
----
+## 8. 何时记账，十秒临时白名单又是什么
 
-## 24. 推后时为何扩max
-
-原exact Alarm的max等于旧when，若只改when不改max就会出现 `max < when` 的非法窗口。
-
-代码至少把max扩到minTime，使节流后的新窗口重新合法。这进一步说明exact不是跨政策不可移动的绝对点。
-
----
-
-## 25. lastDispatch何时才记账
-
-只有真实发送成功、建立in-flight之后，DeliveryTracker才写：
+到达节流门不等于已经消耗一次间隔。`DeliveryTracker.deliverLocked()` 只有在发送没有立即失败、Alarm 已建立 InFlight 后才记录：
 
 ```java
-mLastAllowWhileIdleDispatch.put(creatorUid, nowElapsed);
+mLastAllowWhileIdleDispatch.put(alarm.creatorUid, nowELAPSED);
 ```
 
-PendingIntent已取消或Listener Binder发送失败会在此前return，不消耗一次AWI交付间隔。
+若 `PendingIntent.send()` 立即抛出 `CanceledException`，或 direct listener 调用在建立 InFlight 前失败，方法会提前返回，不更新这次成功交付时间。这里的“成功”仍只表示 AMS 成功发起并跟踪交付，不代表应用业务逻辑最终成功。
 
----
+每次普通 AWI 交付还会根据 creator UID 当前是否在前台更新 `mUseAllowWhileIdleShortTime`。UID 进入前台时，AppStateTracker 回调也会把它设为 `true`；UID 被移除时，短间隔状态和 last-dispatch 账本都会清理。
 
-## 26. ALLOW_WHILE_IDLE_UNRESTRICTED是谁的
-
-Binder先清除调用者传来的unrestricted；若没有WorkSource，且calling UID是core、SystemUI或用户电源白名单，服务端自动添加unrestricted并清除普通AWI。
-
-它表示受信任主体正常穿过idle，不走普通AWI长/短间隔节流。
-
----
-
-## 27. 为什么有WorkSource时不给unrestricted
-
-即使调用者自身是core/白名单，只要显式代表别人归因，条件要求 `workSource == null` 就不自动授予unrestricted。
-
-这是防止特权代理把自身idle豁免无条件扩散给任意工作来源。
-
----
-
-## 28. Unrestricted也不进AWI临时白名单路径
-
-DeliveryTracker的 `allowWhileIdle`布尔只检查普通 `FLAG_ALLOW_WHILE_IDLE`。unrestricted flag已清掉普通flag，因此不会传 `mIdleOptions`，也不更新AWI last-dispatch账本。
-
-它靠自身受信任/白名单身份运行，不需要每次再申请10秒临时例外。
-
----
-
-## 29. 10秒临时白名单如何附加
-
-Constants用 `BroadcastOptions`构造：
+十秒临时白名单来自 `BroadcastOptions`：
 
 ```java
 opts.setTemporaryAppWhitelistDuration(
-    ALLOW_WHILE_IDLE_WHITELIST_DURATION);
+        ALLOW_WHILE_IDLE_WHITELIST_DURATION);
 mIdleOptions = opts.toBundle();
 ```
 
-普通AWI PendingIntent发送时把这个Bundle传给 `PendingIntent.send()`，由AMS组件启动/广播链识别并临时放行目标应用。
+普通 AWI 的 `PendingIntent.send()` 会携带 `mIdleOptions`。公开 AWI API本来就只接收 `PendingIntent`；direct-listener 分支不传这个 Bundle。unrestricted flag 也不满足代码里的普通 `allowWhileIdle` 布尔，因此既不使用这份 Bundle，也不更新普通 AWI 账本。
 
----
+临时白名单和 AlarmManager 的 `*alarm*` WakeLock 是两件事：
 
-## 30. 只有成功发送PendingIntent才得到这个选项
+- 白名单给目标应用一小段受限政策例外时间；
+- WakeLock 由 AMS 按所有 InFlight 交付的引用计数持有，直到 callback、complete 或 timeout 收账。
 
-`mIdleOptions`只出现在 `alarm.operation.send(...)` 分支。普通公开AWI API本来只接收PendingIntent；direct Listener交付没有这条
-BroadcastOptions路径。
+默认时长相近不代表所有者、用途或结束条件相同。
 
-不要泛化成“任何带AWI flag的回调都自动获得10秒应用白名单”。
+三个 AWI 常量都能从 `Settings.Global.ALARM_MANAGER_CONSTANTS` 热更新，解析处没有建立“非负”或 `long >= short` 的跨字段约束。更新白名单时长会重建后续发送使用的 Bundle；更新最小间隔不会主动重排已经按旧 `minTime` 放回 Batch 的 Alarm。
 
----
+## 9. 穿过 Doze 后还有哪些政策门
 
-## 31. 白名单10秒不是WakeLock 10秒
+普通 AWI 并不豁免 App Standby 配额。`isExemptFromAppStandby()` 只认：
 
-临时白名单允许应用在电源/后台限制上获得短暂操作空间；AlarmManager自己的 `*alarm*` WakeLock则持续到PendingIntent finished或listener complete/timeout。
-
-两种期限、所有者和结束条件不同。App仍应尽快完成或转入合规的前台/Job机制。
-
----
-
-## 32. 白名单时长可热更新
-
-`Settings.Global.ALARM_MANAGER_CONSTANTS`变化时重建 `mIdleOptions`。下一次AWI PendingIntent发送读取新Bundle。
-
-已在飞的PendingIntent不会因为常量变化被追溯延长/缩短；负数等配置边界还要看BroadcastOptions/AMS下游校验，不能只看字段类型。
-
----
-
-## 33. AWI与background restriction的关系
-
-`isBackgroundRestricted()`把普通AWI视为Battery Saver豁免候选：
-
-```java
-exemptOnBatterySaver = (flags & ALLOW_WHILE_IDLE) != 0;
+```text
+AlarmClock
+core creator UID
+FLAG_ALLOW_WHILE_IDLE_UNRESTRICTED
 ```
 
-随后仍调用AppStateTracker综合判断。AWI不是绕过所有后台限制的万能位，但会改变其传入政策参数。
+普通 `FLAG_ALLOW_WHILE_IDLE` 不在其中。因此它设置时仍会按 `sourcePackage + creatorUserId` 调整交付时间，成功交付后也会写 App wakeup history。它可能同时受“App Standby 配额门”和“AWI creator-UID 时间门”。下一章会专门展开前一扇门。
 
----
+到期取出后还有 `isBackgroundRestricted()`。普通 AWI 会把 `isExemptOnBatterySaver=true` 传给 AppStateTracker，这可绕过 force-all-apps-standby 这一层，但不能绕过用户通过 `RUN_ANY_IN_BACKGROUND` 施加的强制限制。AlarmClock、启动 Activity 的 PendingIntent 另有直接豁免；foreground-service PendingIntent 也会改变传给政策层的参数。
 
-## 34. AlarmClock和UI PendingIntent有额外豁免
+因此“AWI 不受后台限制”过于宽泛。更准确的说法是：它改变若干政策门的输入，但没有删除整条政策链。
 
-AlarmClock直接不做background defer；PendingIntent启动Activity也不延迟，foreground-service PendingIntent会作为更重要类型咨询AST政策。
+## 10. idle 结束时，挂起 Alarm 怎样回来
 
-这是“Alarm类别 × PendingIntent目标类型 × App状态”的组合判断，而不是只看wakeup/exact。
-
----
-
-## 35. Idle结束的正常触发链
-
-当 `mPendingIdleUntil`自己到期：
+当 `mPendingIdleUntil` 自己进入触发列表时，AMS 依次执行：
 
 ```java
 mPendingIdleUntil = null;
@@ -412,396 +281,135 @@ rebatchAllAlarmsLocked(false);
 restorePendingWhileIdleAlarmsLocked();
 ```
 
-同时DIC listener收到状态Alarm，推进deep idle/maintenance状态机。
+`restorePendingWhileIdleAlarmsLocked()` 逐项调用 `reAddAlarmLocked()`，然后重设 kernel Alarm 和 next alarm clock。它只是把挂起项恢复到正常调度结构，并不在当前调用栈里同步发送所有 `PendingIntent`。未来时间、App Standby、后台限制以及后续到期检查仍然有效。
 
----
+显式取消当前 `IDLE_UNTIL` 时也会清引用、rebatch 并 restore；全量 rebatch 若发现原来的 idle-until 对象意外丢失，也有防御性恢复。否则挂起列表可能失去释放入口。
 
-## 36. Restore不是“全部立即交付”
+`mNextWakeFromIdle` 被触发或取消后会清空并 rebatch，剩余 `WAKE_FROM_IDLE` Alarm 在重加时重新选出最早者。这个字段是缓存的最早引用，不是完整候选列表。
 
-`restorePendingWhileIdleAlarmsLocked()`逐个调用 `reAddAlarmLocked(a, now, false)`，再重设kernel Alarm和next alarm clock。
+## 11. Alarm 交付怎样反馈给 maintenance
 
-重加会重新转换/调整时间与standby政策；已过期项可进入近期Batch，但仍要等待AlarmThread取出和后续政策。restore不直接遍历发送所有PendingIntent。
-
----
-
-## 37. 取消IdleUntil也会恢复
-
-remove匹配到当前IDLE_UNTIL后清引用、rebatch，再调用restore。否则普通Alarm可能永远留在pending-while-idle。
-
-全量rebatch发现IDLE_UNTIL意外丢失也有同样防御性恢复。
-
----
-
-## 38. WAKE_FROM_IDLE到期也可能结束idle
-
-IDLE_UNTIL在设置时已被更早的next-wake拉到该时刻，因此真正到点时通常当前idle边界Alarm也随之到期。
-
-WAKE_FROM_IDLE自身从triggerList取出后会清 `mNextWakeFromIdle`并rebatch；两者协作，不能只看一个引用解释全部状态变化。
-
----
-
-## 39. NextWake取消后的重算
-
-remove operation/package/uid若删掉当前next-wake，会清引用并rebatch；重加剩余Alarm时重新选择下一枚WAKE_FROM_IDLE。
-
-所以 `mNextWakeFromIdle=null`只是缓存无当前候选，不是遍历列表永久删除了所有用户闹钟。
-
----
-
-## 40. 普通AWI仍受App Standby quota
-
-`isExemptFromAppStandby()` 只豁免AlarmClock、core creator和unrestricted；普通 `FLAG_ALLOW_WHILE_IDLE` 不在这个公式里。因此普通AWI
-仍会按source package/user经过standby时间调整，并在成功交付后写入App wakeup history。
-
-同时它还受自己的last-dispatch 5秒/9分钟门。也就是说普通AWI是“standby配额门 AND AWI频率门”，不是二选一；第33节所说的
-Battery Saver后台限制参数豁免，也不能泛化成App Standby quota豁免。
-
----
-
-## 41. 交付顺序可以与同App普通Alarm颠倒
-
-App的普通Alarm在pending-while-idle，后设置的AWI却仍在主Batch并先交付。API文档明确系统可让AWI与其他Alarm乱序。
-
-业务不得依赖“同PendingIntent之外所有Alarm严格按set先后顺序”。
-
----
-
-## 42. Alarm active反馈何时变true
-
-第一个成功交付进入in-flight时：
+第一枚 Alarm 成功建立 InFlight 时：
 
 ```text
 mBroadcastRefCount: 0 → 1
-acquire *alarm* WakeLock
-post REPORT_ALARMS_ACTIVE(1)
+  → 获取 AMS 的 *alarm* WakeLock
+  → Handler 投递 REPORT_ALARMS_ACTIVE(1)
+  → DeviceIdleInternal.setAlarmsActive(true)
 ```
 
-Handler再调用DeviceIdleInternal `setAlarmsActive(true)`。它不是Alarm到期或入triggerList就立即为true，而是成功发起交付后。
-
----
-
-## 43. 反馈为何通过Handler
-
-DeliveryTracker在AMS `mLock`内改变refcount，但将跨服务LocalServices调用post到Alarm Handler，避免持Alarm锁直接获取DIC monitor。
-
-这与第142章JSS在自身锁内直接调用的实现不同，说明相同闭环目标可以采用不同锁边界。
-
----
-
-## 44. Alarm active何时变false
-
-每个PendingIntent finished、Listener complete或timeout都会减少ref；最后一个完成时释放WakeLock并post
-`REPORT_ALARMS_ACTIVE(0)`。
-
-DIC收到false后才尝试early exit。jobs、alarms、active idle ops仍需全部inactive。
-
----
-
-## 45. Handler异步反馈的保守与竞态
-
-true/false都是消息。若短交付在Handler处理true前已完成，队列通常仍按入队顺序处理true再false；DIC可能短暂看到active后归零。
-
-Alarm WakeLock和DIC minimum active-op另有保护，但不能把异步布尔当作每枚Alarm精确计数账本。
-
----
-
-## 46. 广播in-flight listener是另一条通知
-
-AMS还对 `AlarmManagerInternal.InFlightListener`调用 `broadcastAlarmPending(uid)` / `broadcastAlarmComplete(uid)`，只针对PendingIntent broadcast。
-
-这与全局 `setAlarmsActive(boolean)`不同：前者按广播UID通知内部消费者，后者按所有成功Alarm交付refcount聚合给DIC。
-
----
-
-## 47. Doze maintenance期间会怎样
-
-maintenance公开idle mode暂时false，DIC的IDLE_UNTIL Alarm已经触发并恢复普通Alarm；它们重新进入主Batch并可能交付。
-
-Alarm交付成功后 `mAlarmsActive=true`可阻止maintenance提前结束；最后完成后false允许DIC按jobs/ops共同判断归还窗口。
-
----
-
-## 48. 预算Alarm仍是上界
-
-与jobs-active相同，alarms-active只阻止DIC的early-exit路径；deep/light状态机已经安排的预算/状态Alarm仍可推进回idle。
-
-一个接收器卡住不会凭 `mAlarmsActive=true`无限延长maintenance；Alarm listener自身还有timeout，广播也有BroadcastQueue完成/超时链。
-
----
-
-## 49. Upcoming AlarmClock为何阻止进入idle
-
-用户马上需要被叫醒时，先进入Doze再很快退出会产生额外状态切换，并可能让预备工作来不及完成。
-
-DIC以 `MIN_TIME_TO_ALARM`提前避让；这是一种用户可见时效优先级，不应让普通后台App滥用AlarmClock伪装任务。
-
----
-
-## 50. setAlarmClock的成本
-
-它是RTC_WAKEUP、exact、Standalone、WAKE_FROM_IDLE，并进入系统下一闹钟UI/广播。它还可能改变DIC进入idle的计划。
-
-因此只应表示真正面向用户的闹钟，不是规避AWI节流的通用后台入口。
-
----
-
-## 51. light idle与mPendingIdleUntil
-
-`setIdleUntil()`由deep idle状态机使用；light状态机普通用 `AlarmManager.set(ELAPSED_REALTIME_WAKEUP, listener)`安排自己的阶段闹钟。
-
-AMS的 `mPendingIdleUntil != null`更直接表示deep Alarm idle gate，不能把它简单等同于PowerManager所有light/deep idle mode组合。
-
----
-
-## 52. Battery Saver也会影响AWI长短门
-
-`getWhileIdleMinIntervalLocked()`除了Doze，还读取AppStateTracker的force-all-apps-standby（EBS/Battery Saver相关）状态。
-
-不在Doze但EBS开启时，前台/最近前台UID可用short，其他UID用long。方法名“WhileIdle”覆盖的政策范围比deep Doze更广。
-
----
-
-## 53. 常量没有跨字段关系钳位
-
-short、long、whitelist duration从KeyValueListParser直接读取long，当前段没有保证：
+每个 `PendingIntent` finished、listener complete 或 listener timeout 都会减少引用。最后一枚完成时：
 
 ```text
-short >= 0
-long >= short
-whitelist >= 0
+mBroadcastRefCount: 1 → 0
+  → 释放 WakeLock
+  → Handler 投递 REPORT_ALARMS_ACTIVE(0)
+  → DIC 尝试 exitMaintenanceEarlyIfNeededLocked()
 ```
 
-设备定制若写入反常值，会破坏预期节流/选项语义，必须联合测试，不能只相信字段名。
+通过 Handler 反向通知，避免 AMS 持有自身锁时直接进入 DIC monitor。代价是 DIC 看到的是异步、全局布尔状态，不是每枚 Alarm 的精确计数。
 
----
+DIC 只有在以下条件同时成立时才会提前结束 deep/light maintenance：
 
-## 54. 常量更新不重排已节流Alarm
+```java
+mActiveIdleOpCount <= 0 && !mJobsActive && !mAlarmsActive
+```
 
-改变long interval后，已经因旧minTime放回Batch的Alarm不会在Constants Observer里主动重算；下一次到期检查才读取新值。
+所以 `alarmsActive` 只阻止 early exit，不负责打开 maintenance，也不会取消状态机已经安排的预算上界。它与按 UID 通知广播 pending/complete 的 `InFlightListener` 也不是同一条反馈链。
 
-若新long变短，旧when可能仍偏晚；若变长，下一次触发会再次推后。这和第143章“字段已变不等于全量重建”一致。
+## 12. 用三个场景检验模型
 
----
-
-## 55. dump应看哪些字段
+场景一：deep Doze 中有普通 exact 和 AWI exact。
 
 ```text
-Pending idle until
-Pending alarms while idle
+普通 exact：standalone，但无 idle 例外 → pending-while-idle
+AWI exact：穿过 idle 门 → 进入 Batch → 到期时再查 creator UID 间隔
+```
+
+场景二：同一 creator UID 的第一枚 AWI 在 T 成功发起交付，第二枚在 T+1 分钟到期。设备仍在 deep Doze，默认 long 为 9 分钟。
+
+```text
+第二枚的合法下限 = T + 9 分钟
+T + 1 分钟到期检查 → 重排到 T + 9 分钟
+```
+
+如果第一枚的 `PendingIntent` 已取消、发送立即失败，没有建立 InFlight，则 T 不会写入 last-dispatch，第二枚不能基于这次失败计算九分钟。
+
+场景三：用户 AlarmClock 早于 DIC 原计划的 deep-idle 截止点。
+
+```text
+AlarmClock → 服务端添加 WAKE_FROM_IDLE
+  → 成为 mNextWakeFromIdle
+  → AMS 拉早 IDLE_UNTIL
+  → DIC 也通过 upcoming-alarm 检查避免临近时进入 idle
+```
+
+这三例分别验证了：exact 与 idle 权限正交、AWI 是推迟而非丢弃、AlarmClock 与普通 AWI 走不同通道。
+
+## 13. 静态阅读与诊断清单
+
+先用只读命令定位四条链：
+
+```bash
+rg -n "setIdleUntil|mPendingIdleUntil|mPendingWhileIdleAlarms" \
+  frameworks/base/services/core/java/com/android/server/AlarmManagerService.java \
+  frameworks/base/apex/jobscheduler/service/java/com/android/server/DeviceIdleController.java
+
+rg -n "mNextWakeFromIdle|getNextWakeFromIdleTime|isUpcomingAlarmClock" \
+  frameworks/base/services/core/java/com/android/server/AlarmManagerService.java \
+  frameworks/base/apex/jobscheduler/service/java/com/android/server/DeviceIdleController.java
+
+rg -n "mLastAllowWhileIdleDispatch|getWhileIdleMinIntervalLocked|mIdleOptions" \
+  frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
+
+rg -n "REPORT_ALARMS_ACTIVE|setAlarmsActive|isOpsInactiveLocked" \
+  frameworks/base/services/core/java/com/android/server/AlarmManagerService.java \
+  frameworks/base/apex/jobscheduler/service/java/com/android/server/DeviceIdleController.java
+```
+
+阅读 `dumpsys alarm` 对应实现时，优先建立这组证据：
+
+```text
+Idling until / Pending alarms
 Next wake from idle
-Last allow while idle dispatch times
+Last allow while idle dispatch times / Next allowed
 mUseAllowWhileIdleShortTime
-Constants short/long/whitelist
-In-flight + Broadcast ref count
+short / long / whitelist constants
+Alarm expectedWhenElapsed 与实际 whenElapsed
+Broadcast ref count / Outstanding deliveries
 ```
 
-同时对照Alarm的expectedWhen与actual when，才能判断是standby推迟还是AWI节流重排。
+只看到“Pending”还不够：要先判断它位于主 Batch、idle 挂起、background 挂起还是 non-wakeup 延迟队列。只看到 AWI flag 也不够：还要计算 creator UID 的 next allowed，并检查 App Standby 与用户强制后台限制。
 
----
+## 14. 结论与下一章
 
-## 56. 场景一：Doze中普通exact Alarm
-
-即使window=0、Standalone，只要没有三种idle例外flag，rebatch时仍进入pending-while-idle。
-
-Exact只控制batch窗口，不授予Doze穿透权。maintenance/退出idle时恢复后才重新竞争交付。
-
----
-
-## 57. 场景二：同UID连续两枚AWI
-
-第一枚在deep idle时成功交付，记录last=T。第二枚T+1分钟到期，默认long=9分钟，因此被重排到T+9分钟，哪怕它原来是exact。
-
-不是丢弃，而是更新when/max并重新入Batch。
-
----
-
-## 58. 场景三：AWI PendingIntent已取消
-
-到期后 `operation.send()`抛CanceledException，未建立in-flight，也不更新last dispatch；若它是repeating，还移除后续重复项。
-
-“到过节流门”不等于“消耗一次成功AWI配额”。
-
----
-
-## 59. 场景四：系统白名单调用者
-
-无WorkSource的白名单调用者在Binder边界被转为UNRESTRICTED，普通AWI flag清除。它穿过pending-while-idle，不进普通5秒/9分钟账本，
-也不靠AWI BroadcastOptions获得10秒临时白名单。
-
----
-
-## 60. 场景五：用户闹钟早于deep idle截止
-
-AlarmClock成为mNextWakeFromIdle，AMS把DIC的IDLE_UNTIL拉到更早时刻；DIC自身也通过upcoming检查避免进入/继续deep idle。
-
-两层防线既保护已经进入idle的情况，也减少临近闹钟时新进入idle。
-
----
-
-## 61. 场景六：maintenance中两个Alarm交付
-
-第一个成功使全局ref 0→1并报告alarms active；第二个只把ref加到2。一个完成变1不发false，最后一个完成变0才释放WakeLock并报告false。
-
-DIC只需要“是否至少一个仍在飞”的集合语义，不需要知道Alarm数量。
-
----
-
-## 62. 场景七：IdleUntil被取消
-
-AMS从Batch移除idle Alarm，清 `mPendingIdleUntil`，全量rebatch并restore挂起列表。普通Alarm恢复到主调度结构，但不会在取消调用栈里被逐个同步发送。
-
----
-
-## 63. macOS只读练习一：画三种flag矩阵
-
-```bash
-sed -n '1934,2022p' \
-  frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
-```
-
-为普通、AWI、unrestricted、wake-from-idle、idle-until五类Alarm填写“主Batch/挂起/特殊引用/是否节流”。
-
----
-
-## 64. macOS只读练习二：手算节流
-
-默认long=9分钟，假设last=100分钟：
+把开头问题压缩成一张决策图：
 
 ```text
-Alarm A at 104分钟到期
-Alarm B at 110分钟到期
+Alarm 设置
+  ├─ IDLE_UNTIL：system-only，建立 deep-idle 挂起门
+  └─ 其他 Alarm
+       ├─ 无 AWI / unrestricted / wake-from-idle → idle 中挂起
+       └─ 有例外 → 留在主 Batch
+                    ├─ 普通 AWI → App Standby + creator UID 频率门
+                    ├─ unrestricted → 不走普通 AWI 频率与临时白名单路径
+                    └─ AlarmClock → WAKE_FROM_IDLE，参与 idle 边界协商
+
+成功发起交付
+  → 普通 AWI PendingIntent 获得默认 10 秒临时白名单
+  → InFlight 引用与 WakeLock 开始
+  → DIC 收到 alarms-active
+全部完成
+  → 引用归零、WakeLock 释放
+  → DIC 可在 jobs 与 active-op 也空闲时提前收回 maintenance
 ```
 
-推演A的新when、A交付后last以及B是否再次推迟。再将A发送失败重算一次。
+最终应记住五点：
 
----
+1. exact、wakeup、allow-while-idle、wake-from-idle 是彼此独立的维度；
+2. `mPendingIdleUntil` 通过容器分流挂起普通 Alarm，而不是给每枚 Alarm 增加 constraint bit；
+3. 普通 AWI 按 `creatorUid` 在到期时节流，r48 默认 deep Doze 最小间隔为 9 分钟；
+4. 十秒临时白名单只附加在普通 AWI 的 `PendingIntent` 发送路径，不等于 AMS WakeLock；
+5. Alarm 的 InFlight 聚合状态只影响 maintenance 能否提前结束，不会无限延长维护窗口。
 
-## 65. macOS只读练习三：追恢复链
-
-```bash
-rg -n "restorePendingWhileIdleAlarmsLocked|mPendingIdleUntil = null" \
-  frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
-```
-
-区分自然到期、显式remove、rebatch防御三条恢复入口。
-
----
-
-## 66. macOS只读练习四：追临时白名单
-
-```bash
-rg -n "mIdleOptions|TemporaryAppWhitelist|allowWhileIdle" \
-  frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
-```
-
-确认Bundle在哪里创建、只在哪条发送分支使用、何时更新last-dispatch。
-
----
-
-## 67. macOS只读练习五：对照DIC
-
-```bash
-rg -n "setIdleUntil|getNextWakeFromIdleTime|setAlarmsActive" \
-  frameworks/base/apex/jobscheduler/service/java/com/android/server/DeviceIdleController.java \
-  frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
-```
-
-画出DIC→AMS状态Alarm、AMS→DIC active反馈和用户AlarmClock预避让三条边。
-
----
-
-## 68. macOS只读练习六：审计配置
-
-定位`ALLOW_WHILE_IDLE_SHORT_TIME/LONG_TIME/WHITELIST_DURATION`的默认、解析和消费者，回答：
-
-1. 是否钳位负数；
-2. 是否保证long≥short；
-3. 更新是否重排已有Alarm；
-4. dump展示哪个值。
-
----
-
-## 69. 常见误解纠正
-
-- 误解：Exact自动穿过Doze。纠正：还必须有idle例外flag。
-- 误解：所有wakeup都是WAKE_FROM_IDLE。纠正：后者是受信任的Doze边界语义。
-- 误解：AWI在Doze中任意频率。纠正：默认每creator UID至少9分钟，且普通AWI仍受App Standby配额。
-- 误解：源码默认就是文档所说15分钟。纠正：r48为9分钟。
-- 误解：10秒白名单就是10秒Alarm WakeLock。纠正：两套机制。
-- 误解：AlarmClock也走普通AWI节流。纠正：它走WAKE_FROM_IDLE。
-- 误解：restore会同步发送所有挂起Alarm。纠正：只是重新加入调度结构。
-- 误解：mPendingIdleUntil等于所有light/deep idle状态。纠正：它直接对应deep idle gate。
-- 误解：alarms-active能无限续maintenance。纠正：只阻止early exit。
-
----
-
-## 70. 面试式自测
-
-1. IDLE_UNTIL、WAKE_FROM_IDLE、AWI分别解决什么？
-2. 普通exact Alarm为何仍会进入pending-while-idle？
-3. 用户AlarmClock怎样从AMS和DIC两边影响Doze？
-4. AWI节流为何用creatorUid？
-5. short/long默认各是多少，选择公式是什么？
-6. exact AWI被节流时怎样修复窗口？
-7. 哪些失败不更新last dispatch？
-8. unrestricted由谁授予，为什么要求WorkSource为空？
-9. 10秒临时白名单在哪条交付路径附加？
-10. IdleUntil结束后普通Alarm为何不是立即全发？
-11. setAlarmsActive与broadcast in-flight listener有何不同？
-12. 配置热更新为何不会完整重排已有节流Alarm？
-
----
-
-## 71. 本章结论
-
-1. DIC用system-only IDLE_UNTIL告诉AMS挂起普通Alarm；
-2. 已有和新增普通Alarm都会转入pending-while-idle；
-3. AWI、unrestricted和WAKE_FROM_IDLE仍留在主调度路径；
-4. AlarmClock由服务端授予WAKE_FROM_IDLE并影响DIC进入idle；
-5. 普通RTC_WAKEUP不自动等于WAKE_FROM_IDLE；
-6. setAndAllowWhileIdle是heuristic，exact版本只是初始窗口为0；
-7. AWI按PendingIntent creatorUid记录成功交付时间；
-8. r48默认short 5秒、long 9分钟、临时白名单10秒；
-9. deep Doze始终选long，EBS非Doze时按UID前台状态选长短；
-10. AWI到期时若过密会被重排，不是直接丢弃；
-11. 只有成功建立in-flight才更新last dispatch；
-12. 普通AWI仍受App Standby配额；trusted unrestricted才同时不走普通AWI节流/临时白名单和standby配额；
-13. AWI PendingIntent通过BroadcastOptions获得短暂应用白名单；
-14. 白名单与Alarm WakeLock是不同的所有权/期限机制；
-15. IdleUntil结束或取消时，挂起Alarm重新加入调度而非同步全发；
-16. Alarm in-flight聚合反馈只阻止DIC early exit，不突破maintenance预算上界。
-
-一句话记忆：
-
-> AllowWhileIdle不是Doze的“关闭按钮”，而是一条受身份、每UID时间门和短暂白名单共同约束的窄通道；真正的Doze边界仍由IDLE_UNTIL与WAKE_FROM_IDLE协商。
-
----
-
-## 72. 生成后复读修订
-
-初稿后重新核对AlarmManager API、AMS flag重写/触发/交付和DIC状态机，重点修订：
-
-1. 分开IDLE_UNTIL、WAKE_FROM_IDLE、AWI三种语义；
-2. 明确普通wakeup不自动wake-from-idle；
-3. 补出IDLE_UNTIL会被更早用户闹钟拉早并加随机fuzz；
-4. 限定mPendingIdleUntil直接对应deep gate而非所有idle mode；
-5. 纠正文档示例15分钟与r48默认9分钟差异；
-6. 发现short实际为5秒而非泛称一分钟；
-7. 逐分支还原Doze/EBS/UID前台的长短选择；
-8. 明确节流按creatorUid且只记成功in-flight；
-9. 解释exact被推后时max也必须扩展；
-10. 区分ordinary与unrestricted flag及WorkSource限制；
-11. 限定10秒BroadcastOptions只在普通AWI PendingIntent分支；
-12. 区分临时白名单与共享Alarm WakeLock；
-13. 限定restore只是re-add而非同步deliver；
-14. 复核 `isExemptFromAppStandby()` 后纠正普通AWI并不豁免App Standby配额；
-15. 区分全局alarms-active与按UID广播in-flight通知；
-16. 补出常量无长短/非负跨字段钳位且更新不重排已有Alarm；
-17. 所有练习均为macOS只读源码推演，不执行设备Alarm命令。
-
----
-
-## 73. 下一章
-
-第147章深入AlarmManager App Standby配额：从source package/user的滚动wakeup history、ACTIVE/WORKING/FREQUENT/RARE/NEVER配额，
-追expected/actual时间、reorder触发、parole/charging、restricted bucket独立窗口及豁免类别。
+下一章继续追问：普通 AWI 已穿过 Doze 门后，为什么还可能被 App Standby 配额再次改写时间？第 147 章将沿 `sourcePackage + creatorUserId` 的滚动唤醒历史、bucket 配额和重排触发条件展开。

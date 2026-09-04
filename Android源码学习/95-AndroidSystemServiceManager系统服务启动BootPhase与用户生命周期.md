@@ -1,123 +1,88 @@
-# 95 Android SystemServiceManager：系统服务启动、BootPhase、依赖顺序与用户生命周期
+# 95 Android SystemServiceManager：系统服务启动、BootPhase 与用户生命周期
 
-> 源码版本：Android 11（`android-11.0.0_r48`）  
-> 阅读环境：macOS 只读本地源码，不要求编译或连接设备。  
-> 本章目标：理解 system_server 如何创建、启动和编排 `SystemService`，能区分构造、`onStart()`、Binder 发布、BootPhase、`systemReady()`、用户解锁与 boot completed 等不同完成点。
+> 源码版本：Android 11（`android-11.0.0_r48`）
+> 阅读环境：macOS 本地只读源码；验证命令不要求编译或连接设备。
+> 贯穿实例：`StorageManagerService.Lifecycle`，对外 Binder 名为 `mount`。
 
----
+## 1. 先看真实故障：`mount` 已存在，为什么存储仍未就绪
 
-## 1. SystemServiceManager 是什么
-
-`SystemServiceManager`（下文简称 SSM）是 system_server 进程内的系统服务生命周期调度器。它主要负责：
-
-- 创建继承 `SystemService` 的服务；
-- 调用 `onStart()`；
-- 保存已启动服务列表；
-- 顺序分发 `onBootPhase()`；
-- 分发用户 start/unlock/switch/stop 生命周期；
-- 记录慢回调和启动 trace；
-- 加载位于额外 jar 中的 SystemService。
-
-它不负责：
-
-- 保存跨进程 Binder 服务目录——那是 servicemanager；
-- 为应用构造 Manager wrapper——那是 SystemServiceRegistry；
-- 自动推断服务依赖图；
-- 自动把耗时初始化放到后台线程；
-- 自动保证每个服务已经“业务可用”。
-
-三章关系：
+一次开机卡顿可能呈现出看似矛盾的现象：
 
 ```text
-SystemServiceManager
-  管 system_server 内服务对象的启动与生命周期
-           │ onStart 中 publishBinderService
-           ↓
-ServiceManager
-  管名字 → Binder 的跨进程目录
-           │ 客户端按名字取得 Binder
-           ↓
-SystemServiceRegistry
-  为 Context 构造并缓存 Java Manager wrapper
+service check mount：found
+SystemServer：已经打印 StartStorageManagerService
+后续服务：仍然因为存储、包信息或用户目录未准备好而失败
 ```
 
----
+只看 Binder 名字，很容易得出“StorageManagerService 已完全启动”的错误结论。
 
-## 2. 为什么需要统一生命周期框架
-
-system_server 中有大量服务。若每个服务都由 SystemServer 手写完整启动、ready、用户切换逻辑，会产生：
-
-- 生命周期接口不统一；
-- 启动耗时难以统一记录；
-- 异常信息缺少服务名和阶段；
-- 用户事件容易漏发；
-- 服务启动顺序难以审查。
-
-`SystemService` 抽象类提供统一协议：
-
-```java
-public abstract void onStart();
-public void onBootPhase(int phase) {}
-public void onUserStarting(TargetUser user) {}
-public void onUserUnlocking(TargetUser user) {}
-public void onUserUnlocked(TargetUser user) {}
-public void onUserSwitching(TargetUser from, TargetUser to) {}
-public void onUserStopping(TargetUser user) {}
-public void onUserStopped(TargetUser user) {}
-```
-
-服务只覆写自己关心的回调。
-
----
-
-## 3. 本章源码地图
+Android 11 的真实路径却是：
 
 ```text
-frameworks/base/services/java/com/android/server/SystemServer.java
-frameworks/base/services/core/java/com/android/server/SystemServiceManager.java
-frameworks/base/services/core/java/com/android/server/SystemService.java
-frameworks/base/services/core/java/com/android/server/SystemServerInitThreadPool.java
-frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
-frameworks/base/services/core/java/com/android/server/am/UserController.java
-frameworks/base/core/java/com/android/server/LocalServices.java
+构造 Lifecycle
+  → 先加入 SystemServiceManager.mServices
+  → Lifecycle.onStart()
+      → 构造 StorageManagerService
+      → publishBinderService("mount", ...)
+      → 尝试连接 vold / storaged
+  → 后续 phase 500、550、1000 再推进不同能力
+  → 每个用户又有 start / unlock / switch / stop 生命周期
 ```
 
-实例服务可选择：
+其中连接 daemon 失败会安排重试；某些 phase 方法还只是向服务自己的 Handler 投递消息。
+所以“服务名已注册”只覆盖了这条链中的一个完成点。
+
+**一句话结论：SystemServiceManager（SSM）按显式顺序调用生命周期方法，但它既不计算依赖图，也不证明服务已经业务可用。**
+
+学完本章，你应该能解决三类问题：
+
+- 开机为何卡在某个服务或某个 BootPhase；
+- 服务为何“查得到”，调用时却仍遇到未初始化依赖；
+- 用户切换、解锁或停止时，为什么某个服务状态没有及时更新。
+
+本章只讨论 system_server 内 `SystemService` 生命周期框架。Binder 目录、应用侧
+Manager wrapper、native daemon 自身生命周期只在边界处说明。
+
+## 2. 先分清三个名字相近的角色
+
+| 角色 | 所在位置 | 管理对象 | 本章实例中的动作 |
+|---|---|---|---|
+| `SystemServiceManager` | system_server | `SystemService` Java 对象及生命周期 | 构造并启动 `StorageManagerService.Lifecycle` |
+| `ServiceManager` / servicemanager | system_server 门面 / 独立进程 | 服务名到 Binder 的目录 | 保存 `mount → IStorageManager Binder` |
+| `SystemServiceRegistry` | Framework 客户端侧 | `Context.getSystemService()` 的 Manager wrapper | 创建并缓存 `StorageManager` |
+
+三者的连接关系是：
 
 ```text
-frameworks/base/services/core/java/com/android/server/power/PowerManagerService.java
-frameworks/base/services/core/java/com/android/server/display/DisplayManagerService.java
-frameworks/base/services/core/java/com/android/server/BatteryService.java
+SystemServer
+  → SystemServiceManager.startService(Lifecycle)
+  → Lifecycle.onStart()
+  → publishBinderService("mount", binder)
+  → ServiceManager.addService("mount", binder)
+
+应用 Context.getSystemService(Context.STORAGE_SERVICE)
+  → SystemServiceRegistry 创建 StorageManager
+  → StorageManager 再查询 Binder 名 "mount"
 ```
 
----
+这里甚至有两个不同的字符串：`Context.STORAGE_SERVICE` 是 `"storage"`，
+IStorageManager 的 Binder 目录名是 `"mount"`。不要用 wrapper 名推断 Binder 名。
 
-## 4. SSM 在哪里创建
+关键源码集中在 `SystemServer.java`、`SystemServiceManager.java`、`SystemService.java`、
+`StorageManagerService.java`、`ActivityManagerService.java`、`UserController.java`，以及客户端侧的
+`SystemServiceRegistry.java`、`StorageManager.java`。
 
-SystemServer 初始化 system Context 后：
+SystemServer 创建 SSM 后，只把它放进进程内的 `LocalServices`：
 
 ```java
 mSystemServiceManager = new SystemServiceManager(mSystemContext);
-mSystemServiceManager.setStartInfo(
-        mRuntimeRestart,
-        mRuntimeStartElapsedTime,
-        mRuntimeStartUptime);
+mSystemServiceManager.setStartInfo(...);
 LocalServices.addService(SystemServiceManager.class, mSystemServiceManager);
-SystemServerInitThreadPool.start();
 ```
 
-含义：
+SSM 自己不是可供应用查询的 Binder 服务。
 
-1. SSM 持有 system Context。
-2. 记录此次 system_server 是正常开机还是 runtime restart，以及时间基准。
-3. 把 SSM 自己放进 LocalServices，供 system_server 内其他代码取得。
-4. 启动一个只用于启动阶段并行任务的线程池。
-
-SSM 不是 Binder 服务，普通应用不能按名字查询它。
-
----
-
-## 5. SystemServer 的三大启动区
+随后 SystemServer 依次调用：
 
 ```java
 startBootstrapServices(t);
@@ -125,1229 +90,560 @@ startCoreServices(t);
 startOtherServices(t);
 ```
 
-### Bootstrap services
+这三段首先是源码组织和人工编排边界，不是 SSM 自动计算出的依赖层级。
 
-用于“把系统托起来”的关键服务，依赖纠缠最复杂，例如 Installer、ATMS/AMS、PowerManager、DisplayManager、PMS、UserManager。
+## 3. 一条主线看完：StorageManagerService 怎样启动和发布
 
-### Core services
+这个服务同时具备字符串类名启动、Lifecycle wrapper、Binder 早发布、三个 phase，
+以及新旧用户回调，适合在同一路径观察 Android 11 的迁移期边界。
 
-基本而重要、但不属于早期依赖死结的服务，例如 BatteryService、UsageStatsService 等。
+### 3.1 SystemServer 的显式位置就是依赖的一部分
 
-### Other services
-
-数量最多的其余 Framework 服务，并在后半段推进 ready 和允许应用启动。
-
-这三组不是安全等级，也不是三类进程；主要是 SystemServer 源码组织与依赖顺序。
-
----
-
-## 6. 启动顺序不是自动拓扑排序
-
-SSM 没有读取类似：
-
-```text
-PowerManager dependsOn LightsService
-```
-
-再自动计算拓扑序。Android 11 的主要依赖表达方式是：
-
-- SystemServer 中显式代码顺序；
-- 注释说明“必须在 X 前/后”；
-- BootPhase 契约；
-- `Future`/latch 等显式等待；
-- 调用前检查某服务是否完成初始化。
-
-例如 DisplayManager 必须先提供默认显示，随后才进入：
+`StorageManagerService$Lifecycle` 在 `startOtherServices()` 中启动：
 
 ```java
-startBootPhase(PHASE_WAIT_FOR_DEFAULT_DISPLAY);
+mSystemServiceManager.startService(STORAGE_MANAGER_SERVICE_CLASS);
+storageManager = IStorageManager.Stub.asInterface(
+        ServiceManager.getService("mount"));
 ```
 
-再继续启动 PackageManager。
+源码紧邻注释说明：后面的通知服务依赖存储服务，所以必须先启动存储。
+这条顺序写在 SystemServer 代码里，SSM 没有 `dependsOn()` 图可供解析。
 
-所以移动 SystemServer 中一段启动代码可能改变系统正确性，即使它仍能编译。
+此启动还受工厂测试模式和 `system_init.startmountservice` 属性条件控制。
+因此某产品上“类存在”也不等于这条调用一定执行。
 
----
+### 3.2 `startService(String)` 最终仍走统一反射入口
 
-## 7. `startService(Class)` 的完整流程
-
-```java
-PowerManagerService service =
-        mSystemServiceManager.startService(PowerManagerService.class);
-```
-
-内部步骤：
+SSM 的路径可压缩为：
 
 ```text
-检查是 SystemService 子类
-  → 反射查找 public Constructor(Context)
+按类名加载 StorageManagerService$Lifecycle
+  → 确认它继承 SystemService
+  → 查找 public Constructor(Context)
   → constructor.newInstance(mContext)
-  → mServices.add(service)
-  → service.onStart()
-  → 慢调用检查
-  → 返回服务对象
+  → startService(instance)
 ```
 
-源码要求构造器必须形如：
+被反射选择的构造器签名必须是 public `(Context)`；类可以另有其他构造器。
+
+`Lifecycle` 构造器本身很轻：
 
 ```java
-public DemoService(Context context) {
+public Lifecycle(Context context) {
     super(context);
 }
 ```
 
-不是任意构造函数，也不能只有 private/package-private Context 构造器。
+真正的 `StorageManagerService` 到 `onStart()` 才创建。
 
----
+### 3.3 最容易漏看的顺序：先入表，再 `onStart`
 
-## 8. 为什么构造和 onStart 分开
-
-建议的语义是：
-
-### 构造器
-
-- 保存依赖；
-- 创建基本字段和锁；
-- 建立尚未对外暴露的内部对象；
-- 尽量不依赖其他尚未启动服务。
-
-### `onStart()`
-
-- 发布 BinderService；
-- 发布 LocalService；
-- 注册必要观察者；
-- 启动该服务的基础能力。
-
-分开后 SSM 能统一：
-
-- 将实例加入生命周期列表；
-- 包装 `onStart()` 异常；
-- 记录耗时；
-- 给所有已启动服务分发后续 phase/user 事件。
-
-但框架没有强制构造器“绝不做 I/O”，这仍靠服务作者遵守启动性能纪律。
-
----
-
-## 9. 先加入 mServices，再调用 onStart
-
-源码顺序：
+SSM 的核心只有几行：
 
 ```java
 mServices.add(service);
-try {
-    service.onStart();
-} catch (RuntimeException ex) {
-    throw new RuntimeException(..., ex);
-}
+service.onStart();
+warnIfTooLong(..., service, "onStart");
 ```
 
-这意味着 `onStart()` 抛异常前，实例已进入列表。但通常该异常会一路导致 SystemServer 启动失败并终止当前启动，不会继续当作正常已启动服务运行。
+因此 `mServices` 表示“应接收后续生命周期的对象”，并不严格等于“已经成功完成
+onStart 的对象”。`onStart()` 抛异常时没有自动从列表回滚。
 
-不要由此推导出“失败服务之后仍会可靠接收 phase”。启动异常不是正常恢复协议；关键服务失败常被视为 system_server 致命错误。
-
----
-
-## 10. 三种 startService 入口
-
-### 按 Class
+Storage 的 `onStart()` 是：
 
 ```java
-startService(DemoService.class)
+mStorageManagerService = new StorageManagerService(getContext());
+publishBinderService("mount", mStorageManagerService);
+mStorageManagerService.start();
 ```
 
-类型安全且最常见。
-
-### 按类名字符串
+`publishBinderService()` 最终只是：
 
 ```java
-startService("com.android.server.demo.DemoService")
+ServiceManager.addService(name, service, allowIsolated, dumpPriority);
 ```
 
-由指定 ClassLoader 加载。
+SSM 不替服务创建 Binder Stub，也不检查发布了哪个名字。
 
-### 从 jar 加载
+### 3.4 `onStart()` 返回时 daemon 仍可能缺席
+
+`StorageManagerService.start()` 尝试连接两个已有 native Binder 服务：
 
 ```java
-startServiceFromJar(className, jarPath)
+connectStoraged();
+connectVold();
 ```
 
-SSM 为路径缓存 `PathClassLoader`，父加载器固定为 system_server class loader。这允许设备特定或模块化服务位于额外 jar。
-
-类找不到的异常提示中特别建议检查设备 feature，说明可选硬件服务应先用 `PackageManager.hasSystemFeature()` 判断，而不是无条件加载不存在实现。
-
----
-
-## 11. 也可以传入已经创建的实例
-
-SystemServer 有时写：
-
-```java
-mSystemServiceManager.startService(
-        new OverlayManagerService(mSystemContext));
-```
-
-此路径不经过反射，只做：
+如果查不到，代码不是在 SSM 主链上无限等待，而是向 `BackgroundThread` 每秒投递重连：
 
 ```text
-mServices.add(instance) → instance.onStart()
+storaged/vold 未找到
+  → 记录 trying again
+  → postDelayed(connect..., 1 秒)
+  → onStart 仍可返回
 ```
 
-适合构造方式特殊或实例已由外部工厂建立的服务。它仍进入统一 phase/user 生命周期列表。
+这正是首屏故障的答案：`mount` 可见，表示客户端能取得 Binder；它不证明服务已连上
+vold、storaged，也不证明 PackageManager、AppOps、用户存储状态已经准备好。
 
----
+## 4. 构造、启动、发布和 ready 是不同完成点
 
-## 12. onStart 完成不等于系统服务完全 ready
+排障时不要只说“服务启动了”，应指出下面哪一层已经完成：
 
-至少要区分：
+| 完成点 | Storage 主线中的证据 | 尚不能推出 |
+|---|---|---|
+| `Lifecycle` 构造完成 | public `Context` 构造器返回 | 真正存储服务已创建 |
+| 加入 `mServices` | `mServices.add(service)` | `onStart()` 成功 |
+| 实现对象构造完成 | `new StorageManagerService(...)` 返回 | `mount` 已发布、daemon 已连接 |
+| Binder 发布调用完成 | `publishBinderService("mount", ...)` | 所有业务方法都 ready |
+| `onStart()` 返回 | `startService()` 可返回 | phase、用户数据、异步重连完成 |
+| phase 500 回调返回 | `servicesReady()` 返回 | phase 550/1000 的工作完成 |
+| phase 550 回调返回 | `systemReady()` 已投递消息 | Handler 已处理该消息 |
+| phase 1000 回调返回 | `bootCompleted()` 同步部分返回 | 所有异步初始化、应用广播完成 |
+| 用户 unlocking 回调返回 | 必要 staging 与 daemon 同步调用结束 | `H_COMPLETE_UNLOCK_USER` 已处理 |
 
-```text
-constructed       Java 对象构造完成
-started           onStart 返回
-published         Binder 名字已 addService
-phase-ready       收到某个 onBootPhase 并完成对应工作
-systemReady       某些旧服务的专用 systemReady() 已调用
-user-ready        某个用户已 start/unlock
-boot-completed    PHASE_BOOT_COMPLETED 回调完成
-business-ready    该服务所需依赖/数据确实可处理某项业务
-```
+### 4.1 `onStart()` 的框架契约很窄
 
-一个服务可能在 `onStart()` 早期发布 Binder，但方法内部根据 ready 标志拒绝部分调用；也可能等某 phase 才注册广播或接触第三方应用。
+`SystemService` 建议在 `onStart()` 发布 Binder 和 LocalService，但框架并不要求每个服务
+都发布 Binder，也不验证“服务业务可用”。Local-only 服务完全可以没有全局名字。
 
-所以看到 `service list` 中已有名字，只能证明“已发布且目录可见”，不能证明全部业务准备完成。
+对 Storage 而言，真正实现对象的构造器已经做了不少事情：创建 HandlerThread、读取配置、
+发布 `StorageManagerInternal` LocalService、注册 receiver。它说明“构造器应轻量”是设计建议，
+不是 SSM 强制规则。
 
----
+### 4.2 Binder 发布是并发可见性边界
 
-## 13. 为什么有的服务不走 SystemServiceManager
+一旦 `mount` 进入 servicemanager，其他线程或进程就可能立即发事务。
+若发布前没有建立 Binder 方法所需的最小不变量，客户端可能观察到半初始化状态。
 
-SystemServer 中仍能看到：
+应在发布前建立基础请求所需的不变量；未到目标 phase 时明确拒绝暂不可用功能；
+对可恢复依赖可以重连，但不能把“正在重连”伪装成“已经完全可用”。
 
-```java
-ServiceManager.addService(...);
-SomeLegacyService.main(...);
-service.systemReady();
-```
+### 4.3 `systemReady()` 不是统一完成点
 
-原因包括：
+具体服务内部常有 `servicesReady()`、`systemReady()`、`bootCompleted()` 等历史命名。
+它们的语义由服务自己定义。只有真实调用点才能说明它对应哪个 phase，不能看到名字就自动
+映射为 `PHASE_SYSTEM_SERVICES_READY`。
 
-- 历史遗留结构；
-- 服务不是 `SystemService` 子类；
-- 特殊静态工厂/复杂互相依赖；
-- native 服务或模块服务使用自己的生命周期。
+## 5. BootPhase：单调里程碑，不是依赖求解器
 
-因此 SSM 是主框架，但不是 system_server 里所有对象的唯一启动入口。读某服务时应先确认它是否真的在 `mServices` 中。
+Android 11 的阶段常量如下：
 
----
-
-## 14. BootPhase 是什么
-
-BootPhase 是 system_server 向已启动 SystemService 广播的**单调递增里程碑**。
-
-Android 11 常量：
-
-| 数值 | 阶段 | 核心语义 |
+| 值 | 常量 | 契约重点 |
 |---:|---|---|
-| 100 | `WAIT_FOR_DEFAULT_DISPLAY` | 默认显示应可用 |
-| 480 | `LOCK_SETTINGS_READY` | 可取得锁设置数据 |
-| 500 | `SYSTEM_SERVICES_READY` | 可安全调用 Power/PMS 等核心服务 |
-| 520 | `DEVICE_SPECIFIC_SERVICES_READY` | 设备特定服务 ready |
-| 550 | `ACTIVITY_MANAGER_READY` | 可发送广播 |
-| 600 | `THIRD_PARTY_APPS_CAN_START` | 可启动/绑定三方应用，应用可调用服务 |
-| 1000 | `BOOT_COMPLETED` | `SystemService` 的最终 boot phase；基类契约称 boot completed、Home 已 started，但不能据此证明 Launcher 首帧已绘制或用户已经可交互 |
+| 100 | `PHASE_WAIT_FOR_DEFAULT_DISPLAY` | 默认显示应可用 |
+| 480 | `PHASE_LOCK_SETTINGS_READY` | 可取得锁设置数据 |
+| 500 | `PHASE_SYSTEM_SERVICES_READY` | 可安全调用核心系统服务 |
+| 520 | `PHASE_DEVICE_SPECIFIC_SERVICES_READY` | 设备特定服务已到约定点 |
+| 550 | `PHASE_ACTIVITY_MANAGER_READY` | 可以发送广播 |
+| 600 | `PHASE_THIRD_PARTY_APPS_CAN_START` | 可 start/bind 三方应用 |
+| 1000 | `PHASE_BOOT_COMPLETED` | Framework 最终 boot phase |
 
-数值之间故意留空，便于加入新阶段；代码不应假设相邻阶段差 1。
+数值有意留空；不要写“下一阶段等于当前阶段加一”。
 
----
-
-## 15. BootPhase 不是“状态枚举切换”
-
-SSM 只保存最新的：
-
-```java
-private int mCurrentPhase = -1;
-```
-
-推进时要求：
+SSM 推进 phase 的关键逻辑是：
 
 ```java
 if (phase <= mCurrentPhase) {
-    throw new IllegalArgumentException(
-            "Next phase must be larger than previous");
+    throw new IllegalArgumentException(...);
 }
-```
-
-所以它是里程碑序列：到达 600 意味着此前 100、480、500、520、550 已按主启动路径经过，而不是“系统当前只处于 600、已离开 500”。
-
-服务常写：
-
-```java
-if (phase == PHASE_SYSTEM_SERVICES_READY) { ... }
-```
-
-也有服务根据 `phase >= 某值` 推导能力。
-
----
-
-## 16. phase 如何分发
-
-```java
+mCurrentPhase = phase;
 final int serviceLen = mServices.size();
 for (int i = 0; i < serviceLen; i++) {
-    SystemService service = mServices.get(i);
-    service.onBootPhase(mCurrentPhase);
+    mServices.get(i).onBootPhase(mCurrentPhase);
 }
 ```
 
-关键事实：
+由此得到五个精确结论：
 
-- 按加入 `mServices` 的顺序串行调用；
-- 默认运行在调用 `startBootPhase()` 的 SystemServer 线程，通常是主启动线程；
-- 每个服务回调有 trace；
-- 超过 50ms 会警告；
-- 一个服务抛异常会包装为 RuntimeException，通常中断本阶段和启动过程。
+1. phase 对整个 SSM 严格单调；重复和倒退都会失败。
+2. `mCurrentPhase` 在分发前已经更新；中途失败不会回滚。
+3. 回调按加入 `mServices` 的顺序串行执行。
+4. 本轮先固定 `serviceLen`；回调中新增的服务不会插入本轮尾部。
+5. 晚启动服务不会补收已经过去的 phase，只会收到未来 phase。
 
-它不是并行广播，也没有“失败后自动跳过继续”的通用容错。
+SSM 本身不切线程：前六个 phase 来自 SystemServer 启动路径，phase 1000 则由 AMS `finishBooting()` 推进；判断线程应追真实调用点。
 
----
+所以在 phase 500 之后才启动 Storage Lifecycle，它不会自动执行 `servicesReady()`。
+这类错误能编译，也可能先看到 `mount`，直到业务访问包或 AppOps 数据时才暴露。
 
-## 17. 为什么只通知“此刻已经启动”的服务
-
-源码进入 phase 时先固定：
+### 5.1 Storage 对三个 phase 的真实响应
 
 ```java
-final int serviceLen = mServices.size();
+if (phase == PHASE_SYSTEM_SERVICES_READY) {
+    mStorageManagerService.servicesReady();
+} else if (phase == PHASE_ACTIVITY_MANAGER_READY) {
+    mStorageManagerService.systemReady();
+} else if (phase == PHASE_BOOT_COMPLETED) {
+    mStorageManagerService.bootCompleted();
+}
 ```
 
-只遍历当时列表长度。如果在某服务 `onBootPhase()` 中又加入新服务，新服务不会在同一轮尾部被意外调用。
+- phase 500：取得 `PackageManagerInternal`、PackageManager Binder、AppOps Binder，并解析 provider。
+- phase 550：注册 screen observer，然后向 Storage Handler 投递 `H_SYSTEM_READY`。
+- phase 1000：设置 `mBootCompleted`，投递 `H_BOOT_COMPLETED`，并同步检查 FUSE 属性。
 
-更重要的是，SSM 的 `startService()` 并不会自动补发所有已经过去的 phase。因此服务应在其依赖的 phase 之前启动；晚启动服务不能假设框架会从 100 开始补课。
+“phase 回调返回”只说明同步方法返回。phase 550 投递的 Handler 消息可能仍在队列中；
+SSM 不追踪它，也不会自动为下一 phase 建立屏障。
 
-这也是启动位置属于接口契约的一部分。
+### 5.2 phase 1000 不等于所有“开机完成”观察点
 
----
+Android 11 中，phase 1000 由 `ActivityManagerService.finishBooting()` 推进，不是紧跟
+`startOtherServices()` 返回立即发生。该方法还会等待 boot animation 等条件。
 
-## 18. phase 回调为什么必须快
+它不等于：
 
-`SERVICE_CALL_WARN_TIME_MS = 50`。超过 50ms 只会打印 warning，不会自动杀死服务或取消工作。
+- Launcher 首帧已经绘制；
+- 每个用户都已解锁；
+- 所有 `BOOT_COMPLETED` Receiver 已执行完；
+- 每个服务自己投递的异步工作都已结束。
 
-但多个服务串行执行，若 100 个服务各阻塞 100ms，就额外增加 10 秒启动时间。因此回调应：
+phase 1000 分发完成后，SSM 还会关闭 `SystemServerInitThreadPool`。这只约束启动专用线程池，
+不代表所有服务自建 Handler 或 executor 已清空。
 
-- 只做里程碑所需的最小同步操作；
-- 可并行且无即时依赖的重活提交给受控线程池；
-- 明确在进入下一关键阶段前是否必须 join/wait；
-- 不在主线程等待可能反向调用 system_server 的 Binder 链。
+## 6. 依赖顺序、晚启动和失败：SSM 不替你做什么
 
-“异步”不能只启动线程而不建立完成屏障，否则后续阶段可能在依赖未完成时继续。
+### 6.1 没有自动拓扑排序
 
----
-
-## 19. `SystemServerInitThreadPool` 的使用边界
-
-SystemServer 启动阶段会提交可并行任务，例如读取配置、启动某些 native 服务或 WebView 准备。
-
-模式：
+SSM 不读取这样的声明：
 
 ```text
-submit task → 主线程继续启动无依赖服务
-            → 在真正依赖点 wait Future/latch
-            → PHASE_BOOT_COMPLETED 后关闭 init pool
+Storage dependsOn PackageManager
+Notification dependsOn Storage
 ```
 
-`startBootPhase(PHASE_BOOT_COMPLETED)` 结束时：
+Android 11 主要靠以下机制人工表达依赖：
 
-```java
-SystemServerInitThreadPool.shutdown();
-```
+- SystemServer 中的代码先后；
+- “必须在 X 前/后”的源码注释；
+- 服务选择在哪个 BootPhase 获取依赖；
+- `Future`、latch 或显式等待形成的完成屏障；
+- 服务自己的 ready 标志和错误处理。
 
-它是启动专用线程池，不应被当作系统服务运行期的通用 executor。
+Storage 先于通知服务启动，是代码顺序；Storage 到 phase 500 才取包和 AppOps 依赖，是阶段契约。
+SSM 不检查这些选择是否互相一致。
 
----
+### 6.2 LocalServices 也不会替你等待
 
-## 20. 第一阶段为何是默认显示
-
-Bootstrap 启动 DisplayManager 后：
-
-```java
-mDisplayManagerService =
-        mSystemServiceManager.startService(DisplayManagerService.class);
-mSystemServiceManager.startBootPhase(
-        t, PHASE_WAIT_FOR_DEFAULT_DISPLAY);
-```
-
-随后才启动 PackageManager 等。早期 Framework 创建 Resources、configuration、系统 UI 环境时需要可靠的默认显示信息。
-
-这里 phase 名称表达“调用此阶段时主启动代码认为应满足的系统条件”。SSM 本身没有检查物理显示是否真的 ready；具体服务回调和上游启动代码共同履行契约。
-
----
-
-## 21. SYSTEM_SERVICES_READY 做什么
-
-在大量服务已创建，LockSettings ready 后，SystemServer 推进：
-
-```java
-PHASE_LOCK_SETTINGS_READY
-PHASE_SYSTEM_SERVICES_READY
-```
-
-后者意味着服务可以更安全地调用 PowerManager、PackageManager 等核心系统服务。
-
-“可以安全调用”不是说此前 Binder 名字绝对不存在，而是整体依赖和内部初始化已到约定里程碑。早于该阶段调用某接口可能遇到：
-
-- 对方尚未发布；
-- 已发布但内部 systemReady 尚未完成；
-- 锁和回调依赖形成启动死锁；
-- 数据库/用户数据尚不可用。
-
----
-
-## 22. ACTIVITY_MANAGER_READY 与应用可启动不同
-
-`PHASE_ACTIVITY_MANAGER_READY = 550` 表示可以发送广播，但不要直接等同于三方应用已经可以自由启动。
-
-下一阶段：
+`LocalServices.getService(SomeInternal.class)` 是 system_server 内普通 Java 查表：
 
 ```text
-PHASE_THIRD_PARTY_APPS_CAN_START = 600
+已发布 → 立即返回对象
+未发布 → 返回 null
 ```
 
-才表示服务可以 start/bind 三方应用，并允许应用进入并调用系统服务。
+它没有 lazy start、依赖通知或线程切换。LocalService 的方法也在调用者线程直接执行，除非实现
+显式 post 到自己的 Handler。
 
-两阶段分开，是为了让系统组件先完成广播、网络、WebView、包数据等准备，再打开三方代码这个更复杂的世界。
+### 6.3 迟启动的修复不是“再发一次旧 phase”
 
----
+phase 严格递增，同一个 phase 不能重放。发现服务启动位置太晚时，通常应：
 
-## 23. PHASE_BOOT_COMPLETED 从哪里触发
+1. 把服务移到所需 phase 之前；
+2. 或重构服务，让它只依赖未来阶段；
+3. 为真正异步依赖设置明确、可验证的完成屏障。
 
-它并非紧接 `startOtherServices()` 同步调用。Android 11 中最终由 ActivityManagerService 的 `finishBooting()` 推进：
+在 `onBootPhase()` 中隐式启动另一服务尤其危险：新服务不会收到当前 phase，依赖关系也更难读。
 
-```java
-mSystemServiceManager.startBootPhase(
-        t, SystemService.PHASE_BOOT_COMPLETED);
-```
+### 6.4 SSM 抛异常，最终是否致命仍由调用者决定
 
-触发与启动 Home、完成系统启动、加密/用户流程等条件相关。
+SSM 会包装并向上抛构造、`onStart()` 和 phase 回调异常，但它不是最终恢复策略。
+SystemServer 外层通常把未处理的启动异常记录为 `Failure starting system services` 后重新抛出；
+某些具体调用点又会 `catch (Throwable)`、`reportWtf()` 后继续。
 
-`SystemService` 注释把 phase 1000 描述为“boot completed 且 Home application 已启动”，这是
-Framework 为系统服务定义的里程碑语义。它不等价于 Launcher 已绘制首帧、设备已经可流畅交互，
-也不证明某个用户的 `BOOT_COMPLETED` 广播及所有 Receiver 都已执行完；这些是不同时间线与
-不同观测点。
-
-因此：
+Storage 的启动调用正位于局部 `try/catch` 内。若 `onStart()` 失败：
 
 ```text
-SystemServer.startOtherServices 返回
-    ≠ PHASE_BOOT_COMPLETED 已完成
+Lifecycle 已在 mServices
+  → SSM 抛出异常
+  → SystemServer 此处可以记录后继续
+  → 以后 phase 仍可能碰到这个半初始化 Lifecycle
 ```
 
-`isBootCompleted()` 只是判断 SSM 当前 phase 是否达到 1000，不是读取 `sys.boot_completed` 属性，也不直接等价于某个用户已完成所有应用级初始化。
+因此“SSM 一定让 system_server 崩溃”和“SSM 会跳过坏服务继续”都不准确；要追真实调用者。
 
----
+## 7. 用户生命周期：另一条可重复的时间线
 
-## 24. BootPhase 与广播的区别
-
-| BootPhase | BOOT_COMPLETED/LOCKED_BOOT_COMPLETED 广播 |
-|---|---|
-| system_server 内 SystemService 生命周期回调 | Android 组件广播机制 |
-| 只给 SSM 管理的服务对象 | 发给符合条件的 Receiver |
-| 普通 Java 串行调用 | 经 AMS/BroadcastQueue 调度 |
-| 不经过 Intent 解析 | 有用户、权限、进程启动等语义 |
-| 更早、更直接、开销较低 | 面向应用/组件生态 |
-
-SystemService 文档建议内部服务优先监听 phase，减少为了同一系统里程碑再注册广播带来的延迟。
-
----
-
-## 25. `systemReady()` 为什么仍然存在
-
-旧服务或非 SystemService 架构仍有专用：
-
-```java
-wm.systemReady();
-vibrator.systemReady();
-networkService.systemReady();
-```
-
-这些调用由 SystemServer 显式编排，有时还返回 latch。它们与统一 `onBootPhase()` 共存，是历史演进结果。
-
-不能把任意类的 `systemReady()` 自动映射为 `PHASE_SYSTEM_SERVICES_READY`：
-
-- 调用时间可能在 phase 前或后；
-- 语义由具体服务定义；
-- 异常处理方式可能不同；
-- 可能有额外参数和完成信号。
-
-读启动链必须跟随真实调用点。
-
----
-
-## 26. safe mode 如何传给服务
-
-SystemServer 检测安全模式后：
-
-```java
-mSystemServiceManager.setSafeMode(safeMode);
-```
-
-SystemService 可通过：
-
-```java
-isSafeMode()
-```
-
-它内部从 LocalServices 取得 SSM，再读取标志。
-
-安全模式标志不是一个 BootPhase。它是一项可供服务查询的启动环境，服务决定是否禁用第三方扩展、调整策略或跳过某些初始化。
-
----
-
-## 27. runtime restart 是什么
-
-`mRuntimeRestarted` 表示 Android runtime/system_server 重新启动，而非设备从 bootloader 完整冷启动。
-
-服务可用：
-
-```java
-isRuntimeRestarted()
-getRuntimeStartElapsedTime()
-getRuntimeStartUptime()
-```
-
-区分它有助于：
-
-- 诊断启动耗时；
-- 避免把 runtime restart 当设备首次开机；
-- 恢复 native daemon 中仍存在的状态；
-- 处理此前 system_server Binder 全部死亡后重新发布。
-
-但 SSM 只提供事实，具体恢复逻辑由各服务实现。
-
----
-
-## 28. 用户生命周期为何独立于设备 BootPhase
-
-设备可能有多个用户，且用户可在设备已经启动很久后启动、解锁、切换和停止。
+BootPhase 是一次、单调的设备/system_server 时间线；用户事件可对多个用户重复发生：
 
 ```text
-设备生命周期：BootPhase 100 → ... → 1000（一次、单调）
+设备：phase 100 → 480 → 500 → 520 → 550 → 600 ─────→ 1000
 
-用户 0：start → unlocking → unlocked ───────────────
-用户 10：             start → unlocking → unlocked → stop → stopped
-前台用户：0 ───────────── switch 0→10 ─────────────
+用户 0：start → unlocking → unlocked ───────────────────────
+用户 10：                 start → unlocking → unlocked → stop → stopped
+前台用户：0 ───────────────────────────── switch 0 → 10 ─────
 ```
 
-Boot completed 不等于每个用户都 unlocked；用户 unlocked 也不等于设备刚进入 boot completed。
+SSM 的入口与新式回调对应为：
 
----
-
-## 29. 用户回调对应关系
-
-SSM 的入口与服务回调：
-
-| SSM 入口 | SystemService 回调 | 含义 |
+| SSM 入口 | `SystemService` 回调 | 边界 |
 |---|---|---|
-| `startUser` | `onUserStarting` | 建立该运行用户的 per-user 状态 |
-| `unlockUser` | `onUserUnlocking` | CE 存储已可用，处于 unlocking |
-| `onUserUnlocked` | `onUserUnlocked` | 用户已进入 unlocked |
-| `switchUser(from,to)` | `onUserSwitching` | 前台用户切换 |
-| `stopUser` | `onUserStopping` | 停止前清理，仍可访问 CE 的最后阶段 |
+| `startUser` | `onUserStarting` | 建立 running user 状态 |
+| `unlockUser` | `onUserUnlocking` | CE 已可用，仍在 unlocking |
+| `onUserUnlocked` | `onUserUnlocked` | unlocked 转换完成 |
+| `switchUser(from,to)` | `onUserSwitching` | 前台用户改变 |
+| `stopUser` | `onUserStopping` | 停止前；仍可访问 CE 的最后回调 |
 | `cleanupUser` | `onUserStopped` | 用户进程清理完成后的最终释放 |
 
-命名中的 `cleanupUser` 对应 `onUserStopped`，不是同名直译，读代码时容易看漏。
+在分发前，`preSystemReady()` 从 LocalServices 取得 `UserManagerInternal`。
+若它尚未设置或 userId 不存在，构造 `TargetUser` 时会抛 `IllegalStateException`。
+SSM 自己不维护用户数据库。
 
----
+`TargetUser` 包装的是 UserManagerService 引用的 live `UserInfo`；服务可以读取，不能修改。
+分发还会先调用 `isUserSupported()`（默认 true）；switch 时 from/to 任一用户受支持就会通知。
+Storage Lifecycle 没有覆写该过滤器，因此默认接收所有用户。
 
-## 30. TargetUser 为什么包装 UserInfo
+### 7.1 Android 11 deprecated bridge 的准确方向
 
-新回调使用：
+SSM 只调用新式 `TargetUser` 方法。`SystemService` 基类再从新方法桥接到旧方法：
 
-```java
-SystemService.TargetUser
+```text
+onUserStarting(TargetUser)
+  → onStartUser(UserInfo)
+  → onStartUser(int)
+
+onUserUnlocking(TargetUser) → onUnlockUser(UserInfo) → onUnlockUser(int)
+onUserSwitching(from,to)    → onSwitchUser(UserInfo,UserInfo) → onSwitchUser(int)
+onUserStopping(TargetUser)  → onStopUser(UserInfo) → onStopUser(int)
+onUserStopped(TargetUser)   → onCleanupUser(UserInfo) → onCleanupUser(int)
 ```
 
-它包装 `UserInfo` 并提供 user handle/id。源码强调内部 UserInfo 是 UserManagerService 引用的“live object”，服务不能修改它。
+`onUserUnlocked(TargetUser)` 在 r48 没有对应的 deprecated 链，默认实现为空。
 
-TargetUser 帮助 API 更明确地表达：
+Storage 恰好展示迁移期混用：
 
-- 当前操作的目标用户；
-- switch 时 from/to 两个用户；
-- 未来可扩展用户生命周期契约。
+- 直接覆写新式 `onUserStarting(TargetUser)`；
+- 仍覆写旧式 `onUnlockUser(int)`、`onSwitchUser(int)`、`onStopUser(int)`、
+  `onCleanupUser(int)`；
+- 依靠基类桥接使这些旧 override 仍被调用；
+- 没有覆写 `onUserUnlocked(TargetUser)`。
 
-SystemService 仍保留旧 `onStartUser(int)` 等 deprecated 方法，新回调默认桥接旧方法，帮助历史服务迁移。
+如果子类改为覆写新方法但不调用 `super`，旧 override 不会再自动执行。这是迁移时常见遗漏。
 
----
+### 7.2 Storage 的用户完成边界
 
-## 31. 用户事件如何取得 UserInfo
+`onUnlockUser(int)` 有意同步阻塞，先确保用户 staging area 可供 zygote 派生进程 bind mount，
+再通知 vold、storaged；之后只投递 `H_COMPLETE_UNLOCK_USER`。
 
-ActivityManager 进入 system ready 前调用：
+因此回调返回时：关键挂载前置动作已完成，但 volume 广播、旧 OBB 迁移等 Handler 工作可以仍未完成。
+
+`onStopUser(int)` 关闭 storage session 并撤销 package monitor；`onCleanupUser(int)` 才通知
+vold/storaged 用户停止并从 `mSystemUnlockedUsers` 移除。两者不是同一事件的两个名字。
+
+### 7.3 用户回调运行在哪个线程
+
+SSM 的 `onUser()` 只是普通 for 循环，没有内部 Handler，也没有为每个服务创建线程。
+回调运行在调用 SSM 入口的线程上，并按 `mServices` 顺序串行执行。
+
+在 r48 的真实调用点中：
+
+- 初始 system user 的 `startUser()` 可从 AMS `systemReady()` 主启动路径直接进入；
+- 后续 start/unlock/switch 消息多由 `UserController.mHandler` 处理；
+- 该 Handler 使用 AMS 自己 `ServiceThread` 的 Looper，而不是服务专属线程；
+- Storage 回调内部再决定同步 Binder 调用或投递到 Storage Handler。
+
+所以不能笼统写“所有用户回调都在 SystemServer 主线程”，也不能写“SSM 自动切到服务线程”。
+
+## 8. 异常、50ms 告警和 trace 的真实含义
+
+### 8.1 三类分发的异常策略不同
+
+| 路径 | r48 SSM 行为 | 后果边界 |
+|---|---|---|
+| 反射构造 | 包装为 `RuntimeException` 并上抛 | 调用者决定终止还是捕获 |
+| `onStart()` | 捕获 `RuntimeException`，包装后上抛 | 对象已留在 `mServices` |
+| `onBootPhase()` | 捕获 `Exception`，包装后上抛 | 中断本轮；phase 已更新，不回滚 |
+| 用户回调 | 每服务捕获 `Exception`，`Slog.wtf` | 继续通知后面的服务 |
+
+用户运行期需要尽量让其他服务仍收到清理事件，所以采用“记录严重错误后继续”；
+启动 phase 更强调全局不变量，默认中断。两者都不是自动恢复协议。
+
+### 8.2 50ms 是静态告警阈值，不是实测结论
+
+源码固定：
 
 ```java
-mSystemServiceManager.preSystemReady();
-```
-
-SSM 从 LocalServices 取得：
-
-```java
-UserManagerInternal
-```
-
-之后用户事件才能把 userId 转成 UserInfo/TargetUser。如果尚未 `preSystemReady()` 或 userId 不存在，SSM 抛 IllegalStateException。
-
-这说明用户回调依赖 UserManager 的内部服务已经发布，不是 SSM 自己维护用户数据库。
-
----
-
-## 32. `isUserSupported()` 的过滤
-
-SystemService 默认：
-
-```java
-public boolean isUserSupported(TargetUser user) {
-    return true;
+private static final int SERVICE_CALL_WARN_TIME_MS = 50;
+if (duration > SERVICE_CALL_WARN_TIME_MS) {
+    Slog.w(...);
 }
 ```
 
-不支持某些用户类型的服务可覆写，例如只支持 full user、不支持 profile 或 headless system user。
+它表示单次同步 `onStart`、`onBootPhase` 或用户回调墙钟时间大于 50ms 就打印 warning。
+它不是 ANR、超时取消、CPU 使用率，也不是“此服务在所有设备实测耗时 50ms”。
 
-SSM 分发前检查；switch 事件特殊处理：只要 from 或 to 任一用户受支持，就仍调用服务，因为服务可能需要离开旧支持用户或进入新支持用户。
+计时使用 `SystemClock.elapsedRealtime()`，会包含：
 
-```text
-from supported, to unsupported → 仍需通知退出
-from unsupported, to supported → 仍需通知进入
-```
-
----
-
-## 33. 用户回调的异常策略与 BootPhase 不同
-
-BootPhase 中服务抛异常：包装成 RuntimeException，通常中断系统启动。
-
-用户事件中服务抛异常：
-
-```java
-Slog.wtf(...)
-```
-
-然后继续给后续服务分发。
-
-原因是用户切换/停止发生在运行期，一个服务失败不应轻易让其他所有服务错过清理。但 `wtf` 仍表示严重 Framework 错误，不是可以忽略的正常事件。
-
----
-
-## 34. 用户回调在哪个线程执行
-
-Android 11 此处是普通循环直接调用服务方法，没有为每个服务创建线程：
-
-```text
-调用 SSM 用户入口的线程
-  → service A callback
-  → service B callback
-  → service C callback
-```
-
-因此：
-
-- 回调通常串行；
-- 慢服务会拖慢整个用户状态推进；
-- 超过 50ms 会警告；
-- 服务若需异步工作，要自己安排线程；
-- 若后续用户状态依赖任务完成，必须保留正确同步屏障。
-
-“SystemService 生命周期回调”不等于“自动运行在每个服务自己的 HandlerThread”。
-
----
-
-## 35. onUserUnlocking 与 onUserUnlocked
-
-`onUserUnlocking` 文档说明：用户正处于 `STATE_RUNNING_UNLOCKING`，CE 存储已可用；回调全部完成后才转到 `STATE_RUNNING_UNLOCKED`。
-
-适合：
-
-- 打开 CE 数据库；
-- 迁移/加载用户凭据保护数据；
-- 建立必须在 unlocked 前完成的状态。
-
-`onUserUnlocked` 发生在状态已是 unlocked 后，更适合：
-
-- 启动不阻塞状态切换的用户功能；
-- 通知依赖已解锁语义的内部模块；
-- 执行可延后的工作。
-
-若业务同时接受 unlocking/unlocked，应使用 `isUserUnlockingOrUnlocked()`，避免在窗口期错误拒绝。
-
----
-
-## 36. onUserStopping 与 onUserStopped
-
-`onUserStopping`：
-
-- 在该用户 SHUTDOWN 广播之前；
-- 应停止使用用户资源、解绑该用户进程服务；
-- 是仍可访问目标用户 CE 存储的最后回调。
-
-`onUserStopped`：
-
-- 该用户所有应用进程清理之后；
-- 用于删除内存缓存、listener、session 等最终状态；
-- 不应再假设 CE 数据可访问。
-
-把磁盘写入拖到 `onUserStopped` 可能已经太晚。
-
----
-
-## 37. 前台用户切换与用户启动不是一回事
-
-用户可以已经在后台 running/unlocked，再成为前台用户。此时主要发生：
-
-```text
-onUserSwitching(from, to)
-```
-
-而不是重新完整调用 start/unlock。
-
-一个服务应分开维护：
-
-- running users 集合；
-- unlocked users 集合；
-- current foreground user；
-- 每用户资源与仅前台资源。
-
-仅用一个 `mCurrentUser` 无法覆盖后台多用户运行模型。
-
----
-
-## 38. 服务启动异常的传播
-
-反射阶段可能失败：
-
-- 不是 SystemService 子类；
-- 没有 public `Context` 构造器；
-- 构造器本身抛异常；
-- 类不存在；
-- jar/ClassLoader 配置错误。
-
-`onStart()` 也可能抛 RuntimeException。SSM 包装后继续抛出，SystemServer 外层记录：
-
-```text
-Failure starting system services
-```
-
-并重新抛出。关键启动失败通常导致 system_server 退出，由 init/zygote 相关机制重新拉起；反复失败可能进入 Watchdog/RescueParty 等更高层恢复路径。
-
-不要在 `onStart()` 捕获所有 Throwable 后假装成功。若关键不变量不成立，带着半初始化服务继续运行往往更危险；可选能力则应在明确设计下优雅降级。
-
----
-
-## 39. SystemServer 为什么有大量 try/catch `reportWtf`
-
-并非所有启动步骤都经 SSM，也并非所有失败都同等致命。SystemServer 对某些“make ready”或可选服务调用会：
-
-```java
-try { ... } catch (Throwable e) {
-    reportWtf("...", e);
-}
-```
-
-这表示该调用点有意选择记录严重错误后继续启动。它是逐点的容错决策，不是 SSM 默认策略。
-
-阅读异常边界时要看真实调用者：
-
-```text
-SSM start/onBootPhase 默认传播
-SystemServer 某些显式步骤选择 reportWtf 后继续
-用户生命周期 SSM 内部 wtf 后继续下一服务
-```
-
----
-
-## 40. 慢调用 warning 如何理解
-
-SSM 对 `onStart`、`onBootPhase`、用户回调都测量 elapsed realtime，超过 50ms：
-
-```text
-Service X took N ms in onStart/onBootPhase/...
-```
-
-这不是 ANR，也不代表 CPU 一直执行了 N ms；其中可能包含锁等待、I/O、Binder 等墙钟延迟。
-
-排查应结合：
-
-- `atrace`/Perfetto 的 `StartService X`、`OnBootPhase` slice；
-- 线程栈；
-- Binder 调用目标；
+- CPU 执行；
+- 锁等待；
+- Binder 同步等待；
 - 磁盘 I/O；
-- 是否错误等待 init thread pool future；
-- 上下游启动依赖。
+- 调度停顿。
 
----
+反射构造发生在 `onStart` 计时之前，但包含在外层 `StartService <class>` trace 中。
+Storage 的真正实现对象是在 Lifecycle.onStart 内构造，因此这部分恰好又计入它的 onStart warning。
 
-## 41. 一个服务的推荐结构
+### 8.3 trace 结束只标记同步代码返回
 
-```java
-public final class DemoService extends SystemService {
-    private final BinderService mBinderService = new BinderService();
-    private final LocalService mLocalService = new LocalService();
+SSM 会创建 `StartService <class>`、`OnBootPhase_<phase>_<class>`、
+`ssm.on<event>User-<id>_<class>` 等 slice。
 
-    public DemoService(Context context) {
-        super(context);
-    }
+slice 能回答“调用线程在这个同步区间停留多久”，不能自动回答：
 
-    @Override
-    public void onStart() {
-        publishBinderService("demo", mBinderService);
-        publishLocalService(DemoManagerInternal.class, mLocalService);
-    }
+- post 到 Handler 的任务何时完成；
+- daemon 重连何时成功；
+- Binder 对端内部异步工作是否结束；
+- 此耗时究竟是 CPU、锁、I/O 还是调度造成。
 
-    @Override
-    public void onBootPhase(int phase) {
-        if (phase == PHASE_SYSTEM_SERVICES_READY) {
-            // 取得并连接核心依赖
-        } else if (phase == PHASE_THIRD_PARTY_APPS_CAN_START) {
-            // 开放涉及第三方进程的能力
-        }
-    }
+Storage phase 550 的 `systemReady()` 只投递消息，就是最直接的反例。
+定位慢启动要把 trace、warning、线程栈、Binder 目标和异步完成信号一起看。
 
-    @Override
-    public void onUserUnlocking(TargetUser user) {
-        // 打开该用户 CE 数据
-    }
+## 9. 按“问题 → 机制 → 验证”排查
 
-    @Override
-    public void onUserStopping(TargetUser user) {
-        // 在 CE 最后可用阶段提交并关闭
-    }
-}
-```
+### 9.1 问题：`mount` 查得到，但调用仍失败
 
-真实服务还需设计锁、Handler、权限、SELinux、错误恢复与 dump。
-
----
-
-## 42. Binder 过早发布的风险
-
-PowerManager 的注释强调：它早期发布后必须立即能够处理 native daemon 调用，包括权限验证。
-
-如果普通服务在 `onStart()` 一开始发布 Binder，随后才初始化必要字段，就可能出现：
+机制/方案：先把“目录可见、daemon 连接、phase-ready、user-ready”拆成独立状态再逐层检查：
 
 ```text
-publish binder
-  → 客户端立刻 transact
-  → 服务读到半初始化状态
+Binder 发布完成了吗？           → service check 只能回答这一层
+vold/storaged 连接了吗？         → 看连接/死亡/重试日志
+phase 500 servicesReady 到了吗？ → 看 OnBootPhase_500 与依赖字段
+目标用户 unlock 到哪一步？      → 看 SSM 用户 trace 与 Storage Handler
 ```
 
-安全方案包括：
+验证结论必须写成具体完成点，例如“`mount` 已发布，但 `H_COMPLETE_UNLOCK_USER` 未处理”，
+而不是笼统写“Storage 没启动”。
 
-- 发布前建立处理基本调用所需不变量；
-- Binder 方法检查 ready 状态并返回明确错误；
-- 把必须同步完成的初始化放在发布前；
-- 不要靠“客户端应该晚一点调用”的时间假设。
+### 9.2 问题：服务在 phase 500 取依赖时为空
 
-Binder 发布是并发可见性边界。
+机制/方案：SSM 没有拓扑排序；应把依赖移到 phase 前发布，或在真实依赖点建立完成屏障。
 
----
+验证：
 
-## 43. 锁与启动依赖死锁示例
+1. 找服务的 `startService` 位置；
+2. 找依赖的发布位置；
+3. 比较两者与所有 `startBootPhase` 调用点；
+4. 查是否有异步任务，以及依赖点是否真的等待 Future/latch。
 
-危险时序：
+### 9.3 问题：晚启动服务从未执行初始化
 
-```text
-SystemServer main: ServiceA.onStart 持有 A 锁
-  → Binder 同步调用 ServiceB
-ServiceB Binder thread: 回调 ServiceA
-  → 等待 A 锁
-SystemServer main 等 ServiceB reply
-```
+机制/方案：`startService()` 不重放历史 phase；应前移启动位置或改为只依赖未来阶段。
 
-启动时服务未完全 ready、线程池数量有限，更容易形成等待环。
+验证：确认服务加入 `mServices` 时的 `mCurrentPhase`，再核对它只监听的 phase 是否已经过去。
+不要尝试重复调用旧 phase；单调性检查会直接抛异常。
 
-设计原则：
+### 9.4 问题：用户解锁被某服务拖慢
 
-- 不持内部主锁做外部 Binder 调用；
-- phase 回调中减少同步跨服务往返；
-- 明确 LocalService 直调的调用线程与锁顺序；
-- 异步 callback 不假设立即执行；
-- 用 trace 和锁图审查依赖。
+机制/方案：SSM 串行直调；必要同步工作保留屏障，非关键重活才异步化。
 
----
+验证：找 `ssm.onUnlockingUser-<id>_<class>` slice 和超过 50ms 的 warning，再追该回调内部
+是否故意阻塞、是否随后还有异步 Handler 工作。
 
-## 44. LocalService 在启动依赖中的作用
+### 9.5 macOS 本地源码命令
 
-服务 A 在 `onStart()` 发布 LocalService 后，后续服务 B 可通过：
-
-```java
-LocalServices.getService(AInternal.class)
-```
-
-取得同进程接口。这能显式表达“B 必须在 A 发布之后启动”。若顺序反了，可能得到 null。
-
-LocalServices 没有等待、lazy start 或通知机制，因此依赖仍由 SystemServer 顺序/phase 保证。
-
-而且直调不会切换到 A 的线程；若 AInternal 要求特定线程，接口实现必须 post 到 Handler 或明确注释调用约束。
-
----
-
-## 45. BootPhase 中启动新服务为什么危险
-
-技术上 `onBootPhase()` 可以通过 LocalServices 取得 SSM 再启动服务，但新服务不会自动收到当前或过去 phase，而且会令启动顺序更隐蔽。
-
-除非架构明确设计，否则更易读的方式是：
-
-- 在 SystemServer/受控 initializer 中显式启动；
-- 在正确 phase 前加入列表；
-- phase 回调只推进已有服务状态。
-
-否则新服务可能认为 `SYSTEM_SERVICES_READY` 将来会来，实际已经错过。
-
----
-
-## 46. 服务的线程模型不是 SSM 决定的
-
-SSM 只在调用线程同步执行生命周期方法。服务运行期可以选择：
-
-- 在 system_server Binder 线程池处理 Binder 请求；
-- 用主线程 Handler；
-- 创建专用 HandlerThread；
-- 使用共享 BackgroundThread/FgThread/IoThread；
-- 把工作交给 native daemon。
-
-因此看到服务由 SSM 在 system_server 主线程 `onStart()`，不能推断它所有 Binder 方法也在主线程。
-
-必须分别追：
-
-```text
-生命周期调用线程
-Binder 入站线程
-Handler 实际处理线程
-callback 返回线程
-```
-
----
-
-## 47. SystemServiceManager 是否管理服务停止
-
-Android 11 SSM 没有一个与 `startService()` 对称的通用 `stopService()` 来卸载整个 SystemService。
-
-system_server 服务通常与进程同生命周期：
-
-```text
-启动一次 → 运行到 system_server 退出
-```
-
-用户停止只清理该用户相关状态，不是销毁整个服务对象。硬件/模块可以内部断开重连，但仍由具体服务实现。
-
-这与应用组件 Service 的 `onCreate/onDestroy` 生命周期完全不同。
-
----
-
-## 48. 与应用 Service 的区别
-
-| SystemService | 应用 `android.app.Service` |
-|---|---|
-| 主要在 system_server | 在应用进程 |
-| SSM 创建/启动 | AMS/ActiveServices 调度 |
-| `onStart/onBootPhase/onUser...` | `onCreate/onStartCommand/onBind/onDestroy` |
-| 通常进程级常驻 | 可按组件需求创建销毁 |
-| `publishBinderService` 注册全局 Binder 名字 | `onBind` 返回给绑定者 Binder |
-| 强特权内部代码 | 受应用 UID/沙箱约束 |
-
-两者名字都有 Service，但不是同一套框架。
-
----
-
-## 49. 常见误区纠正
-
-### 误区 1：SystemServiceManager 就是 ServiceManager
-
-错误。前者在 system_server 内管理 Java 服务生命周期；后者是 Binder 服务目录。
-
-### 误区 2：`startService()` 返回就代表服务所有功能 ready
-
-错误。它只表明构造和 `onStart()` 返回。
-
-### 误区 3：BootPhase 会自动检查依赖条件
-
-错误。SSM 只分发数值；SystemServer 与各服务共同保证里程碑语义。
-
-### 误区 4：BootPhase 回调并行执行
-
-错误。Android 11 SSM 按服务列表串行直调。
-
-### 误区 5：晚启动服务会收到历史 phase
-
-错误。`startService()` 没有补发机制。
-
-### 误区 6：服务 onStart 抛异常后 SSM 会跳过并继续
-
-错误。默认包装并向上抛，关键启动通常失败。
-
-### 误区 7：用户 unlocked 等于设备 boot completed
-
-错误。两条生命周期相互关联但独立。
-
-### 误区 8：onUserStopped 仍适合写 CE 数据
-
-错误。onUserStopping 才是仍能访问 CE 的最后回调。
-
-### 误区 9：LocalService 调用自动进入服务线程
-
-错误。它在调用者线程普通 Java 直调。
-
-### 误区 10：所有 system_server 服务都由 SSM 启动
-
-错误。仍有历史、native、模块化和特殊静态入口。
-
----
-
-## 50. 完整启动时序图
-
-```text
-SystemServer main
-  │
-  ├─ createSystemContext
-  ├─ new SystemServiceManager
-  ├─ start init thread pool
-  │
-  ├─ startBootstrapServices
-  │    ├─ start Power/Display/AMS/PMS...
-  │    └─ phase 100: default display
-  │
-  ├─ startCoreServices
-  │    └─ Battery/Usage...
-  │
-  ├─ startOtherServices
-  │    ├─ 更多服务
-  │    ├─ phase 480: lock settings
-  │    ├─ phase 500: system services
-  │    ├─ phase 520: device specific
-  │    ├─ phase 550: activity manager
-  │    └─ phase 600: third-party apps
-  │
-  └─ AMS.finishBooting（稍后）
-       └─ phase 1000: boot completed
-            └─ shutdown init thread pool
-```
-
-这不是每行都紧邻执行；部分工作通过 AMS callback、future 和异步线程完成。
-
----
-
-## 51. 用户生命周期图
-
-```text
-UserController / AMS
-       │
-       ├─ SSM.startUser(10)
-       │    └─ services.onUserStarting(10)
-       │
-       ├─ SSM.unlockUser(10)
-       │    └─ services.onUserUnlocking(10)   CE 已可用
-       │
-       ├─ SSM.onUserUnlocked(10)
-       │    └─ services.onUserUnlocked(10)
-       │
-       ├─ SSM.switchUser(0, 10)
-       │    └─ services.onUserSwitching(0,10)
-       │
-       ├─ SSM.stopUser(10)
-       │    └─ services.onUserStopping(10)    CE 最后可用窗口
-       │
-       └─ SSM.cleanupUser(10)
-            └─ services.onUserStopped(10)     进程清理完成
-```
-
----
-
-## 52. 新服务启动设计检查表
-
-### 构造与发布
-
-- 是否有 public `Context` 构造器？
-- 构造器是否足够轻？
-- 发布 Binder 前是否建立必要不变量？
-- 是否需要同时发布 LocalService？
-- add/find/call SELinux 和 Framework 权限是否完整？
-
-### 依赖与 phase
-
-- 必须在谁之后启动？
-- 谁必须在它之后启动？
-- 哪个 phase 才能调用外部服务？
-- 是否可能晚于所需 phase 才加入 mServices？
-- 异步任务在哪里等待完成？
-
-### 用户
-
-- 数据是 device-wide 还是 per-user？
-- 是否依赖 DE/CE？
-- 支持 full user、profile、headless system user 中哪些？
-- stop 时何时提交 CE 数据？
-- switch 与 start 是否被错误合并？
-
-### 性能与恢复
-
-- 回调是否可能超过 50ms？
-- 是否持锁跨 Binder 调用？
-- system_server runtime restart 后如何恢复？
-- 依赖 Binder 死亡后如何重连？
-
----
-
-## 53. Mac 上的源码阅读练习
-
-### 练习 1：追一项服务的创建
+在 AOSP 根目录运行：
 
 ```bash
-rg -n "startService\(PowerManagerService.class|class PowerManagerService|void onStart\(" \
-  frameworks/base/services
-```
+# 确认版本
+git -C frameworks/base describe --tags --exact-match HEAD
 
-写出构造、加入 mServices、onStart、publish Binder 的顺序。
-
-### 练习 2：标记所有 phase 调用点
-
-```bash
-rg -n "startBootPhase" \
+# 启动位置、显式先后与所有 phase 推进点
+rg -n "StartStorageManagerService|STORAGE_MANAGER_SERVICE_CLASS|startBootPhase" \
   frameworks/base/services/java/com/android/server/SystemServer.java \
   frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
-```
 
-目标：不要只看常量声明，要知道每个 phase 在真实启动代码何处推进。
-
-### 练习 3：选一个服务阅读 phase
-
-```bash
-rg -n "onBootPhase" \
-  frameworks/base/services/core/java/com/android/server/power/PowerManagerService.java
-```
-
-记录每个 phase 前后，服务新增了哪些能力。
-
-### 练习 4：追用户事件来源
-
-```bash
-rg -n "startUser\(|unlockUser\(|onUserUnlocked\(|switchUser\(|stopUser\(|cleanupUser\(" \
-  frameworks/base/services/core/java/com/android/server/am \
+# SSM 的加入时机、分发、异常和 50ms 阈值
+rg -n "mServices.add|SERVICE_CALL_WARN_TIME_MS|startService\(|startBootPhase|onUser\(" \
   frameworks/base/services/core/java/com/android/server/SystemServiceManager.java
+
+# Storage 的完整生命周期
+rg -n "class Lifecycle|void onStart|onBootPhase|onUserStarting|onUnlockUser|onSwitchUser|onStopUser|onCleanupUser" \
+  frameworks/base/services/core/java/com/android/server/StorageManagerService.java
+
+# 新用户 API 到 deprecated API 的桥接方向
+rg -n "onUserStarting|onStartUser|onUserUnlocking|onUnlockUser|onUserSwitching|onSwitchUser|onUserStopping|onStopUser|onUserStopped|onCleanupUser" \
+  frameworks/base/services/core/java/com/android/server/SystemService.java
+
+# 用户事件的真实调用线程来源
+rg -n "getSystemServiceManager\(\)\.(startUser|unlockUser|onUserUnlocked|switchUser|stopUser)|systemServiceManagerCleanupUser|getHandler" \
+  frameworks/base/services/core/java/com/android/server/am/UserController.java
 ```
 
-区分 UserController 状态变化与 SSM 回调分发。
+## 10. 踩坑、检查题与读完就能做的事
 
-### 练习 5：找异步任务的完成屏障
+### 10.1 十个常见误写
 
-```bash
-rg -n "SystemServerInitThreadPool|waitForFuture|Future<|CountDownLatch" \
-  frameworks/base/services/java/com/android/server/SystemServer.java
-```
+1. **“SSM 就是 ServiceManager。”** 错；一个管进程内生命周期，一个管跨进程 Binder 名字。
+2. **“SystemServiceRegistry 启动系统服务。”** 错；它主要创建应用侧 Manager wrapper。
+3. **“三大启动区是自动依赖层。”** 错；它们是 SystemServer 的显式组织和顺序。
+4. **“进入 `mServices` 表示 onStart 成功。”** 错；加入发生在 onStart 之前且失败不回滚。
+5. **“onStart 返回表示服务完全 ready。”** 错；只表示同步 onStart 返回。
+6. **“Binder 名存在表示所有方法可用。”** 错；发布只是并发可见性边界。
+7. **“晚启动服务会补收旧 phase。”** 错；r48 没有 replay。
+8. **“phase 失败可以原 phase 重试。”** 错；`mCurrentPhase` 已更新，重复值被拒绝。
+9. **“所有生命周期回调都自动切到服务线程。”** 错；SSM 在调用者线程直调。
+10. **“50ms 是 Android 对该服务的实测耗时。”** 错；它只是静态 warning 阈值。
 
-对每个 submit 问：谁等待它、在哪个依赖点等待、异常如何传播？
+### 10.2 上线前检查表
 
----
+- public `Context` 构造器是否存在，构造和 onStart 各自做了什么？
+- 对象何时加入 `mServices`，失败后调用者是否可能继续？
+- Binder/LocalService 在什么时刻发布，发布前最小不变量是否成立？
+- 服务依赖谁，依赖由代码顺序、phase 还是显式屏障保证？
+- 服务是否可能晚于自己需要的 phase 才启动？
+- callback 返回后是否仍有 Handler、Future 或 native daemon 工作？
+- 用户数据依赖 DE 还是 CE，stopping 与 stopped 分工是否正确？
+- 用户回调实际从哪个 Handler/Looper 进入？
+- 超过 50ms 是 CPU、I/O、锁、Binder 还是调度等待？
+- 验证证据证明的是 published、phase-ready、user-ready 还是 business-ready？
 
-## 54. 自测题
+### 10.3 自测题
 
-1. SSM 与 servicemanager 的区别是什么？
-2. `startService(Class)` 对构造器有什么要求？
-3. 实例何时加入 `mServices`？
-4. `onStart()` 返回说明哪些事情，不说明哪些事情？
-5. BootPhase 为什么必须单调递增？
-6. 某服务在 phase 500 后启动，会自动收到 100～500 吗？
-7. phase 回调在哪个线程、按什么顺序调用？
-8. 超过 50ms 会怎样？
-9. PHASE_BOOT_COMPLETED 为什么不一定在 startOtherServices 返回前发生？
-10. onUserUnlocking 与 onUserUnlocked 的区别是什么？
-11. 哪个是访问 CE 的最后回调？
-12. 用户回调抛异常和 BootPhase 抛异常的处理有何不同？
-13. LocalService 调用会自动切线程吗？
-14. init thread pool 为什么需要完成屏障？
+1. 为什么 `mServices.add()` 在 `onStart()` 之前很重要？
+2. `service check mount` 成功能证明哪些事实？
+3. SSM 如何知道通知服务依赖存储服务？
+4. phase 500 之后启动的服务会收到 phase 500 吗？
+5. 某个 phase 回调抛异常后，`mCurrentPhase` 会回退吗？
+6. Storage phase 550 返回能否证明 `H_SYSTEM_READY` 已处理？
+7. r48 中 SSM 调用的是新式还是旧式用户回调？
+8. 为什么 Storage 覆写 deprecated `onUnlockUser(int)` 仍有效？
+9. `onUserStopping` 和 `onUserStopped` 哪个仍可访问 CE？
+10. 50ms warning 为什么不能直接归因于 CPU 慢？
 
----
+### 10.4 参考答案
 
-## 55. 参考答案
+1. 它说明列表是生命周期登记表，不是成功服务表；失败不会自动回滚。
+2. 只证明当前调用者能从 servicemanager 取得 `mount` Binder，不能证明全部初始化完成。
+3. 它不知道；依赖由 SystemServer 的显式顺序和注释表达。
+4. 不会；`startService()` 不补发历史 phase。
+5. 不会；SSM 先更新 phase，再开始回调，且只允许继续增大。
+6. 不能；该方法只投递 Handler 消息。
+7. 新式 `TargetUser` 回调。
+8. 基类的新式回调默认向下桥接到 deprecated 方法。
+9. `onUserStopping`；它是仍可访问目标用户 CE 的最后回调。
+10. 计时是 elapsed realtime，可能包含锁、I/O、Binder 和调度等待。
 
-1. SSM 管 system_server 内 Java 服务生命周期；servicemanager 管跨进程名字到 Binder 的目录。
-2. 必须继承 SystemService，并具有 public `Constructor(Context)`。
-3. 在调用 `onStart()` 之前。
-4. 说明构造和 onStart 完成；不保证 Binder 已发布、所有 phase/用户数据/依赖和业务都 ready。
-5. phase 是累积里程碑，倒退或重复会破坏一次性初始化假设。
-6. 不会，Android 11 startService 不补发历史 phase。
-7. 在调用 startBootPhase 的线程上，按 mServices 注册顺序串行。
-8. 记录 warning；不会自动取消，但会拖慢后续服务。
-9. 最终由 AMS `finishBooting()` 在其启动条件满足后推进；这只是 Framework phase 里程碑，
-   不等价于 Home 首帧、用户已可交互或所有 BOOT_COMPLETED Receiver 已完成。
-10. unlocking 时 CE 已可用但用户仍在状态转换；unlocked 是转换完成后。
-11. `onUserStopping()`。
-12. BootPhase 默认向上抛并中断启动；用户回调记录 wtf 后继续分发其他服务。
-13. 不会，是调用者线程的 Java 直调。
-14. 否则主线程会越过实际依赖，后续 phase/服务可能看到未完成状态。
+### 10.5 读完就能做的事
 
----
-
-## 56. 第二遍复读：六个最容易混淆的完成点
-
-### 56.1 created 与 started
-
-构造器返回只是 created；`onStart()` 返回才是 SSM 意义的 started。SSM 在二者之间先把实例加入生命周期列表。
-
-### 56.2 started 与 published
-
-`onStart()` 通常发布 Binder，但框架没有强制每个服务必须发布，也没有自动验证名字。Local-only 服务可能根本没有公共 Binder。
-
-### 56.3 published 与 callable
-
-名字已在 servicemanager 可见，不代表任意客户端有 SELinux find/call、Framework permission，也不代表服务内部 ready。
-
-### 56.4 phase reached 与每个异步任务完成
-
-SSM 只知道同步回调已经返回。服务回调若 fire-and-forget 提交异步任务，除非显式等待，phase 完成并不保证该任务结束。
-
-### 56.5 device boot 与 user unlock
-
-BootPhase 是设备/system_server 主时间线；用户回调是每用户可重复时间线。设备 boot completed 时仍可能有用户未启动或未解锁。
-
-### 56.6 stopping 与 stopped
-
-stopping 是停止过程且 CE 最后可用；stopped 是用户进程清理后的最终内存清理阶段。二者不能只当同一事件的两个名字。
-
----
-
-## 57. 本章总结
-
-把 SSM 主链压缩为：
+把本章压缩成一条排障主线：
 
 ```text
-SystemServer 按显式依赖顺序
-  → SSM 反射构造 SystemService
+SystemServer 显式排序
+  → SSM 反射构造 Lifecycle
   → 先加入 mServices
   → 同步 onStart
-  → 服务发布 Binder/LocalService
-  → SystemServer 单调推进 BootPhase
-  → SSM 按启动顺序串行回调所有已启动服务
-  → AMS/UserController 在运行期触发每用户生命周期
+  → 服务自行发布 Binder / LocalService
+  → 单调、串行分发未来 BootPhase
+  → AMS / UserController 触发可重复的用户事件
+  → 服务自行决定同步完成、异步投递和真正 ready 条件
 ```
 
-真正读懂启动代码的关键，不是记住 phase 数值，而是始终追问：
+读任何系统服务时，始终追问四句话：
 
 ```text
 谁在什么线程调用？
-此前依赖真的完成了吗？
-回调返回代表哪个完成点？
-是否还有异步任务？
-服务已发布是否就能处理所有调用？
-当前是设备阶段还是某个用户阶段？
+返回时究竟完成了哪一层？
+依赖由哪条显式顺序或屏障保证？
+日志、Binder 名和 trace 分别只能证明什么？
 ```
-
----
-
-## 58. 下一章预告
-
-第 96 章将学习：
-
-**Android SystemServer 启动性能：TimingsTrace、InitThreadPool、启动依赖与卡顿排查**
-
-将重点研究：
-
-- SystemServer 主线程启动 trace 如何形成；
-- `TimingsTraceAndSlog` 与 Perfetto/atrace 对应关系；
-- InitThreadPool 任务如何并行与汇合；
-- 50ms slow service warning 怎样定位；
-- Binder、锁、磁盘 I/O 和 ClassLoader 如何拖慢启动；
-- 如何在不真正编译的情况下做源码级启动关键路径分析。

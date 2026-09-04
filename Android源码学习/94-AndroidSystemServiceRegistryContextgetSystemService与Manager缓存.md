@@ -1,313 +1,222 @@
-# 94 Android SystemServiceRegistry：Context.getSystemService、Manager 缓存与服务发布链路
+# 94 Android SystemServiceRegistry：同一 Activity 为什么取到同一个 PowerManager
 
-> 源码版本：Android 11（`android-11.0.0_r48`）  
-> 本章目标：从 `Context.getSystemService()` 追到 `SystemServiceRegistry`，分清服务名、Manager wrapper、AIDL 接口、Binder 服务端与 LocalService，并理解三种 Fetcher 的缓存范围和并发初始化。
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`
+> 本章主场景：一个 Activity 先后两次调用 `getSystemService(PowerManager.class)`
 
----
-
-## 1. 先回答：`getSystemService()` 得到的究竟是什么
-
-应用常写：
+你可能写过这样的代码：
 
 ```java
-PowerManager pm = context.getSystemService(PowerManager.class);
+PowerManager first = getSystemService(PowerManager.class);
+PowerManager second = getSystemService(PowerManager.class);
+Log.d("Power", "same = " + (first == second));
 ```
 
-返回的通常不是：
+在 Android 11 r48 中，若这两次查询落到同一个 `ContextImpl`，且首次创建成功，两个变量会指向同一个 `PowerManager` 对象。
 
-- `PowerManagerService` 服务端实例；
-- AIDL 自动生成的 `IPowerManager.Proxy` 本身；
-- servicemanager 中保存的裸 `IBinder`。
+**先给结论：`getSystemService()` 取到的是 App 进程内的 Manager wrapper，不是 system_server 里的服务对象。** 首次调用会把 `PowerManager.class` 映射为 `"power"`，找到创建配方，构造 `PowerManager` 并放进该 `ContextImpl` 的缓存槽；后续查询直接返回这个槽里的对象。
 
-它通常是一个面向开发者的 **Manager wrapper（Java 管理器门面）**：
+这个知识不只是为了记一条调用链。它能帮你判断：
 
-```text
-PowerManager
- ├─ 保存 Context、Handler 等客户端环境
- ├─ 保存 IPowerManager 接口代理
- ├─ 把易用 Java API 转成 AIDL 调用
- └─ 可能维护客户端监听器、token、缓存或参数转换
+- 为什么重复查询通常不会重新构造 Manager；
+- 为什么换一个 Activity、display Context 或 user Context 后，对象可能不再 `==`；
+- 为什么 Manager 非空，远端 Binder 仍可能已经死亡；
+- 为什么底层的 `ServiceNotFoundException` 通常变成了公开 API 的 `null`。
+
+本章只追踪“查表→创建→缓存→失败”。不展开 WakeLock 业务、SystemServer 完整启动顺序，也不把 Android 11 的内部缓存实现当成所有版本的 API 承诺。
+
+## 1. 你拿到的到底是谁：先把四个“系统服务”拆开
+
+“系统服务”在口语里常同时指好几样东西。如果不先拆开，很容易把“缓存 Manager”错听成“在 App 里缓存了整个电源服务”。
+
+| 名字 | 本场景中的对象 | 在哪里 | 作用 |
+|---|---|---|---|
+| Context service name | `"power"` / `Context.POWER_SERVICE` | 字符串常量 | 连接 Registry 配方与 Binder 目录 |
+| Manager wrapper | `PowerManager` | App 进程 | 向应用提供易用 Java API |
+| Binder 接口 | `IPowerManager` | App 端通常是 Proxy | 把 Manager 调用变成 Binder 事务 |
+| 服务端实现 | `PowerManagerService.BinderService` | system_server | 做权限检查并执行电源逻辑 |
+
+它们的进程和持有关系如下：
+
+```mermaid
+flowchart LR
+    subgraph A[App 进程]
+        ACT[Activity]
+        CI[ContextImpl]
+        REG[SystemServiceRegistry]
+        PM[PowerManager wrapper]
+        IPM[IPowerManager Proxy]
+        ACT --> CI --> REG --> PM --> IPM
+    end
+    subgraph S[system_server]
+        PMS[PowerManagerService.BinderService]
+    end
+    IPM -->|Binder| PMS
 ```
 
-先记住五层：
+这张图的意义是：
 
-```text
-Context API
-  → SystemServiceRegistry
-  → PowerManager（客户端 wrapper）
-  → IPowerManager（AIDL Proxy）
-  → PowerManagerService.BinderService（system_server）
-```
+- `PowerManager` 是本地 Java 对象，构造它不等于复制了一份 `PowerManagerService`；
+- Manager 里可以保存 AIDL 接口、`Context`、`Handler` 和客户端状态；
+- 真正的电源操作仍要经 Binder 到 system_server；
+- 缓存本地 Manager 和保证远端存活，是两件事。
 
-上一章的 ServiceManager 只负责其中“按名字取得 Binder”的一小段。
+可以把 `PowerManager` 想成“银行 App 里的客户端页面”，把 `PowerManagerService` 想成“银行后台”。手机上保留了页面对象，不能证明后台此刻一定可达。这个类比只用来建立第一层印象，下面回到 r48 真实类和字段。
 
----
+## 2. 为什么 class 入口还要绕到字符串入口
 
-## 2. 三个相似名字必须分开
+表面上，`PowerManager.class` 已经能唯一表达类型，似乎可以直接拿它去 Registry 查对象。但 `Context` 的兼容边界要求 class 版本最终仍调用可被子类重写的字符串版本。
 
-| 名称 | 例子 | 本质 |
-|---|---|---|
-| service name | `Context.POWER_SERVICE`，值为 `"power"` | 跨进程目录键和 Framework API 键 |
-| Manager class | `PowerManager.class` | 应用拿到的 Java 门面类型 |
-| server implementation | `PowerManagerService` / 内部 `BinderService` | system_server 中真正执行系统逻辑的对象 |
-
-名字可能相互关联，但不是同一个对象。
-
-```text
-"power" ── Registry 映射 ──> PowerManager.class
-   │
-   └──── ServiceManager 映射 ──> IPowerManager Binder
-```
-
-SystemServiceRegistry 管的是“Framework 如何构造 Manager wrapper”；ServiceManager 管的是“服务名对应哪个 Binder”。
-
----
-
-## 3. 本章源码地图
-
-```text
-frameworks/base/core/java/android/content/Context.java
-frameworks/base/core/java/android/content/ContextWrapper.java
-frameworks/base/core/java/android/app/ContextImpl.java
-frameworks/base/core/java/android/app/SystemServiceRegistry.java
-frameworks/base/services/core/java/com/android/server/SystemService.java
-frameworks/base/core/java/com/android/server/LocalServices.java
-frameworks/base/services/java/com/android/server/SystemServer.java
-frameworks/base/services/core/java/com/android/server/power/PowerManagerService.java
-frameworks/base/core/java/android/os/PowerManager.java
-```
-
-模块化注册还可观察：
-
-```text
-frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobSchedulerFrameworkInitializer.java
-frameworks/base/telephony/java/android/telephony/TelephonyFrameworkInitializer.java
-frameworks/base/wifi/java/android/net/wifi/WifiFrameworkInitializer.java
-frameworks/base/apex/statsd/framework/java/android/os/StatsFrameworkInitializer.java
-```
-
----
-
-## 4. 两个公开入口最终汇合
-
-旧式字符串入口：
+Android 11 r48 的公开入口只有几行：
 
 ```java
-PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
-```
-
-类型安全入口：
-
-```java
-PowerManager pm = context.getSystemService(PowerManager.class);
-```
-
-`Context` 中 class 版本并非直接按 class 创建对象：
-
-```java
-public final <T> T getSystemService(Class<T> serviceClass) {
+public final @Nullable <T> T getSystemService(
+        @NonNull Class<T> serviceClass) {
     String serviceName = getSystemServiceName(serviceClass);
-    return serviceName != null ? (T) getSystemService(serviceName) : null;
+    return serviceName != null
+            ? (T) getSystemService(serviceName) : null;
 }
 ```
 
-原因是 `getSystemService(String)` 可以被子类重写。因此真实步骤为：
+源码：`frameworks/base/core/java/android/content/Context.java`，方法 `getSystemService(Class<T>)`。
 
-```text
-PowerManager.class
-  → getSystemServiceName(class)
-  → "power"
-  → getSystemService("power")
-```
+这几行证明了两件事：
 
-class API 更安全，但底层仍落到字符串名字。
+1. class 入口先得到 service name，再调用字符串入口；
+2. class 没有对应名字时，公开方法直接返回 `null`。
 
----
-
-## 5. ContextWrapper 为什么没有自己的实现
-
-Activity、Service 等常通过 `ContextThemeWrapper` 或其他 `ContextWrapper` 暴露 Context API。`ContextWrapper` 通常只是转发：
+在 Activity 中，调用还会经过 `ContextWrapper`。它默认只把工作交给 `mBase`：
 
 ```java
 public Object getSystemService(String name) {
     return mBase.getSystemService(name);
 }
+
+public String getSystemServiceName(Class<?> serviceClass) {
+    return mBase.getSystemServiceName(serviceClass);
+}
 ```
 
-层层 unwrap 后，核心实现通常落到 `ContextImpl`。
+源码：`frameworks/base/core/java/android/content/ContextWrapper.java`。Activity 的 base 最终是一个 Activity 专属的 `ContextImpl`。
 
-```text
-Activity / Service / ContextWrapper
-                │ mBase
-                ↓
-             ContextImpl
-```
-
-但 Manager 构造时可能需要外层 Activity/Service，因此 `ContextImpl` 同时保存 `outerContext`。这解释了源码里为什么常见：
+`ContextImpl` 在做完错误视觉 Context 的诊断后，把查询交给 Registry：
 
 ```java
-ctx.getOuterContext()
-```
-
-base ContextImpl 负责底层实现，outer Context 保留组件身份、主题和显示环境。
-
----
-
-## 6. ContextImpl 的入口非常短
-
-Android 11 `ContextImpl`：
-
-```java
-@Override
 public Object getSystemService(String name) {
-    // 省略错误 Context 使用检查
+    // 省略 incorrect Context 使用诊断
     return SystemServiceRegistry.getSystemService(this, name);
 }
 
-@Override
 public String getSystemServiceName(Class<?> serviceClass) {
     return SystemServiceRegistry.getSystemServiceName(serviceClass);
 }
 ```
 
-这说明 ContextImpl 不为每个系统服务写一大段 switch。统一映射和构造逻辑集中在 `SystemServiceRegistry`。
+源码：`frameworks/base/core/java/android/app/ContextImpl.java`。注释明确说明省略了中间诊断代码，不把两段伪装成原文中紧邻的全部实现。
 
-Android 11 还会检查从错误 Context 获取 UI/visual 服务的问题。例如 WindowManager、LayoutInflater 与 Context 的 display/configuration/主题强相关，不应随意从不合适的非视觉 Context 获取。
+于是本场景的入口链是：
 
----
-
-## 7. SystemServiceRegistry 的三张静态表
-
-核心成员：
-
-```java
-Map<Class<?>, String> SYSTEM_SERVICE_NAMES;
-Map<String, ServiceFetcher<?>> SYSTEM_SERVICE_FETCHERS;
-Map<String, String> SYSTEM_SERVICE_CLASS_NAMES;
+```text
+Activity.getSystemService(PowerManager.class)
+  → getSystemServiceName(PowerManager.class)
+  → "power"
+  → Activity/ContextWrapper.getSystemService("power")
+  → Activity 的 ContextImpl
+  → SystemServiceRegistry.getSystemService(ctx, "power")
 ```
 
-分别回答：
+这里没有反射构造 `PowerManager.class`，也没有自动切到主线程。调用是同步的：哪个线程调用，查表和首次构造就在哪个线程上进行；只是构造器可能额外保存一个主线程 `Handler`。
 
-| 表 | 输入 → 输出 | 用途 |
+## 3. Registry 不存服务端，它存的是“如何造 Manager”
+
+如果把 `SystemServiceRegistry` 误认为 servicemanager，就会误以为它的 Map 里放着 system_server 对象。实际上，Android 11 r48 的三张表是：
+
+```java
+private static final Map<Class<?>, String>
+        SYSTEM_SERVICE_NAMES = new ArrayMap<>();
+private static final Map<String, ServiceFetcher<?>>
+        SYSTEM_SERVICE_FETCHERS = new ArrayMap<>();
+private static final Map<String, String>
+        SYSTEM_SERVICE_CLASS_NAMES = new ArrayMap<>();
+```
+
+源码：`frameworks/base/core/java/android/app/SystemServiceRegistry.java`。
+
+| 表 | 输入 → 输出 | 本场景的结果 |
 |---|---|---|
-| `SYSTEM_SERVICE_NAMES` | Manager class → service name | class API 转字符串 API |
-| `SYSTEM_SERVICE_FETCHERS` | service name → ServiceFetcher | 创建或取得 Manager wrapper |
-| `SYSTEM_SERVICE_CLASS_NAMES` | service name → 简单类名 | 诊断错误 Context 使用 |
+| `SYSTEM_SERVICE_NAMES` | Manager class → service name | `PowerManager.class → "power"` |
+| `SYSTEM_SERVICE_FETCHERS` | service name → 创建/缓存策略 | `"power" → PowerManager fetcher` |
+| `SYSTEM_SERVICE_CLASS_NAMES` | service name → 类的简名 | 用于错误 Context 等诊断 |
 
-注意这里没有保存 system_server 的服务对象。Fetcher 知道怎样在客户端创建 wrapper，必要时才调用上一章的 `ServiceManager` 获取 Binder。
-
----
-
-## 8. `registerService()` 做的只是登记配方
+登记方法只是把这三个关系同时放进表：
 
 ```java
 private static <T> void registerService(
-        String serviceName,
-        Class<T> serviceClass,
+        String serviceName, Class<T> serviceClass,
         ServiceFetcher<T> serviceFetcher) {
     SYSTEM_SERVICE_NAMES.put(serviceClass, serviceName);
     SYSTEM_SERVICE_FETCHERS.put(serviceName, serviceFetcher);
-    SYSTEM_SERVICE_CLASS_NAMES.put(serviceName, serviceClass.getSimpleName());
+    SYSTEM_SERVICE_CLASS_NAMES.put(
+            serviceName, serviceClass.getSimpleName());
 }
 ```
 
-例如 PowerManager：
+**登记配方不等于立即构造对象。** `SystemServiceRegistry` 做静态初始化时，它只会创建 fetcher 并填表；`PowerManager` 要等某个 `ContextImpl` 首次查询时才会创建。
+
+PowerManager 的真实配方是：
 
 ```java
 registerService(Context.POWER_SERVICE, PowerManager.class,
         new CachedServiceFetcher<PowerManager>() {
     public PowerManager createService(ContextImpl ctx)
             throws ServiceNotFoundException {
-        IBinder powerBinder = ServiceManager.getServiceOrThrow(
-                Context.POWER_SERVICE);
-        IPowerManager powerService = IPowerManager.Stub.asInterface(powerBinder);
-        // 还会取得 thermal service
-        return new PowerManager(ctx.getOuterContext(), powerService,
-                thermalService, ctx.mMainThread.getHandler());
+        IBinder pb = ServiceManager.getServiceOrThrow(Context.POWER_SERVICE);
+        IPowerManager ps = IPowerManager.Stub.asInterface(pb);
+        IBinder tb = ServiceManager.getServiceOrThrow(Context.THERMAL_SERVICE);
+        IThermalService ts = IThermalService.Stub.asInterface(tb);
+        return new PowerManager(ctx.getOuterContext(), ps, ts,
+                ctx.mMainThread.getHandler());
     }
 });
 ```
 
-注册时并没有立即构造 PowerManager，也不一定立即查询 Binder。它只是登记一个延迟创建配方。
+源码：`SystemServiceRegistry` 中 PowerManager 的注册块。Android 11 中这两个常量分别是 `"power"` 和 `"thermalservice"`。
 
----
+这段源码证明：
 
-## 9. 静态初始化何时发生
+- PowerManager 选择的是 `CachedServiceFetcher`；
+- 它构造时会取 `power` 和 `thermalservice` 两个 Binder；
+- `asInterface()` 把 `IBinder` 变成 AIDL 接口；
+- 最后创建的才是 App 看到的 `PowerManager`；
+- 一个 Manager 并不必然只包装一个 Binder 服务。
 
-`SystemServiceRegistry` 第一次主动使用时由 Java 类加载器执行静态初始化块。Android 核心类通常在 Zygote 预加载阶段已加载，因此许多注册工作会在 Zygote 中完成，然后由应用进程继承静态表。
-
-但不要把这句话绝对化成“每次一定在 Zygote 完成”。关键语义是：
-
-- 每个进程看到自己的 Java 静态状态；
-- 注册配方在类静态初始化阶段建立；
-- Manager 实例通常仍是第一次 `getSystemService` 时惰性创建；
-- Binder 代理属于具体进程，不是把 Zygote 中已连接的业务 Binder 随便当全局对象共享。
-
-SystemServer 启动后还把：
+另一端，`PowerManagerService.onStart()` 用同一个名字发布 Binder：
 
 ```java
-SystemServiceRegistry.sEnableServiceNotFoundWtf = true;
-```
-
-用于强化核心系统组件查询不存在服务时的诊断。
-
----
-
-## 10. 获取服务的主入口
-
-```java
-public static Object getSystemService(ContextImpl ctx, String name) {
-    if (name == null) return null;
-    ServiceFetcher<?> fetcher = SYSTEM_SERVICE_FETCHERS.get(name);
-    if (fetcher == null) return null;
-    return fetcher.getService(ctx);
+public void onStart() {
+    publishBinderService(Context.POWER_SERVICE, mBinderService,
+            false, DUMP_FLAG_PRIORITY_DEFAULT
+                    | DUMP_FLAG_PRIORITY_CRITICAL);
+    publishLocalService(PowerManagerInternal.class, mLocalService);
 }
 ```
 
-主链可以画成：
+源码：`frameworks/base/services/core/java/com/android/server/power/PowerManagerService.java`。本章只关心第一条 Binder 发布。
+
+于是两个注册中心的分工是：
 
 ```text
-context.getSystemService(PowerManager.class)
-  → class 映射为 "power"
-  → ContextImpl.getSystemService("power")
-  → SYSTEM_SERVICE_FETCHERS.get("power")
-  → CachedServiceFetcher.getService(ctx)
-  → 首次：createService(ctx)
-  → ServiceManager.getServiceOrThrow("power")
-  → IPowerManager.Stub.asInterface(binder)
-  → new PowerManager(...)
-  → 放入此 ContextImpl 的缓存槽
+SystemServiceRegistry（App 进程内）
+  "power" → 如何创建 PowerManager
+
+ServiceManager / servicemanager（Binder 目录）
+  "power" → PowerManagerService 发布的 IBinder
 ```
 
-第二次由同一 ContextImpl 获取时，一般直接返回缓存中的 PowerManager。
+前者产生客户端 wrapper，后者定位 Binder 能力。两边都用 `"power"`，不表示它们是同一张 Map。
 
----
+## 4. 为什么缓存是数组槽，而不是每个 Context 再存一张 Map
 
-## 11. ServiceFetcher 是策略接口
-
-```java
-interface ServiceFetcher<T> {
-    T getService(ContextImpl ctx);
-}
-```
-
-Android 11 主要有三种实现：
-
-| Fetcher | 实例范围 | 是否传入 Context | 代表例子 |
-|---|---|---|---|
-| `CachedServiceFetcher` | 每个 ContextImpl 一个 | 是 | PowerManager、UserManager、WindowManager |
-| `StaticServiceFetcher` | 每个进程一个 | 否 | HdmiControlManager 等 |
-| `StaticApplicationContextServiceFetcher` | 每进程一个，首次构造时选用 application Context | Application Context | Android 11 的 ConnectivityManager、TestNetworkManager |
-
-“缓存范围”说的是 Java Manager wrapper，不是服务端 Binder 实例数。
-
-无论应用里有多少个 PowerManager wrapper，它们通常都指向 system_server 中同一个 `power` Binder 服务。
-
----
-
-## 12. CachedServiceFetcher 的槽位设计
-
-每创建一个 `CachedServiceFetcher`，构造器分配固定索引：
+每一个 `CachedServiceFetcher` 在被创建时，会领到一个固定索引：
 
 ```java
 private final int mCacheIndex;
@@ -317,7 +226,7 @@ CachedServiceFetcher() {
 }
 ```
 
-静态注册完成后，`sServiceCacheSize` 就是每个 ContextImpl 所需缓存槽数量。ContextImpl 构造时创建：
+Registry 的静态初始化完成后，`sServiceCacheSize` 就是一个 `ContextImpl` 需要的缓存槽数。`ContextImpl` 创建自己的两个数组：
 
 ```java
 final Object[] mServiceCache =
@@ -327,946 +236,361 @@ final int[] mServiceInitializationStateArray =
         new int[mServiceCache.length];
 ```
 
-可视化：
+源码：`frameworks/base/core/java/android/app/ContextImpl.java`。
+
+两类对象的关系可以画成：
 
 ```text
-全局注册配方                         某个 ContextImpl
-PowerFetcher  mCacheIndex=0  ───────> mServiceCache[0] = PowerManager
-WindowFetcher mCacheIndex=1  ───────> mServiceCache[1] = WindowManager
-UserFetcher   mCacheIndex=2  ───────> mServiceCache[2] = UserManager
+进程内唯一的 Power fetcher
+  mCacheIndex = P（P 是内部值，不应硬编码）
+           │
+           ├─ Activity ContextImpl.mServiceCache[P] → PowerManager A
+           │
+           ├─ Application ContextImpl.mServiceCache[P] → PowerManager B
+           │
+           └─ User ContextImpl.mServiceCache[P] → PowerManager C
 ```
 
-数组比以字符串为 key 的每 Context Map 更紧凑、更快；代价是注册顺序和 cache size 必须在 ContextImpl 创建前稳定。
+索引 P 对该进程中的各个 `ContextImpl` 含义一致，但槽中的 Manager 对象分属不同 Context。不要记某个具体数字：注册顺序、编译配置和模块化注册都可以让它改变。
 
----
+为什么这样设计？源码能直接确定的是：
 
-## 13. 为什么还需要初始化状态数组
+- name 到 fetcher 的查表只放在全局 Registry；
+- 找到 fetcher 后，它用整数索引访问当前 Context 的槽；
+- 缓存对象和初始化状态长度完全对齐。
 
-只看 `mServiceCache[index] == null` 无法区分：
+由此可以推断，这个结构避免了每个 Context 再维护一份字符串到对象的映射，并让缓存值与并发状态用同一个索引配对。代价是可缓存服务必须在 `ContextImpl` 分配数组前完成受控注册。Android 11 的模块化注册 API 也用 `ensureInitializing()` 限制它只能在 Registry 类初始化期执行。
 
-- 尚未初始化；
-- 正在由另一个线程初始化；
-- 初始化成功但结果异常被清空；
-- 服务不存在，创建失败并决定缓存 null。
+## 5. 两个线程同时首次查询，为什么只会创建一份
 
-所以每个槽还有状态：
+单看 `mServiceCache[P] == null` 不够。`null` 可能表示“没开始”，也可能表示“另一个线程正在创建”或“已确认服务不存在”。
 
-```text
-STATE_UNINITIALIZED = 0
-STATE_INITIALIZING  = 1
-STATE_READY         = 2
-STATE_NOT_FOUND     = 3
-```
+`ContextImpl` 因此为每个槽保留状态：
 
-状态机：
+| 状态 | 数值 | 意义 |
+|---|---:|---|
+| `STATE_UNINITIALIZED` | 0 | 尚未有线程创建 |
+| `STATE_INITIALIZING` | 1 | 某个线程正在创建 |
+| `STATE_READY` | 2 | 创建路径已正常完成 |
+| `STATE_NOT_FOUND` | 3 | 初始化未发布为 READY；正常缺失路径是 `ServiceNotFoundException` |
 
-```text
-UNINITIALIZED
-   │ 首个线程抢到初始化权
-   ↓
-INITIALIZING ── 成功 ──> READY
-   │
-   └─ ServiceNotFoundException ──> NOT_FOUND
-```
-
-`NOT_FOUND` 会让以后查询直接返回 null，避免每次重复尝试和重复日志。
-
----
-
-## 14. 多线程同时查询如何避免创建两份 Manager
-
-`CachedServiceFetcher.getService()` 的核心并发协议：
-
-1. 所有线程先锁定 `ctx.mServiceCache`。
-2. 第一个看到 UNINITIALIZED 的线程把 gate 改为 INITIALIZING。
-3. 它释放锁后执行 `createService(ctx)`。
-4. 其他线程发现 INITIALIZING，在 cache 对象上等待。
-5. 创建线程写入对象和最终状态，调用 `notifyAll()`。
-6. 等待线程醒来重查槽位。
-
-为什么构造 Manager 时不持有 cache 锁？
-
-- `createService` 可能查询 Binder；
-- 构造器可能执行更复杂初始化；
-- 长时间持锁会阻塞同 Context 的其他系统服务查询；
-- 还可能形成锁顺序和重入风险。
-
-所以源码采用“锁内抢初始化资格，锁外真正创建，锁内发布结果”。
-
----
-
-## 15. 等待时为什么保存 interrupt 状态
-
-等待线程被中断时，源码不会直接退出并返回不完整状态，而是记录：
+第一个进入的线程在 cache 锁下抢到“初始化权”：
 
 ```java
-interrupted = true;
-```
-
-继续等到初始化完成后，再：
-
-```java
-Thread.currentThread().interrupt();
-```
-
-理由是系统服务获取 API 没有声明 `InterruptedException`，并发初始化协议又不能让等待者越过尚未发布的结果。于是它完成获取，同时恢复线程的中断标志，让上层之后仍能观察到中断。
-
----
-
-## 16. READY 但对象是 null 的特殊分支
-
-源码注释提到：若 gate 是 READY，但缓存对象变成 null，就退回 UNINITIALIZED 再创建。
-
-```java
-if (gates[index] == STATE_READY) {
-    gates[index] = STATE_UNINITIALIZED;
-}
-```
-
-正常路径 READY 应伴随非空对象。这个分支是防御性恢复：有人或某些内部路径清空对象后，不应让 Context 永久返回 null。
-
-它不是公开的“清理所有 Manager 缓存”API，也不意味着 Framework 定期驱逐这些对象。
-
----
-
-## 17. StaticServiceFetcher：进程级 wrapper
-
-```java
-class StaticServiceFetcher<T> implements ServiceFetcher<T> {
-    private T mCachedInstance;
-
-    public final T getService(ContextImpl ctx) {
-        synchronized (this) {
-            if (mCachedInstance == null) {
-                mCachedInstance = createService();
-            }
-            return mCachedInstance;
-        }
+synchronized (cache) {
+    T service = (T) cache[mCacheIndex];
+    if (service != null
+            || gates[mCacheIndex] == STATE_NOT_FOUND) {
+        ret = service;
+        break;
+    }
+    if (gates[mCacheIndex] == STATE_UNINITIALIZED) {
+        doInitialize = true;
+        gates[mCacheIndex] = STATE_INITIALIZING;
     }
 }
 ```
 
-Fetcher 对象本身位于静态注册表，每个进程只有一份，因此 `mCachedInstance` 也是进程级。
+上面是 `CachedServiceFetcher.getService()` 的关键分支，常量在原文中通过 `ContextImpl.` 限定，这里为了聚焦状态转换省略了限定名。
 
-它适合不依赖具体 Context、主题、display、用户包装或组件生命周期的 Manager。
-
-若创建抛 `ServiceNotFoundException`，`mCachedInstance` 仍为 null，后续查询会再次尝试；这与 CachedServiceFetcher 的 `STATE_NOT_FOUND` 缓存 null 行为不同。
-
----
-
-## 18. StaticApplicationContextServiceFetcher
-
-这是 Android 11 中主要为 ConnectivityManager 等少数 manager 保留的特殊折中；r48 的
-TestNetworkManager 也使用它：
+抢到权限后，线程会先释放 cache 锁，再调用 `createService(ctx)`：
 
 ```java
-Context appContext = ctx.getApplicationContext();
-mCachedInstance = createService(appContext != null ? appContext : ctx);
-```
-
-它仍缓存一份实例，但避免持有某个 Activity Context，降低 Activity 泄漏风险。如果 application Context 暂时为空（系统进程或应用初始化很早期），才使用传入的 ContextImpl。
-
-源码 TODO 仍写着希望在 ConnectivityManager 不再需要后删除这种特殊类型，但同一 r48 文件中
-TestNetworkManager 也已经使用它，可见该注释没有完全跟上调用点。判断使用者应以实际
-`new StaticApplicationContextServiceFetcher` 搜索结果为准。学习时仍应把它看作少数历史兼容
-场景，不要自然推广成新服务的默认模板。
-
----
-
-## 19. 为什么许多 Manager 必须按 Context 缓存
-
-Context 不只是“能调用 API 的对象”，它携带：
-
-- package/attribution 身份；
-- user；
-- display 与窗口环境；
-- configuration、Resources、theme；
-- 主线程 Handler；
-- outer Activity/Service。
-
-例如 WindowManager：
-
-```java
-return new WindowManagerImpl(ctx);
-```
-
-它与 display/window token 等环境强相关。把 Activity A 的 WindowManager 给 Activity B 使用，语义可能错误。
-
-因此 `Context` 文档提醒：通过某个 Context 取得的系统服务可能与这个 Context 紧密关联，不应随意跨 Context 共享。
-
----
-
-## 20. “每个 Context 一个”要说准确
-
-`CachedServiceFetcher` 缓存位于 **每个 ContextImpl**，不是每个 Java Context wrapper 必然独立。
-
-多个 ContextWrapper 若共享同一个 base ContextImpl，会落到同一缓存；不同 Activity、不同 display Context、不同 configuration Context 可能拥有不同 ContextImpl 和不同 Manager wrapper。
-
-```text
-Wrapper A ─┐
-           ├─ 同一 ContextImpl → 同一 cached Manager
-Wrapper B ─┘
-
-Activity ContextImpl ────────→ Manager A
-Application ContextImpl ─────→ Manager B
-```
-
-所以最稳妥的措辞是“per-ContextImpl cache”。
-
----
-
-## 21. Manager 何时查询 Binder
-
-有三类常见模式。
-
-### 模式 A：Registry 构造时立即查 Binder
-
-```java
-IBinder b = ServiceManager.getServiceOrThrow(Context.USER_SERVICE);
-IUserManager service = IUserManager.Stub.asInterface(b);
-return new UserManager(ctx, service);
-```
-
-### 模式 B：Manager 构造时自己查
-
-```java
-return new ClipboardManager(ctx.getOuterContext(), handler);
-```
-
-ClipboardManager 内部再按自身设计取得远端接口。
-
-### 模式 C：传入延迟查询函数
-
-```java
-return new TetheringManager(
-        ctx, () -> ServiceManager.getService(Context.TETHERING_SERVICE));
-```
-
-因此不能看到 Registry 的 `createService()` 没有 `ServiceManager.getService`，就断言该 Manager 没有 Binder 后端。必须继续进入 Manager 类阅读。
-
----
-
-## 22. `getServiceOrThrow()` 为什么在这里常见
-
-Framework 预期很多核心服务在应用可运行前就已发布。如果缺少，静默返回一个带 null Binder 的 Manager 往往只会把错误推迟到更难理解的位置。
-
-`ServiceManager.getServiceOrThrow(name)` 找不到时抛：
-
-```text
-ServiceNotFoundException
-```
-
-Fetcher 捕获它并调用 `onServiceNotFound()`：
-
-- 核心 UID 进程通常 `Log.wtf`；
-- 普通应用通常写 warning；
-- 最终 Manager 可能返回 null。
-
-“OrThrow” 不一定会原样穿透为应用看到的运行时异常，因为 Registry fetcher 已经捕获了受检异常。
-
----
-
-## 23. Manager 缓存不是 Binder 存活保证
-
-假设 Context 缓存了 PowerManager：
-
-```text
-mServiceCache[index] → PowerManager → IPowerManager.Proxy → Binder handle
-```
-
-如果远端服务死亡：
-
-- Java Manager 对象仍可能留在缓存；
-- 其中 Binder Proxy 可能已经死亡；
-- 调用会抛/转换 `RemoteException`；
-- 是否自动重连取决于具体 Manager 的实现。
-
-SystemServiceRegistry 的职责是 wrapper 构造与缓存，不是统一的 Binder death 重连框架。
-
-因此不能说“getSystemService 有缓存，所以系统服务重启对应用透明”。
-
----
-
-## 24. 服务端如何发布 Binder 服务
-
-SystemServer 使用 `SystemService` 生命周期框架。服务通常在 `onStart()` 中：
-
-```java
-@Override
-public void onStart() {
-    publishBinderService(Context.DEMO_SERVICE, new BinderService());
+T service = null;
+int newState = STATE_NOT_FOUND;
+try {
+    service = createService(ctx); // 此时没持有 cache 锁
+    newState = STATE_READY;
+} catch (ServiceNotFoundException e) {
+    onServiceNotFound(e);
+} finally {
+    synchronized (cache) {
+        cache[mCacheIndex] = service;
+        gates[mCacheIndex] = newState;
+        cache.notifyAll();
+    }
 }
 ```
 
-`SystemService.publishBinderService()` 只是封装：
+这是整个并发设计里最值得理解的一点：**锁内决定谁初始化，锁外做可能较慢的 Binder 查询和对象构造，锁内发布结果。**
+
+如果整个 `createService()` 都持有 cache 锁，一次 Binder 查询或构造器重入就可能长时间占住同一 `ContextImpl` 的服务缓存锁。r48 的选择是让其他线程看到 `INITIALIZING` 后等待，而不是再构造一份。
+
+```mermaid
+sequenceDiagram
+    participant A as 线程 A
+    participant C as ContextImpl cache[P]
+    participant B as 线程 B
+    A->>C: 锁内设为 INITIALIZING
+    A->>A: 锁外 createService(ctx)
+    B->>C: 发现 INITIALIZING
+    C-->>B: wait()
+    A->>C: 写入 PowerManager + READY
+    A->>C: notifyAll()
+    C-->>B: 重查后取到同一对象
+```
+
+完成点也要说准：
+
+- `cache[P]` 与最终状态在同一次 `synchronized(cache)` 中发布；
+- `notifyAll()` 只表示等待者可以重查状态，不表示远端服务永远存活；
+- 创建者返回 Manager 后，本次 `getSystemService()` 才结束；
+- 所有这些步骤都在 App 进程内，不会自动切线程。
+
+等待者如果被 interrupt，这个 API 不会向外抛 `InterruptedException`。它记住中断，等槽位稳定后再恢复当前线程的 interrupt 标志。这是并发协调细节，不是服务构造被取消。
+
+还有一个防御分支：若状态是 `READY` 但对象变成了 `null`，r48 会把状态退回 `UNINITIALIZED` 并重新创建。这不是一个公开的缓存驱逐 API，也不意味着 Manager 会定期刷新。
+
+## 6. CachedServiceFetcher 与 StaticServiceFetcher 到底差在哪里
+
+两个 fetcher 的“创建一次”不是同一个范围。最容易记住的方法是：看它把对象放在哪里。
+
+| 维度 | `CachedServiceFetcher` | `StaticServiceFetcher` |
+|---|---|---|
+| 缓存位置 | `ctx.mServiceCache[mCacheIndex]` | fetcher 自己的 `mCachedInstance` |
+| 实例范围 | 每个 `ContextImpl` 一份 | 每个 Java 进程一份 |
+| 创建入参 | `createService(ContextImpl)` | `createService()` |
+| 并发协调 | Context cache 槽位状态机 | `synchronized(fetcher)` |
+| 缺失后再查 | 同一 Context 记 `NOT_FOUND` | 对象仍为 null，下次重试 |
+| r48 例子 | `PowerManager` | `HdmiControlManager` |
+
+`StaticServiceFetcher` 的实现很直接：
 
 ```java
-protected final void publishBinderService(
-        String name, IBinder service,
-        boolean allowIsolated, int dumpPriority) {
-    ServiceManager.addService(name, service, allowIsolated, dumpPriority);
+private T mCachedInstance;
+
+public final T getService(ContextImpl ctx) {
+    synchronized (StaticServiceFetcher.this) {
+        if (mCachedInstance == null) {
+            try {
+                mCachedInstance = createService();
+            } catch (ServiceNotFoundException e) {
+                onServiceNotFound(e);
+            }
+        }
+        return mCachedInstance;
+    }
 }
 ```
 
-于是它与上一章衔接：
+源码：`SystemServiceRegistry.StaticServiceFetcher`。
 
-```text
-SystemService.onStart
-  → publishBinderService
-  → ServiceManager.addService
-  → native servicemanager 服务表
-```
+“Static”只表示它的 fetcher 挂在该 Java 进程的静态 Registry 中。它不是跨 App 进程、跨用户或跨设备的单例，更不是 system_server 里的服务端对象。
 
-`publishBinderService` 不是另一个注册中心，只是 system_server 服务的便利方法。
-
----
-
-## 25. 客户端与服务端如何靠同一个名字接上
-
-服务端：
+PowerManager 为什么不用 static 方案？从 r48 构造器可以看到，它保存了来自当前 `ContextImpl` 的 outer Context 和主线程 Handler：
 
 ```java
-publishBinderService(Context.POWER_SERVICE, binder);
+public PowerManager(Context context,
+        IPowerManager service,
+        IThermalService thermalService, Handler handler) {
+    mContext = context;
+    mService = service;
+    mThermalService = thermalService;
+    mHandler = handler;
+}
 ```
 
-客户端 Registry：
+这证明 wrapper 携带客户端 Context 环境；至于所有历史设计动机，单凭这个构造器无法全部还原，不需要虚构理由。
 
-```java
-ServiceManager.getServiceOrThrow(Context.POWER_SERVICE);
-```
+Android 11 还有 `StaticApplicationContextServiceFetcher`：它仍在 fetcher 上保留一份进程级 wrapper，但首次构造时传 application Context，r48 的 `ConnectivityManager` 使用它。这是当版本的特殊折中，不应被理解成“所有 Manager 都该使用 application Context”。
 
-二者共享 `Context.POWER_SERVICE == "power"`。完整闭环：
+## 7. 换 Context 或换用户后，哪些东西会变，哪些不会
 
-```text
-PowerManagerService
-  └─ publish "power" + Binder
-             ↓
-       native ServiceManager map
-             ↓
-Registry fetcher query "power"
-  └─ IBinder → IPowerManager → PowerManager
-```
+“per-Context 缓存”的精确说法是 **per-`ContextImpl`**。很多对外暴露的 Context 是 wrapper，自己并没有 `mServiceCache`。
 
-如果两边名字不同，即使服务已经运行，也接不上。
+按 Android 11 r48 的默认转发与创建路径，可以这样判断：
 
----
-
-## 26. `SystemService`、`SystemServiceRegistry` 名字很像但职责不同
-
-| 类 | 所在侧 | 职责 |
+| 两次查询 | PowerManager wrapper 的典型结果 | 原因 |
 |---|---|---|
-| `com.android.server.SystemService` | system_server | 服务生命周期、boot phase、user 回调、发布 Binder/LocalService |
-| `android.app.SystemServiceRegistry` | 每个 Framework Java 进程 | Context API 的 Manager 注册、构造和缓存 |
-| `android.os.ServiceManager` | 客户端门面/跨进程 | 按字符串名字注册或取得 Binder |
-| native servicemanager | 独立进程 | 保存 Binder 服务目录并做访问控制 |
+| 同一 Activity，先后查两次 | 同一对象 | 落到同一 Activity `ContextImpl` 的同一槽 |
+| 两个 wrapper 默认转发到同一 base | 同一对象 | 实际使用同一 `ContextImpl` 缓存 |
+| Activity Context 与 Application Context | 通常不是同一对象 | 它们通常是不同 `ContextImpl` |
+| 两个 Activity | 通常不是同一对象 | Activity 各有 ContextImpl |
+| `createContextAsUser()` 返回的 Context | 有自己的 wrapper | r48 会新建 `ContextImpl` 并保存目标 user |
+| 另一个 App 进程 | 必然是另一份 Java 对象 | Registry 静态状态也不跨进程 |
 
-读代码前先看 package，能避免大量混乱。
+表里说的是 r48 内部对象身份，不是鼓励业务代码依赖 `==`。`Context` 的公开文档反而提醒：由某个 Context 取得的服务可能与该 Context 紧密相关，一般不要在不同 Context 之间随意共享。
 
----
-
-## 27. LocalServices 是另一条完全不同的通道
-
-`SystemService` 还提供：
-
-```java
-publishLocalService(MyInternal.class, implementation);
-getLocalService(MyInternal.class);
-```
-
-它进入 `LocalServices`，本质是 system_server 同进程内的 class → object Map。
+不同 wrapper 也不意味着不同服务端：
 
 ```text
-Binder Service                         LocalService
-跨进程可用                             仅 system_server 同进程
-按字符串名字                           按 Java Class
-需要 Binder/AIDL/Parcel                普通 Java 方法调用
-有 Binder/SELinux/身份边界              依赖调用方已在可信 system_server 内
-面向 App/其他进程及系统组件             面向 system_server 服务间内部协作
+Activity A 的 PowerManager ─┐
+                              ├─ IPowerManager ─Binder→ 同一 power 服务
+Application 的 PowerManager ─┘
 ```
 
-LocalService 常命名为 `XxxManagerInternal`，它不是应用能通过 `Context.getSystemService()` 获取的公共 Manager。
+对 `PowerManager` 这个贯穿例子来说，`"power"` 仍是同一个 Binder 目录名。用户 Context 中创建了另一个 Manager，不等于驱动为它克隆了一个 `PowerManagerService`。
 
----
+用户与权限语义也不能只靠缓存隔离来判断：
 
-## 28. 为什么同时发布 BinderService 和 LocalService
+- Context 可以向 Manager 提供 user、package、attribution、display 和 Resources；
+- Binder 调用到服务端后，服务端还会根据 calling UID/PID、权限和具体 API 规则裁决；
+- 某个 Manager 是全局服务、按 user 设计，还是按 display 设计，要继续读那个 Manager 与服务端，不能仅凭 fetcher 名称猜。
 
-一个系统服务可能提供两张“脸”：
+一个实用的泄漏边界是：`PowerManager` 保存了构造时的 Context。Activity 自己的 cache 持有 Manager，两者同寿命通常没问题；如果应用又把这个 Manager 放进长寿命静态字段，就可能间接留住 Activity。但不能因此就把所有查询机械地改成 application Context；视觉、display 或 user 相关 Manager 需要正确的 Context 语义。
 
-```text
-                    ┌─ BinderService：跨进程、权限检查、稳定边界
-PowerManagerService ┤
-                    └─ LocalService：system_server 内高效内部接口
-```
+## 8. 查询失败时，为什么有时是 null，有时却是远端异常
 
-好处：
+先把失败分在不同阶段。否则看到一个 `null` 就去查 Binder 驱动，很可能从错误的层次开始。
 
-- 公共 Binder API 不必暴露所有内部能力；
-- system_server 服务间调用不必序列化 Parcel；
-- 内部接口可以传递只适合同进程的对象或 callback；
-- 权限与生命周期边界更清楚。
-
-但 LocalService 不是自动线程安全的。普通 Java 直调会在调用者线程执行，服务实现仍要自行处理锁和线程切换。
-
----
-
-## 29. 类型安全入口并非编译期保证服务一定存在
-
-```java
-context.getSystemService(PowerManager.class)
-```
-
-泛型帮助减少错误强转，但运行时仍可能返回 null，例如：
-
-- class 未在 Registry 注册；
-- 设备不支持可选功能；
-- instant app 无权访问某些服务；
-- 底层服务未发布；
-- Registry 的 producer 决定返回 null。
-
-所以 API 注解、设备能力和文档仍要一起看。类型安全只保证“非 null 时返回类型应正确”。
-
----
-
-## 30. 为什么不直接让每个 Manager 自己做单例
-
-如果所有 Manager 都各自实现静态单例，会遇到：
-
-- 无法统一 class/name 映射；
-- 难以表达 per-Context 与 per-process 差异；
-- Context、user、display、theme 容易被错误共享；
-- 并发初始化和缺失服务处理重复实现；
-- 模块化 Framework wrapper 难以集中注册。
-
-Registry 把“如何生产和缓存 wrapper”抽成 Fetcher，同时仍允许每个 Manager 自己处理远端连接、callback 和业务状态。
-
----
-
-## 31. Android 11 的模块化注册
-
-SystemServiceRegistry 静态块末尾调用：
-
-```java
-JobSchedulerFrameworkInitializer.registerServiceWrappers();
-BlobStoreManagerFrameworkInitializer.initialize();
-TelephonyFrameworkInitializer.registerServiceWrappers();
-WifiFrameworkInitializer.registerServiceWrappers();
-StatsFrameworkInitializer.registerServiceWrappers();
-```
-
-这些模块通过公开给系统模块的注册方法接入：
-
-```java
-registerStaticService(...)
-registerContextAwareService(...)
-```
-
-为了保证缓存索引在初始化期固定，Registry 用 `sInitializing` 与 `ensureInitializing()` 限制：只能在它的静态初始化调用链中注册。
-
-这反映 Android 模块化后的设计：服务 wrapper 不必全部硬编码在一个巨大文件中，但仍必须在受控阶段完成注册。
-
----
-
-## 32. 带 Binder 与不带 Binder 的 producer
-
-模块注册 API 分成：
-
-```text
-StaticServiceProducerWithBinder
-StaticServiceProducerWithoutBinder
-ContextAwareServiceProducerWithBinder
-ContextAwareServiceProducerWithoutBinder
-```
-
-含义是两个维度的组合：
-
-| 维度 | 选择 A | 选择 B |
+| 失败点 | r48 的关键结果 | 同一 Context 下次怎样 |
 |---|---|---|
-| wrapper 范围 | static/process | context-aware/per ContextImpl |
-| 创建参数 | Registry 先取 Binder 后传入 | producer 自己创建，不直接接收 Binder |
+| `PowerManager.class` 没有 class→name 映射 | class API 返回 `null` | 仍是 `null` |
+| `"power"` 没有 fetcher | Registry 返回 `null` | 仍是 `null` |
+| fetcher 查不到 `power` 或 `thermalservice` | 抛出后捕获 `ServiceNotFoundException`，返回 `null` | Cached 槽已是 `NOT_FOUND` |
+| `createService()` 正常返回 null | 本次是 `READY + null` | 下次退回 `UNINITIALIZED` 再试 |
+| Manager 已构造，远端后来死亡 | Manager 仍可能非空，业务调用失败 | Registry 通常仍返回旧 Manager |
 
-“without Binder”不代表这个 Manager 永远不用 Binder；它可能在内部稍后查询，或本身只包装本地能力。这里只描述 producer 构造签名。
+`ServiceManager.getServiceOrThrow()` 的契约是：按名字取不到 `IBinder` 时，抛受检的 `ServiceNotFoundException`。但 `CachedServiceFetcher` 已经在内部捕获它，调用 `onServiceNotFound()` 记日志，然后把该 Context 的槽发布为 `STATE_NOT_FOUND`。
 
----
+所以，应用通过 `Context.getSystemService()` 查 PowerManager 时，通常不会直接捕获到这个受检异常，而是得到 `null`。对普通 App UID，`onServiceNotFound()` 写 warning；对核心系统 UID，它使用 `Log.wtf`。`wtf` 首先是严重诊断日志，不应简化为“此处一定抛给调用者”。
 
-## 33. 以 PowerManager 串起完整调用
+### `NOT_FOUND` 为什么是个启动时序承诺
 
-### 33.1 system_server 启动服务
-
-```text
-SystemServer
-  → SystemServiceManager.startService(PowerManagerService)
-  → PowerManagerService.onStart()
-  → publishBinderService("power", BinderService)
-```
-
-### 33.2 客户端首次获取 Manager
+假设 Activity 在 `power` 已发布、`thermalservice` 尚未发布时首次查询：
 
 ```text
-Context.getSystemService(PowerManager.class)
-  → class → "power"
-  → CachedServiceFetcher[power]
-  → ServiceManager.getServiceOrThrow("power")
-  → IPowerManager.Stub.asInterface
-  → new PowerManager(context, proxy, ...)
-  → cache[index] = PowerManager
+查到 power Binder
+  → 查 thermalservice 失败
+  → ServiceNotFoundException
+  → Activity ContextImpl 的 Power 槽 = NOT_FOUND
+  → 以后同一 ContextImpl 直接返回 null
 ```
 
-### 33.3 客户端调用
+即使 thermal service 稍后发布，这个槽也不会因为 servicemanager 变化自动从 `NOT_FOUND` 回到 `UNINITIALIZED`。因此 `CachedServiceFetcher + getServiceOrThrow()` 适合 Framework 预期在客户端可用前已经发布的服务。可晚到的后端不能不加思考地照搬这个模式。
 
-```java
-PowerManager.WakeLock lock = pm.newWakeLock(...);
-lock.acquire();
-```
+### Manager 非空为什么仍不能作为存活检查
 
-概念上：
+成功时的引用链是：
 
 ```text
-PowerManager/WakeLock
-  → IPowerManager.acquireWakeLock(...)
-  → Binder driver
-  → PowerManagerService.BinderService
-  → 权限/身份检查
-  → PowerManagerService 内部状态机
+mServiceCache[P]
+  → PowerManager
+      → IPowerManager Proxy
+      → IThermalService Proxy
 ```
 
-SystemServiceRegistry 只参与首次取得 wrapper，不参与每次 wake lock 业务调用。
+远端死亡不会自动把 `mServiceCache[P]` 清成 `null`。因此再次 `getSystemService()` 仍可能得到同一 Manager，但之后的业务 Binder 调用才报 `RemoteException` 或经 Manager 转换后的运行时异常。是否能重连，必须读具体 Manager；`SystemServiceRegistry` 没有为所有服务提供统一的 Binder death 恢复。
 
----
+还有一条实现边界：Fetcher 只捕获 `ServiceNotFoundException`。若 `createService()` 抛出未检查异常，异常会继续传给调用者；`finally` 仍会以初始值 `NOT_FOUND` 发布槽位并唤醒等待者。不要把“未注册的 class 按契约返回 null”扩大成“这条路径绝不可能抛任何运行时异常”。
 
-## 34. 并不是每个 Context 服务背后都有独立 Binder 名字
+## 9. 排查时别被这些表面现象带偏
 
-LayoutInflater：
+遇到问题时，先判断它停在“class→name”、“name→fetcher”、“fetcher创建”还是“Manager调远端”，再放断点：
 
-```java
-return new PhoneLayoutInflater(ctx.getOuterContext());
-```
+| 观察到的问题 | 第一个断点/搜索点 | 先排除什么 |
+|---|---|---|
+| class 查询为 null | `getSystemServiceName(class)` | class 没注册 |
+| name 查询为 null | `SYSTEM_SERVICE_FETCHERS.get(name)` | name 不存在 |
+| 首次构造为 null | `createService()` / `onServiceNotFound()` | Binder 尚未发布 |
+| 不同 Context 对象不同 | `ContextImpl.mServiceCache` | per-ContextImpl 缓存 |
+| Manager 非空但调用失败 | Manager 内的 AIDL 字段 | 远端死亡/业务异常 |
 
-WindowManager：
+因此，“两次是同一对象”应查 cached fetcher，“换 Activity 后对象不同”应先查 `ContextImpl`，“Manager 非空但调用失败”才应继续追 AIDL 与远端生命周期。
 
-```java
-return new WindowManagerImpl(ctx);
-```
+## 10. 在 macOS 上不编译，怎样自己证明这条链
 
-SensorManager：
-
-```java
-return new SystemSensorManager(context, looper);
-```
-
-这些 Manager 的实现结构各不相同：
-
-- 有的纯粹是本地 wrapper；
-- 有的通过其他全局类/JNI/native 通道连接服务；
-- 有的在构造器内部获取 Binder；
-- 有的一个 wrapper 组合多个 Binder 服务。
-
-所以 `Context.getSystemService` 是统一的获取门面，不代表所有服务后端具有完全相同的 AIDL 结构。
-
----
-
-## 35. 一个 Manager 也可能组合多个服务
-
-Android 11 PowerManager 的 fetcher 同时取得：
-
-```text
-"power"   → IPowerManager
-"thermal" → IThermalService
-```
-
-然后构造一个 PowerManager。这说明：
-
-```text
-一个 Manager class ≠ 必然只对应一个 Binder name
-```
-
-反过来也可能存在一个 Binder 服务被多个客户端 wrapper 或内部 API 使用。Registry 映射是 Framework API 设计，不是强制一对一数据库关系。
-
----
-
-## 36. 用户、包和 display 身份来自哪里
-
-Manager 方法需要调用者环境时，通常从构造时传入的 Context 获取：
-
-- `getOpPackageName()`；
-- attribution tag；
-- userId；
-- displayId；
-- Resources/configuration；
-- main looper/Handler。
-
-跨 Binder 后，服务端还能从 Binder 获取真实 calling UID/PID，不能只信客户端传来的 packageName。
-
-因此常见安全模式是：
-
-```text
-Context 提供声明身份与环境
-+ Binder driver 提供不可伪造的 calling UID/PID
-+ 服务端 PackageManager/AppOps/权限校验二者关系
-```
-
-Manager wrapper 的便利不等于安全裁决在客户端完成。
-
----
-
-## 37. Context 泄漏与 Manager 泄漏
-
-若某 Manager 按 ContextImpl 缓存并保存 outer Activity Context，那么它与 Activity 生命周期一致通常没有问题；Activity 被释放时，其 ContextImpl、cache 和 Manager 可一起回收。
-
-危险场景是应用自己把 Activity 获取到的 Manager 放进静态变量：
-
-```text
-static field → Manager → Activity Context → View/Window/Resources
-```
-
-这可能延长 Activity 生命周期。
-
-但也不要机械规定“所有 Manager 必须从 applicationContext 获取”。WindowManager、LayoutInflater 等视觉服务需要正确的 Activity/display Context。原则是按照 API 语义选择 Context，不是只为了避免泄漏一律改 application Context。
-
----
-
-## 38. 服务发布时序为何重要
-
-如果客户端在服务端 `publishBinderService()` 前调用 fetcher：
-
-- `getServiceOrThrow()` 可能抛 ServiceNotFoundException；
-- CachedServiceFetcher 可能把该槽记为 `STATE_NOT_FOUND`；
-- 同一个 ContextImpl 后续不会自动重试该 Manager。
-
-因此 Framework 启动顺序必须保证核心服务在允许对应客户端运行前已发布。SystemServer 的 bootstrap/core/other services 与 boot phases 不只是整理代码，而是在建立依赖时序。
-
-对于真正可晚到或可重启的后端，Manager 往往需要自行设计延迟查询、callback、death recipient 或重连，不能盲目套首次永久缓存失败的模式。
-
----
-
-## 39. `sEnableServiceNotFoundWtf` 的边界
-
-SystemServer 开启该标志后，Registry 会对未知 Manager 或意外 null 发 `Slog.wtf`，帮助发现系统启动顺序和注册错误。
-
-但源码也为部分可能合法返回 null 的服务做例外，例如 Android 11 中的 Content Capture、App Prediction、Incremental Service。
-
-`wtf` 是严重诊断日志，不等价于 Java 一定立刻抛异常或进程必然崩溃。最终行为还取决于日志/系统策略和调用路径。
-
----
-
-## 40. 新增一个 Framework 系统服务要改哪些层
-
-概念清单：
-
-### 服务端
-
-1. 实现 SystemService 或在合适宿主中创建服务。
-2. 定义 Binder/AIDL 接口及 Stub 实现。
-3. 在 SystemServer 合适阶段启动。
-4. `publishBinderService("demo", binder)`。
-5. 配置 service_contexts 与 SELinux add/find/call。
-
-### 客户端 Framework API
-
-1. 定义 `DemoManager`。
-2. 在 Context 定义服务名常量（若属于公共 Context API）。
-3. 在 SystemServiceRegistry 注册 name、class、fetcher。
-4. 选择正确缓存范围。
-5. 在 fetcher 或 Manager 内取得 Binder 并 `asInterface()`。
-6. 处理服务不存在、死亡、多用户、线程和 callback 生命周期。
-
-### 可选内部通道
-
-1. 定义 `DemoManagerInternal`。
-2. 服务端 `publishLocalService()`。
-3. system_server 内消费者 `LocalServices.getService()`。
-
-这比“只向 ServiceManager addService”多出 Framework 易用 API 和生命周期设计。
-
----
-
-## 41. 如何选择 Fetcher
-
-可以按以下问题判断：
-
-```text
-Manager 是否依赖具体 Context 的 user/display/theme/package/Handler？
- ├─ 是 → CachedServiceFetcher
- └─ 否
-     ├─ 真正可全进程共享 → StaticServiceFetcher
-     └─ 必须持有 Application Context → 特殊 application-context 方案
-```
-
-再复查：
-
-- Manager 会不会持有 Activity 导致泄漏？
-- 不同用户 Context 是否应该得到不同语义？
-- 不同 display Context 是否必须产生不同 wrapper？
-- 服务晚发布时是否允许缓存 NOT_FOUND？
-- Binder 重启后 wrapper 能否恢复？
-
-缓存选择是语义设计，不只是性能优化。
-
----
-
-## 42. 常见误区纠正
-
-### 误区 1：`getSystemService()` 直接从 servicemanager 返回 Manager
-
-错误。servicemanager 返回 IBinder；SystemServiceRegistry/Manager 构造逻辑产生 Java wrapper。
-
-### 误区 2：Manager 和 system_server Service 是同一个类实例
-
-错误。它们通常跨进程，Manager 是客户端门面，Service 是服务端实现。
-
-### 误区 3：所有 Manager 都是进程单例
-
-错误。大量 Manager 是 per-ContextImpl，只有 StaticServiceFetcher 是进程级 wrapper。
-
-### 误区 4：同一 App 中 `getSystemService()` 永远返回 `==` 相同对象
-
-错误。同一 ContextImpl 的 cached fetcher 通常相同；不同 ContextImpl 可能不同。
-
-### 误区 5：不同 wrapper 意味着不同系统服务端实例
-
-错误。多个 wrapper 可以持有指向同一 Binder 服务的代理。
-
-### 误区 6：Manager 已缓存，所以远端死亡会自动重连
-
-错误。重连策略由具体 Manager 决定。
-
-### 误区 7：LocalServices 是没有权限检查的跨进程快速 Binder
-
-错误。它完全是 system_server 同进程 Java 对象表，不经过 Binder。
-
-### 误区 8：`publishBinderService()` 发布的是 Manager
-
-错误。发布的是 IBinder/Stub；Manager 在客户端构造。
-
-### 误区 9：class API 找不到服务一定抛异常
-
-错误。公开契约通常允许返回 null；内部异常可能被 Fetcher 捕获并记录。
-
-### 误区 10：所有 Context 都应该换成 applicationContext
-
-错误。视觉、display、user 等 Context 相关服务需要正确 Context。
-
----
-
-## 43. 一张对象与缓存关系图
-
-```text
-App Process
-┌─────────────────────────────────────────────────────────────┐
-│ SystemServiceRegistry（静态配方表）                          │
-│   "power" → PowerFetcher(index=0)                           │
-│                     │                                       │
-│   Activity ContextImpl                 App ContextImpl       │
-│   cache[0] → PowerManager A            cache[0] → PM B      │
-│                 │ IPowerManager.Proxy          │ Proxy      │
-└─────────────────┼──────────────────────────────┼─────────────┘
-                  └──────────────┬───────────────┘
-                                 │ Binder driver
-                                 ↓
-System Server
-┌─────────────────────────────────────────────────────────────┐
-│ PowerManagerService.BinderService（通常同一个服务端 Binder） │
-│ PowerManagerService.LocalService（只供本进程内部）            │
-└─────────────────────────────────────────────────────────────┘
-```
-
-两份 PowerManager wrapper 不等于两份 PowerManagerService。
-
----
-
-## 44. 一张首次查询时序图
-
-```text
-Caller       Context/Impl        Registry/Fetcher       ServiceManager       Server
-  │ get(PowerManager.class)             │                     │                │
-  ├────────────>│ class→"power"         │                     │                │
-  │             ├──────────────────────>│                     │                │
-  │             │                       │ cache miss           │                │
-  │             │                       │ gate=INITIALIZING    │                │
-  │             │                       ├─ getService("power")>│                │
-  │             │                       │<────── IBinder ──────┤                │
-  │             │                       │ asInterface + new PM │                │
-  │             │                       │ cache + READY        │                │
-  │<────────────┴───────────────────────┤                     │                │
-  │ PowerManager API                    │                     │                │
-  ├──────────────────────────────────────── Binder call ─────────────────────>│
-```
-
-后续同一 ContextImpl 再查，一般在 Fetcher cache 处返回，不再走 ServiceManager。
-
----
-
-## 45. Mac 上的只读源码练习
-
-### 练习 1：追 class 与 string 两个入口
+下面都是只读命令。先进入 Android 11 r48 源码根目录：
 
 ```bash
-rg -n "getSystemService\(|getSystemServiceName\(" \
+cd /Users/ninebot/androidSource
+```
+
+### 验证一：class 入口为什么会回到 name
+
+```bash
+rg -n 'getSystemService\(|getSystemServiceName\(' \
   frameworks/base/core/java/android/content/Context.java \
+  frameworks/base/core/java/android/content/ContextWrapper.java \
   frameworks/base/core/java/android/app/ContextImpl.java
 ```
 
-写出：class → name → fetcher 的三步转换。
+应记录三个观察：
 
-### 练习 2：对比三个 Fetcher
+1. `Context.getSystemService(Class)` 是 final；
+2. 它先 class→name，然后调字符串方法；
+3. `ContextWrapper` 默认转发，`ContextImpl` 进入 Registry。
+
+### 验证二：PowerManager 的配方和槽位在哪
 
 ```bash
-rg -n "class (CachedServiceFetcher|StaticServiceFetcher|StaticApplicationContextServiceFetcher)" \
+rg -n 'POWER_SERVICE, PowerManager.class|mCacheIndex|createServiceCache' \
+  frameworks/base/core/java/android/app/SystemServiceRegistry.java \
+  frameworks/base/core/java/android/app/ContextImpl.java
+```
+
+继续用 `sed` 打开命中位置附近，应证明：
+
+- PowerManager 使用 `CachedServiceFetcher`；
+- fetcher 同时取 power 与 thermal Binder；
+- fetcher 保存索引，Manager 保存在 `ContextImpl` 数组中。
+
+### 验证三：并发创建与失败后果
+
+```bash
+rg -n 'STATE_(UNINITIALIZED|INITIALIZING|READY|NOT_FOUND)|notifyAll|wait\(' \
+  frameworks/base/core/java/android/app/ContextImpl.java \
   frameworks/base/core/java/android/app/SystemServiceRegistry.java
 ```
 
-分别记录缓存对象放在哪里、是否接收 Context、创建失败后是否重试。
+读 `CachedServiceFetcher.getService()` 时，在纸上记下：哪些操作在 `synchronized(cache)` 里，`createService()` 在哪里，`ServiceNotFoundException` 会把 gate 改成什么。
 
-### 练习 3：对比三个服务例子
-
-```bash
-rg -n "registerService\(Context\.(POWER|WINDOW|CONNECTIVITY)_SERVICE" \
-  frameworks/base/core/java/android/app/SystemServiceRegistry.java
-```
-
-继续打开完整代码，比较 PowerManager、WindowManager、ConnectivityManager 为什么选择不同方式。
-
-### 练习 4：追服务端发布
+### 验证四：客户端名字与服务端发布是否接上
 
 ```bash
-rg -n "publishBinderService\(Context.POWER_SERVICE|publishLocalService" \
-  frameworks/base/services frameworks/base/core/java/com/android/server
+rg -n 'publishBinderService\(Context.POWER_SERVICE|getServiceOrThrow' \
+  frameworks/base/services/core/java/com/android/server/power/PowerManagerService.java \
+  frameworks/base/core/java/android/app/SystemServiceRegistry.java \
+  frameworks/base/core/java/android/os/ServiceManager.java
 ```
 
-画出 BinderService 与 LocalService 两条分支。
+预期结果是：服务端以 `Context.POWER_SERVICE` 发布，PowerManager fetcher 以同一常量查询。`getServiceOrThrow()` 本身在 Binder 不存在时抛受检异常，Fetcher 再决定如何转成 Manager 获取结果。
 
-### 练习 5：观察模块化 wrapper 注册
+这些静态阅读可以证明类映射、缓存位置、锁与失败分支。它不能证明某台设备此刻的 `power` 服务一定存在，也不能替代运行时 trace。厂商分支若修改 Registry 或服务发布，应以设备对应 commit 再核对。
 
-```bash
-rg -n "registerServiceWrappers|register(ContextAware|Static)Service" \
-  frameworks/base/wifi frameworks/base/telephony frameworks/base/apex \
-  frameworks/base/core/java/android/app/SystemServiceRegistry.java
-```
+## 11. 检查题、答案与立即可做的 takeaway
 
-目标：理解模块把“配方”注册回核心 Registry，而不是创建第二套 Context API。
+### 1. `getSystemService(PowerManager.class)` 为什么不直接拿 class 创建对象？
 
----
+答：`Context` 的 class 入口先通过 Registry 把 class 映射为 `"power"`，然后调用可被 Context 子类重写的字符串入口。实际创建逻辑在 `ServiceFetcher`，不是反射 `PowerManager.class`。
 
-## 46. 阅读一个新 Manager 的固定七问
+### 2. 同一 Activity 两次查询的对象为什么相同？
 
-1. Context service name 是什么？
-2. Registry 对应哪个 Manager class？
-3. 使用哪种 Fetcher，缓存范围是什么？
-4. `createService()` 是否立即取得 Binder？
-5. Manager 保存 Context、Handler、Binder、callback 中的哪些对象？
-6. 服务端在哪里 `publishBinderService()`？
-7. 服务死亡、用户切换、Context 销毁后如何清理或恢复？
+答：两次默认都转发到同一 Activity `ContextImpl`。PowerManager 的 cached fetcher 使用同一 `mCacheIndex`，第二次直接命中 `mServiceCache[index]`。
 
-回答完这七问，通常就不会只停留在 API 表面。
+### 3. `CachedServiceFetcher` 为什么不只判断 cache 是否为 null？
 
----
+答：`null` 无法区分未初始化、其他线程正在初始化和已确认找不到。状态数组负责单次创建、等待与 `NOT_FOUND` 记忆。
 
-## 47. 自测题
+### 4. 为什么 `createService()` 在 cache 锁外执行？
 
-1. `getSystemService(PowerManager.class)` 为什么仍要先映射为字符串？
-2. SystemServiceRegistry 与 native servicemanager 各保存什么？
-3. CachedServiceFetcher 的 cache index 何时分配？
-4. 为什么 ContextImpl 同时需要对象数组和状态数组？
-5. Manager 创建为什么放在 cache 锁外？
-6. StaticServiceFetcher 的“static”是跨设备还是跨进程？
-7. 两个 Activity 取得的 PowerManager 一定 `==` 吗？
-8. 两个 PowerManager wrapper 是否表示两个 PowerManagerService？
-9. `STATE_NOT_FOUND` 会产生什么后果？
-10. publishBinderService 最终调用谁？
-11. LocalService 能否给普通 App 使用？
-12. Registry 中没直接调用 ServiceManager，能否证明该 Manager 无 Binder？
+答：它可能查 Binder 或调用更复杂的构造逻辑。锁内只抢初始化权和发布结果，可以避免长时间占有 Context 的公共 cache 锁。
 
----
+### 5. PowerManager fetcher 抛出 `ServiceNotFoundException` 后，应用一定能捕到这个异常吗？
 
-## 48. 参考答案
+答：通常不能。`CachedServiceFetcher` 在内部捕获它、记录日志、标记 `STATE_NOT_FOUND`，最终 `Context.getSystemService()` 返回 `null`。
 
-1. 因为子类可以重写字符串版本，Context 契约要求 class 入口先映射名字再调用它。
-2. Registry 保存客户端 wrapper 的映射/构造配方；servicemanager 保存名字到 Binder 的运行时目录。
-3. Registry 静态初始化创建 CachedServiceFetcher 时。
-4. null 不能区分未初始化、正在初始化和确认不存在，还需 gate 协调并发。
-5. 避免耗时 Binder/构造操作长期占锁以及锁重入、死锁风险。
-6. 当前 Java 进程。
-7. 不一定；不同 ContextImpl 有不同缓存槽对象。
-8. 不是；它们通常连接同一个服务端 Binder。
-9. 同一 ContextImpl 后续该槽通常直接返回 null，不再创建。
-10. `android.os.ServiceManager.addService()`，再进入 native servicemanager。
-11. 不能；它是 system_server 同进程内部对象表。
-12. 不能；Manager 构造器或后续方法可能自己查询 Binder/JNI/native 服务。
+### 6. PowerManager 非空，能否证明远端 power 服务正常？
 
----
+答：不能。Registry 缓存的是 Manager wrapper，远端死亡不会自动清除槽位。存活、重连和异常转换要继续读具体 Manager。
 
-## 49. 第二遍复读：最容易不理解的地方
+### 可立即执行的阅读法
 
-### 49.1 “系统服务”一词同时指四样东西
+下次遇到任意 `getSystemService(XxxManager.class)`，不要先把整个 Registry 从头读到尾。只做六步：
 
-日常说的系统服务可能是：system_server 服务实现、它发布的 Binder、应用拿到的 Manager，或 Context 中的 service name。讨论时最好明确使用 `PowerManagerService`、`IPowerManager Binder`、`PowerManager wrapper`、`"power"`。
+1. 在 `Context.java` 找 `XxxManager` 对应的 service name；
+2. 在 `SystemServiceRegistry.java` 找这一条 `registerService`；
+3. 记下它是 Cached 还是 Static，对象缓存在哪里；
+4. 只读 `createService()` 的关键几行，看 Binder 在哪里取得；
+5. 按同一 name 搜索服务端 `publishBinderService()`；
+6. 记下三个边界：调用线程、Context/user 范围、缺失与死亡后的行为。
 
-### 49.2 两级注册表不能合并理解
-
-SystemServiceRegistry 是每进程内的 Java wrapper 配方表；native servicemanager 是全系统 Binder 名字目录。前者产生易用 API 对象，后者返回跨进程引用。
-
-### 49.3 “缓存 Manager”不等于“缓存服务端”
-
-per-Context cache 存的是 PowerManager 等 wrapper。服务端对象仍在 system_server；Binder driver 和代理连接二者。
-
-### 49.4 “每 Context”准确说是每 ContextImpl
-
-Wrapper 可以共享 base ContextImpl；不同 ContextImpl 才有独立 `mServiceCache`。outer Context 又可能被 Manager 用于组件/视觉语义。
-
-### 49.5 `NOT_FOUND` 是启动时序承诺
-
-CachedServiceFetcher 把找不到结果记在该 ContextImpl 中，说明它适合预期已经发布的服务。可晚到服务若照搬，会出现“后来发布了但旧 Context 仍返回 null”的问题。
-
-### 49.6 LocalService 不是 Binder 的优化模式
-
-它没有 Parcel、Proxy、UID 传播和跨进程能力，只是可信 system_server 内的 Java 对象引用。调用线程也不会自动切换。
-
----
-
-## 50. 本章总结
-
-主链压缩如下：
+只要能用自己的话说出这句话，本章就算建立了模型：
 
 ```text
-Context.getSystemService(Class)
-  → Registry 将 class 映射为 name
-  → name 找到 Fetcher
-  → Fetcher 按 per-Context/process 策略创建并缓存 Manager
-  → Manager 构造时或稍后通过 ServiceManager 按 name 获取 Binder
-  → AIDL asInterface 形成远端接口
-  → Manager API 经 Binder 直达 system_server 的 BinderService
+class 先变成 name，name 找到 fetcher；
+fetcher 创建并缓存本地 Manager，
+Manager 再持有通往远端服务的 Binder 接口。
 ```
 
-服务端的反向链路：
-
-```text
-SystemServer 启动 SystemService
-  → onStart
-  → publishBinderService
-  → ServiceManager.addService
-  → native servicemanager 保存 name + Binder
-```
-
-同进程内部则可另走：
-
-```text
-publishLocalService → LocalServices → 普通 Java 直调
-```
-
-理解这三条链后，就能准确回答：“我拿到的 Manager 从哪来，它缓存在哪里，它最终调用哪个服务端？”
-
----
-
-## 51. 下一章预告
-
-第 95 章将学习：
-
-**Android SystemServiceManager：系统服务启动、BootPhase、依赖顺序与用户生命周期**
-
-重点包括：
-
-- SystemServer 如何分阶段启动服务；
-- `startService()` 如何反射构造并调用 `onStart()`；
-- `startBootPhase()` 为什么只能单调前进；
-- 服务启动失败如何影响 system_server；
-- `onUserStarting/Unlocking/Unlocked/Stopping/Stopped` 如何分发；
-- Binder 发布完成、boot phase 完成和真正业务 ready 的区别。
+这同时回答了开头的问题：同一 Activity 的第二次查询返回同一 `PowerManager`，是因为它命中了同一 `ContextImpl` 的 Manager 缓存槽，不是因为 system_server 的服务对象被复制到了 App 中。

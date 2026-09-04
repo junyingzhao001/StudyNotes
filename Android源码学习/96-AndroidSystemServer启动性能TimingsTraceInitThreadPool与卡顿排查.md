@@ -1,1108 +1,647 @@
-# 96 Android SystemServer 启动性能：TimingsTrace、InitThreadPool、依赖与卡顿排查
+# 96 Android SystemServer 启动性能：从一段大耗时追到真正的关键路径
 
-> 源码版本：Android 11（`android-11.0.0_r48`）  
-> 本章目标：不靠“感觉启动慢”，而是用关键路径、trace slice、耗时日志、Future 汇合点和线程等待关系定位 system_server 启动瓶颈。  
-> 环境说明：本章以 macOS 只读源码分析为主，不要求编译 AOSP；有设备时可选用 adb/Perfetto 验证。
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`
+> 阅读环境：macOS 上静态阅读本地 AOSP，不要求编译
+> 贯穿场景：`StartServices` 很宽，继续拆开 `StartWindowManagerService` 内的等待、创建与注册
 
----
+开机明显变慢，日志里却只有一条很宽的 `StartServices`，最容易做出的错误判断是：“SystemServer 启动服务太多，所以整体都慢。”这句话没有指出哪个线程、哪项工作、哪个等待点控制了完成时间，也无法指导修改。
 
-## 1. 启动性能的核心不是“总工作量”，而是关键路径
+本章用一条真实源码路径拆开它：SystemServer 主线程在 bootstrap 阶段把 SensorService 提交给初始化线程池，自己继续启动其他服务；进入 `StartWindowManagerService` 后，主线程先通过 Future 等 Sensor，再创建 WMS，最后向 ServiceManager 注册 window 和 input 两个 Binder 服务。这个 slice 很宽时，三段中的任何一段都可能控制结束时间，不能只凭名字归因。
 
-假设开机要做三个任务：
+**一句话结论：先用 SystemServer timing slice 缩小主线程区间，再把 submit、worker slice、Future 汇合点和线程状态连成同一条关键路径；只有控制了某个完成里程碑的那段执行或等待，才是这次启动慢的有效解释。**
 
-```text
-A = 500 ms
-B = 800 ms
-C = 300 ms
-```
+读完后你应该能做到四件事：
 
-若全部串行：总时间约 1600ms。若 A、B 并行，但 C 必须等两者：
+1. 解释 `TimingsTraceAndSlog` 的 trace、begin 日志和 duration 日志为什么不是同一种证据；
+2. 区分主线程顺序执行、线程池提交、worker 真正完成和 Future 汇合；
+3. 判断 `StartWindowManagerService` 变宽时，慢在 Sensor 等待、WMS 创建还是 Binder 服务注册；
+4. 在 Mac 上完成静态路径核对，并为以后真机 Perfetto 验证写出可证伪的假设。
 
-```text
-主线程：A ─────────┐
-后台池：B ──────────────┐
-                     join ├─ C
-```
+本章不提供“优化后快了多少”的数字。没有同设备、同构建、同启动类型的实测，任何毫秒收益都只是猜测。
 
-总时间接近 `max(A,B)+C=1100ms`，而不是三个时长相加。
+## 1. 先定义问题：你测的到底是哪一段启动
 
-因此启动分析要找：
+“开机完成”至少可能指下面几种不同终点：
 
-- system_server 主线程上的串行工作；
-- 并行任务的最长分支；
-- 主线程真正等待 Future/latch 的位置；
-- 后续 phase 必须等待的依赖；
-- Binder、锁、I/O 造成的不可见等待。
-
-这条决定最终时间的最长依赖链就是**关键路径**。
-
----
-
-## 2. 先区分四类“启动时间”
-
-日常说“Android 启动用了 20 秒”可能指：
-
-| 时间区间 | 起止点示例 | 主要负责人 |
+| 观察范围 | 可能的起点与终点 | 本章能解释多少 |
 |---|---|---|
-| bootloader/kernel | 上电 → init | Bootloader、kernel、驱动 |
-| userspace boot | init → framework ready | init、native daemon、Zygote、SystemServer |
-| system_server init | SystemServer.run → services ready | 本章重点 |
-| 用户可交互 | 启动动画/Home/解锁完成 | AMS、WMS、SystemUI、Launcher、用户状态 |
+| 整机开机 | 上电到可交互 | 只能解释其中一段 |
+| userspace | init 启动到 framework ready | 能解释 system_server 部分 |
+| SystemServer 初始启动 | `SystemServer.run()` 到进入 `Looper.loop()` | timing trace 覆盖较多 |
+| 某个 boot phase | phase 开始到所有回调返回 | 可结合 SSM slice |
+| 用户可交互 | Launcher/SystemUI 可用 | 还受其他进程和系统状态影响 |
 
-优化前必须声明测量边界。`SystemServerTiming` 只能解释 system_server 中被打点的区间，不能代表完整上电时间。
+因此看到 `StartServices` 很宽，只能先得出：
 
----
+> SystemServer 主线程从开始启动服务，到 bootstrap、core、other 三组方法返回，经历了较长墙钟时间。
 
-## 3. 本章源码地图
+它不能直接证明：
 
-```text
-frameworks/base/services/java/com/android/server/SystemServer.java
-frameworks/base/services/core/java/com/android/server/SystemServiceManager.java
-frameworks/base/services/core/java/com/android/server/SystemServerInitThreadPool.java
-frameworks/base/services/core/java/com/android/server/utils/TimingsTraceAndSlog.java
-frameworks/base/core/java/android/util/TimingsTraceLog.java
-frameworks/base/core/java/com/android/internal/util/ConcurrentUtils.java
-frameworks/base/core/java/android/os/Trace.java
-frameworks/base/services/core/java/com/android/server/Watchdog.java
-```
+- CPU 一直在执行 Java；
+- 某个 `SystemService.onStart()` 是根因；
+- 初始化线程池没有贡献；
+- SystemUI 或 Launcher 已经可交互；
+- 某个静态阈值已经被“实测达到”。
 
-可选观察命令涉及：
+本章把诊断目标定义得更小、更可验证：
 
 ```text
-adb logcat
-atrace / Perfetto
-dumpsys activity processes
-dumpsys binder_calls_stats
+StartServices
+  → 找最宽的子区间
+  → 定位该区间内的同步调用或 Future 汇合
+  → 连接对应 worker / Binder / 锁 / I/O
+  → 判断谁控制这个区间的 traceEnd
 ```
 
----
+这里的“完成点”是理解性能的核心。一个方法被 submit，不代表开始；worker 开始，不代表完成；Future 完成，也不代表用户已经可交互。
 
-## 4. SystemServer 主线程是一条大串行链
+## 2. 主线程骨架：三组服务启动仍是顺序调用
 
-`SystemServer.run()` 准备主 Looper、创建 system Context 和 SSM 后调用：
+`SystemServer.run()` 在准备环境、主 Looper、SystemServiceManager 和初始化线程池后，按固定顺序进入三组服务启动方法。
+
+`frameworks/base/services/java/com/android/server/SystemServer.java`
 
 ```java
-startBootstrapServices(t);
-startCoreServices(t);
-startOtherServices(t);
-```
-
-这些方法中的绝大多数普通语句都在 system_server 主线程顺序执行：
-
-```text
-StartInstaller
- → StartActivityManager
- → StartPowerManager
- → StartDisplayManager
- → WaitForDisplay
- → StartPackageManager
- → ...
-```
-
-某个步骤慢 500ms，若它位于主线程关键路径，通常直接增加至少约 500ms。只有显式提交到其他线程的工作才可能与主线程重叠。
-
----
-
-## 5. TimingsTraceAndSlog 是什么
-
-SystemServer 创建计时器：
-
-```java
-TimingsTraceAndSlog t = new TimingsTraceAndSlog();
-```
-
-使用方式：
-
-```java
-t.traceBegin("StartPowerManager");
-mSystemServiceManager.startService(PowerManagerService.class);
-t.traceEnd();
-```
-
-它同时做两件事：
-
-1. 调用 `Trace.traceBegin/traceEnd`，产生 `TRACE_TAG_SYSTEM_SERVER` slice。
-2. 在允许的构建类型中记录嵌套开始时间并输出 duration 日志。
-
-名字 `AndSlog` 表示它还会在 begin 时向 logcat 写阶段名。
-
----
-
-## 6. trace slice 与耗时日志不是一回事
-
-`TimingsTraceLog.traceBegin()` 先执行：
-
-```java
-Trace.traceBegin(mTraceTag, name);
-```
-
-然后 Android 11 中只有非 user build 的 `DEBUG_BOOT_TIME` 才保存嵌套开始时间，用于 `traceEnd()` 时计算并 `Slog.d`：
-
-```text
-StartPowerManager took to complete: 12ms
-```
-
-因此：
-
-- Perfetto/atrace slice 是否可见，取决于 trace tag 是否启用和采集配置；
-- logcat duration 是否输出，还受 build type、日志级别影响；
-- 没有 duration 日志，不代表代码没有 trace 打点；
-- begin 时的 `Slog.i` 与 end 时的 duration log 也不是同一条记录。
-
-排查时不要只 `grep "took to complete"` 就断言某段没有打点。
-
----
-
-## 7. TimingsTraceLog 为什么要求同线程
-
-构造时记录：
-
-```java
-mThreadId = Thread.currentThread().getId();
-```
-
-每次 begin/end 都调用 `assertSameThread()`。如果从另一线程使用同一实例，会抛 IllegalStateException。
-
-原因：
-
-- begin/end 使用栈式嵌套；
-- `Trace.traceEnd()` 关闭当前线程最近 slice；
-- 开始时间数组也按单线程栈维护；
-- 跨线程 begin/end 会破坏配对关系。
-
-异步任务必须创建自己的：
-
-```java
-TimingsTraceAndSlog.newAsyncLog()
-```
-
-不能把 SystemServer 主线程的 `t` 捕获到线程池里继续使用。
-
----
-
-## 8. 嵌套深度与 user build 边界
-
-非 user build 默认最多保存 10 层嵌套计时：
-
-```java
-MAX_NESTED_CALLS = 10;
-```
-
-超过后会警告“不再记录该层 duration”。这不一定阻止底层 Trace API 的 slice 形成，因为 `Trace.traceBegin()` 在深度检查之前已经调用。
-
-user build 中用于 Java duration 计算的数组可以不创建，降低启动时调试开销。性能观测功能本身也有成本，所以量产版本往往减少详细日志。
-
----
-
-## 9. `traceEnd()` 必须放 finally
-
-推荐：
-
-```java
-t.traceBegin("StartDemo");
 try {
-    startDemo();
+    t.traceBegin("StartServices");
+    startBootstrapServices(t);
+    startCoreServices(t);
+    startOtherServices(t);
+} catch (Throwable ex) {
+    Slog.e("System", "******************************************");
+    Slog.e("System", "************ Failure starting system services", ex);
+    throw ex;
 } finally {
-    t.traceEnd();
+    t.traceEnd(); // StartServices
 }
 ```
 
-如果异常路径漏掉 end：
+这段代码给出两个重要边界：
 
-- 后续 slice 嵌套结构错误；
-- duration 名称与结束位置错配；
-- `getUnfinishedTracesForDebug()` 会看到未完成项；
-- Perfetto 时间线难以阅读。
+1. 三个方法是同一线程上的普通 Java 调用，`startCoreServices` 必须等 `startBootstrapServices` 返回；
+2. 这三个方法本身不会自动并行；若有工作与主线程重叠，源码中必然存在显式异步边界，例如线程池提交、自建线程或 Handler、Binder/native 异步调用。
 
-打点的正确性也是源码质量的一部分。不能为了“有 trace”只加 begin 不保证成对退出。
+bootstrap、core、other 是源码组织分组，不是三个并发层，也不是严格的稳定性或权限等级。
 
----
-
-## 10. SystemServiceManager 的第二层计时
-
-SystemServer 外层常有：
+可以把主线程看成一条单行铁路：
 
 ```text
-StartPowerManager
+SystemServer 主线程
+  InitBeforeStartServices
+       ↓
+  startBootstrapServices
+       ↓
+  startCoreServices
+       ↓
+  startOtherServices
+       ↓
+  StartServices.traceEnd
+       ↓
+  Looper.loop
 ```
 
-SSM 内部又有：
+大多数 `t.traceBegin("StartX")` / `traceEnd()` 是这条铁路上的站牌。某个站牌很宽，表示当前线程从 begin 到 end 的墙钟区间很宽；区间里可能包含当前线程运行、调度等待、同步 Binder、锁、文件 I/O、Future 或 GC 暂停。
 
-```text
-StartService com.android.server.power.PowerManagerService
-```
+所以第一步不是猜服务内部算法，而是继续展开嵌套 slice，并看该线程在区间内究竟处于什么状态。
 
-并测量 `onStart()`：超过 50ms 打印：
+### `traceEnd` 到底证明了什么
 
-```text
-Service ... took N ms in onStart
-```
+`StartServices.traceEnd` 证明三个启动方法已经返回或异常路径进入 finally。它不证明所有提交到线程池的任务都结束，因为有些 Future 会在更晚的消费者处等待，有些只由 boot-completed 阶段的线程池 shutdown 收口。
 
-三者的范围不同：
+同理，`StartService X` 的 `traceEnd()` 位于 `finally`：正常路径结束说明构造与 `onStart()` 已返回，异常路径也会关闭 slice，此时只能说明控制流已经离开这段范围，不能说服务启动成功。即使正常返回，服务另起的线程、延迟消息或后续 boot phase 也可能仍未完成。
 
-| 指标 | 包含范围 |
-|---|---|
-| SystemServer 外层 slice | 调用点包住的所有代码 |
-| SSM `StartService` trace | 反射构造、加入列表、onStart |
-| 50ms warning | 只测 onStart 或单个生命周期回调 |
+## 3. TimingsTraceAndSlog：同一个名字产生三类线索
 
-外层慢、onStart 不慢时，可能慢在类加载、调用前后代码或额外初始化；反之应进入服务 `onStart()` 深挖。
+SystemServer 用 `TimingsTraceAndSlog t = new TimingsTraceAndSlog()` 创建主线程专用计时对象。
 
----
+`TimingsTraceAndSlog` 的 begin 先写一条 info 日志，再调用父类：
 
-## 11. 50ms warning 不是硬超时
-
-`SystemServiceManager`：
+`frameworks/base/services/core/java/com/android/server/utils/TimingsTraceAndSlog.java`
 
 ```java
-if (duration > 50) {
-    Slog.w(TAG, "Service ... took ...");
+@Override
+public void traceBegin(@NonNull String name) {
+    Slog.i(mTag, name);
+    super.traceBegin(name);
 }
 ```
 
-它不会：
+父类真正发出同步 trace slice，并在非 user 构建中保存开始时间：
 
-- 中断回调；
-- 回滚服务；
-- 自动迁移后台；
-- 立即触发 Watchdog；
-- 证明有 bug。
-
-它是“值得调查”的阈值。第一次初始化确实可能超过 50ms，但应解释时间花在哪里、是否位于关键路径、能否缓存/并行/延后。
-
----
-
-## 12. elapsedRealtime、uptime 与 CPU time
-
-本章源码主要使用：
+`frameworks/base/core/java/android/util/TimingsTraceLog.java`
 
 ```java
-SystemClock.elapsedRealtime()
-SystemClock.uptimeMillis()
+public void traceBegin(String name) {
+    assertSameThread();
+    Trace.traceBegin(mTraceTag, name);
+
+    if (!DEBUG_BOOT_TIME) return;
+    if (mCurrentLevel + 1 >= mMaxNestedCalls) {
+        Slog.w(mTag, "not tracing duration of '" + name + "' because already reached "
+                + mMaxNestedCalls + " levels");
+        return;
+    }
+    mCurrentLevel++;
+    mStartNames[mCurrentLevel] = name;
+    mStartTimes[mCurrentLevel] = SystemClock.elapsedRealtime();
+}
 ```
 
-区别：
-
-- elapsedRealtime 包含设备深度睡眠时间；
-- uptime 不包含深度睡眠；
-- 两者都是单调时间，不受用户改墙钟影响；
-- 它们都不是线程 CPU time。
-
-system_server 启动时通常不会进入长时间深睡眠，两者数值常接近，但语义仍不同。某步骤 wall duration 500ms 可能是 CPU 执行、锁等待、Binder 等待或 I/O 阻塞，不能仅凭数字判定 CPU 热点。
-
----
-
-## 13. InitThreadPool 如何创建
+结束时先关闭 trace slice；非 user 构建再计算 duration：
 
 ```java
-int size = Runtime.getRuntime().availableProcessors();
-mService = ConcurrentUtils.newFixedThreadPool(
-        size,
-        "system-server-init-thread",
-        Process.THREAD_PRIORITY_FOREGROUND);
+public void traceEnd() {
+    assertSameThread();
+    Trace.traceEnd(mTraceTag);
+
+    if (!DEBUG_BOOT_TIME) return;
+    if (mCurrentLevel < 0) {
+        Slog.w(mTag, "traceEnd called more times than traceBegin");
+        return;
+    }
+    final String name = mStartNames[mCurrentLevel];
+    final long duration = SystemClock.elapsedRealtime() - mStartTimes[mCurrentLevel];
+    mCurrentLevel--;
+    logDuration(name, duration);
+}
 ```
 
-特点：
+三类线索不要混成一条：
 
-- 固定线程数等于可用处理器数量；
-- 线程名便于 trace/stack 识别；
-- 前台调度优先级；
-- 只服务 system_server 启动期；
-- PHASE_BOOT_COMPLETED 后关闭。
+| 线索 | 产生位置 | 它能回答什么 | 看不到时不能推断什么 |
+|---|---|---|---|
+| begin 日志 | `TimingsTraceAndSlog.traceBegin` 的 `Slog.i` | 代码走到哪个阶段 | 看不到不一定没执行，可能是采集/过滤问题 |
+| trace slice | `Trace.traceBegin/End` | 线程上的 begin-end 时间线 | slice 宽不等于 CPU 时间长 |
+| duration 日志 | 非 user 构建的 `logDuration` | Java 计时栈算出的墙钟耗时 | user build 没日志不代表没有 trace |
 
-线程数等于 CPU 数不代表可以无代价提交无限 CPU 重活。多个前台优先级任务可能与主线程、SurfaceFlinger 等争抢 CPU 和内存带宽。
+r48 中 `DEBUG_BOOT_TIME = !Build.IS_USER`。因此 user build 仍会调用 Trace API，但 `traceEnd()` 不会维护 Java duration 数组并输出每段 `"... took to complete"` 日志；代码若直接调用 `logDuration()`（例如后文的 `TotalBootTime`）仍是另一条路径。trace 是否最终可见，还取决于目标设备是否启用相应 tag、采集配置和缓冲区。
 
----
+`TimingsTraceAndSlog` 另有 `BOTTLENECK_DURATION_MS = -1`。这表示它自己的 “Slow duration” warning 默认关闭，不能把它写成某个已经生效的慢调用阈值。
 
-## 14. submit 做了哪些额外工作
+### 为什么主线程的 `t` 不能传给 worker
 
-每个任务需要 description：
+`TimingsTraceLog` 在构造时记录当前线程 id，每次 begin/end 都先 `assertSameThread()`。同步 trace 和嵌套计时栈都属于创建它的线程。
+
+异步任务应在线程内部创建：
 
 ```java
-SystemServerInitThreadPool.submit(runnable, "StartSensorService");
+TimingsTraceAndSlog traceLog = TimingsTraceAndSlog.newAsyncLog();
+traceLog.traceBegin("AsyncWork");
+try {
+    doWork();
+} finally {
+    traceLog.traceEnd();
+}
 ```
 
-内部：
+`newAsyncLog()` 使用日志 tag `SystemServerTimingAsync`，trace tag 仍是 `TRACE_TAG_SYSTEM_SERVER`。不要捕获主线程的 `t` 到 pool 中使用；这会触发同线程检查。
 
-1. 检查 pool 已启动且未 shutdown。
-2. 将 description 加入 `mPendingTasks`。
-3. 在线程池执行时创建 async timing log。
-4. 产生 `InitThreadPoolExec:<description>` trace。
-5. debug build 记录开始/完成日志。
-6. 正常完成后从 pending 列表移除。
-7. RuntimeException 记录并放进 Future。
+## 4. 缩小到具体服务：外层 slice 与 50 ms warning 范围不同
 
-description 不只是好看的文字；pool 关闭超时时会用 pending list 报告未完成任务。
+假设你已从 `StartServices` 展开到 `StartWindowManagerService`。仍不能直接说“WMS 创建慢”，因为这个 SystemServer 外层区间同时包住 Future 等待、WMS 创建和 Binder 注册。这里的 WMS 也不是经 SystemServiceManager 启动的 `SystemService`，所以这条路径根本没有一个可供归因的“WMS `onStart()`”。
 
----
+其他经 SystemServiceManager 启动的服务才会出现 `StartService <类名>` 和 50 ms `onStart()` 计时。下面用它作范围对照；中间省略类型检查和反射异常分支：
 
-## 15. 异步任务失败不一定立即让主线程知道
-
-线程池任务抛 RuntimeException 后，异常被 Future 保存。提交线程不会在 submit 时同步收到。
-
-```text
-main submit(task) → 立即拿 Future 继续
-worker task throws → Future 标记 failed
-main 若从不 get/wait → 可能只看到 worker 日志
-```
-
-只有在正确依赖点调用类似：
+`frameworks/base/services/core/java/com/android/server/SystemServiceManager.java`
 
 ```java
-ConcurrentUtils.waitForFutureNoInterrupt(future, description);
+public <T extends SystemService> T startService(Class<T> serviceClass) {
+    try {
+        final String name = serviceClass.getName();
+        Slog.i(TAG, "Starting " + name);
+        Trace.traceBegin(Trace.TRACE_TAG_SYSTEM_SERVER, "StartService " + name);
 ```
 
-主线程才会观察完成与异常。
-
-所以性能和正确性问题是同一件事：并行任务必须明确“谁拥有 Future、何时汇合、失败如何传播”。
-
----
-
-## 16. Android 11 的几个真实并行任务
-
-SystemServer 包括：
-
-- `SystemConfig::getInstance`；
-- SensorService 启动；
-- secondary Zygote preload；
-- BlobStore service 启动；
-- WebView preparation；
-- 某些 HIDL/native 服务初始化。
-
-并非所有 submit 都保留 Future。有些任务只要求最终在 boot complete 前结束；有些有明确早期消费者，必须保留并等待。
-
-读每个 submit 时固定问：
-
-```text
-任务产物是什么？
-第一个消费者是谁？
-消费者前有没有 wait？
-若任务失败，系统能否继续？
-若一直不结束，shutdown 会怎样？
+```java
+        startService(service);
+        return service;
+    } finally {
+        Trace.traceEnd(Trace.TRACE_TAG_SYSTEM_SERVER);
+    }
+}
 ```
 
----
+`startService(service)` 中只对 `onStart()` 单独测量：
 
-## 17. SensorService 的提交与汇合
+```java
+long time = SystemClock.elapsedRealtime();
+try {
+    service.onStart();
+} catch (RuntimeException ex) {
+    throw new RuntimeException("Failed to start service " + service.getClass().getName()
+            + ": onStart threw an exception", ex);
+}
+warnIfTooLong(SystemClock.elapsedRealtime() - time, service, "onStart");
+```
 
-早期提交：
+超过阈值只打印警告：
+
+```java
+private void warnIfTooLong(long duration, SystemService service, String operation) {
+    if (duration > SERVICE_CALL_WARN_TIME_MS) {
+        Slog.w(TAG, "Service " + service.getClass().getName() + " took " + duration + " ms in "
+                + operation);
+    }
+}
+```
+
+Android 11 r48 中几个容易被误读的数字如下：
+
+| 源码常量/条件 | 作用范围 | 超过后的行为 | 不能当成什么 |
+|---|---|---|---|
+| SSM `> 50 ms` | `onStart`、`onBootPhase` 及部分用户生命周期回调 | 写 warning，继续执行 | ANR、Watchdog 或服务超时 |
+| SystemServer `60 * 1000` | 非 runtime restart、非首启/升级时，检查开机以来 `elapsedRealtime` | `Slog.wtf` | 单独 `StartServices` 的实测耗时 |
+| Looper dispatch 100 ms | 主 Looper 消息执行 | slow log | `Looper.loop()` 前的启动代码计时 |
+| Looper delivery 200 ms | 消息等待到开始分发 | slow log | 某个服务初始化阈值 |
+| pool shutdown 20 s | phase 1000 后等待线程池终止 | 抓栈并抛异常 | 每个 Future 的超时 |
+
+这些都是源码中的诊断条件，不是这台设备的测量结果。必须把“阈值是 50 ms”与“某次实际用了多少”分开。
+
+60 秒分支尤其容易被标题误导。它实际比较的是开机以来的 `elapsedRealtime()`，并跳过 runtime restart、首启和升级：
+
+`frameworks/base/services/java/com/android/server/SystemServer.java`
+
+```java
+if (!mRuntimeRestart && !isFirstBootOrUpgrade()) {
+    final long uptimeMillis = SystemClock.elapsedRealtime();
+    FrameworkStatsLog.write(FrameworkStatsLog.BOOT_TIME_EVENT_ELAPSED_TIME_REPORTED,
+            FrameworkStatsLog
+                    .BOOT_TIME_EVENT_ELAPSED_TIME__EVENT__SYSTEM_SERVER_READY,
+            uptimeMillis);
+    final long maxUptimeMillis = 60 * 1000;
+    if (uptimeMillis > maxUptimeMillis) {
+        Slog.wtf(SYSTEM_SERVER_TIMING_TAG,
+                "SystemServer init took too long. uptimeMillis=" + uptimeMillis);
+    }
+}
+```
+
+### 外层慢、warning 不出现，应该查哪里
+
+可能慢在服务构造、类加载、静态初始化、SystemServer 调用前后、Future、同步 Binder、锁或 I/O；50 ms warning 只测指定生命周期回调。反过来，看到 warning 也只说明回调值得调查，它不会中断、回滚或自动把工作移到后台，更不证明这段一定控制当前开机里程碑。
+
+## 5. InitThreadPool：submit 只完成“入队”，不是完成任务
+
+SystemServer 在启动服务前调用 `SystemServerInitThreadPool.start()`。构造器按运行时报告的可用处理器数建立固定线程池：
+
+`frameworks/base/services/core/java/com/android/server/SystemServerInitThreadPool.java`
+
+```java
+private SystemServerInitThreadPool() {
+    final int size = Runtime.getRuntime().availableProcessors();
+    Slog.i(TAG, "Creating instance with " + size + " threads");
+    mService = ConcurrentUtils.newFixedThreadPool(size,
+            "system-server-init-thread", Process.THREAD_PRIORITY_FOREGROUND);
+}
+```
+
+这解释了线程名、池大小和优先级，但不证明“线程越多启动越快”。worker 可能与主线程、其他进程争抢 CPU、I/O、内存带宽或全局锁。
+
+提交时，description 先进入 pending 列表，然后 Executor 返回 Future：
+
+```java
+synchronized (mPendingTasks) {
+    Preconditions.checkState(!mShutDown, TAG + " already shut down");
+    mPendingTasks.add(description);
+}
+return mService.submit(() -> {
+    TimingsTraceAndSlog traceLog = TimingsTraceAndSlog.newAsyncLog();
+    traceLog.traceBegin("InitThreadPoolExec:" + description);
+```
+
+任务执行与异常分支紧接在后面：
+
+```java
+try {
+    runnable.run();
+} catch (RuntimeException e) {
+    Slog.e(TAG, "Failure in " + description + ": " + e, e);
+    traceLog.traceEnd();
+    throw e;
+}
+synchronized (mPendingTasks) {
+    mPendingTasks.remove(description);
+}
+```
+
+源码随后可选打印“Finished executing”，再执行 `traceLog.traceEnd()`。这条路径有四个不同完成点：
+
+| 时刻 | 已经保证什么 | 尚未保证什么 |
+|---|---|---|
+| `submit()` 返回 | Executor 已接受并返回 Future | worker 可能尚未开始 |
+| `InitThreadPoolExec:X` begin | worker 开始包装任务 | X 尚未完成 |
+| Future 进入完成态 | 包装任务返回、抛异常，或 Future 被取消 | 依赖方尚未观察；取消也不保证忽略中断的任务已经停下 |
+| `Future.get()` 返回 | 任务成功，依赖方越过屏障 | 后续服务或用户可交互仍未保证 |
+
+任务抛 `RuntimeException` 时，wrapper 会记录错误、调用一次 `traceEnd()` 并重新抛出，异常被 Future 保存。提交线程不会在 `submit()` 当场收到它；只有持有 Future 的代码执行 `get`，才能让失败传播到依赖点。若 runnable 自己开启了嵌套 slice 却未在异常路径关闭，最终 trace 仍可能不配对。
+
+异常分支还发生在 `mPendingTasks.remove(description)` 之前。因此 pending 描述主要是 shutdown 失败时的诊断线索，不应被当成一套精确、独立的任务状态机。
+
+## 6. 贯穿案例：SensorService 在哪里并行，又在哪里变回串行
+
+SensorService 不能过早启动：源码注释说明它需要 PackageManager、AppOps 和 permission service。依赖具备后，bootstrap 末尾才提交：
+
+`frameworks/base/services/java/com/android/server/SystemServer.java`
 
 ```java
 mSensorServiceStart = SystemServerInitThreadPool.submit(() -> {
+    TimingsTraceAndSlog traceLog = TimingsTraceAndSlog.newAsyncLog();
+    traceLog.traceBegin(START_SENSOR_SERVICE);
     startSensorService();
+    traceLog.traceEnd();
 }, START_SENSOR_SERVICE);
+
+t.traceEnd(); // startBootstrapServices
 ```
 
-主线程继续启动无依赖工作。到 WindowManager/Input 等需要底层传感器服务的关键位置前：
+主线程随后进入 core 和 other services。进入 WMS 的外层 slice 后，源码先设置硬依赖，再创建 WMS，并注册两个 Binder 服务，最后才结束 slice：
 
 ```java
-ConcurrentUtils.waitForFutureNoInterrupt(
-        mSensorServiceStart, START_SENSOR_SERVICE);
+t.traceBegin("StartWindowManagerService");
+// WMS needs sensor service ready
+ConcurrentUtils.waitForFutureNoInterrupt(mSensorServiceStart, START_SENSOR_SERVICE);
+mSensorServiceStart = null;
+wm = WindowManagerService.main(context, inputManager, !mFirstBoot, mOnlyCore,
+        new PhoneWindowManager(), mActivityManagerService.mActivityTaskManager);
+ServiceManager.addService(Context.WINDOW_SERVICE, wm, false,
+        DUMP_FLAG_PRIORITY_CRITICAL | DUMP_FLAG_PROTO);
+ServiceManager.addService(Context.INPUT_SERVICE, inputManager, false,
+        DUMP_FLAG_PRIORITY_CRITICAL);
+t.traceEnd();
 ```
 
-图示：
+关键时序是：
+
+```mermaid
+sequenceDiagram
+    participant M as SystemServer 主线程
+    participant P as InitThreadPool
+    participant S as Sensor 初始化
+    M->>P: submit(StartSensorService)
+    P-->>M: 返回 Future
+    par 主线程继续
+        M->>M: core 与部分 other services
+    and worker 执行
+        P->>S: startSensorService()
+    end
+    M->>M: begin StartWindowManagerService
+    M->>P: Future.get()
+    P-->>M: 完成或异常
+    M->>M: WindowManagerService.main()
+    M->>M: 注册 window 与 input Binder 服务
+    M->>M: end StartWindowManagerService
+```
+
+并行收益来自 submit 与第一个消费者之间的独立工作窗口；风险来自共享状态、资源竞争和错误传播：
+
+- Sensor 早已完成时，Future 汇合几乎不再增加关键路径；
+- Sensor 尚未完成时，剩余时间落进 `StartWindowManagerService` 外层 slice；
+- Sensor 失败时，Future 在汇合点把异常带回主线程；
+- worker 若持有主线程更早需要的锁，并行窗口可能提前消失；
+- 删除 wait 会破坏 WMS 的明确依赖，不是“免费优化”。
+
+### 为什么这个 wait 没有自己的超时
+
+`ConcurrentUtils.waitForFutureNoInterrupt` 直接调用 `Future.get()`：
+
+`frameworks/base/core/java/com/android/internal/util/ConcurrentUtils.java`
+
+```java
+public static <T> T waitForFutureNoInterrupt(Future<T> future, String description) {
+    try {
+        return future.get();
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IllegalStateException(description + " interrupted");
+    } catch (ExecutionException e) {
+        throw new RuntimeException(description + " failed", e);
+    }
+}
+```
+
+它没有 timeout 参数。“NoInterrupt”也不表示吞掉中断：源码恢复 interrupt flag，然后抛异常。
+
+本章把等待依赖俗称为“join”，但 r48 这里没有调用 `Thread.join()`：早期屏障实际是 `Future.get()`，线程池总屏障实际是 `awaitTermination()`。
+
+如果 Sensor 一直不完成，这次 `Future.get()` 自身不会超时，主线程的正常控制流也无法继续到 phase 1000。Watchdog 杀掉进程等外部机制仍可能终止这次等待，但后面的“线程池 shutdown 最多等 20 秒”不会替这个早期 Future 汇合兜底。
+
+### 怎样判断宽 slice 的责任归属
+
+在同一时间轴同时看：
+
+1. 主线程 `StartWindowManagerService` 的起止；
+2. worker 上 `InitThreadPoolExec:StartSensorService` 与内层 `StartSensorService`；
+3. 主线程在 `Future.get` 附近是 Sleeping/Blocked 还是 Running；
+4. worker 内部又在运行、等 Binder、等锁还是等 I/O；
+5. `WindowManagerService.main()` 与随后两次 `ServiceManager.addService()` 各自占了多少。
+
+若 worker 的结束点与主线程重新运行对齐，Sensor 分支很可能控制了汇合；若 worker 早已结束，就应继续分析 `WindowManagerService.main()` 和两个 Binder 服务注册。这里必须用 trace 或栈验证，不能按标签名称猜。
+
+## 7. 不同汇合点：早期消费者与 boot-completed 总屏障
+
+SystemServer 的异步任务并不都在同一个地方等待。下表是代表路径，不是整个进程所有 pool 提交的穷举：
+
+| 任务 | 提交后的主线程行为 | 明确汇合点 | 为什么在那里等 |
+|---|---|---|---|
+| SensorService | 继续 core/other services | WMS 创建前 | WMS 明确需要 Sensor ready |
+| BlobStore service | 继续启动其他服务 | device-specific ready 后 | 后续 ready 流程前收口 |
+| secondary Zygote preload | 提前运行 | WebView worker 内等待 | WebView preparation 依赖 preload |
+| WebView preparation | 与 system-ready 工作重叠 | phase 600 前 | 三方应用可能使用 WebView |
+| 未保存 Future 的启动任务 | 主线程继续 | pool shutdown | 最多等待 20 秒；超时后诊断并让当前启动路径失败，不保证任务已停下 |
+
+这些任务是否存在还受 ABI、feature 和 `mOnlyCore` 等分支影响；表格描述的是 r48 中相应路径被启用后的依赖。
+
+WebView 的结构说明 join 不一定发生在主线程：
 
 ```text
-main:   submit Sensor ── other work ── wait ── WMS/Input next
-worker:        └──────── startSensor ── done
-```
-
-若 worker 在 main 到达 wait 前完成，等待几乎为零；若没完成，剩余时长进入主线程关键路径。
-
----
-
-## 18. WebView prepare 为什么要等到三方应用前
-
-WebView preparation 可以与部分 systemReady 工作并行，但在：
-
-```java
+secondary Zygote preload
+          ↓ worker 内 join
+WebView preparation
+          ↓ 主线程 join
 PHASE_THIRD_PARTY_APPS_CAN_START
 ```
 
-之前必须等待完成，因为三方应用一旦启动，就可能立刻使用 WebView。
+这条链上任意一段变慢，都可能最终推迟 phase 600。只看主线程最后一次 `Future.get`，仍需向上游 worker 继续追。
 
-正确优化不是简单删掉 wait，而是：
+### phase 1000 后的 shutdown 是限时收口检查
 
-- 尽可能早提交；
-- 与无依赖工作重叠；
-- 保留“开放三方应用”之前的必要汇合。
+SystemServiceManager 给所有已启动服务分发 boot-completed phase 后，记录总时长并关闭 init pool：
 
-删除安全屏障可能让 trace 看起来更快，却把启动竞态转成运行期崩溃。
-
----
-
-## 19. Zygote preload 的依赖链
-
-secondary Zygote preload 可异步执行；WebView prepare 内又可能等待它。
-
-```text
-secondary zygote preload
-          ↓
-WebView preparation
-          ↓
-third-party apps can start
-```
-
-即使三个任务运行在不同位置，它们仍形成依赖链。Perfetto 中不能只看主线程空不空，还要沿 Flow/Future/日志把 worker 任务与主线程 join 连接起来。
-
----
-
-## 20. Pool shutdown 是最后一道完整性检查
-
-PHASE_BOOT_COMPLETED 分发完成后 SSM 调用：
+`frameworks/base/services/core/java/com/android/server/SystemServiceManager.java`
 
 ```java
-SystemServerInitThreadPool.shutdown();
+if (phase == SystemService.PHASE_BOOT_COMPLETED) {
+    final long totalBootTime = SystemClock.uptimeMillis() - mRuntimeStartUptime;
+    t.logDuration("TotalBootTime", totalBootTime);
+    SystemServerInitThreadPool.shutdown();
+}
 ```
 
-shutdown：
+`OnBootPhase_1000` 的 trace 在上述判断之前已经结束，所以它不包含 pool 等待；shutdown 自己另有 `WaitInitThreadPoolShutdown` slice。不过调用 `startBootPhase()` 的父级 `FinishBooting` slice 尚未结束，因此父级区间仍会包含这次等待。`TotalBootTime` 使用 uptime 差值，50 ms 生命周期告警使用 `elapsedRealtime`，两种口径不能直接混算。
 
-1. 禁止新任务。
-2. `ExecutorService.shutdown()`。
-3. 最多等待 20 秒。
-4. 被中断或超时则抓 system_server 和重要 native 进程堆栈。
-5. `shutdownNow()` 取回未开始任务。
-6. 若仍未正常结束，抛 IllegalStateException 并列出 unfinished descriptions。
-
-它不是“boot complete 后悄悄丢弃后台任务”。相反，它要求启动任务必须收敛，否则把问题升级为严重启动错误。
-
----
-
-## 21. 为什么不能在 boot completed 后继续 submit
-
-pool 的生命周期就是启动期。关闭后 `sInstance=null`，再次 submit 会因 precondition 失败。
-
-运行期工作应使用服务自己的 Handler/Executor 或系统共享线程，而不是依赖 init pool。否则：
-
-- 生命周期不清楚；
-- boot complete 关闭时可能竞态；
-- pending task 会阻塞 shutdown；
-- 调试人员误把常驻任务当启动未完成。
-
----
-
-## 22. 并行化的四个必要条件
-
-一段启动工作适合并行，至少要满足：
-
-1. 不依赖主线程后续马上产生的数据。
-2. 不会与主线程并发修改无保护的共享状态。
-3. 有明确的第一个消费者与完成屏障。
-4. 异常能在合适位置被观察和处理。
-
-还要考虑：
-
-- 是否触发 class initialization 锁竞争；
-- 是否同步 Binder 回调主线程；
-- 是否同时进行大量磁盘随机 I/O；
-- 是否争抢 PackageManager 全局锁；
-- 是否真的减少关键路径，而不是把工作换到另一线程后仍立刻 wait。
-
----
-
-## 23. “submit 后马上 wait”通常没有并行收益
+shutdown 禁止新任务，调用 Executor shutdown，再最多等待源码常量 20 秒：
 
 ```java
-Future<?> f = pool.submit(task);
-waitForFutureNoInterrupt(f);
+synchronized (sInstance.mPendingTasks) {
+    sInstance.mShutDown = true;
+}
+sInstance.mService.shutdown();
+final boolean terminated;
+try {
+    terminated = sInstance.mService.awaitTermination(SHUTDOWN_TIMEOUT_MILLIS,
+            TimeUnit.MILLISECONDS);
+} catch (InterruptedException e) {
+    Thread.currentThread().interrupt();
+    dumpStackTraces();
+    t.traceEnd();
+    throw new IllegalStateException(TAG + " init interrupted");
+}
 ```
 
-如果中间没有主线程可重叠工作：
+若 20 秒内未终止，它先抓 system_server 与 Watchdog 关注的 native 进程堆栈，再调用 `shutdownNow()` 尝试中断任务，最后抛出包含未开始 runnable 和 pending descriptions 的 `IllegalStateException`。任务若忽略中断，仍可能继续运行；这里保证的是等待方失败，不是 worker 已被强制停止。
 
-- 增加线程调度和 Future 开销；
-- 总时间几乎不变；
-- trace 更分散；
-- 调试更复杂。
+因此 shutdown 不是“boot completed 后后台任务随便继续”，也不是每项任务的通用 20 秒超时。它只把 phase 1000 后同步等待线程池正常终止的时间限制为 20 秒；超时后的诊断与抛异常并不能给每个任务提供强制终止保证。
 
-并行优化需要扩大：
+## 8. 从“大段耗时”到根因：按证据层级逐步缩小
 
-```text
-submit ─────────────── first consumer / join
-```
+下面这张表可以直接用于一次慢启动调查：
 
-之间的独立工作窗口，同时不能越过真实依赖。
-
----
-
-## 24. 常见瓶颈一：磁盘 I/O
-
-SystemServer 启动可能读取：
-
-- package/settings XML；
-- system config；
-- user/service 状态文件；
--数据库和 journal；
-- dex/oat/profile 元数据；
-- sysfs/procfs 节点。
-
-症状：
-
-- slice wall time 长，但 CPU running 时间低；
-- 线程处于 uninterruptible sleep 或文件系统等待；
-- 首次启动/升级明显比稳定重启慢；
-- 多个并行任务同时读盘后反而变慢。
-
-优化方向：减少同步读取、合并小文件、缓存稳定配置、延迟非关键数据、避免在关键路径 fsync；但涉及持久化正确性时不能为了速度删除安全写入。
-
----
-
-## 25. 常见瓶颈二：Binder 同步等待
-
-system_server 主线程在启动中调用 native daemon/HAL：
-
-```text
-main → Binder transact → daemon/HAL
-main blocked waiting reply
-```
-
-耗时可能实际发生在：
-
-- 对端 Binder 队列排队；
-- 对端线程池不足；
-- 对端等待驱动/硬件；
-- 对端反向同步调用 system_server；
-- SELinux/audit 或服务 lazy start。
-
-仅看 system_server Java 栈会看到 `BinderProxy.transactNative`，需要继续检查目标进程 trace 和 Binder flow。
-
----
-
-## 26. 常见瓶颈三：锁竞争
-
-启动并行化后，两个任务可能同时需要：
-
-- PackageManager lock；
-- AMS global lock；
-- WMS global lock；
-- class loader lock；
-- LocalServices 内某服务锁；
-- 文件/数据库内部锁。
-
-如果 worker 持锁，main 在 join 前更早的位置就被同一锁挡住，并行窗口会消失。
-
-```text
-worker: [hold global lock ─────────]
-main:          wait lock ──────────
-```
-
-优化前画锁持有与外部调用图，避免简单增加线程把串行依赖变成不可预测竞争。
-
----
-
-## 27. 常见瓶颈四：类加载与静态初始化
-
-首次 `startService(Class)` 可能触发：
-
-- dex page fault；
-- ClassLinker 工作；
-- verification；
-- 静态字段初始化；
-- native library load；
-- SystemServiceRegistry 等大静态块。
-
-若某 trace 外层很慢但 `onStart` warning 不明显，构造器之前的类初始化可能是原因。
-
-不要把大 I/O、Binder 查询或线程启动塞入静态初始化块：它在类首次使用线程执行，依赖点隐蔽，异常表现为 `ExceptionInInitializerError`，还可能持有 class initialization lock。
-
----
-
-## 28. 常见瓶颈五：GC 与内存压力
-
-启动阶段大量解析 XML、扫描包、构建 map/list，会快速分配对象。症状：
-
-- Perfetto 中出现 GC pause/concurrent GC；
-- ART 日志显示频繁 GC；
-- 主线程被 suspend；
-- 多个并行任务提高瞬时内存峰值。
-
-优化应先查对象生命周期和重复解析，而不是盲目调大 heap。并行化可缩短墙钟时间，也可能提高峰值内存、触发更早 GC，最终抵消收益。
-
----
-
-## 29. 常见瓶颈六：日志与调试功能
-
-大量启动日志、stack trace、StrictMode、Binder calls stats、debug instrumentation 会有成本。userdebug/eng 与 user 版本的启动时间不能直接横比。
-
-但不要把所有差异归咎于日志：
-
-- 同一 build、同一采集配置做前后对照；
-- 分清冷 page cache 与热 cache；
-- 多次测量看分布；
-- 避免 trace buffer 太小导致事件丢失；
-- 记录是否首次启动、OTA 后首启、runtime restart。
-
----
-
-## 30. Looper slow dispatch 与启动阶段
-
-SystemServer 主 Looper 设置：
-
-```java
-setSlowLogThresholdMs(
-        SLOW_DISPATCH_THRESHOLD_MS,   // 100ms
-        SLOW_DELIVERY_THRESHOLD_MS);  // 200ms
-```
-
-含义：
-
-- dispatch 慢：消息真正执行太久；
-- delivery 慢：消息从计划到开始执行等待太久。
-
-但 SystemServer 早期许多启动代码发生在 `Looper.loop()` 正式进入消息循环之前，未必表现为普通 slow dispatch。因此启动 trace 与 Looper slow log 是互补工具，不能相互替代。
-
----
-
-## 31. Watchdog 与 50ms warning 的量级不同
-
-| 机制 | 关注点 | 典型结果 |
+| 观察 | 当前最多能下什么结论 | 下一份证据 |
 |---|---|---|
-| SSM 50ms warning | 单个生命周期回调偏慢 | 日志提醒 |
-| Looper slow log | 消息投递/执行偏慢 | 日志与诊断 |
-| Watchdog | system_server 关键线程长时间无响应/锁死 | 抓取现场，可能终止 system_server |
+| `StartServices` 很宽 | 三组启动方法的墙钟区间宽 | 展开 bootstrap/core/other |
+| 某个 `StartX` 很宽 | 当前线程被该代码范围占住 | 看嵌套 slice、线程状态、调用栈 |
+| SSM 打印 `took ... in onStart` | 回调超过 50 ms 诊断线 | 查回调内部，并判断是否在关键路径 |
+| 主线程停在 `Future.get` | 它在等异步任务完成 | 找对应 `InitThreadPoolExec:X` |
+| worker slice 很宽 | runnable 的墙钟区间宽 | 看 Running/Runnable、Binder、锁、I/O |
+| 主线程 Runnable | 想运行但未获 CPU | 查 CPU 竞争、频率和占用者 |
+| 主线程 Sleeping/Blocked | 在等某种依赖 | 查唤醒者、锁 owner 或 Binder 对端 |
+| begin 日志存在、无 duration | 已进入阶段 | 核对 build type、日志级别和 trace |
+| 没看到 slice | 当前采集没有该事件 | 查 tag/category、缓冲区，不能断言代码没走 |
 
-50ms warning 多次累积会拖慢启动，但远未必构成 Watchdog 超时。Watchdog 超时也不一定能由某一条 `took 60ms` 日志解释。
+### 一条可复用的“问题 → 机制 → 验证”链
 
----
+**问题：`StartWindowManagerService` 为什么变宽？**
 
-## 32. BOOT_TIME_EVENT 与 trace 的区别
+先提出三个区段：Sensor Future 汇合、`WindowManagerService.main()`、两个 Binder 服务注册。每个区段内部又可能被 Binder、锁、I/O、调度或 GC 拖住。
 
-SystemServer 还通过 `FrameworkStatsLog.write()` 记录宏观事件，例如：
+再用源码确认边界：
 
-- system_server init start；
-- package manager init start/ready；
-- system_server ready。
+- Future wait 位于 slice begin 后、`WindowManagerService.main()` 前；
+- wait 无超时；
+- worker 有 `InitThreadPoolExec:StartSensorService`；
+- 两次 `ServiceManager.addService()` 位于 WMS 创建之后、slice end 之前；
+- SSM 的 50 ms warning 不覆盖这条直接启动 WMS 的路径。
 
-Atom/事件适合跨设备统计关键里程碑；trace 适合单次启动的详细时间线。
+最后用同一次 trace 验证：
 
-```text
-统计 Atom：这批设备 PMS 初始化 P95 多久？
-Perfetto：这一次 PMS 的 820ms 卡在哪个线程/锁/Binder？
-```
+- 对齐 main 和 worker 的时间；
+- 找 main 的阻塞调用栈或线程状态；
+- Binder 沿 transaction 到对端，锁找到 owner；
+- I/O 对齐文件系统事件，Runnable 检查 CPU 竞争。
 
-二者粒度和用途不同。
+只有证据支持某一条依赖控制 `traceEnd`，才能把它写成根因。
 
----
+### 优化也要围绕完成点
 
-## 33. 日志法的最低成本分析流程
+确认依赖后，才考虑提前 submit、缩短 worker 工作、减少共享锁、把非关键工作延后到合适 phase。必要 join 和异常传播必须保留。
 
-有 userdebug 设备时可先：
+“submit 后马上 wait”“全部扔进线程池”“删除 wait”“把工作移出 trace 标签”都可能让代码更复杂或数字更好看，却没有缩短真实关键路径。
+
+## 9. macOS 静态验证与以后真机验证
+
+先在本地源码根目录执行：
 
 ```bash
-adb logcat -b all -v threadtime \
-  -s SystemServerTiming SystemServerTimingAsync SystemServiceManager
+cd /Users/ninebot/androidSource
 ```
 
-关注：
-
-```text
-StartX
-X took to complete: Nms
-Service X took N ms in onStart/onBootPhase
-InitThreadPoolExec:X
-WaitInitThreadPoolShutdown
-```
-
-日志法优点是快；缺点是：
-
-- user build 可能没有 duration；
-- 无法完整显示 CPU 调度和锁；
-- begin/end 日志可能交错；
-- 多线程事件不能只按文本顺序推断依赖。
-
-发现大块后应进入 trace。
-
----
-
-## 34. Perfetto 中应看什么
-
-采集需包含适当 atrace category（常见 `ss`/system_server）与调度、Binder、频率、I/O 等数据。打开后：
-
-1. 找 `system_server` 主线程。
-2. 找 `StartServices/startBootstrapServices/startOtherServices`。
-3. 展开嵌套 `StartX`。
-4. 查同时间段 `system-server-init-thread-*`。
-5. 看主线程是 Running、Runnable 还是 Sleeping/Blocked。
-6. 沿 Binder transaction 查看目标进程。
-7. 查 GC、I/O、锁竞争和 CPU 频率。
-8. 找 Future wait 与 worker 完成的交点。
-
-大 slice 只是入口，线程状态和跨线程依赖才告诉你原因。
-
----
-
-## 35. 线程状态如何解读
-
-| 状态 | 常见含义 | 下一步 |
-|---|---|---|
-| Running | 正在 CPU 执行 | 看调用栈/方法热点 |
-| Runnable | 想运行但未获得 CPU | 看 CPU 竞争、优先级、核心频率 |
-| Sleeping | 等待事件/Future/Binder/I/O | 查 wakeup 与依赖线程 |
-| blocked on monitor | Java 锁竞争 | 找锁 owner 及其等待链 |
-| binder wait | 同步 IPC | 沿 transaction 到目标进程 |
-
-不要看到主线程不 Running 就说“SystemServer 没做事”。它可能被另一条关键路径控制。
-
----
-
-## 36. 冷启动、热启动与首次启动
-
-至少分三种样本：
-
-### 冷设备启动
-
-文件页不在内存、硬件初始化完整，最接近用户开机体验。
-
-### runtime restart / framework restart
-
-kernel/native daemon/文件缓存可能仍在，只重启 runtime/system_server，通常更快。
-
-### 首次启动或 OTA 后首启
-
-包扫描、dexopt、数据迁移、APEX/rollback 检查更多，可能显著更慢。
-
-比较数据前记录 `mRuntimeRestart`、first boot、upgrade、build type 和设备温度。否则结论可能只是样本不同。
-
----
-
-## 37. 平均值不够
-
-启动受 I/O、温度、调度和后台状态影响。应多次测量：
-
-```text
-median / P50：典型体验
-P90/P95：偶发慢启动
-max：极端异常线索
-```
-
-一次从 10.2s 到 9.7s 不能证明优化有效。应控制变量、重复测试、保留原始 trace，并确认功能/启动依赖未被破坏。
-
----
-
-## 38. 源码级关键路径分析法（无需设备）
-
-Mac 上可以建立表格：
-
-| 序号 | 主线程步骤 | 是否 submit | Future | 第一个 wait/消费者 | 依赖 |
-|---:|---|---|---|---|---|
-| 1 | SystemConfig | 是 | 未保存 | 隐式首次 get | 配置解析 |
-| 2 | SensorService | 是 | `mSensorServiceStart` | WMS 前 wait | PMS/AppOps |
-| 3 | BlobStore | 是 | `mBlobStoreServiceStart` | phase 520 前后 wait | 包/存储 |
-| 4 | WebView prep | 是 | local Future | phase 600 前 wait | Zygote preload |
-
-然后画 DAG：
-
-```text
-提交点 → worker work → wait点 → 下一 phase
-主线程其他 startService ──────┘
-```
-
-即使没有实测时长，也能找出潜在串行点、错误早等、遗漏等待和隐式依赖。
-
----
-
-## 39. 优化策略一：延后非关键工作
-
-如果一项工作不影响：
-
-- 默认显示；
-- PMS/AMS/WMS 基础 ready；
-- 启动 Home；
-- 用户解锁；
-- 第一帧交互；
-
-可以考虑推到更晚 phase 或 boot completed 后。
-
-但“延后”不是“消失”：
-
-- 可能把卡顿转移到用户首次使用；
-- 可能违反广播/三方应用可启动前的安全依赖；
-- 需要明确触发、重试和异常处理；
-- 不能让 Binder 已发布却在首个调用中做不可控重初始化。
-
----
-
-## 40. 优化策略二：安全并行
-
-适合：相互独立的只读配置解析、预加载、无共享锁 native 初始化。
-
-不适合直接并行：
-
-- 修改相同全局 map；
-- 依赖确定注册顺序；
-- 同时持有 PMS/WMS/AMS 大锁；
-- 必须在主 Looper 线程初始化的对象；
-- 可能互相 Binder 回调的服务。
-
-并行优化必须同时提交“依赖证明”：为什么并发安全、在哪里 join、错误如何传播。
-
----
-
-## 41. 优化策略三：缩小同步初始化
-
-把服务初始化拆成：
-
-```text
-最小可发布核心
-  + phase 前必须完成部分
-  + 用户解锁后部分
-  + 首次使用可延迟部分
-  + 后台维护部分
-```
-
-但发布前必须建立线程安全不变量。一个好设计不是“onStart 越短越好”，而是“onStart 只同步完成对外安全可见所必需的状态”。
-
----
-
-## 42. 优化策略四：减少重复工作
-
-常见重复：
-
-- 同一 XML 被多个服务各自解析；
-- 相同包列表反复复制/排序；
-- 同一 Binder 服务每次重新查询；
-- 相同文件存在性/属性反复同步读取；
-- 启动阶段生成很快就丢弃的大对象。
-
-可通过共享只读快照、LocalService、明确缓存生命周期减少。但缓存要考虑用户、配置变化、OTA 和 runtime restart，不能只为一次 benchmark 永久缓存错误状态。
-
----
-
-## 43. 优化策略五：消除主线程同步 Binder
-
-先判断调用是否必须在当前点拿到结果：
-
-- 若结果影响下一步安全决策，保留同步但优化对端。
-- 若只是通知，可考虑 oneway/异步 callback，但要保证顺序和失败语义。
-- 若可预取，提前在独立线程启动并在使用点 join。
-- 若对端尚未 ready，调整明确启动顺序而不是轮询 sleep。
-
-不能为减少等待随意改成 oneway；oneway 没有同步返回和异常，且会形成异步队列积压。
-
----
-
-## 44. 错误的“优化”示例
-
-### 删除必要 wait
-
-时间线变短，但三方 App 偶发在 WebView/包数据未准备时启动。
-
-### 全部扔线程池
-
-造成锁竞争、CPU 抢占、内存峰值和不可预测时序。
-
-### 只移动 trace 标签
-
-测量数字变小，真实工作被挪到标签外，用户体验未变化。
-
-### 捕获异常继续
-
-表面 boot 成功，服务半初始化，后续更难诊断。
-
-### 把工作移到第一次 API 调用
-
-开机指标好看，但用户第一次点功能出现长卡顿。
-
-性能优化必须以端到端用户里程碑和正确性验证为准。
-
----
-
-## 45. 一次慢启动的排查模板
-
-```text
-现象：从哪一里程碑到哪一里程碑慢？
-环境：build、设备、冷/热、首次/升级、温度
-证据：logcat duration + Perfetto trace
-最大 slice：名称、线程、开始/结束
-线程状态：Running/Runnable/Sleeping/Blocked
-依赖：Binder 目标、锁 owner、Future worker、I/O 文件
-根因：真正控制关键路径的工作
-修改：延后/并行/减少/优化对端
-正确性：依赖屏障、异常、用户/phase 边界
-结果：多次 P50/P95，回归检查
-```
-
-“某服务 slice 最大”只是定位入口，不等于根因结论。
-
----
-
-## 46. 常见误区纠正
-
-### 误区 1：所有 `traceBegin` 都会在 logcat 打 duration
-
-错误。user build 与日志配置会影响 duration 日志，trace slice 是另一条机制。
-
-### 误区 2：异步任务不算启动时间
-
-错误。只要关键路径最终 wait 它，或 boot complete shutdown 等它，就会影响启动。
-
-### 误区 3：线程池越大启动越快
-
-错误。CPU/I/O/锁竞争可能让主线程更慢。
-
-### 误区 4：50ms warning 就是 ANR
-
-错误。它只是 SSM 性能提醒。
-
-### 误区 5：主线程 slice 长就是 CPU 热点
-
-错误。可能在等 Binder、锁、Future 或 I/O。
-
-### 误区 6：去掉 wait 就是优化
-
-错误。可能破坏依赖和启动安全。
-
-### 误区 7：SystemServer ready 等于用户已经看到 Launcher
-
-错误。不同指标的起止里程碑不同。
-
-### 误区 8：一次测量足够
-
-错误。应控制环境并看分布。
-
-### 误区 9：userdebug 和 user 可直接横比
-
-错误。调试日志、检查和 instrumentation 不同。
-
-### 误区 10：把工作挪出 trace 就变快了
-
-错误。测量边界变化不等于用户关键路径变化。
-
----
-
-## 47. 复读：最容易不理解的五个关系
-
-### 47.1 slice 时长与 CPU 时长
-
-slice 是 begin 到 end 的墙钟区间，包含执行和等待。CPU 忙不忙必须结合调度轨道。
-
-### 47.2 submit 与完成
-
-submit 只表示排队成功；worker 开始、任务完成、Future 被消费是三个不同时间点。
-
-### 47.3 并行分支与关键路径
-
-一条 worker 任务耗时很长，但若在用户里程碑后才需要，它未必影响当前指标；短任务若主线程立即等待，反而可能直接在关键路径。
-
-### 47.4 trace 与日志
-
-trace 为时间线结构，日志为离散文本。二者共享名字但启用条件、线程关系和分析能力不同。
-
-### 47.5 boot completed 与 pool shutdown
-
-Android 11 在 phase 1000 回调之后关闭 init pool；仍未完成的启动任务最多再被等待 20 秒，超时会抓栈并失败，而不是静默留到运行期。
-
----
-
-## 48. Mac 上的只读练习
-
-### 练习 1：导出主线程 trace 名字
+### 第一步：确认主线程骨架和 trace 名字
 
 ```bash
+rg -n 'traceBegin\("StartServices"|startBootstrapServices\(t\)|startCoreServices\(t\)|startOtherServices\(t\)' \
+  frameworks/base/services/java/com/android/server/SystemServer.java
 rg -n 't\.traceBegin\("' \
   frameworks/base/services/java/com/android/server/SystemServer.java
 ```
 
-按行号整理启动顺序，不要按字母排序。
+按行号阅读，才能保留真实启动顺序；把 trace 名字按字母排序没有诊断价值。
 
-### 练习 2：配对 submit 与 wait
+### 第二步：配对 submit、Future 与 join
 
 ```bash
-rg -n "SystemServerInitThreadPool\.submit|waitForFutureNoInterrupt" \
+rg -n 'SystemServerInitThreadPool\.submit|waitForFutureNoInterrupt' \
+  frameworks/base/services/java/com/android/server/SystemServer.java
+rg -n 'mSensorServiceStart|START_SENSOR_SERVICE|StartWindowManagerService' \
   frameworks/base/services/java/com/android/server/SystemServer.java
 ```
 
-为每个 Future 标出提交点、等待点和中间可重叠工作。
+把结果记成“提交行 → Future 保存位置 → 第一个消费者 → wait 行”，就能先画出静态依赖图。
 
-### 练习 3：比较两层计时
+### 第三步：核对计时与阈值的范围
 
 ```bash
-rg -n "StartService |warnIfTooLong|SERVICE_CALL_WARN_TIME_MS" \
+rg -n 'DEBUG_BOOT_TIME|traceBegin|traceEnd|logDuration|assertSameThread' \
+  frameworks/base/core/java/android/util/TimingsTraceLog.java
+rg -n 'SERVICE_CALL_WARN_TIME_MS|warnIfTooLong|SystemServerInitThreadPool.shutdown' \
   frameworks/base/services/core/java/com/android/server/SystemServiceManager.java
-```
-
-说明外层 StartX 与 SSM onStart warning 的范围差异。
-
-### 练习 4：检查 pool 失败路径
-
-```bash
-sed -n '1,220p' \
+rg -n 'SHUTDOWN_TIMEOUT_MILLIS|mPendingTasks|awaitTermination|dumpStackTraces' \
   frameworks/base/services/core/java/com/android/server/SystemServerInitThreadPool.java
 ```
 
-回答：任务异常何时被主线程看见？shutdown 超时抓哪些栈？pending description 何时删除？
+这些命令能验证控制流、默认常量和静态依赖，不能告诉你目标设备哪段实际最慢。
 
-### 练习 5：画静态关键路径图
+### 有设备时补齐动态证据
 
-任选 Sensor、WebView 或 BlobStore，画：
+先低成本保留日志：
 
-```text
-submit → worker prerequisites → execution → Future completion
-     ↘ main overlapping work → wait → next phase/consumer
+```bash
+adb logcat -b all -v threadtime \
+  -s SystemServerTiming SystemServerTimingAsync \
+  SystemServiceManager SystemServerInitThreadPool
 ```
 
----
+然后查看目标设备支持的 atrace category，并用 Perfetto 采集 system_server trace、sched 线程状态与唤醒、Binder transaction；按问题补 CPU frequency、I/O 和 ART GC。
 
-## 49. 自测题
+对同一问题要记录 build 类型、冷启动或 runtime restart、首启/升级状态、设备温度和采集配置。前后版本在相同条件下重复采样，再报告 P50/P90 等分布；本章没有这些数据，因此不编造收益。
 
-1. 为什么三项工作总时长不能简单相加？
-2. TimingsTraceAndSlog 能否跨线程共用？
-3. user build 没有 duration 日志是否说明没有 trace？
-4. SSM 50ms warning 测的是哪一段？
-5. InitThreadPool 的线程数和优先级是什么？
-6. submit 返回说明任务完成了吗？
-7. Future 异常怎样传播到主线程？
-8. 为什么 WebView prepare 必须在 phase 600 前汇合？
-9. shutdown 最多等待多久？
-10. 主线程处于 Sleeping 是否说明它不影响启动？
-11. 并行化为何可能变慢？
-12. 如何区分 wall duration 与 CPU time？
+日志适合快速找名字，Perfetto 适合证明线程与等待关系。不同次启动的日志与 trace 不能强行拼成同一条因果链。
 
----
+## 10. 常见翻车点、检查题答案与行动清单
 
-## 50. 参考答案
+### 六个常见翻车点
 
-1. 并行任务可重叠，最终由最长依赖链决定。
-2. 不能；实例记录创建线程并维护线程内嵌套栈。
-3. 不说明；Trace slice 和 Java duration 日志启用条件不同。
-4. 单个 SystemService 的 onStart/onBootPhase/用户回调墙钟时长。
-5. 可用 CPU 数量的固定线程池，前台线程优先级。
-6. 不说明，只表示任务已提交并返回 Future。
-7. 在 Future get/`waitForFutureNoInterrupt` 等汇合点观察并包装传播。
-8. 三方 App 启动后可能立即使用 WebView，依赖必须先完成。
-9. Android 11 源码为 20 秒。
-10. 不说明；它可能在关键路径上等待决定性依赖。
-11. 会引入 CPU/I/O/锁/内存竞争及调度开销。
-12. 用调度轨道/线程运行区间结合 slice 分析，不能只看 begin-end。
+1. **把 slice 时长当 CPU 时间。** begin-end 是墙钟区间，包含等待与调度。
+2. **把 submit 当完成。** 它只返回 Future，任务甚至可能尚未开始。
+3. **只看主线程。** Future 后面可能连着 worker、Binder、锁或 I/O。
+4. **把 50 ms warning 当超时。** 它只报警，不取消、不回滚，也不是 ANR。
+5. **认为 20 秒 shutdown 会保护所有 join。** 早期 Future 卡住时可能根本到不了 phase 1000。
+6. **比较不同样本。** userdebug 与 user、冷启与 runtime restart、首启与稳定重启不能直接横比。
 
----
+### 检查题与答案
 
-## 51. 本章总结
+1. **为什么 `StartServices` 很宽仍不能定位服务？** 它包住三组方法及其中所有运行和等待，必须继续展开。
+2. **user build 没 duration 日志，能否断言没有 trace？** 不能；r48 仍调用 Trace API，只是不维护 Java duration 栈。
+3. **为何异步任务要 `newAsyncLog()`？** 计时对象绑定创建线程，主线程实例不能跨线程 begin/end。
+4. **SSM 的 50 ms warning 测什么？** `onStart`、`onBootPhase` 等一次生命周期回调的 elapsed time；外层范围更大。
+5. **Sensor submit 后主线程为何能前进？** submit 返回 Future，不等待 runnable 完成。
+6. **Sensor 的剩余耗时何时进入关键路径？** 主线程到 WMS 前调用 `Future.get()` 而 worker 尚未结束时。
+7. **`waitForFutureNoInterrupt` 有超时吗？** 没有；中断和任务异常都会转成异常传播。
+8. **pool 的 20 秒是什么？** phase 1000 后 `awaitTermination` 的上限，不是每个任务的 timeout。
+9. **怎样区分 Sensor、WMS 创建和服务注册谁慢？** 对齐外层 slice、worker 结束点、主线程栈，并为创建与两次注册补更细的区间或调用证据。
+10. **Mac 静态阅读能证明优化收益吗？** 不能；收益需目标设备同条件多次测量。
 
-SystemServer 启动性能的分析主线：
+### 读完就能做的事
+
+以后看到 SystemServer 启动慢，按下面顺序记录：
 
 ```text
-SystemServer 主线程串行骨架
-  + TimingsTraceAndSlog 标记区间
-  + SSM 记录服务生命周期慢调用
-  + InitThreadPool 提供受控并行
-  + Future/latch 在真实依赖点汇合
-  + Perfetto 还原线程、Binder、锁、I/O、GC
-  = 找到决定用户里程碑的关键路径
+[ ] 明确起点、终点、build 和启动类型
+[ ] 从 StartServices 向下找到最小可信 slice
+[ ] 标出区间内每个 submit、worker、Future 和 join
+[ ] 对齐主线程与 worker 的线程状态和完成点
+[ ] 沿 Binder、锁、I/O、GC 或调度追到真正控制者
+[ ] 修改前写清依赖、异常传播和不可越过的 boot phase
+[ ] 同条件重复采样，用分布和功能回归验证结果
 ```
 
-真正的优化不是让某条日志数字变小，而是：
-
-- 缩短端到端关键路径；
-- 保留所有正确依赖和失败传播；
-- 不把卡顿转移到首个用户操作；
-- 用同环境、多样本和 trace 证明结果。
-
----
-
-## 52. 下一章预告
-
-第 97 章将继续学习：
-
-**Android system_server 线程模型：主 Looper、Binder 线程池、ServiceThread、HandlerThread 与 Watchdog**
-
-重点回答生命周期回调、Binder 请求和 Handler 消息分别在哪个线程执行，以及线程池耗尽、锁等待和主线程消息堆积如何形成系统级卡顿。
+回到贯穿场景：`StartWindowManagerService` 很宽时，正确结论不是“WMS 慢”，而是“这个区间包含 Sensor Future 汇合、WMS 创建以及 window/input 两次 Binder 服务注册”。先分清哪一段控制 `traceEnd()`，再决定优化 Sensor、WMS、注册过程，还是它们背后的 Binder、锁、I/O 或调度链。

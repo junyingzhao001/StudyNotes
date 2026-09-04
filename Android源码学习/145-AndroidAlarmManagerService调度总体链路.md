@@ -1,822 +1,300 @@
 # 145 Android AlarmManagerService：调度总体链路
 
-> 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
-> 学习方式：macOS只读源码，不要求编译、不要求连接设备  
-> 前置章节：第25、124、142、143章
+> 源码版本：Android 11 / API 30 / `android-11.0.0_r48`
+>
+> 学习方式：macOS 静态阅读；不在 Mac 上编译或连接设备
+>
+> 前置阅读：第 25、124、142、143 章
 
----
+## 先看问题：应用设置一万个 Alarm，kernel 为什么通常只需要两个近期截止点
 
-## 1. Alarm不是一个“延时Handler”
+AlarmManagerService 把应用的 RTC/elapsed、exact/window/repeating 请求统一换算到 elapsed 时间轴，再经权限、Doze、App Standby、background restriction 和 non-wakeup 延迟政策，组织成可合并的 Batch。Java 内存可以保存大量逻辑 Alarm，写给 native 的通常只是最近 wakeup 与最近 non-wakeup 两个截止点。
 
-AlarmManager跨越应用API、Binder、system_server内存批次、App Standby/Doze政策、JNI、Linux timerfd、epoll、WakeLock以及
-PendingIntent/Listener回调。
+timerfd 到点只表示 system_server 应重新检查；AlarmThread 还要取出 Batch、重新安排 repeating、执行政策延期、排序投递，并用 InFlight/WakeLock 等待 PendingIntent 或 listener 完成确认。
 
-它解决的不是“过一会执行一段Java代码”这么简单，而是设备可能休眠、墙钟可能被修改、数千应用需要合并唤醒时，怎样用较少的
-kernel定时器维护大量逻辑Alarm。
+本章回答：**一个 `set*()` 请求从 API 时间语义到 kernel timerfd、再到应用回调和完成账，在哪些位置被转换、合并、推迟或失败？**
 
----
+## 1. 四种类型包含两条独立语义轴
 
-## 2. 本章目标
-
-本章先建立总体地图：四种时钟类型怎样进入统一elapsed时间轴，exact/window/heuristic怎样形成可合并区间，Batch怎样压缩成
-kernel的一个wakeup和一个non-wakeup截止点，AlarmThread怎样取出、延迟、排序并交付，以及WakeLock怎样覆盖异步完成。
-
-Doze、App Standby quota、AllowWhileIdle和统计会在后续章节分别深入，本章只说明它们在主链中的插入位置。
-
----
-
-## 3. 源码地图
-
-```text
-frameworks/base/core/java/android/app/AlarmManager.java
-frameworks/base/core/java/android/app/IAlarmManager.aidl
-frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
-frameworks/base/services/core/jni/com_android_server_AlarmManagerService.cpp
-```
-
-这一章Java和Native源码都在当前checkout中，可以从API一直追到timerfd，而不必猜测内核接口。
-
----
-
-## 4. 总体调用链
-
-```mermaid
-flowchart LR
-    APP["应用 AlarmManager"] --> AIDL["IAlarmManager Binder"]
-    AIDL --> AMS["system_server AlarmManagerService"]
-    AMS --> POL["权限/时钟转换/政策调整"]
-    POL --> BAT["mAlarmBatches"]
-    BAT --> NEXT["只选下一wakeup与non-wakeup"]
-    NEXT --> JNI["JNI timerfd_settime"]
-    JNI --> EP["epoll_wait"]
-    EP --> AT["AlarmThread"]
-    AT --> DEL["PendingIntent或IAlarmListener"]
-    DEL --> WL["完成回调释放alarm WakeLock"]
-```
-
-关键压缩点是：Java可以保存很多Alarm，但kernel只需要知道下一次该叫醒system_server的时刻。
-
----
-
-## 5. 四种公开类型
-
-| 类型 | 输入时间轴 | 到点是否唤醒设备 |
+| 类型 | 输入时间轴 | 到点能否唤醒设备 |
 |---|---|---|
-| `RTC_WAKEUP` | wall clock毫秒 | 是 |
-| `RTC` | wall clock毫秒 | 否 |
-| `ELAPSED_REALTIME_WAKEUP` | boot elapsed毫秒 | 是 |
-| `ELAPSED_REALTIME` | boot elapsed毫秒 | 否 |
+| `RTC_WAKEUP` | wall clock | 是 |
+| `RTC` | wall clock | 否 |
+| `ELAPSED_REALTIME_WAKEUP` | elapsed realtime | 是 |
+| `ELAPSED_REALTIME` | elapsed realtime | 否 |
 
-类型值低位还编码了wakeup属性：0/2为wakeup，1/3为non-wakeup。
+RTC 表示日历时刻，会受手工校时或网络校时影响；elapsed 表示本次 boot 已经过的时间，包含设备休眠，不随 wall clock 改动。两者都不同于深睡不累计的 uptime。
 
----
+“每天 8 点”通常需要 RTC 语义；“30 分钟后重试”通常应基于 elapsed。`WAKEUP` 只表示到点可唤醒 SoC，不保证绕过 Doze/standby、立即启动组件或让应用无限执行。
 
-## 6. RTC与ELAPSED的根本区别
+## 2. 所有公开 set 变体最终编码成同一组参数
 
-RTC表达“日历上的某个时刻”，用户或网络校时会改变它；elapsed表达“从本次启动以来经过多久”，不受墙钟前后拨影响，并包含休眠时间。
-
-“每天8点”适合RTC；“30分钟后重试”通常适合ELAPSED。两者都不是 `uptimeMillis`，后者在深睡时停止累计。
-
----
-
-## 7. API最终汇聚到setImpl
-
-`set()`、`setWindow()`、`setExact()`、`setRepeating()`、`setAndAllowWhileIdle()`、`setAlarmClock()`最终都把差异编码成：
+`set()`、`setWindow()`、`setExact()`、`setRepeating()`、`setAndAllowWhileIdle()`、`setExactAndAllowWhileIdle()` 与 `setAlarmClock()` 最终进入 `AlarmManager.setImpl()`，再经 `IAlarmManager.set()` 传递：
 
 ```text
-type
-triggerAtMillis
-windowMillis
-intervalMillis
-flags
-PendingIntent 或 Listener
-WorkSource
-AlarmClockInfo
+type + triggerAtMillis + windowMillis + intervalMillis + flags
+PendingIntent 或 IAlarmListener
+WorkSource + AlarmClockInfo + callingPackage
 ```
 
-然后调用 `mService.set(...)` 进入Binder。
+普通 `set()` 对 target SDK 19 及以上使用 `WINDOW_HEURISTIC=-1`；旧兼容应用可保持 exact。`setExact()` 使用 `WINDOW_EXACT=0`，正 window 是显式 `[trigger, trigger+window]`。
 
----
+Android 11 的 repeating 只能使用 PendingIntent；Binder 入口若 `interval!=0 && directReceiver!=null` 直接抛 `IllegalArgumentException`。listener 若要周期行为，应在回调后重新设置 one-shot，而不是假设服务端 repeat。
 
-## 8. PendingIntent与Listener二选一
+## 3. Binder 边界先校验归因，再重写特权 flags
 
-服务端要求：
+服务端从 Binder 取得真实 calling UID，并用 `mAppOps.checkPackage(callingUid, callingPackage)` 防止冒用包名。非空 WorkSource 要求 `UPDATE_DEVICE_STATS`，它改变电量/WakeLock 归因，不是普通应用可随意指定的字段。
+
+外部调用者传入的 `WAKE_FROM_IDLE` 与 `ALLOW_WHILE_IDLE_UNRESTRICTED` 会先被清掉；非 system UID 的 `IDLE_UNTIL` 也被清掉。服务端再依据 alarm clock、core/SystemUI/白名单身份重新赋予可信 flags。
+
+exact 请求还会自动成为 standalone：
 
 ```java
-(operation == null && directReceiver == null)
-|| (operation != null && directReceiver != null)
+            // If this is an exact time alarm, then it can't be batched with other alarms.
+            if (windowLength == AlarmManager.WINDOW_EXACT) {
+                flags |= AlarmManager.FLAG_STANDALONE;
+            }
 ```
 
-都为空或同时非空都被丢弃。为兼容旧版本，这个内层检查只日志并return，而不是统一抛异常。
+源码路径：`frameworks/base/services/core/java/com/android/server/AlarmManagerService.java`
 
----
+因此 exact 的成本不只是窗口宽度为零，还显式禁止与普通 Batch 合并。
 
-## 9. Listener怎样跨Binder
+## 4. PendingIntent 与 listener 是两种完成协议
 
-客户端用 `ListenerWrapper` 把 `OnAlarmListener` 包成 `IAlarmListener.Stub`。服务端注册binder death；客户端对象不可达或进程死亡时，
-对应Alarm可以清理。
+内部要求 operation 与 directReceiver 恰好一个非空；都空或同时存在时只记警告并 return，这是为旧版本静默失败行为保留的兼容边界。
 
-回调到客户端后，wrapper再post到指定Handler；未指定则应用主Looper。因此AlarmThread不会直接在应用主线程运行用户代码。
+listener 在客户端由 `ListenerWrapper extends IAlarmListener.Stub` 包装。`IAlarmListener.doAlarm()` 是 oneway Binder；wrapper 收到后 post 到指定 Handler，未指定时使用应用主线程 Handler。用户 `onAlarm()` 在 `finally` 中调用 `IAlarmCompleteListener.alarmComplete()`，即使回调抛异常也尽量回执 system_server。
 
----
+服务端对 listener binder 注册 death recipient；无法 link 或投递时直接放弃。PendingIntent 则通过 `send(..., OnFinished, handler, ...)` 获得发送完成回调。
 
-## 10. Repeating只能使用PendingIntent
+两条路径都不是“AlarmThread 直接执行应用 Java 方法”。
 
-Binder入口发现 `interval != 0 && directReceiver != null` 会抛 `IllegalArgumentException`。
+## 5. 输入时间怎样固定成 elapsed 窗口
 
-Listener没有稳定的跨进程重发身份和传统重复语义，应用若需要listener周期工作，应在回调后自行设置下一次one-shot。
+`setImpl()` 先做归一化：
 
----
+- window 超过半天被视为可疑并钳到 1 小时；
+- repeating interval 钳到 `MIN_INTERVAL..MAX_INTERVAL`；
+- 非法 type 抛异常；
+- 负 trigger 先改成 0；
+- 非 core UID 的最终 trigger 至少为 `nowElapsed + MIN_FUTURITY`，r48 默认 5 秒。
 
-## 11. callingPackage防冒名
-
-服务端读取真实 `Binder.getCallingUid()`，再调用：
-
-```java
-mAppOps.checkPackage(callingUid, callingPackage);
-```
-
-包名用于归因与政策，但不能由调用者随便声称为其他包。
-
----
-
-## 12. WorkSource是特权归因
-
-传入WorkSource需要 `UPDATE_DEVICE_STATS`。它影响WakeLock/电量统计归因，却不允许普通App把成本随意记到别人名下。
-
-Alarm对象还同时保存calling uid/package与PendingIntent creator uid/sourcePackage，后续standby和统计必须选对身份。
-
----
-
-## 13. flags在Binder边界会被重写
-
-外部调用者不能直接保留 `WAKE_FROM_IDLE` 或 unrestricted allow-while-idle；非system UID也不能设置 `IDLE_UNTIL`。
-
-服务端根据exact、alarmClock、core/白名单身份重新添加受信任flag。这是“客户端请求”到“服务端有效政策”的安全边界。
-
----
-
-## 14. Exact自动成为Standalone
-
-```java
-if (windowLength == WINDOW_EXACT) {
-    flags |= FLAG_STANDALONE;
-}
-```
-
-Standalone不会与其他Batch合并。因此exact的成本不仅是区间宽度为0，还会显式阻止coalescing。
-
----
-
-## 15. set()自API 19起默认不精确
-
-客户端 `legacyExactLength()` 对targetSdk < KITKAT返回0；新应用返回 `WINDOW_HEURISTIC=-1`。
-
-所以同样调用 `set()`，老目标版本仍按exact，现代应用让系统自动计算窗口。这是compat行为，不是设备随机差异。
-
----
-
-## 16. 三种窗口表示
+RTC 类型通过当时 `wallNow-elapsedNow` 偏移换成 `nominalTrigger`，随后所有 Batch 端点都使用 elapsed。窗口分三类：
 
 ```text
-windowLength == 0  → exact，maxElapsed == triggerElapsed
-windowLength > 0   → 显式窗口，[trigger, trigger+window]
-windowLength < 0   → heuristic，由系统计算maxTriggerTime
+window = 0   → maxElapsed = triggerElapsed
+window > 0   → maxElapsed = triggerElapsed + window
+window < 0   → maxTriggerTime() 计算一次 heuristic 上界并固定窗口
 ```
 
-窗口表示“可以在哪个区间交付”，不是执行持续时间。
+heuristic 对“距触发还有多久”或 repeat interval 取 75%，低于 10 秒时不 fuzz。窗口在设置时固定，时间接近时不会不断收缩。
 
----
+## 6. 每 UID 上限与 replacement 有一个顺序陷阱
 
-## 17. Heuristic窗口算法
-
-Android 11以futurity或repeat interval的75%作为可延后范围；小于10秒则不模糊：
+r48 默认每 UID 最多 500 个并发已登记 Alarm，配置不能调得更低。外层在进入 `setImplLocked(type,...)` 前检查：
 
 ```java
-max = trigger + 0.75 * futurity;
+            if (mAlarmsPerUid.get(callingUid, 0) >= mConstants.MAX_ALARMS_PER_UID) {
 ```
 
-例如现在起40分钟后的one-shot，理论窗口可延后约30分钟。之后standby/idle政策还可能进一步调整实际when。
+而按相同 PendingIntent/listener 删除旧 Alarm 的 `removeLocked()` 位于更深一层、start-mode 检查之后。因此 UID 已达到 500 时，即使请求本意只是 replacement，也会先抛 `IllegalStateException`，旧 Alarm 保持原状。
 
----
+未达到上限时，AMS 先问 `isAppStartModeDisabled()`；disabled 直接 return，也不会移除旧 Alarm。只有这些检查通过后，才按相同目标删除旧记录、增加计数并插入新 Alarm。
 
-## 18. 负trigger怎样处理
+所以“相同 PendingIntent 的 set 会替换旧 Alarm”成立，但不是无条件、无失败窗口的原子更新承诺。
 
-客户端先把负值改0；服务端也再次检查并改0。随后非core调用还要经过 `MIN_FUTURITY`，所以“0”通常不是立即在elapsed 0触发，而是被推到
-当前时刻加最小未来量。
+## 7. Batch 表示窗口交集
 
-双层校验兼顾不同/旧客户端和Binder直接调用者。
-
----
-
-## 19. MIN_FUTURITY防即时刷Alarm
-
-服务端先把输入转为elapsed，再计算：
+每个 Alarm 有 `[whenElapsed, maxWhenElapsed]`。Batch 可接纳新 Alarm 的条件是区间有交集：
 
 ```java
-minTrigger = nowElapsed + (core ? 0 : MIN_FUTURITY);
-triggerElapsed = max(nominalTrigger, minTrigger);
-```
-
-普通应用把时间设在过去，也不会无限制造“立刻到期”的紧密循环。
-
----
-
-## 20. 重复间隔会被钳位
-
-正interval短于 `MIN_INTERVAL` 会扩到最小值，长于 `MAX_INTERVAL` 会截到最大值。
-
-窗口大于半天被认为很可疑并直接限制为1小时。注意这会把一个超长显式window变短，不是简单上限为半天。
-
----
-
-## 21. 四种输入最终统一到elapsed
-
-`convertToElapsed()` 对RTC用当前 `currentTimeMillis - elapsedRealtime` 做偏移转换；ELAPSED类型原样使用。
-
-Alarm仍保存原始 `when` 便于墙钟重算和dump，但Batch的 `start/end` 始终是elapsed时间轴。
-
-```mermaid
-flowchart TD
-    RTC["RTC输入 wall clock"] --> CONV["减去当前 wall-elapsed 偏移"]
-    EL["ELAPSED输入"] --> CONV
-    CONV --> W["whenElapsed"]
-    W --> MAX["maxWhenElapsed"]
-    MAX --> B["统一进入elapsed Batch"]
-```
-
----
-
-## 22. Alarm对象保留哪些事实
-
-核心字段包括：
-
-```text
-type/origWhen/wakeup
-when/whenElapsed/maxWhenElapsed/window/repeat
-expectedWhenElapsed/expectedMaxWhenElapsed
-operation或listener
-uid/creatorUid/packageName/sourcePackage
-flags/workSource/alarmClock/statsTag/count
-```
-
-expected表示standby推迟前的计划，实际when可被政策调整。
-
----
-
-## 23. 相同目标的replacement
-
-创建新Alarm前：
-
-```java
-removeLocked(operation, directReceiver);
-incrementAlarmCount(uid);
-```
-
-同一PendingIntent或同一listener binder只保留一项。再次set更像替换，不是默认叠加多个相同目标Alarm。
-
----
-
-## 24. 每UID Alarm数量上限
-
-持锁后检查 `mAlarmsPerUid >= MAX_ALARMS_PER_UID`，超限抛 `IllegalStateException`。
-
-计数不只看主Batch，还必须随pending-while-idle、background deferred等容器移动保持一致；“当前kernel只设两个timer”不代表应用可无限登记逻辑Alarm。
-
----
-
-## 25. App启动限制可直接拒绝
-
-`ActivityManager.isAppStartModeDisabled()` 为true时，服务端日志后return，不进入Batch。
-
-这发生在replacement remove之前，因此被禁止的新set不会顺便删除同目标旧Alarm；阅读顺序很重要。
-
----
-
-## 26. Batch是窗口交集
-
-一个Batch可容纳新Alarm的条件：
-
-```text
-batch.end >= alarm.whenElapsed
-AND batch.start <= alarm.maxWhenElapsed
+        boolean canHold(long whenElapsed, long maxWhen) {
+            return (end >= whenElapsed) && (start <= maxWhen);
+        }
 ```
 
 加入后：
 
 ```text
-start = max(所有whenElapsed)
-end   = min(所有maxWhenElapsed)
+batch.start = max(所有 whenElapsed)
+batch.end   = min(所有 maxWhenElapsed)
 ```
 
-也就是所有Alarm可接受窗口的交集。
+`start` 是所有成员都已经合法触发的最早共同点，所以 Batch 到 start 就能整批交付。若加入新成员使 start 后移，Batch 会从按 start 排序的 `mAlarmBatches` 中移除再插入。
 
----
+例如 A=[10,30]、B=[20,40] 可合并成 Batch=[20,30]；C=[31,50] 与该 Batch 无交集，另建一批。standalone Alarm 直接跳过 coalesce，每个自成 Batch。
 
-## 27. 为什么Batch在start时交付
+## 8. 政策容器位于 Batch 前后不同位置
 
-Batch中每个Alarm的最早时间都不晚于 `start=max(earliest)`，而start也不超过所有max。到start时整组都合法，因此只唤醒一次即可交付。
+`setImplLocked(Alarm)` 若存在 `mPendingIdleUntil`，且新 Alarm 没有 allow-while-idle/wake-from-idle 等豁免，会直接放入 `mPendingWhileIdleAlarms`，暂不进入 Batch。
 
-若交集为空就不能合并，必须建立另一个Batch。
+允许进入正常集合的 Alarm 先按 App Standby bucket 调整 `whenElapsed/maxWhenElapsed`，再 `insertAndBatchAlarmLocked()`。因此 Batch 看到的可能已经不是应用原始窗口；Alarm 另保留 expected 时间用于 quota/parole 恢复。
 
----
+Batch 到点后 `triggerAlarmsLocked()` 仍可能二次延期：
 
-## 28. 一个手算例子
+- allow-while-idle 距上次交付太近，改到最小间隔后重新 set；
+- background restricted，移入 `mPendingBackgroundAlarms`；
+- 屏灭且本轮没有 wakeup，non-wakeup 可并入 `mPendingNonWakeupAlarms` 延迟交付。
+
+“kernel timer 到点”因此不是应用回调的最终保证，只是政策管线再次运行的触发。
+
+## 9. 大量 Java Alarm 怎样压成两个近期 kernel 时间
+
+`rescheduleKernelAlarmsLocked()` 找：
+
+1. 最早包含 wakeup 的 Batch.start，写 `ELAPSED_REALTIME_WAKEUP`；
+2. 若全局首 Batch 不是该 wakeup Batch，再把首个 non-wakeup start 写 `ELAPSED_REALTIME`；
+3. 若已有延期 non-wakeup，取它与上述 non-wakeup 的更早值。
+
+所以 Java 维护全部逻辑 Alarm/Batch，kernel 通常只知道“下一 wakeup”和“下一 non-wakeup”。native 仍创建多个 timerfd 映射 Android alarm 类型，并额外使用 cancel-on-set fd 观察墙钟变化；Java 正常调度路径已经统一到两个 elapsed 类型。
+
+native 使用绝对 `timerfd_settime(..., TFD_TIMER_ABSTIME, ...)`。由于 timerfd 把全零当作 disarm，源码把 0 截止点替换成 1ns：
+
+```cpp
+    if (!ts->tv_nsec && !ts->tv_sec) {
+        ts->tv_nsec = 1;
+    }
+```
+
+源码路径：`frameworks/base/services/core/jni/com_android_server_AlarmManagerService.cpp`
+
+`epoll_wait()` 返回的多个 fd 被合成为 bit mask；time-change fd 因 `ECANCELED` 置专用标志。AlarmThread 检测 wall clock 与 expected 相差至少约 1 秒时，重建 RTC Batch、重设 TIME_TICK/DATE_CHANGED 并广播时间变化。
+
+## 10. AlarmThread 取出 Batch 后怎样处理 repeat
+
+AlarmThread 长期阻塞于 native `waitForAlarm()`。返回后持 `mLock` 从按 start 排序的头部连续取出 `start<=nowElapsed` 的 Batch，再逐 Alarm 执行 allow-while-idle/background 检查。
+
+repeating Alarm 若设备睡过多个 interval，会计算：
 
 ```text
-A: [10, 20]
-B: [15, 30]
-交集: [15, 20] → 同Batch，start=15
-C: [21, 25]
+count = 1 + floor((now - expectedWhenElapsed) / repeatInterval)
+next  = expectedWhenElapsed + count * repeatInterval
 ```
 
-C与当前Batch没有交集，不能加入。注意不是只比较C和某个单独Alarm，而是比较收窄后的Batch公共区间。
+本次 PendingIntent 收到 `EXTRA_ALARM_COUNT=count`，服务端同时按原 expected 相位安排下一次，而不是简单从“实际交付时刻+interval”开始。这减少长期相位漂移。
 
----
+触发列表按 delivery generation 排序：TIME_TICK 优先，其次 wakeup，最后普通 non-wakeup；同一优先级再按 nominal delivery time。一个包在同代有多项时使用其中最高优先级作为 package class。
 
-## 29. Batch按start排序
+## 11. WakeLock 覆盖投递确认，而非应用任意后台工作
 
-加入Alarm使Batch.start向后移动时，原有排序可能失效；代码先remove旧位置再binarySearch插回。
+`deliverAlarmsLocked()` 仍持 AMS `mLock`，逐项调用 DeliveryTracker。只有 PendingIntent send 或 listener `doAlarm()` 成功发出后，才建立 InFlight、增加 `mBroadcastRefCount`；第一项成功投递获取 `*alarm*` partial WakeLock，并向 DeviceIdleInternal 报 alarms active。
 
-AlarmThread因列表有序，只需从头取到第一个 `start > now` 即可停止。
+无法发送的 canceled PendingIntent 或不可达 listener 在建立 InFlight 前 return，不增加引用，也不等待不存在的完成回调。
 
----
-
-## 30. Standalone绕过合并
-
-Exact、AlarmClock和内部TIME_TICK/DATE_CHANGED等可带Standalone，每个单独建Batch。
-
-Standalone保证不被普通coalescing改变组边界，但仍可能受Doze、standby、后台限制等更高层政策影响；“单独Batch”不等于绝对按时交付。
-
----
-
-## 31. Doze挂起容器插在入Batch之前
-
-若存在 `mPendingIdleUntil`，普通Alarm既没有allow-while-idle也没有wake-from-idle，就放入 `mPendingWhileIdleAlarms` 并return。
-
-它暂时不在主Batch，退出idle时再restore。因而只检查 `mAlarmBatches` 不能统计所有待处理Alarm。
-
----
-
-## 32. App Standby在入Batch前调整时间
-
-`adjustDeliveryTimeBasedOnBucketLocked(a)` 先根据standby bucket与配额推迟实际when，再调用 `insertAndBatchAlarmLocked()`。
-
-这解释了Alarm对象同时保留expected和actual时间：一个描述原计划，一个描述政策后的交付计划。
-
----
-
-## 33. Java只向kernel设置两个近期截止点
-
-`rescheduleKernelAlarmsLocked()`在所有Batch中找：
+完成路径是：
 
 ```text
-第一个含wakeup的Batch.start → ELAPSED_REALTIME_WAKEUP timerfd
-最早普通Batch/延期non-wakeup → ELAPSED_REALTIME timerfd
+PendingIntent OnFinished
+或 listener alarmComplete
+或 listener timeout（默认 5 秒）
+        ↓
+移除对应 InFlight、更新统计、refCount--
+        ↓ refCount==0
+报告 alarms inactive、释放 WakeLock
 ```
 
-RTC Alarm已经转成elapsed，Java这里不必为每种原始类型分别设置一个kernel timer。
+还有 InFlight 时，WakeLock WorkSource 重归因给队头。WakeLock 保证 system_server/交付握手不在中途睡眠，不代表接收方随后启动的任意异步线程都由它持续保护。
 
----
+这也是第 142 章 DIC 三项空闲门中的 `mAlarmsActive` 来源：它与 jobs-active、active idle ops 并列，只影响 maintenance early exit，不等同于 Alarm 数量。
 
-## 34. 为什么仍有多个Native timerfd
+## 12. 无 timerfd 时的 Handler fallback 不是等价替代
 
-JNI为RTC_WAKEUP、RTC、BOOTTIME_WAKEUP、BOOTTIME、MONOTONIC及额外time-change监视建立timerfd数组，属于通用Native接口。
+若 native alarm driver 初始化失败，AMS 不启动 AlarmThread，而用 `Handler.sendMessageAtTime(ALARM_EVENT, when)`。Handler 时间基准是 uptime，且不能像 wakeup timerfd 那样从 suspend 唤醒设备。
 
-Android 11 Java主调度路径在 `rescheduleKernelAlarmsLocked()`主要用elapsed wakeup/non-wakeup两类；额外realtime fd用于检测墙钟改变。
+所以 fallback 可保住设备清醒时的基本调度，却不能被描述为 wakeup/elapsed 语义完全等价。源码也明确记录 “Failed to open alarm driver. Falling back to a handler.”
 
----
+## 13. 启动、重启与选型边界
 
-## 35. 当前实现不是旧式/dev/alarm主路径
+AlarmManagerService 启动时初始化 native fd、Handler、WakeLock 和系统 Alarm；有 driver 才启动 AlarmThread。在 `PHASE_SYSTEM_SERVICES_READY` 才启动常量观察、接入 DeviceIdle/AppStandby/AppStateTracker，并安排 TIME_TICK/DATE_CHANGED。
 
-本地JNI使用 `timerfd_settime(TFD_TIMER_ABSTIME)` 和 `epoll_wait()`。wakeup类型映射到
-`CLOCK_REALTIME_ALARM` / `CLOCK_BOOTTIME_ALARM`。
+普通应用 Alarm 是 system_server 内存状态，不像 persisted Job 那样写 JobStore；设备重启后不会自动恢复。应用若需要跨重启工作，通常要在 BOOT_COMPLETED 后重建 Alarm，或使用满足业务语义的 persisted Job。
 
-很多旧文章描述 `/dev/alarm` ioctl；对r48应以当前timerfd源码为准。
+Alarm 适合具体时刻、低延迟或用户可见 alarm clock；JobScheduler 适合约束驱动、可批处理的后台任务。二者都受系统政策影响，不应只按“哪个更准”选择。
 
----
+## 14. 从源码验证端到端链路
 
-## 36. timerfd的0时刻特殊处理
+在 Android 11 r48 源码根目录只读执行：
 
-Linux把全0 `itimerspec`解释为disarm。JNI若seconds和nanoseconds都为0，会改成1ns，避免“想在最早时刻触发”被当成取消。
+1. 从 API 汇聚到 Binder flag 重写：
 
-这是Java把负毫秒钳到0之后Native仍要处理的接口语义差异。
+   ```bash
+   rg -n 'setImpl\(|WINDOW_EXACT|WINDOW_HEURISTIC' \
+     frameworks/base/core/java/android/app/AlarmManager.java
+   sed -n '2070,2150p' \
+     frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
+   ```
 
----
+2. 读时间归一化、上限与 replacement 顺序：
 
-## 37. AlarmThread是长期阻塞线程
+   ```bash
+   sed -n '1680,1850p' \
+     frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
+   ```
 
-服务启动检测Native driver存在后创建名为 `AlarmManager` 的线程。它循环：
+3. 手算 Batch 交集与 kernel 两个近期值：
 
-```text
-waitForAlarm → 读取RTC/elapsed → 处理time change
-→ triggerAlarmsLocked → 可能延迟non-wakeup
-→ deliver → 重排standby → 重设kernel timer
-```
+   ```bash
+   sed -n '665,725p' \
+     frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
+   sed -n '940,1000p' \
+     frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
+   sed -n '3035,3075p' \
+     frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
+   ```
 
-没有事件时阻塞在epoll，不靠Java忙轮询。
+4. 追 timerfd、epoll 与 time-change bit：
 
----
+   ```bash
+   sed -n '95,130p' \
+     frameworks/base/services/core/jni/com_android_server_AlarmManagerService.cpp
+   sed -n '175,210p' \
+     frameworks/base/services/core/jni/com_android_server_AlarmManagerService.cpp
+   ```
 
-## 38. epoll结果是bit mask
+5. 追触发、repeat 与 InFlight 完成：
 
-每个到期timerfd贡献 `1 << alarm_idx`；额外realtime fd若因 `TFD_TIMER_CANCEL_ON_SET`收到 `ECANCELED`，贡献
-`TIME_CHANGED_MASK`。
+   ```bash
+   sed -n '3490,3620p' \
+     frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
+   sed -n '4535,4820p' \
+     frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
+   ```
 
-一次epoll唤醒可以同时报告多类timer到期，Java用mask判断是否包含wakeup。
+## 15. 练习与参考答案
 
----
+### 练习一：Batch 交集
 
-## 39. 墙钟变化怎样识别
+A=[10,30]、B=[20,40]、C=[25,27] 能否同批，最终 start/end 是多少？
 
-kernel可能产生小幅伪通知，Java用“上次wall + elapsed流逝”计算expected wall，只有偏差至少约±1000ms才认为真实时间变化。
+参考答案：可以，交集为 [25,27]；到 25 时三项都已到各自最早合法时刻。
 
-真实变化会重建RTC映射、重新安排TIME_TICK/DATE_CHANGED、发送 `ACTION_TIME_CHANGED`，并强制重新检查Alarm。
+### 练习二：replacement 上限
 
----
+UID 已有 500 个 Alarm，再用相同 PendingIntent set 新时间。旧项会先被删除吗？
 
-## 40. triggerAlarmsLocked按Batch头部取出
+参考答案：不会。上限检查早于 `removeLocked()`，请求先抛异常，旧 Alarm 保持。
 
-只要第一个Batch.start <= now就remove并遍历；遇到未来Batch立即break。
+### 练习三：sleep 后 repeat
 
-每个Alarm还要依次经过allow-while-idle最小间隔、background restriction等政策。到达Batch时间不等于一定立刻进入triggerList。
+expected=100、interval=10，系统到 135 才处理。本次 count 与 next 是多少？
 
----
+参考答案：`count=1+floor(35/10)=4`，`next=100+4×10=140`，保持原相位。
 
-## 41. AllowWhileIdle可能再次重排
+### 练习四：kernel 到点
 
-若同UID距上次allow-while-idle交付过短，Alarm的when被推到允许的minTime，再调用 `setImplLocked(alarm, rebatching=true)` 放回调度结构。
+wakeup timerfd 已触发，是否证明应用回调马上执行？
 
-因此exact-and-allow-while-idle的“exact”仍受每UIDidle节流，不代表绕过所有系统政策。
+参考答案：不能。Alarm 仍可能被 allow-while-idle 频率、background restriction 或交付失败等分支推迟/丢弃。
 
----
+### 练习五：listener 不 complete
 
-## 42. Background restricted另有等待容器
+direct listener 收到 oneway 回调后不回 `alarmComplete()`，alarm WakeLock 是否永久持有？
 
-被用户强制后台限制的Alarm进入 `mPendingBackgroundAlarms[creatorUid]`，不加入本轮triggerList。
+参考答案：不会；r48 为 listener 安排默认 5 秒 timeout，超时移除 InFlight 并递减引用。PendingIntent 使用自己的 OnFinished 协议。
 
-所以Alarm的完整生命周期可能在主Batch、pending while idle、pending background、pending non-wakeup、in-flight之间移动。
+## 本章带走什么
 
----
+AlarmManager 的端到端模型是：API 把时钟、窗口和目标编码进 Binder 请求；服务端验证身份、重写 flags、统一为 elapsed 窗口，经过政策调整后用窗口交集形成 Batch；Java 再把大量 Batch 压成近期 wakeup/non-wakeup 截止点交给 timerfd。
 
-## 43. Repeating不是一次交付多次回调
-
-如果晚了多个interval，代码计算 `alarm.count`，通过 `Intent.EXTRA_ALARM_COUNT`告诉接收方漏过多少次，然后按原始相位安排下一次。
-
-它不会在一轮中循环发送N个广播，避免休眠醒来后的“补发风暴”。
-
----
-
-## 44. Repeating保持相位不漂移
-
-```java
-delta = count * repeatInterval;
-nextElapsed = expectedWhenElapsed + delta;
-```
-
-下一次基于原预期时间，而不是 `now + interval`。迟到一次不把整个周期永久向后平移。
-
----
-
-## 45. 交付优先级
-
-取出一轮Alarm后计算三档：TIME_TICK最高、wakeup其次、普通最低；同一source package的PriorityClass在本轮复用。
-
-排序影响同一触发集合的发送次序，不改变哪个Alarm已经到期。
-
----
-
-## 46. Non-wakeup可以在屏灭时继续合并
-
-若本轮没有wakeup、设备非interactive且距上次交付足够近，普通Alarm可先放进
-`mPendingNonWakeupAlarms`，等未来交付时刻或某次wakeup一起送。
-
-这是第二层合并：先有Alarm window Batch，再有屏灭期间的non-wakeup delivery fuzz。
-
----
-
-## 47. Wakeup与Non-wakeup的准确含义
-
-Wakeup timer能把设备从suspend叫醒system_server；non-wakeup不会为了它单独唤醒，但设备因其他原因醒来后，已经到期的普通Alarm会处理。
-
-Wakeup不保证启动屏幕，也不保证目标应用永远运行；它只是电源唤醒语义。
-
----
-
-## 48. deliverAlarmsLocked仍持mLock
-
-AMS遍历triggerList，在锁内调用DeliveryTracker发PendingIntent或oneway Listener。真正应用处理异步发生，但发起Binder/Intent发送的成本处于AMS临界区。
-
-完成回调再次获取同一锁更新in-flight与WakeLock。
-
----
-
-## 49. PendingIntent交付路径
-
-```java
-operation.send(context, 0,
-    backgroundIntent.putExtra(EXTRA_ALARM_COUNT, count),
-    onFinished, handler, ...)
-```
-
-PendingIntent可以指向广播、Service或Activity；AlarmManager不是一律“发广播”。不过常见alarm PendingIntent确实是broadcast。
-
----
-
-## 50. Listener交付路径
-
-服务端调用 `alarm.listener.doAlarm(this)`，把DeliveryTracker作为 `IAlarmCompleteListener`传给客户端。
-
-客户端wrapper完成目标Handler上的 `onAlarm()` 后回调complete；服务端还设置 `LISTENER_TIMEOUT`，防客户端永不确认导致WakeLock永久持有。
-
----
-
-## 51. 交付失败不会进入in-flight
-
-PendingIntent已取消或Listener Binder调用抛异常时，代码在建立WakeLock/refcount之前return。
-
-重复PendingIntent若已取消还会移除未来重复项。没有真实投递，就不等待不存在的finished callback。
-
----
-
-## 52. alarm WakeLock的引用计数
-
-第一个成功发起的交付：设置WorkSource、acquire `*alarm*`、报告alarms active；每项加入 `mInFlight` 并增加
-`mBroadcastRefCount`。
-
-每个PendingIntent onFinished、Listener alarmComplete或timeout使计数减一；归零时释放WakeLock。
-
-```mermaid
-sequenceDiagram
-    participant AT as AlarmThread
-    participant DT as DeliveryTracker
-    participant APP as App/Receiver
-    participant WL as *alarm* WakeLock
-    AT->>DT: deliverLocked
-    DT->>APP: PendingIntent.send / listener.doAlarm
-    DT->>WL: first in-flight acquire
-    APP-->>DT: onFinished / alarmComplete
-    DT->>DT: remove InFlight, ref--
-    DT->>WL: ref==0 release
-```
-
----
-
-## 53. WakeLock覆盖的是交付确认
-
-Alarm WakeLock确保从发送到接收完成/超时这段系统不会再次睡下。它不是给应用任意长后台工作的永久租约。
-
-BroadcastReceiver若 `goAsync()`，AMS广播完成链会延后PendingIntent onFinished；Service自身长期工作仍需遵循对应组件与前台服务规则。
-
----
-
-## 54. WorkSource会随队头重归因
-
-有多个in-flight时，一个完成后若仍有剩余，AlarmManager把同一WakeLock的WorkSource改为当前首个InFlight的来源。
-
-这是一把共享WakeLock的动态归因，不是每个Alarm一把锁。
-
----
-
-## 55. 与DeviceIdle的jobs/alarms闭环
-
-第142章见过DeviceIdleController的 `mAlarmsActive`。AlarmManager在in-flight从0→1和1→0时通过Handler报告active状态。
-
-这能让maintenance early-exit等待Alarm交付完成，但状态Alarm预算仍可推进Doze状态机；同样不是无限续窗。
-
----
-
-## 56. Handler fallback不是等价硬件唤醒
-
-Native初始化失败时，`setLocked()`改用 `sendMessageAtTime()`，不启动AlarmThread。
-
-Handler能在进程/CPU运行时提供定时回调，却不能像alarm timerfd那样保证从suspend唤醒设备，所以日志“falling back”代表降级而非完整等价替代。
-
----
-
-## 57. 启动顺序
-
-`onStart()`先初始化Native、Handler、Constants、WakeLock、TIME_TICK/DATE_CHANGED、各Receiver，再根据driver是否存在启动AlarmThread，最后注册UID observer。
-
-Binder与Local service的发布位置还需结合后续onStart/boot代码看；理解主链时要区分对象构造、Native可用和第三方应用真正运行三个阶段。
-
----
-
-## 58. 普通Alarm不跨重启持久化
-
-AMS的逻辑Alarm保存在system_server内存调度结构中，没有为普通应用Alarm提供跨设备重启恢复的持久存储。设备重启后，普通应用应在
-BOOT_COMPLETED等合适事件重新登记；system_server单独崩溃后的整机恢复细节不能仅凭本章这段内存代码泛化承诺。
-
-AlarmClock UI信息也不是“任意Alarm自动持久化”；它是AMS维护的下一闹钟视图与通知。
-
----
-
-## 59. Alarm与JobScheduler怎样选
-
-```text
-需要日历时刻/用户闹钟/短时明确唤醒 → Alarm更接近需求
-可延期、有约束、需要系统批处理/重试/持久Job → JobScheduler
-进程存活期很短的UI超时 → Handler/Executor
-```
-
-不要用高频exact wakeup Alarm模拟后台循环任务，这会绕开JobScheduler本来提供的约束与节电合并。
-
----
-
-## 60. 场景一：现代App调用set
-
-targetSdk ≥19，window=-1。服务端把输入转elapsed，按75% heuristic算max，经过standby调整，寻找有交集Batch，可能与其他App一起在公共start交付。
-
-“调用set”不意味着精确时间点。
-
----
-
-## 61. 场景二：setExact
-
-window=0，服务端加Standalone，Batch区间退化为单点。它不会普通coalesce，但MIN_FUTURITY、Doze、后台限制和权限政策仍可能改变可观察交付。
-
-Android 11这里尚不是后续版本 `SCHEDULE_EXACT_ALARM` 特殊访问模型，不要把Android 12+规则倒灌进r48。
-
----
-
-## 62. 场景三：RTC墙钟向前拨
-
-额外timerfd收到cancel-on-set，AlarmThread识别真实偏差，重建所有RTC→elapsed映射。原本“明天8点”的Alarm仍按新的日历关系定位。
-
-ELAPSED Alarm不应因墙钟前拨而改变相对等待目标。
-
----
-
-## 63. 场景四：设备睡过三个repeat interval
-
-醒来时count包含跨过的次数，只交付一次并携带 `EXTRA_ALARM_COUNT`；下一次基于expected相位推进到未来正确周期。
-
-接收方若要补业务数据，应按幂等状态同步，而不是假设系统逐次重放所有回调。
-
----
-
-## 64. 场景五：两个窗口相交
-
-A `[100,160]`，B `[130,200]` 合成Batch `[130,160]`，实际在start=130即可同时合法交付。加入C `[150,170]` 后公共区间变 `[150,160]`，
-Batch.start后移并重新排序。
-
----
-
-## 65. 场景六：Listener不complete
-
-服务端已持WakeLock并登记InFlight；到 `LISTENER_TIMEOUT` 后移除对应记录、减少ref。后到的alarmComplete被识别为late，不会二次减计数。
-
-当前代码留有“实现目标ANR策略”的TODO，timeout主要保护系统追踪和WakeLock闭合。
-
----
-
-## 66. macOS只读练习一：追六种API
-
-```bash
-rg -n "setImpl\\(" frameworks/base/core/java/android/app/AlarmManager.java
-```
-
-给set、setWindow、setExact、setRepeating、allowWhileIdle、alarmClock列出window/interval/flags差异。
-
----
-
-## 67. macOS只读练习二：手算时间转换
-
-假设：
-
-```text
-nowRTC=1,700,000,000,000
-nowElapsed=500,000,000
-RTC trigger=nowRTC+60,000
-```
-
-按 `trigger - (nowRTC-nowElapsed)` 算nominal elapsed，再考虑MIN_FUTURITY。
-
----
-
-## 68. macOS只读练习三：手算Batch交集
-
-依次加入 `[10,40] [20,30] [25,50] [31,60]`，写出每一步start/end以及最后一个是否还能合并。
-
-再把第二个改成Standalone，观察Batch数量变化。
-
----
-
-## 69. macOS只读练习四：追kernel压缩
-
-```bash
-sed -n '3040,3072p' \
-  frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
-sed -n '35,225p' \
-  frameworks/base/services/core/jni/com_android_server_AlarmManagerService.cpp
-```
-
-区分“Java逻辑Alarm数量”“Java Batch数量”“当前已armed timerfd数量”。
-
----
-
-## 70. macOS只读练习五：追完成闭环
-
-```bash
-sed -n '4570,4820p' \
-  frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
-```
-
-分别画PendingIntent成功、CanceledException、Listener成功、Listener timeout四条refcount/WakeLock路径。
-
----
-
-## 71. macOS只读练习六：找所有等待容器
-
-```bash
-rg -n "mPending.*Alarms|mAlarmBatches|mInFlight" \
-  frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
-```
-
-为每个容器标注进入原因、离开事件、是否计入每UID Alarm上限、是否已开始交付。
-
----
-
-## 72. 常见误解纠正
-
-- 误解：Alarm总按指定点执行。纠正：window、batch、standby、idle都会调整。
-- 误解：RTC_WAKEUP会点亮屏幕。纠正：它只唤醒CPU/系统处理。
-- 误解：set从来都是exact。纠正：现代targetSdk默认heuristic。
-- 误解：每个Alarm对应一个kernel timer。纠正：大量逻辑Alarm压成近期两个主要deadline。
-- 误解：Batch取所有earliest最小值。纠正：公共start是最大earliest。
-- 误解：Repeating漏三次就回调三次。纠正：一次交付加count。
-- 误解：PendingIntent一定是广播。纠正：可指向多种组件。
-- 误解：alarm WakeLock给业务永久保活。纠正：覆盖交付完成/超时闭环。
-- 误解：r48仍以旧 `/dev/alarm` 为主。纠正：当前JNI用timerfd+epoll。
-
----
-
-## 73. 面试式自测
-
-1. RTC与ELAPSED在墙钟变化时有何不同？
-2. wakeup只承诺什么，不承诺什么？
-3. WINDOW_EXACT、显式window、heuristic怎样计算max？
-4. 为什么exact自动Standalone？
-5. Batch start/end如何由成员窗口决定？
-6. Java为什么只需arm近期wakeup和non-wakeup？
-7. timerfd全0为什么被改成1ns？
-8. AlarmThread怎样收到time change？
-9. repeating怎样保持相位？
-10. non-wakeup为何可能到期后仍延迟？
-11. PendingIntent与Listener如何确认完成？
-12. 哪些路径不会增加in-flight ref？
-
----
-
-## 74. 本章结论
-
-1. Alarm是应用API到Linux timerfd的跨进程、跨语言调度链；
-2. 四种类型分为RTC/elapsed与wakeup/non-wakeup两条轴；
-3. 服务端把所有逻辑时间统一投影到elapsed Batch；
-4. exact窗口为0并自动Standalone，现代set默认heuristic；
-5. heuristic默认以futurity/interval的75%形成延后窗口；
-6. 服务端校验包归因、WorkSource权限和受信任flags；
-7. trigger、window、repeat与每UID数量都有防滥用校验；
-8. 相同PendingIntent/listener再次set替换旧项；
-9. Batch是成员窗口交集，start=max earliest、end=min latest；
-10. 主Batch之外还有idle/background/non-wakeup延期容器；
-11. Java主要只把下一wakeup/non-wakeup截止点交给kernel；
-12. r48 JNI使用timerfd绝对时间和epoll，不是旧式/dev/alarm主路径；
-13. AlarmThread取到期Batch后仍执行idle、background、standby等政策；
-14. repeating迟到只交付一次并携带count，下一代保持原相位；
-15. PendingIntent/Listener异步完成由共享WakeLock和refcount闭合；
-16. Alarm到点只代表获得一次交付机会，不等于应用业务必然完成。
-
-一句话记忆：
-
-> AlarmManagerService把海量“希望何时执行”的逻辑请求变成可合并窗口，只把最近的少数硬件截止点交给kernel，再在醒来时重新应用系统政策并用完成回调守住交付边界。
-
----
-
-## 75. 生成后复读修订
-
-初稿后重新核对AlarmManager、Binder入口、Batch、AlarmThread、DeliveryTracker与JNI，重点补强：
-
-1. 区分wall、elapsed、uptime三类时间；
-2. 纠正set对现代targetSdk默认不是exact；
-3. 明确窗口是交付区间而非执行时长；
-4. 用交集公式解释Batch start/end；
-5. 限定Standalone不等于绕过Doze/standby；
-6. 说明启动限制检查发生在replacement remove之前；
-7. 分开calling与PendingIntent creator/source身份；
-8. 补出主Batch外pending-while-idle、background、non-wakeup与in-flight四类等待/执行容器；
-9. 限定Java主路径只arm elapsed wakeup/non-wakeup；
-10. 以r48 JNI确认timerfd+epoll而非旧/dev/alarm；
-11. 补出0 timespec会disarm所以改1ns；
-12. 区分repeat count和多次回调；
-13. 明确PendingIntent不限于广播；
-14. 追完整的Listener timeout与late complete闭环；
-15. 限定Handler fallback不能可靠唤醒suspend设备；
-16. 所有练习保持macOS只读，不执行Alarm设置或系统编译。
-
----
-
-## 76. 下一章
-
-第146章深入AlarmManager的Doze与AllowWhileIdle：追IDLE_UNTIL、WAKE_FROM_IDLE、pending-while-idle恢复、每UID短/长节流、临时白名单、
-Alarm active反馈，以及为什么“exact and allow while idle”仍不保证任意频率和绝对时刻。
+kernel 到点后，AlarmThread 只是重新开始政策与投递阶段：allow-while-idle、background 和 non-wakeup 仍可延期；repeat 按 expected 相位补 count 并安排下一代；成功发出的 PendingIntent/listener 才进入 InFlight，由完成回调或 timeout 结束 WakeLock 引用。每一层都解决不同问题，任何单个“set 成功”“timer 到点”或“回调已发出”都不是整条链的最终完成。

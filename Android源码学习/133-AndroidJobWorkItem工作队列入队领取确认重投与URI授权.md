@@ -1,1468 +1,889 @@
-# 133 Android JobWorkItem 工作队列：入队、领取、确认、重投与 URI 授权
+# 133 JobWorkItem：文件上传到一半进程崩了，哪些任务会重新投递？
 
-> 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
-> 学习方式：macOS 只读源码，不要求编译、不要求连接设备  
-> 前置章节：第 121、123、132 章
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`  
+> 学习方式：macOS 静态阅读，不编译、不连接设备  
+> 前置知识：第 131 章并发调度、第 132 章 `JobServiceContext` 状态机
+
+## 先给结论：这章解决什么问题
+
+假设相册应用把 3 张待上传照片交给同一个 Job：
+
+```text
+W1 = a.jpg
+W2 = b.jpg
+W3 = c.jpg
+```
+
+应用已经领取 W2，但还没报告完成，App 进程就崩溃了。Job 再次执行后，Android 应该重投 W2，还是从 W3 继续？如果 W2 的网络请求其实已经成功，会不会上传两次？
+
+一句话结论是：**JobScheduler 用 `pendingWork` 记录“尚未领取”，用 `executingWork` 记录“已经领取但尚未确认”；在正常处理协议里，只有 `completeWork()` 才表示一项工作成功完成。发生可重试停止时，未确认项会被放回下一次执行，所以业务必须能处理重复。**
+
+读完本章，你应该能：
+
+- 从源码判断某个 WorkItem 当前是“待领取”还是“已领取未确认”；
+- 解释为什么 `dequeueWork()` 不是完成，为什么最后还要再 dequeue 一次；
+- 手算停止后哪些工作重投、顺序怎样、`deliveryCount` 是多少；
+- 判断 URI 权限何时授予、何时撤销；
+- 识别 `JobWorkItem` 不提供跨重启持久化，也不承诺 exactly-once。
+
+本章不讨论 Job 何时满足网络、充电和配额约束；那些决定“仓库什么时候开门”。本章只讨论开门后，一张工作单怎样领取、确认和退回。
 
 ---
 
-## 1. 本章研究“一个 Job 怎样承载很多小任务”
+## 一、为什么一个 Job 里还需要 WorkItem
 
-普通 `schedule(JobInfo)` 更像提交一个“满足条件后执行一次”的任务定义。`enqueue(JobInfo, JobWorkItem)` 则允许应用把一批小工作不断追加到同一个 Job 中：
+### 1. JobInfo 管执行条件，JobWorkItem 管每一小项数据
 
-```text
-JobInfo
-  决定由哪个 JobService 处理、需要哪些约束
+如果每新增一张照片都创建一个不同 `jobId`，系统看到的是很多独立 Job。它们各自参与约束、排序和并发竞争，应用还要管理大量 ID。
 
-JobWorkItem W1/W2/W3
-  各自携带本次小工作的 Intent 数据、流量估算与交付次数
-```
-
-本章沿着 W1 从应用入队到最终确认，回答：
-
-1. `pendingWork` 与 `executingWork` 为什么必须分开；
-2. 为什么 dequeue 不等于处理完成；
-3. `deliveryCount=2` 到底意味着什么；
-4. URI 权限何时授予、何时撤销；
-5. App 崩溃后工作可以重投，为何设备重启后却不能恢复；
-6. 为什么使用 WorkItem 时不应随便调用 `jobFinished()`。
-
----
-
-## 2. 先用“仓库工作单”建立直觉
-
-可以把一个 JobStatus 想成仓库：
+`enqueue(JobInfo, JobWorkItem)` 提供另一种模型：
 
 ```text
-pendingWork
-  待领取区：工作单还没有交给工人
+JobInfo：共用的“仓库规则”
+  哪个 JobService 处理
+  是否需要网络、充电等
 
-executingWork
-  已签出区：工作单已交给工人，但仓库还没收到完成回执
-
-dequeueWork()
-  领取：pending → executing
-
-completeWork()
-  回执：从 executing 删除
+JobWorkItem：不断追加的“工作单”
+  这一次处理哪张照片
+  需要临时访问哪个 content:// URI
+  预计上传/下载多少字节
 ```
 
-最重要的区别是：**拿走工作单不代表工作已经完成**。如果工人处理到一半崩溃，仓库必须知道哪些工作单已经签出但没有回执，才能把它们重新投递。
+因此，3 个 WorkItem **不是 3 个独立 Job，也不会占 3 个 JobServiceContext 执行槽**。它们共用一个 `JobStatus` 和一套约束；同一时刻只占这个 Job 的一个执行槽，被停止后则可能跨多次执行继续处理。
 
----
-
-## 3. 贯穿案例
-
-假设 `com.demo.uploader` 用 Job 80 上传三张照片：
-
-```text
-W1 = photo-a.jpg
-W2 = photo-b.jpg
-W3 = photo-c.jpg
-```
-
-应用先完整处理并确认 W1，然后同时领取 W2、W3；W2 已上传到服务端但还没调用 `completeWork()` 时应用进程崩溃。
-
-重启后框架会把未确认的 W2、W3 重新交付：
-
-```text
-W1：已确认，不再出现
-W2：deliveryCount 由1变2，可能产生重复业务副作用
-W3：deliveryCount 由1变2
-```
-
-这说明框架提供的是未确认项重投，不是端到端 exactly-once。
-
----
-
-## 4. 源码地图
-
-公开 API 与数据对象：
-
-```text
-frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobScheduler.java
-frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobWorkItem.java
-frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobParameters.java
-frameworks/base/apex/jobscheduler/framework/java/android/app/JobSchedulerImpl.java
-```
-
-跨进程接口与服务端入口：
-
-```text
-frameworks/base/apex/jobscheduler/framework/java/android/app/job/IJobScheduler.aidl
-frameworks/base/apex/jobscheduler/framework/java/android/app/job/IJobCallback.aidl
-frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java
-frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobServiceContext.java
-```
-
-真正的队列与 URI 授权：
-
-```text
-frameworks/base/apex/jobscheduler/service/java/com/android/server/job/controllers/JobStatus.java
-frameworks/base/apex/jobscheduler/service/java/com/android/server/job/GrantedUriPermissions.java
-frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobStore.java
-```
-
-测试与示例：
-
-```text
-cts/tests/JobSchedulerSharedUid/src/android/jobscheduler/cts/shareduidtests/EnqueueJobWorkTest.java
-cts/tests/JobSchedulerSharedUid/src/android/jobscheduler/MockJobService.java
-development/samples/ApiDemos/src/com/example/android/apis/app/JobWorkService.java
-```
-
----
-
-## 5. JobWorkItem 的六个核心字段
-
-r48 对象中有：
+### 2. 最小提交示例
 
 ```java
-final Intent mIntent;
-final long mNetworkDownloadBytes;
-final long mNetworkUploadBytes;
-int mDeliveryCount;
-int mWorkId;
-Object mGrants;
+JobInfo job = new JobInfo.Builder(80, uploaderService)
+        .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+        .build();
+
+Intent data = new Intent().setData(photoUri)
+        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+jobScheduler.enqueue(job, new JobWorkItem(data, 0, photoBytes));
 ```
 
-可以分成三组：
+这里的 `Intent` 只是工作数据容器。JobScheduler 不会自动拿它去启动 Activity 或 Service；实际处理组件始终由 `JobInfo.getService()` 决定。
 
-| 分组 | 字段 | 含义 |
+### 3. 这套模型的代价
+
+集中排队带来三个约束：
+
+1. 所有 WorkItem 共用同一份 `JobInfo` 条件；
+2. WorkItem 队列保存在 `system_server` 内存中，不能与 persisted Job 共用；
+3. 已领取但未确认的项目可能重投，业务要自己解决重复副作用。
+
+理解这三点，才能判断它适不适合“照片待上传”这类工作。
+
+---
+
+## 二、先记住两张表：pending 与 executing
+
+把 `JobStatus` 想成一个仓库：
+
+```text
+pendingWork                 executingWork
+待领取区                    已签出区
+[W1, W2, W3]                []
+     │
+     │ dequeueWork()
+     ▼
+[W2, W3]                    [W1]
+                                  │
+                                  │ completeWork(W1)
+                                  ▼
+[W2, W3]                    []
+```
+
+两张表不是重复记账，而是回答两个不同问题：
+
+| 队列 | 系统知道的事实 | 发生可重试停止时 |
 |---|---|---|
-| 应用工作数据 | Intent、上下行估算 | 应用提交并可读取 |
-| 系统队列协议 | workId、deliveryCount | 系统编号与投递计数 |
-| system_server 资源 | grants | URI permission owner 等内部授权对象 |
+| `pendingWork` | 还没有交给 App | 下次继续交付 |
+| `executingWork` | 已交给 App，但没收到完成回执 | 放回队首，重新交付 |
+| 已被 `completeWork()` 删除 | App 已确认完成 | 不再重投 |
 
-`mWorkId` 和 `mGrants` 是隐藏实现字段，不是让应用自行设置的业务标识。
+如果只有一张队列表，系统一旦把 W2 取出，就无法区分“W2 已完成”和“W2 只处理到一半”。这就是两张表存在的根本原因。
 
----
-
-## 6. Intent 在这里不是组件启动指令
-
-`JobWorkItem.getIntent()` 返回的 Intent 是工作数据载体，例如 action、extras、data URI、ClipData。
-
-它不会被 JobScheduler 自动拿去 `startActivity()` 或 `startService()`。真正绑定哪个 JobService，由：
-
-```java
-jobInfo.getService()
-```
-
-决定。应用的 `onStartJob()` 收到 JobParameters 后，再主动 dequeue 并解释每项 Intent。
-
----
-
-## 7. 两种构造方式
-
-只给工作 Intent：
-
-```java
-new JobWorkItem(intent)
-```
-
-此时上下行估算都是：
-
-```text
-JobInfo.NETWORK_BYTES_UNKNOWN = -1
-```
-
-也可以提交估算：
-
-```java
-new JobWorkItem(intent, downloadBytes, uploadBytes)
-```
-
-当 Job 带网络约束时，估算会参与 ConnectivityController 的“这条网络是否可能在执行时限内传完”判断，但不是流量配额或实际计量值。
-
----
-
-## 8. 新对象的 deliveryCount 与 workId 都从0开始
-
-Java 默认值使刚创建的对象具有：
-
-```text
-deliveryCount = 0
-workId = 0
-grants = null
-```
-
-但应用真正从 `dequeueWork()` 拿到它时，system_server 已先调用 `bumpDeliveryCount()`，所以**首次可见交付通常是1**。
-
-不要写成“第一次处理看到0”；0只描述尚未被服务端交付的对象状态。
-
----
-
-## 9. 应用提交对象不是 system_server 保存的同一个 Java 对象
-
-调用链：
+### 状态变化总图
 
 ```mermaid
-sequenceDiagram
-    participant A as "应用调用线程"
-    participant P as "JobSchedulerImpl"
-    participant B as "IJobScheduler Binder"
-    participant S as "JobSchedulerService / system_server"
-    participant J as "JobStatus"
-
-    A->>P: enqueue(jobInfo, originalWork)
-    P->>B: mBinder.enqueue(job, work)
-    B->>S: Parcel反序列化出服务端副本
-    S->>S: 校验调用UID、JobInfo和work
-    S->>J: enqueueWorkLocked(serverWork)
+stateDiagram-v2
+    [*] --> Pending: enqueue
+    Pending --> Executing: dequeueWork<br/>deliveryCount + 1
+    Executing --> [*]: completeWork<br/>撤销该项 URI grant
+    Executing --> Pending: 可重试停止<br/>未确认项回队首
+    Pending --> [*]: cancel/不重试<br/>撤销 URI grant
+    Executing --> [*]: cancel/不重试<br/>撤销 URI grant
 ```
 
-AIDL 参数是 `in`。服务端分配 `workId`、建立 grant、增加 delivery count，都不会反向修改应用最初 new 出来的 `originalWork`。
+注意图中的终点有两种含义：一项 WorkItem 从队列消失，不等于整个 JobServiceContext 已经结束。整个 Job 的结束还有一道“空队列确认门”，后面会展开。
 
 ---
 
-## 10. 从应用到服务端的第一次 Parcel
+## 三、入队：同一个 jobId 不一定只是追加
 
-`writeToParcel()` 写入：
+### 1. Binder 入口先拒绝两个无效条件
+
+文件：
 
 ```text
-Intent存在标志 + Intent
-downloadBytes
-uploadBytes
-deliveryCount
-workId
+frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java
 ```
 
-没有写 `mGrants`。原因不是漏写：grants 是 system_server 内部 permission owner，不能也没有必要交给外部应用持有。
-
-这也说明 Parcelable 只证明对象能跨 Binder/进程，不证明它能跨重启持久化。
-
----
-
-## 11. dequeue 时还会发生第二次 Parcel
-
-应用执行：
+Android 11 的 `enqueue()` 入口包含：
 
 ```java
-JobWorkItem work = params.dequeueWork();
-```
-
-实际是 `IJobCallback.dequeueWork(jobId)` 同步 Binder 调用。system_server 从队列取出内部对象后，把它再 Parcel 给应用。
-
-所以应用应传给 `completeWork()` 的，是**dequeue 返回的对象**；它携带服务端分配的隐藏 workId。不要保存 enqueue 时的原始对象并拿它确认，因为那个副本通常仍是 `workId=0`。
-
----
-
-## 12. workId 是系统确认键，不是 Intent action
-
-入队时：
-
-```java
-work.setWorkId(nextPendingWorkId);
-nextPendingWorkId++;
-```
-
-`nextPendingWorkId` 初始为1。服务端 complete 时只查：
-
-```text
-当前 executingWork 中是否有相同 workId
-```
-
-Intent action、URI、extras 即使相同，也不会合并成同一项。业务若需要去重，必须另设自己的幂等键。
-
----
-
-## 13. workId 的作用域
-
-workId 由某个 JobStatus 的 `nextPendingWorkId` 分配；失败重试或 replacement 时，这个 next 值会迁移给 incoming JobStatus，以避免后续追加与旧项编号冲突。
-
-它不是：
-
-- 全设备唯一 ID；
-- 跨 system_server 重启稳定 ID；
-- 服务端业务去重 ID；
-- jobId 的替代品。
-
-应用一般不需要也不能通过公开 API 读取/设置 workId。
-
----
-
-## 14. Binder 入口先做哪些硬校验
-
-`JobSchedulerStub.enqueue()` 依次：
-
-```text
-读取 Binder calling UID/user
-enforceValidJobRequest(uid, job)
-拒绝 persisted Job
-拒绝 null work
-validateJobFlags(job, uid)
-clearCallingIdentity
-scheduleAsPackage(job, work, uid, ...)
-```
-
-`work == null` 抛 `NullPointerException`；persisted Job 则抛 `IllegalArgumentException`。
-
----
-
-## 15. WorkItem 与 persisted Job 在 r48 不能共用
-
-源码是明确的 API 硬门：
-
-```java
+enforceValidJobRequest(uid, job);
 if (job.isPersisted()) {
     throw new IllegalArgumentException(
             "Can't enqueue work for persisted jobs");
 }
+if (work == null) {
+    throw new NullPointerException("work is null");
+}
 ```
 
-因此不能设计“把 WorkItem 队列写进 jobs.xml，重启后继续”。如果业务必须跨设备重启，应把权威工作列表保存在应用自己的数据库中，Job 只作为唤醒/调度信号。
+这几行直接确定了版本边界：在 r48 中，WorkItem Job 不能设置 `setPersisted(true)`。所以“WorkItem 实现了 Parcelable”绝不等于“它会写进磁盘并跨设备重启恢复”。
 
----
+### 2. 快路径：JobInfo 完全相同，直接追加
 
-## 16. 入队总链路
-
-```text
-JobScheduler.enqueue
-→ JobSchedulerImpl.enqueue
-→ IJobScheduler.enqueue
-→ JobSchedulerStub.enqueue
-→ JobSchedulerService.scheduleAsPackage(job, work, callingUid...)
-→ JobStatus.enqueueWorkLocked
-```
-
-最后一步才分配 workId、创建 URI grant、加入 `pendingWork` 并更新网络估算。
-
----
-
-## 17. pendingWork 是 FIFO
-
-入队：
+`scheduleAsPackage()` 在全局锁内查找同 UID、同 jobId 的现有记录：
 
 ```java
-pendingWork.add(work);
+final JobStatus old = mJobs.getJobByUidAndJobId(uId, job.getId());
+
+if (work != null && old != null && old.getJob().equals(job)) {
+    old.enqueueWorkLocked(work);
+    old.maybeAddForegroundExemption(mIsUidActivePredicate);
+    return JobScheduler.RESULT_SUCCESS;
+}
 ```
 
-领取：
+这条快路径意味着：如果 Job 80 正在运行，而且新提交的 `JobInfo.equals()` 仍为真，新 WorkItem 会直接进入同一个 `JobStatus.pendingWork`。正在循环 dequeue 的 worker 可以在下一次领取时看见它。
+
+### 3. 慢路径：JobInfo 变化，会替换 JobStatus
+
+如果同 jobId 存在，但 `JobInfo.equals()` 为假，服务端会创建新 `JobStatus`，再用它替换旧记录。旧 WorkItem 会迁移过去，但正在运行的旧 Job 可能被停止和重启。
+
+所以“相同 jobId”只保证定位到同一逻辑编号，不保证永远原地追加。官方 API 文档强烈建议每次 enqueue 复用稳定、等价的 `JobInfo`，尤其避免让 extras 或 `ClipData` 每次变化。
+
+可以把它理解为：
+
+```text
+jobId 相同 + JobInfo 相同 → 给原仓库追加一张工作单
+jobId 相同 + JobInfo 变化 → 更换仓库规则，搬迁旧工作单
+```
+
+`JobInfo.Builder.setClipData()` 在这条路径上尤其危险：r48 API 文档明确说明，即便内容看起来相同，也会被当作不同 JobInfo。逐项 URI 应放在 `JobWorkItem` 的 Intent 中，而不是反复改变 JobInfo 的 ClipData。
+
+### 4. 真正的入队动作
+
+文件：
+
+```text
+frameworks/base/apex/jobscheduler/service/java/com/android/server/job/controllers/JobStatus.java
+```
+
+核心代码只有几步：
+
+```java
+work.setWorkId(nextPendingWorkId);
+nextPendingWorkId++;
+if (work.getIntent() != null
+        && GrantedUriPermissions.checkGrantFlags(work.getIntent().getFlags())) {
+    work.setGrants(GrantedUriPermissions.createFromIntent(...));
+}
+pendingWork.add(work);
+updateEstimatedNetworkBytesLocked();
+```
+
+它证明：
+
+- `workId` 由 system_server 分配，初始序号从 1 开始；
+- URI 授权在 **enqueue 时**建立，不是等到 dequeue 才建立；
+- 新项目追加到 `pendingWork` 尾部，正常领取顺序是 FIFO；
+- 每次入队后重新计算剩余网络估算。
+
+### 5. App 手里的原对象没有系统 workId
+
+`JobWorkItem` 通过 AIDL 以 `in` 参数进入 system_server。Binder 传递的是 Parcel 反序列化后的副本，不是同一个 Java 对象。
+
+因此：
+
+```java
+JobWorkItem submitted = new JobWorkItem(data);
+jobScheduler.enqueue(job, submitted);
+
+// 错误思路：以后拿 submitted 调 completeWork()
+```
+
+服务端是在自己的副本上设置 `workId`。应用必须确认 **`dequeueWork()` 返回的对象**，不能拿最初 enqueue 的对象代替。
+
+---
+
+## 四、领取：dequeue 只是“签出”，不是完成
+
+### 1. App 到 system_server 是一次同步 Binder 查询
+
+`JobParameters.dequeueWork()` 的公开代码非常短：
+
+```java
+public JobWorkItem dequeueWork() {
+    return getCallback().dequeueWork(getJobId());
+}
+```
+
+这里的 `IJobCallback.dequeueWork()` 有返回值，所以调用线程会同步等待 system_server 返回一个 WorkItem 或 `null`。这和第 132 章里的 `IJobService.startJob()` oneway 通知不是同一种调用语义。
+
+典型线程关系是：
+
+```mermaid
+sequenceDiagram
+    participant W as App worker线程
+    participant B as IJobCallback Binder
+    participant J as system_server<br/>JobServiceContext
+    participant S as JobStatus
+
+    W->>B: params.dequeueWork()
+    B->>J: dequeueWork(jobId)
+    J->>J: 校验本次执行的 callback token
+    J->>S: dequeueWorkLocked()
+    S->>S: pending[0] → executing<br/>deliveryCount++
+    S-->>W: 返回 WorkItem 副本或 null
+```
+
+不要在 JobService 主线程做耗时上传。`onStartJob()` 在 App 主线程收到开始通知后，应启动受控 worker，并返回 `true` 表示工作仍在异步进行。
+
+### 2. 服务端怎样移动工作单
+
+`JobStatus.dequeueWorkLocked()` 的关键部分是：
 
 ```java
 JobWorkItem work = pendingWork.remove(0);
-```
-
-所以单个 JobStatus 的待领取顺序是 FIFO。这里说的是框架交付顺序，不保证应用并行处理完成顺序，也不保证远端业务提交顺序。
-
----
-
-## 18. dequeue 的完整状态变化
-
-```mermaid
-stateDiagram-v2
-    [*] --> AppObject: "应用new，count=0/id=0"
-    AppObject --> Pending: "enqueue：分配id + 建grant"
-    Pending --> Executing: "dequeue：FIFO + count++"
-    Executing --> Removed: "complete：按id删除 + revoke"
-    Executing --> Pending: "失败重调度：未确认项重投"
-    Pending --> Dropped: "cancel/不重试：revoke"
-    Executing --> Dropped: "cancel/不重试：revoke"
-```
-
-`executing` 在这里表示“已交给应用、未确认”，不证明实际线程仍在 CPU 上运行。
-
----
-
-## 19. deliveryCount 只在 dequeue 时增加
-
-源码顺序：
-
-```java
+if (executingWork == null) {
+    executingWork = new ArrayList<>();
+}
 executingWork.add(work);
 work.bumpDeliveryCount();
+return work;
 ```
 
-以下事件本身不增加 delivery count：
-
-- enqueue；
-- Job 被 stop；
-- 应用崩溃；
-- WorkItem 从旧 executing 迁回新 pending。
-
-只有下一代再次 dequeue 时，1才变2。
-
----
-
-## 20. deliveryCount 不是 Job 总运行次数
-
-每个 WorkItem 独立计数：
+所以第一次成功领取时，应用看到的 `deliveryCount` 通常是 1，而不是 0：
 
 ```text
-W1 首次领取并完成：1
-W2 首次领取后崩溃，再领取：2
-W3 直到第二轮才首次领取：1
+new JobWorkItem() 时：0
+第一次 dequeue 返回：1
+停止后再次投递：2
+再次停止再投递：3
 ```
 
-同一个 Job 的三项可以同时呈现1、2、1。不能拿某一项的 count 推导 JobService 总共启动了多少次。
+这个计数表示“这一个 WorkItem 被交付过几次”，不是整个 Job 运行过几次，也不能代替业务唯一 ID。
 
----
+### 3. workId 与业务 ID 是两套东西
 
-## 21. complete 可以乱序
+系统用隐藏的 `workId` 在 `executingWork` 中找到待确认项。它只服务于当前 JobStatus 队列协议。
 
-应用可以连续 dequeue W1、W2、W3 并行处理，然后按：
-
-```text
-complete W3
-complete W1
-complete W2
-```
-
-确认。`completeWorkLocked()` 遍历 executing 列表按 workId 查找，不要求确认顺序与领取顺序一致。
-
-并行能力来自协议，线程安全、取消和业务幂等仍由应用负责。
-
----
-
-## 22. complete 的精确动作
-
-找到 workId 后：
+照片业务仍应在 Intent 中保存自己的稳定 ID，例如数据库行 ID 或服务端幂等键：
 
 ```java
-executingWork.remove(i);
-ungrantWorkItem(work);
-return true;
+data.putExtra("upload_id", "photo-20260904-001");
 ```
 
-所以 complete 同时代表：
+原因是 `workId`：
 
-1. 这项不应重投；
-2. 这项临时 URI grant 可以撤销；
-3. executing 列表不再保存它。
-
-它不是“打印完成日志”这么轻量的动作。
+- 不是公开业务主键；
+- 不应该跨取消、重建或设备重启保存；
+- 无法帮助服务端判断某次 HTTP 上传是不是已经成功。
 
 ---
 
-## 23. 非法 complete 有两类结果
+## 五、确认：为什么 complete 最后一项后还要再 dequeue
 
-旧运行代际的 callback token 调 complete：
+### 1. completeWork 只删除一项 executingWork
 
-```text
-JSC assertCallerLocked → SecurityException
-```
-
-token 合法，但 workId 不在 executing 中，例如重复 complete 或从未 dequeue：
-
-```text
-服务端返回 false
-JobParameters.completeWork → IllegalArgumentException
-```
-
-一个是运行权限已经过期，另一个是当前代的工作单状态不合法。
-
----
-
-## 24. complete 最后一项不会自动结束 Job
-
-`completeWorkLocked()` 删除项后直接返回，不检查 pending 是否为空，也不调用 JSC cleanup。
-
-应用必须再次：
+App 调用：
 
 ```java
-params.dequeueWork()
+params.completeWork(work);
 ```
 
-当 dequeue 得到 null 且 executing 也空时，JSC 才自动完成整个 Job。
+最终到达：
 
----
+```java
+if (work.getWorkId() == workId) {
+    executingWork.remove(i);
+    ungrantWorkItem(work);
+    return true;
+}
+```
 
-## 25. 为什么必须“再 dequeue 一次”
+这几行只完成两件事：
 
-因为 enqueue 可能与 complete 同时发生。最终 dequeue 在 JSS 同一把 `mLock` 下同时看 pending 与 executing：
+1. 从 `executingWork` 删除对应 workId；
+2. 撤销该 WorkItem 持有的 URI 临时授权。
+
+它没有调用“结束整个 Job”的逻辑。若 workId 不在当前 executing 列表中，服务端返回 `false`，公开 API 随后抛出：
 
 ```text
-enqueue 先拿锁
-  → 新work已进pending，dequeue能看到它
-
-最终dequeue先拿锁
-  → 两表确实空，原Job同步完成；
-    之后enqueue会为新工作建立/取得有效JobStatus
+IllegalArgumentException: Given work is not active
 ```
 
-这是比应用主观判断“我刚处理了最后一项”更可靠的系统判定点。
+常见原因包括：重复 complete、传入 enqueue 时的原对象、或者项目已经不属于这次执行。
 
----
+### 2. 真正结束 Job 的条件发生在下一次 dequeue
 
-## 26. 空队列自动完成的服务端条件
-
-JSC：
+`JobServiceContext.doDequeueWork()` 才检查两张表是否都空：
 
 ```java
 JobWorkItem work = mRunningJob.dequeueWorkLocked();
 if (work == null && !mRunningJob.hasExecutingWorkLocked()) {
     doCallbackLocked(false, "last work dequeued");
 }
+return work;
 ```
 
-只有：
+三种结果要分清：
+
+| pending | executing | 本次 dequeue 结果 |
+|---|---|---|
+| 有项目 | 任意 | 移到 executing 并返回项目 |
+| 空 | 仍有未确认项 | 返回 `null`，但不能认定整个 Job 已正确完成 |
+| 空 | 空 | 返回 `null`，同时 system_server 结束 Job |
+
+这就是循环必须写成“处理并 complete 后，继续 dequeue”，而不能在 complete 最后一项后直接退出协议的原因。最后一次空 dequeue 既检查有没有刚追加的新工作，也告诉系统“待领取和已签出都清零了”。
+
+### 3. 为什么不应主动 jobFinished
+
+对于 WorkItem 模式，r48 的 `JobParameters` 文档明确要求不要用 `jobFinished()` 代替这套协议。考虑一个竞态：
 
 ```text
-pendingWork为空 AND executingWork为空
+worker 认为 W3 是最后一项          另一个线程正在 enqueue W4
+            │                                  │
+            └──── 如果直接 jobFinished ────────┘
+                         可能把队列生命周期提前截断
 ```
 
-才自动 `reschedule=false` 完成。dequeue 得到 null，但还有并行中的 executing 项时，Job 不会结束。
+正确的 final dequeue 和 enqueue 都会进入 system_server，并在同一把 JobScheduler 全局锁下串行化：
+
+- enqueue 先拿锁：W4 先进入 pending，dequeue 能取到它；
+- final dequeue 先拿锁：旧 Job 在锁内完成清理，后来的 enqueue 会创建或使用新的可调度记录。
+
+应用自己调用 `jobFinished()` 绕过了“检查两张表”的条件，可能使尚未完成的队列按“不重试”路径清理。
 
 ---
 
-## 27. WorkItem 模式不要主动 jobFinished
+## 六、一个正确且能抗停止的处理骨架
 
-公开文档明确警告：若使用 enqueue/work queue，不应靠 `jobFinished()` 结束。
-
-`jobFinished(false)` 不执行“两表是否同时为空”的工作协议检查；若新 work 刚先入队，随后 finish 可能把它随旧 Job 一起清掉。应让最终 dequeue-null 路径在系统锁内结束。
-
----
-
-## 28. 一个正确的串行处理骨架
+下面只展示协议关键点，不绑定具体线程库：
 
 ```java
-while (!cancelled) {
-    JobWorkItem work = params.dequeueWork();
-    if (work == null) {
-        return; // system_server已在真正空队列时自动完成
+@Override
+public boolean onStartJob(JobParameters params) {
+    startWorker(() -> drain(params));
+    return true; // onStartJob 返回了，但异步处理还没完成
+}
+
+private void drain(JobParameters params) {
+    JobWorkItem work;
+    while (!stopping && (work = params.dequeueWork()) != null) {
+        uploadIdempotently(work.getIntent());
+        persistBusinessSuccess(work.getIntent());
+        params.completeWork(work);
     }
-    processIdempotently(work.getIntent());
-    params.completeWork(work);
+}
+
+@Override
+public boolean onStopJob(JobParameters params) {
+    stopping = true;
+    cancelWorkerCooperatively();
+    return true; // 希望未确认项按 backoff 重投
 }
 ```
 
-`onStartJob()` 应迅速启动工作线程并返回 true；`onStopJob()` 设置取消状态、停止后台操作，并按是否需要未完成项重投返回 boolean。
-
----
-
-## 29. 官方示例能学协议，不能机械照搬线程工具
-
-ApiDemos 的 `JobWorkService` 使用 AsyncTask：
+顺序不能随意交换：
 
 ```text
-后台循环 dequeue → 处理 → complete
-onStartJob 返回 true
-onStopJob cancel processor 并返回 true
+执行业务副作用
+  → 持久化业务成功状态
+  → completeWork
+  → 再次 dequeue
 ```
 
-这个样例准确展示协议，但 AsyncTask 已是旧式工具。现代代码可换成 Executor、线程池或其他受控机制，核心仍是快速 start、可取消、逐项确认和最终 dequeue-null。
+如果先 `completeWork()` 再上传，进程恰好在两步之间崩溃，系统已经删掉工作单，业务却没完成；这会造成丢失。
 
----
+如果上传成功后、`completeWork()` 前崩溃，系统会重投，可能重复上传。因此业务操作还要使用稳定 `upload_id` 做幂等检查。JobScheduler 无法与远端 HTTP 服务做同一个原子事务。
 
-## 30. STOPPING 时停止领取，尚可出现完成竞态
+### 并行处理也可以，但账更难管
 
-第132章看到：当前 token 仍有效且 JSC 已 STOPPING 时，`dequeueWork()` 返回 null，不再发新项；`completeWork()` 却没有相同 verb 门。
-
-因此后台线程若恰在 cleanup 前完成某项，仍可能成功确认，使它不再重投。应用不能把收到 stop 等同于 executing 列表瞬间冻结，正确做法仍是立刻通知工作线程停止并处理自己的竞态。
-
----
-
-## 31. App 崩溃为什么未确认工作不会立刻丢失
-
-JobService 进程意外断开时，JSC `cleanup(true)`，JSS 创建 failure-rescheduled JobStatus。旧 JobStatus 在被移除前，把工作列表迁给新对象。
-
-这里 system_server 没有死亡，所以权威 pending/executing 内存仍存在；App 进程里的 WorkItem 副本丢失不影响系统端队列。
-
----
-
-## 32. 重投时的顺序
-
-`stopTrackingJobLocked(incomingJob)` 先：
+API 允许连续 dequeue 多项后并行处理，也允许乱序 complete。比如：
 
 ```text
-incoming.pendingWork = old.executingWork
+dequeue W1 → executing=[W1]
+dequeue W2 → executing=[W1,W2]
+complete W2 → executing=[W1]
+complete W1 → executing=[]
+final dequeue → null，并结束 Job
 ```
 
-再追加：
-
-```text
-old.pendingWork
-```
-
-因此“原先已领取但未确认”的项回到队首，排在从未领取项之前，保留原队列的基本先后关系。
+但 `onStopJob()` 到来时，所有 worker 都必须尽快停止继续做副作用；仍未 complete 的项目会作为 executing 项参与重投。初学时建议先写对串行协议，再考虑并行。
 
 ---
 
-## 33. A/B/C/D 手算重投
+## 七、失败重投：不是重新创建三张全新的工作单
 
-停止前：
+### 1. 谁决定是否重试
 
-```text
-A 已complete
-B、C 已dequeue未complete
-D 仍pending
+Job 因约束丢失、执行超时或宿主进程异常而停止时，是否生成下一次 JobStatus，要看具体结束原因和回调结果。
+
+正常收到 `onStopJob()` 时：
+
+- 返回 `true`：请求按失败 backoff 重调度；
+- 返回 `false`：不请求重调度，剩余 WorkItem 会被清理。
+
+但“返回 true”不是任何场景下的绝对保证。例如用户明确 `cancel(jobId)` 是取消，不是“稍后重试”；某些绑定/启动失败路径也可能按不重试收尾。判断问题时必须同时看停止原因和 `needsReschedule`，不能只背 `onStopJob()` 返回值。
+
+宿主 App 进程意外断开时，r48 的 `JobServiceContext.onServiceDisconnected()` 会调用：
+
+```java
+closeAndCleanupJobLocked(true, "unexpectedly disconnected");
 ```
 
-迁移后：
+因此，只要 system_server 和内存中的 JobStatus 仍在，这条路径会尝试生成失败重调度记录。
+
+### 2. 迁移时为什么 executing 放在 pending 前面
+
+旧 JobStatus 停止跟踪时：
+
+```java
+if (executingWork != null && executingWork.size() > 0) {
+    incomingJob.pendingWork = executingWork;
+}
+if (incomingJob.pendingWork == null) {
+    incomingJob.pendingWork = pendingWork;
+} else if (pendingWork != null) {
+    incomingJob.pendingWork.addAll(pendingWork);
+}
+incomingJob.nextPendingWorkId = nextPendingWorkId;
+```
+
+executing 项原本比尚未领取的 pending 项更靠前，所以迁移顺序是：
 
 ```text
-new pending = [B, C, D]
+旧 executingWork + 旧 pendingWork → 新 pendingWork
+```
+
+系统不会在失败时复制“所有历史项目”。已经 complete 的项目早已从 executing 删除，不再迁移。
+
+### 3. 贯穿案例手算
+
+初始：
+
+```text
+pending   = [W1, W2, W3]
+executing = []
+```
+
+W1 完成；W2 和 W3 已领取但未确认：
+
+```text
+pending   = []
+executing = [W2(count=1), W3(count=1)]
+W1        = 已删除
+```
+
+此时进程崩溃，生成可重试的新 JobStatus：
+
+```text
+new.pending   = [W2(count=1), W3(count=1)]
+new.executing = []
 ```
 
 下一次领取：
 
 ```text
-B delivery=2
-C delivery=2
-D delivery=1
+W2 → count=2
+W3 → count=2
 ```
 
-A 已收到确认，不再出现。
+W1 不会出现。W2 即使远端上传已成功，只要没 complete，框架也只能把它判断为“结果未知”，所以会重投。这正是幂等键有意义的地方。
 
----
+### 4. 旧线程迟到确认为什么不能误删新执行
 
-## 34. 重投不是“失败时复制所有历史工作”
+`JobParameters` 内持有这次执行对应的 `IJobCallback`。每次 `JobServiceContext` 开始新执行都会创建新的 callback token。
 
-只迁移当时仍在：
-
-```text
-executingWork + pendingWork
-```
-
-已 complete 项已经删除；它们不会因为整个 Job 失败而复活。
-
-这也是为什么业务应在真正完成持久副作用后再 complete，不能提前确认。
-
----
-
-## 35. onStopJob true 只是重投的必要条件之一
-
-普通约束停止时返回 true，JSC 会向 JSS表达失败重调度意图。但还需原 Job 仍在 JobStore。
-
-若应用显式 `cancel(jobId)`，JSS 已先把旧 Job 从 Store 移除，随后旧 JSC 即使收到 true，也不会让旧定义复活。
-
----
-
-## 36. onStopJob false 会怎样
-
-没有 incoming JobStatus 时，旧 `stopTrackingJobLocked(null)`：
-
-```text
-撤销所有pendingWork grants
-清pendingWork
-撤销所有executingWork grants
-清executingWork
-```
-
-所以 false 不只是“这次不马上跑”，而是普通非周期 Job 剩余工作队列被彻底结束。
-
----
-
-## 37. cancel 不是 retry
-
-公开 `cancel()` 文档说明：当前 Job 会被停止，`onStopJob()` 的返回值被忽略。
-
-服务端先移除调度定义和工作队列，再通知运行槽停止。取消是业务明确撤销，不应让迟到 stop ack 把未完成 WorkItem 再排回来。
-
----
-
-## 38. 相同 jobId 不保证“追加而不中断”
-
-JSS 的快速追加条件是：
+WorkItem 操作进入服务端后先执行：
 
 ```java
-toCancel != null && toCancel.getJob().equals(newJobInfo)
-```
-
-只有 JobInfo equals 相同，才直接 `toCancel.enqueueWorkLocked(work)`。
-
-若 JobInfo 不同，即使 jobId 相同，也创建新 JobStatus、replace 旧定义，正在执行的 JobService 会被 stop。
-
----
-
-## 39. 相同 JobInfo 的快速路径
-
-```mermaid
-flowchart TD
-    ENQ["enqueue(job, work)"] --> OLD{"同uid+jobId已有Job？"}
-    OLD -->|"否"| NEW["创建JobStatus，tracking，再enqueue"]
-    OLD -->|"是"| EQ{"old JobInfo.equals(new)？"}
-    EQ -->|"是"| FAST["直接追加到旧pendingWork，不打断当前Service"]
-    EQ -->|"否"| REPLACE["创建新JobStatus，迁移旧work，stop旧执行，再追加新work"]
-```
-
-快速路径还可能给整个 Job 增加“入队时 source UID 在前台”的内部豁免；它是 Job 级粘性状态，不只属于新 WorkItem。
-
----
-
-## 40. 为什么官方强烈建议稳定复用 JobInfo
-
-每次 enqueue 都重新构造约束略有不同的 JobInfo，会导致：
-
-```text
-旧JobStatus被替换
-旧Controller关系拆除/新建
-当前JobService收到stop
-未完成work迁移
-以后重新竞争执行槽
-```
-
-这既增加开销，又使应用更频繁面对取消、重投和重复副作用。
-
----
-
-## 41. extras 比较可能造成“看似相同，实际 replacement”
-
-API 文档建议 enqueue 模式避免复杂的：
-
-```text
-setExtras(PersistableBundle)
-setTransientExtras(Bundle)
-```
-
-系统会尝试比较，但某些内容可能被判断为变化。若确实使用，应保证字段简单且每次一致。
-
-每项变化数据应优先放在各自 WorkItem 的 Intent 中，而不是不断重建 JobInfo extras。
-
----
-
-## 42. JobInfo ClipData 更应避免
-
-公开文档明确说 enqueue 工作时不应在 JobInfo 上用 `setClipData()`：当前比较会把它视为不同 JobInfo，即使内容看起来一样。
-
-工作级 URI/ClipData 应放进：
-
-```text
-JobWorkItem.getIntent()
-```
-
-由每项独立 grant 生命周期管理。
-
----
-
-## 43. replacement 如何迁移旧 work
-
-JSS 创建 incoming JobStatus 后，`cancelJobImplLocked(old, incoming, ...)` 内部先调用：
-
-```text
-old.stopTrackingJobLocked(incoming)
-```
-
-旧 executing、旧 pending 和 nextPendingWorkId 都迁给 incoming；然后 JSS tracking 新对象。最后，本次新 enqueue 的 work 再追加到 incoming 尾部。
-
-因此 replacement 不必丢旧 work，但会打断旧运行代际。
-
----
-
-## 44. replacement 与 failure reschedule 的共同点和区别
-
-共同点：
-
-```text
-都有 incoming JobStatus
-都可接收旧 executing + pending
-都保留nextPendingWorkId
-```
-
-区别：
-
-```text
-replacement：应用提交了不同JobInfo，约束/配置可能变化
-failure reschedule：框架从旧JobInfo创建带backoff的新实例
-```
-
-两者都不是旧 Java 对象原地继续。
-
----
-
-## 45. replacement 期间旧线程 complete 的边界
-
-replacement 先在 JSS 锁内把旧 executing 列表转移并清空，再向旧 JSC 发 stop。旧应用线程若随后用旧 callback complete：
-
-- token 尚未 cleanup 时，旧 JobStatus executing 已经为空，通常找不到 workId；
-- cleanup 后，token 又会变 stale。
-
-这再次说明不要频繁改变 JobInfo，也不要在 stop 后继续处理旧代际。
-
----
-
-## 46. URI grant 在 enqueue 时就建立
-
-`enqueueWorkLocked()` 在加入 pending 前检查 Intent flags：
-
-```java
-if (work.getIntent() != null
-        && GrantedUriPermissions.checkGrantFlags(
-                work.getIntent().getFlags())) {
-    work.setGrants(GrantedUriPermissions.createFromIntent(...));
+if (mRunningCallback != cb) {
+    throw new SecurityException("Caller no longer running...");
 }
 ```
 
-所以授权不是等到 dequeue 或 JobService 启动才产生。即使约束尚未满足、WorkItem 仍在 pending，授权也可能已经存在。
+所以旧 worker 不能仅凭相同 jobId 操作新一代队列。这里还有一个很容易漏掉的时间窗：replacement 已把 work 搬出旧 JobStatus、但旧 callback 尚未彻底退休时，身份校验可能暂时仍通过，不过旧 `executingWork` 已经没有那项，complete 会返回 false，App 最终得到 `IllegalArgumentException`；callback 退休后再调用，则会得到 `SecurityException`。两条失败路径都不会误删新 JobStatus 中的项目。
+
+换句话说，代际安全不是只靠整数 jobId：主要靠每次执行独立的 callback token，同时也靠 work 只在所属 JobStatus 的 executing 表中按 workId 查找。
 
 ---
 
-## 47. 哪些 flag 会触发授权
+## 八、URI 授权：为什么入队时就给、完成时才撤
 
-只关心：
+### 1. 等待约束期间也可能需要保存授权
+
+照片可能来自另一个 ContentProvider：
 
 ```text
-Intent.FLAG_GRANT_READ_URI_PERMISSION
-Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+content://media/external/images/media/123
 ```
 
-至少有一个才建立 `GrantedUriPermissions`。其他 Intent flags 不会因此创建 URI permission owner。
+如果应用只是把 URI 字符串塞进 Intent，却没有携带读/写 grant flag，未来 JobService 可能没有权限打开它。
 
----
-
-## 48. 一项 WorkItem 会扫描哪些 URI
-
-`createFromIntent()` 处理：
-
-1. Intent 自身的 `data`；
-2. Intent 的 ClipData 中每个 `item.getUri()`；
-3. ClipData item 内嵌 Intent 的 `getData()`。
-
-对带 userId 的 URI，先取 source user，再移除 URI 外层 userId，最后调用 UriGrantsManager 建授权。
-
----
-
-## 49. 授权给谁
-
-参数来自 JobStatus 的 source 身份：
-
-```text
-sourceUid
-sourcePackageName
-sourceUserId
-```
-
-真正目标是执行 Job 的 source package/user。`scheduleAsPackage()` 等场景中，它不一定等于最初调用 JobScheduler 的 calling package。
-
----
-
-## 50. 每个 WorkItem 有独立 permission owner
-
-第一次成功 grant 某个 URI 时创建：
-
-```text
-newUriPermissionOwner("job: " + tag)
-```
-
-该 `GrantedUriPermissions` 对象保存自己的 owner 与 URI 列表，并挂在对应 WorkItem 的 `mGrants`。
-
-所以两个 work 都引用 URI A 时，完成 W1 只撤 W1 owner 的授权；W2 owner 仍可使 A 保持可访问。
-
----
-
-## 51. mGrants 为什么不跨 Parcel
-
-应用不需要看到 permission-owner Binder 和内部 URI 列表，只需要正常访问自己收到的 URI。
-
-system_server 保存的队列对象持有 `mGrants`；发给应用的 WorkItem 副本没有这个字段。应用回传 complete 时只带 workId，系统再从自己的 executingWork 找到原对象并 revoke。
-
----
-
-## 52. complete 是逐项撤销授权
-
-```text
-complete W1
-→ 找到system_server内部W1
-→ W1.grants.revoke()
-→ 删除W1
-```
-
-若 W1 拥有 URI A+B，而 W2 只拥有 A：
-
-```text
-W1完成后：
-B 应失去授权
-A 仍因W2而可用
-```
-
-CTS 的多 URI WorkItem 用例正是按这个方向验证。
-
----
-
-## 53. retry 时授权不会先撤再重建
-
-未完成 WorkItem 对象从旧 executing/pending 列表迁到 incoming pending，连同内部 grants 引用一起迁移。
-
-下一次 dequeue 不重新扫描 Intent 建一份新 owner；仍沿用该项在 enqueue 时建立的授权，直到 complete 或彻底清除。
-
----
-
-## 54. cancel 或不重试会批量撤销
-
-没有 incoming JobStatus 时：
+r48 在 enqueue 时检查：
 
 ```java
-ungrantWorkList(pendingWork);
-ungrantWorkList(executingWork);
+return (flags & (FLAG_GRANT_READ_URI_PERMISSION
+        | FLAG_GRANT_WRITE_URI_PERMISSION)) != 0;
 ```
 
-每项 owner 都 revoke，随后列表清空。
+有 grant flag 时，`GrantedUriPermissions.createFromIntent()` 会扫描 Intent 的 data URI 和 ClipData URI，为该项创建 permission owner。授权必须从 enqueue 就开始，因为 Job 可能等待网络很久，调用方原先持有的临时上下文早已结束。
 
-资源回收跟随 system_server 的权威队列状态，不依赖 App 是否还保留 WorkItem 副本。
+### 2. 授权跟着 WorkItem 走
 
----
-
-## 55. CTS 如何证明“pending 期间已有 grant”
-
-测试先制造 storage low，让 Job 因约束不能执行；然后 enqueue 带 URI grant flags 的 WorkItem。
-
-接着撤掉测试自己原有的显式授权，却仍断言 URI 可访问。此时 Job 还没运行，剩下的正是 JobScheduler 在 enqueue 阶段建立的 grant。
-
-最后解除 storage low、处理并 complete，全队列结束后再等待 grant 撤销。
-
----
-
-## 56. URI grant 时间线
-
-```mermaid
-sequenceDiagram
-    participant A as "应用enqueue"
-    participant J as "JobStatus / system_server"
-    participant U as "UriGrantsManager"
-    participant S as "JobService应用进程"
-
-    A->>J: WorkItem(Intent data/ClipData + grant flags)
-    J->>U: enqueue时创建每项permission owner并grant
-    Note over J,U: Job即使因约束仍pending，grant已存在
-    J->>S: dequeue返回WorkItem副本（不含mGrants）
-    S->>J: completeWork(workId)
-    J->>U: 用内部原对象revoke该项owner
-```
-
----
-
-## 57. WorkItem 为什么能跨 App 进程死亡
-
-权威队列在 system_server 的 JobStatus 中。App 崩溃只丢失：
-
-- 应用进程内的 WorkItem 副本；
-- 工作线程状态；
-- 本代 JobParameters/callback 的可用性。
-
-JSS 仍可把未确认项从旧 JobStatus 迁到 failure-rescheduled JobStatus。因此这是“跨应用进程死亡”，不是磁盘持久化。
-
----
-
-## 58. 为什么不能跨 system_server 或设备重启
-
-三个证据互相印证：
-
-1. Binder enqueue 明确禁止 persisted Job；
-2. JobStore 只序列化 persisted JobInfo、约束、运行窗口、extras 等，不写 pending/executing work；
-3. 为持久化而使用的 JobStatus copy constructor 也不复制工作列表。
-
-system_server 一旦重启，内存队列和 grants 都不再是可恢复事实。
-
----
-
-## 59. Parcelable 与 persistence 必须分开
-
-```text
-Parcelable
-  解决进程间/Parcel边界传输
-
-persisted Job
-  解决JobStore XML与系统重启恢复
-```
-
-JobWorkItem 实现 Parcelable，却被 API 明确禁止加入 persisted Job。这是理解“可序列化对象不等于已持久化状态”的典型源码例子。
-
----
-
-## 60. 正确的跨重启业务设计
-
-如果照片上传必须设备重启后继续：
-
-```text
-应用数据库：保存photoId、状态、幂等键、重试次数
-JobScheduler persisted Job：只表示“条件允许时唤醒扫描数据库”
-JobService：事务性领取数据库任务并更新状态
-```
-
-不要把唯一业务事实只放在 JobWorkItem Intent extras 中。
-
----
-
-## 61. 网络估算怎样汇总
-
-JobStatus 重算总下载/上传量时先取 JobInfo 基础估算，再扫描 `pendingWork`。
-
-若基础值不是 UNKNOWN，就把每个已知 pending work 值相加。已经 dequeue 到 `executingWork` 的项不参与这次总量。
-
-因此 dequeue 会触发重算，总估算可能随待领取队列缩短而下降。
-
----
-
-## 62. r48 网络估算注释与实现有偏差
-
-源码注释说任何组成部分 unknown 时整个结果应 unknown；但实际代码结构是：
-
-```text
-若基础Job值已经UNKNOWN
-  → 保持UNKNOWN
-否则某个work值UNKNOWN
-  → 跳过该work，不把总量改成UNKNOWN
-```
-
-这是 r48 的实现/注释漂移。讲当前运行行为时以代码为准，不照抄注释推导另一套公式。
-
----
-
-## 63. 网络估算不是“全部未完成工作”
-
-executingWork 仍未确认，却不在当前累加循环中；UNKNOWN work 还可能被跳过。
-
-所以这个字段更准确地说是 JobScheduler 当前用于网络启动判断的估算快照，不是业务审计意义的完整剩余字节，也不应拿它做精确进度条。
-
----
-
-## 64. WorkItem 与周期 Job 的边界
-
-r48 硬性禁止的是 persisted，并没有在 enqueue 入口直接禁止 periodic JobInfo。
-
-但周期实例正常完成时，旧 JobStatus 被 stopTracking；若没有 failure incoming，剩余 work 会被清掉，然后 JSS 另建下一周期 JobStatus。这个组合语义不直观，不应把 WorkItem 当成跨周期永久队列。
-
----
-
-## 65. WorkItem 与前台调度豁免
-
-相同 JobInfo 快速追加时会调用：
+`JobWorkItem` 内部有一个隐藏字段：
 
 ```java
-toCancel.maybeAddForegroundExemption(
-        mIsUidActivePredicate);
+Object mGrants;
 ```
 
-若任一 work 在 source UID 活跃时入队，且 Job 没有 early/late 时间约束，整个 JobStatus 可获得内部前台调度豁免。
+它指向 system_server 内部的 `GrantedUriPermissions`，不会写进传给 App 的 Parcel。App 得到的是 URI 和 flags 等数据，不会得到 permission owner 对象本身。
 
-这是 Job 级状态，不是 WorkItem 自带一个公开“前台”位。
-
----
-
-## 66. enqueue 成功不等于立即执行
-
-新 JobStatus 仍要经过：
+生命周期如下：
 
 ```text
-显式/隐式约束
-用户与Service可用性
-ready/batching
-pending排序
-JobConcurrencyManager并发槽
-JobServiceContext绑定
+enqueue
+  └─ 创建该项 grant，pending 期间已有效
+
+dequeue
+  └─ WorkItem pending → executing，grant 继续保留
+
+retry/replacement
+  └─ WorkItem 搬到新 JobStatus，grant 跟随，不先撤销
+
+completeWork
+  └─ 只撤销这一项的 grant
+
+cancel / 不重试清理
+  └─ 批量撤销 pending 和 executing 的剩余 grant
 ```
 
-唯一特殊的是：新 Job 若此刻完整 ready，JSS 可以直接加入 pending 并尝试分槽；这仍不保证 `enqueue()` 返回时业务已完成。
+### 3. 两个相同 URI 的 WorkItem 也要逐项确认
+
+W1、W2 都引用同一个 URI 时，它们可以各自拥有 grant owner。完成 W1 会撤销 W1 的授权账，但 W2 的授权仍可能让目标包继续访问该 URI。不要通过“现在还能不能打开 URI”反推某一个具体 WorkItem 是否已经 complete。
+
+CTS 的 `testEnqueueMultipleUriGrantWork()` 正是在 Job 尚因存储约束等待时撤掉原始显式授权，然后验证 WorkItem grant 仍有效；全部处理完成后，再等待权限被撤销。这个测试证明授权窗口覆盖 pending 阶段，而不仅是执行阶段。
 
 ---
 
-## 67. 运行中快速追加怎样被当前 worker 看见
+## 九、网络字节估算：r48 只统计仍 pending 的项目
 
-相同 JobInfo 的 work 直接进现有 JobStatus.pendingWork，不重启 JobService。
+`JobWorkItem(Intent, downloadBytes, uploadBytes)` 可给每项提供预计流量。它用于调度判断，不是网络计费器，也不会限制应用实际传输了多少。
 
-当前 worker 处理完已有项后继续调用 `dequeueWork()`，就能领取新追加项。若它已经在最终 dequeue-null 路径中完成，后到 enqueue 会建立/重新推动可执行 Job，不应依赖旧线程常驻轮询。
+`JobStatus.updateEstimatedNetworkBytesLocked()` 在 r48 中从 JobInfo 的基础估算开始，再遍历：
 
----
-
-## 68. 最终 dequeue 与并发 enqueue 的线性化点
-
-两者都持 JSS `mLock`：
-
-```mermaid
-flowchart TD
-    RACE["最终dequeue 与 enqueue 竞态"] --> FIRST{"谁先获得mLock？"}
-    FIRST -->|"enqueue先"| ADD["新work加入pending"]
-    ADD --> SEE["dequeue看到新work，不结束"]
-    FIRST -->|"dequeue先"| EMPTY["两表空，旧Job同步完成"]
-    EMPTY --> LATER["之后enqueue按当时Store状态追加或建新Job"]
+```java
+if (pendingWork != null) {
+    for (int i = 0; i < pendingWork.size(); i++) {
+        // 累加 pendingWork 的上下行估算
+    }
+}
 ```
 
-这就是官方要求用 dequeue-empty 收尾，而不是应用自己猜“最后一项”的根本原因。
-
----
-
-## 69. dumpsys 怎样观察两张队列表
-
-有设备时 `adb shell dumpsys jobscheduler` 的 JobStatus 可显示：
+这里没有遍历 `executingWork`。因此当前版本的字段更接近：
 
 ```text
-Pending work:
-Executing work:
+base Job 估算 + 尚未 dequeue 的 WorkItem 估算
 ```
 
-每项 dump 包含索引、内部 workId、delivery count、Intent 和 grants。
+而不是“所有未 complete 项的总剩余流量”。当 W2 从 pending 移到 executing 后，它的估算会从这个汇总值中消失，即使上传尚未完成。
 
-本章 macOS 学习不要求连接设备；可以直接读 `JobStatus.dump()` 确认这些输出来自哪些字段。
+另外，如果 JobInfo 的某一方向基础估算是 `NETWORK_BYTES_UNKNOWN (-1)`，r48 的累加逻辑会保持该方向 unknown，而不会靠 WorkItem 已知值拼出一个看似精确的总数。
 
----
-
-## 70. CTS 基础 FIFO 证据
-
-`EnqueueJobWorkTest` 连续 enqueue 多个不同 action，再让 MockJobService 循环 dequeue/complete，比较收到顺序。
-
-它把公开 API、跨进程传输、服务端 FIFO、应用侧回执和最终自动结束连成真实证据，不只是单测某个 ArrayList。
+这是 Android 11 r48 的具体实现边界，不应外推成所有 Android 版本都完全相同。排查新版本时，要重新看同名方法。
 
 ---
 
-## 71. CTS 串行重投证据
+## 十、进程崩溃能重投，为什么设备重启不能
 
-`testEnqueueMultipleRedeliver()`：
+这里有两个常被混在一起的“死亡”：
+
+| 事件 | system_server 内存中的 JobStatus | WorkItem 结果 |
+|---|---|---|
+| JobService 所在 App 进程崩溃 | 仍在 | 可按失败路径迁移、重投未确认项 |
+| system_server 重启或设备重启 | 内存对象消失 | WorkItem 队列不能恢复 |
+
+原因很直接：
+
+1. WorkItem Job 被 `enqueue()` 明确禁止设置 persisted；
+2. `pendingWork`、`executingWork` 是 JobStatus 的内存字段；
+3. `JobStore` 的持久化 XML 只处理允许持久化的 Job 定义，没有 WorkItem 队列恢复协议；
+4. `Parcelable` 只代表对象能经 Parcel 跨 Binder，不代表它会自动写磁盘。
+
+如果“设备重启后仍必须上传”是业务要求，可靠来源应该是应用自己的数据库：
 
 ```text
-work1/2/3完成
-work4领取后等待stop，delivery=1
-shell触发timeout
-再追加work5/6
-下一次预期work4 delivery=2，之后work5/6=1
+数据库：业务事实与幂等状态的真相来源
+JobWorkItem：进程存活期间的高效调度队列
+启动/解锁后：扫描数据库未完成记录，再恢复调度
 ```
 
-它直接证明 delivery count 在再次 dequeue 时增长，以及已完成项不会重新出现。
+不要把唯一一份任务数据只放进 JobWorkItem Intent。
 
 ---
 
-## 72. CTS 并行重投证据
+## 十一、从业务角度理解：它提供的是哪一种交付语义
 
-`testEnqueueMultipleParallelRedeliver()` 让 work2、work3 延迟 complete，work4 等待 stop。
+### 1. 不是 exactly-once
 
-重启后预期：
+以 W2 上传为例：
 
 ```text
-work2=2, work3=2, work4=2, work5=1, work6=1
+远端已接收 W2
+    ↓
+App 还没 completeWork
+    ↓
+进程崩溃
+    ↓
+W2 被重投
 ```
 
-说明 executing 列表可保存多项未确认 work，并按原列表顺序整体放回新 pending 前部。
+框架看不到远端服务器是否提交成功，只看得到 complete 回执有没有到达。于是“副作用已发生、确认未到达”这个时间窗必然可能产生重复。
 
----
+### 2. 也不能无限制地宣传 at-least-once
 
-## 73. CTS URI grant 证据
+在 system_server 内存仍在、结束路径选择重调度、Job 没被取消等前提下，未确认项会重投。但设备重启会丢失内存队列，取消或不重试也会清理项目。
 
-`testEnqueueMultipleUriGrantWork()`：
+更准确的说法是：**在一次内存调度生命周期内，JobScheduler 对可重试停止提供未确认项重投；端到端可靠性仍由持久化业务队列和幂等处理保证。**
 
-1. storage low 阻止执行；
-2. enqueue 两项含 data/ClipData URI 的 work；
-3. 撤销测试预先建立的显式授权；
-4. 仍能访问 URI，证明 Job grant 已在 pending 阶段存在；
-5. 处理时逐项验证需要/不需要的 URI；
-6. 完成后等待全部授权撤销。
+### 3. 一个实用的幂等方案
 
----
-
-## 74. 贯穿案例的完整状态图
-
-```mermaid
-flowchart LR
-    DB["enqueue W1,W2,W3"] --> P["pending: W1,W2,W3"]
-    P --> A["领取并complete W1"]
-    A --> BC["领取W2,W3：executing，count=1"]
-    BC --> CRASH["App崩溃，system_server仍活"]
-    CRASH --> NEW["failure JobStatus pending: W2,W3"]
-    NEW --> RED["再次领取：W2/W3 count=2"]
-    RED --> IDEM["业务用photoId幂等处理"]
-    IDEM --> DONE["逐项complete，再dequeue null"]
-```
-
-若设备/system_server 一起重启，图中的内存迁移链不存在；必须依赖应用数据库恢复。
-
----
-
-## 75. exactly-once 为什么不是框架承诺
-
-W2 可能已经把照片提交给服务端，但 App 在 `completeWork()` 前崩溃。system_server 只能看到“没有回执”，必须重投。
-
-因此可能出现：
+照片上传可以这样分工：
 
 ```text
-业务副作用已发生
-框架确认未发生
-→ 再次交付
+1. 数据库插入 upload_id，状态=PENDING
+2. enqueue WorkItem，只携带 upload_id 与 URI
+3. worker 查询数据库；若已 SUCCESS，直接 complete
+4. 请求远端时携带 upload_id 作为幂等键
+5. 远端成功后，本地事务写 SUCCESS
+6. 最后 completeWork
 ```
 
-应用应使用 photoId/requestId 作为幂等键，服务端拒绝重复提交，或用事务状态机安全恢复。
+即便第 5、6 步之间崩溃，重投后也能通过数据库或远端幂等键识别已经完成，不必重复产生业务结果。
 
 ---
 
-## 76. at-least-once 也有作用域
+## 十二、怎样观察两张队列表
 
-在 system_server 仍存活、Job 走 `reschedule=true` 且调度定义仍存在时，未确认项可重投。
+在真机环境中，`dumpsys jobscheduler` 的 JobStatus dump 会分别输出 pending 和 executing work。r48 的 dump 代码位于：
 
-但以下情况会清掉剩余队列或使它无法恢复：
+```text
+JobStatus.dump(...)
+  → Pending work
+  → Executing work
+  → dumpJobWorkItem(...)
+```
 
-- onStopJob 返回 false；
-- 应用 cancel；
-- 应用绕过工作队列协议而调用 `jobFinished(false)`；
-- system_server/设备重启；
-- 调度定义已被其他合法取消路径移出 JobStore。
+诊断时不要只看“Job 正在运行”，至少记录：
 
-所以不能无条件宣传“JobWorkItem 永不丢”。
+| 观察项 | 能回答的问题 |
+|---|---|
+| Job 的 UID + jobId | 找的是不是同一条 JobStatus |
+| pending 数量与 workId | 还有多少没交给 App |
+| executing 数量与 workId | 哪些已交付但没确认 |
+| delivery count | 某项是否发生过重投 |
+| stop reason / failure count | 为什么进入下一次执行 |
+| JobInfo 是否变化 | enqueue 是快路径追加还是替换 |
 
----
-
-## 77. 常见误解一：首次 deliveryCount 是0
-
-错误。新对象内部从0开始，但 dequeue 先 bump，再跨 Binder 返回；首次正常交付为1。
-
----
-
-## 78. 常见误解二：Intent action 就是确认ID
-
-错误。complete 用隐藏 workId；action/extras 只供应用解释。相同 Intent 可以是两个独立工作单。
+本章在 macOS 上只做静态阅读，没有声称已经运行这些命令。实际设备的 dump 文案会随 Android 版本变化，应以设备分支代码为准。
 
 ---
 
-## 79. 常见误解三：dequeue 后系统就认为已完成
+## 十三、容易翻车的判断
 
-错误。dequeue 把项移到 executing，只有 complete 才删除并撤 grant。
+### “dequeue 返回 null，所以一定结束了”
 
----
+不一定。如果 `pendingWork` 空但 `executingWork` 仍有并行项目，dequeue 会返回 null，却不会通过“两张表都空”的结束条件。
 
-## 80. 常见误解四：complete 最后一项会结束 Job
+### “complete 最后一项后，Job 自动结束”
 
-错误。还要再 dequeue；只有 pending 与 executing 同时空，JSC 才自动完成。
+不对。complete 只删 executing 项；还需要再 dequeue 一次，让 system_server 在同一临界区确认 pending 和 executing 都空。
 
----
+### “onStopJob 返回 true，取消后也会重投”
 
-## 81. 常见误解五：dequeue null 总会立即结束
+不对。用户或系统的明确 cancel 是移除任务，不等于失败重试。要结合具体停止路径判断。
 
-错误。若其他并行 work 仍在 executing，dequeue null 不完成 Job。
+### “相同 jobId 永远只向原队列追加”
 
----
+不对。还要 `JobInfo.equals()` 为真，否则会发生替换和旧 work 迁移，正在执行的旧 Job 可能被打断。
 
-## 82. 常见误解六：onStopJob true 保留所有历史 work
+### “deliveryCount=1 表示重试了一次”
 
-错误。只保留 pending 与 executing 未确认项；已 complete 的历史项不会复活，而且显式 cancel 后 true 也不能复活旧 Job。
+不对。首次 dequeue 就是 1；大于 1 才说明至少发生过再次交付。
 
----
+### “URI grant 在 Job 开始运行时才创建”
 
-## 83. 常见误解七：cancel 等于稍后再试
+不对。r48 在 enqueue 时创建，在 pending 等待约束期间就可能有效。
 
-错误。cancel 是撤销定义、清队列和授权；retry 需要有效的 failure-rescheduled incoming JobStatus。
+### “WorkItem 是 Parcelable，所以重启后能恢复”
 
----
+不对。Parcel 是进程通信格式，持久化还需要单独的磁盘写入和恢复协议；r48 甚至直接拒绝 persisted WorkItem Job。
 
-## 84. 常见误解八：相同 jobId 一定不中断追加
+### “completeWork 就能让 HTTP 请求 exactly-once”
 
-错误。还要 JobInfo.equals 相同；不同 JobInfo 会 replacement 并停止旧运行。
-
----
-
-## 85. 常见误解九：URI 权限在 dequeue 时才授予
-
-错误。enqueue 时建立；CTS 在约束阻止执行的 pending 阶段即可证明授权存在。
+不对。远端成功与本地 complete 不能构成原子提交，中间崩溃仍会重投。要靠业务幂等。
 
 ---
 
-## 86. 常见误解十：Parcelable 所以可跨重启
+## 十四、macOS 静态练习：自己证明，不靠背结论
 
-错误。Parcel 是 Binder 传输格式；enqueue 明确禁止 persisted，JobStore 不写工作队列。
+以下命令都只读源码，可在 `/Users/ninebot/androidSource` 执行。
 
----
-
-## 87. 常见误解十一：网络估算就是全部剩余量
-
-错误。r48 只累加 pending，不含 executing；unknown 分支还有实现/注释偏差。
-
----
-
-## 88. 常见误解十二：WorkItem Intent 会被系统自动分发
-
-错误。它是 JobService 自己读取的数据；JobInfo.service 才决定服务组件。
-
----
-
-## 89. 面试题：为什么需要 pending 和 executing 两张表
-
-参考回答：
-
-pending 表示未交付，executing 表示已交付未确认。若只有一张队列，dequeue 后就无法区分“已完成”与“App 拿到后崩溃”，也无法只重投未确认项。complete 是两阶段领取协议的确认点。
-
----
-
-## 90. 面试题：为什么 complete 最后一项后还要 dequeue
-
-参考回答：
-
-complete 与 enqueue 可能并发。最终 dequeue 与 enqueue 都持 JSS mLock，可以线性化地判断 pending 与 executing 是否同时为空；应用自行 jobFinished 不执行该检查，可能清掉刚入队工作。
-
----
-
-## 91. 面试题：App 崩溃与设备重启有何不同
-
-参考回答：
-
-App 崩溃时 system_server 的 JobStatus 队列仍在，可通过 failure reschedule 迁移未确认项；设备或 system_server 重启时内存队列消失，而 WorkItem 又不允许 persisted，也不在 jobs.xml 中，所以不能恢复。
-
----
-
-## 92. macOS 只读练习一：读 JobWorkItem Parcel
+### 练习 1：证明首次 deliveryCount 是 1
 
 ```bash
-sed -n '28,212p' \
-  frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobWorkItem.java
+rg -n "dequeueWorkLocked|bumpDeliveryCount|mDeliveryCount" \
+  frameworks/base/apex/jobscheduler/{service,framework}/java
 ```
 
-列出哪些字段写入 Parcel，回答为什么 `mGrants` 不写，以及 enqueue 原对象为什么拿不到服务端分配的 workId。
+追踪顺序：
 
----
-
-## 93. macOS 只读练习二：追 enqueue 快慢路径
-
-```bash
-sed -n '1068,1158p' \
-  frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java
+```text
+JobParameters.dequeueWork
+→ IJobCallback.dequeueWork
+→ JobServiceContext.doDequeueWork
+→ JobStatus.dequeueWorkLocked
+→ JobWorkItem.bumpDeliveryCount
 ```
 
-分别画出：没有旧 Job、旧 JobInfo 相同、旧 JobInfo 不同三条路径。
+预期结论：新对象字段默认是 0，但服务端在返回给 App 之前先 `++`，所以首次可见交付是 1。
 
----
+### 练习 2：手算重投顺序
 
-## 94. macOS 只读练习三：手算两张队列表
+阅读：
 
 ```bash
-sed -n '596,689p' \
+sed -n '596,690p' \
   frameworks/base/apex/jobscheduler/service/java/com/android/server/job/controllers/JobStatus.java
 ```
 
-用 A/B/C/D 推演：A complete，B/C executing，D pending；重试后顺序和 delivery count 分别是什么。
+给定：
 
----
-
-## 95. macOS 只读练习四：追 URI grant
-
-```bash
-sed -n '35,174p' \
-  frameworks/base/apex/jobscheduler/service/java/com/android/server/job/GrantedUriPermissions.java
-
-sed -n '414,470p' \
-  cts/tests/JobSchedulerSharedUid/src/android/jobscheduler/cts/shareduidtests/EnqueueJobWorkTest.java
+```text
+pending=[W4,W5]
+executing=[W2,W3]
+W1 已 complete
 ```
 
-找出 grant 的建立时点、扫描范围、target 身份、逐项撤销和测试证据。
+问题：可重试停止后新 pending 是什么？下次四项 count 怎样变化？
 
----
+答案：新 pending 是 `[W2,W3,W4,W5]`。W2、W3 曾领取过，下一次 dequeue 时 count 从 1 变 2；W4、W5 首次领取时从 0 变 1。W1 不再出现。
 
-## 96. macOS 只读练习五：证明非持久化
+### 练习 3：证明 complete 不结束整个 Job
 
 ```bash
-sed -n '2648,2675p' \
-  frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java
+sed -n '635,654p' \
+  frameworks/base/apex/jobscheduler/service/java/com/android/server/job/controllers/JobStatus.java
 
-rg -n "pendingWork|executingWork|JobWorkItem" \
-  frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobStore.java
+sed -n '376,407p' \
+  frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobServiceContext.java
 ```
 
-第一条给出禁止 persisted 的正证据；第二条预期找不到工作队列 XML 序列化路径。
+预期观察：`completeWorkLocked()` 只删除 executing 项；`doCallbackLocked(false, "last work dequeued")` 出现在 dequeue 空且 executing 为空的分支。
 
----
-
-## 97. macOS 只读练习六：核对 CTS 重投
+### 练习 4：证明 URI grant 覆盖 pending 阶段
 
 ```bash
-sed -n '305,412p' \
-  cts/tests/JobSchedulerSharedUid/src/android/jobscheduler/cts/shareduidtests/EnqueueJobWorkTest.java
+rg -n "enqueueWorkLocked|createFromIntent|ungrantWorkItem|revoke" \
+  frameworks/base/apex/jobscheduler/service/java/com/android/server/job
+
+rg -n "testEnqueueMultipleUriGrantWork" \
+  cts/tests/JobSchedulerSharedUid/src/android/jobscheduler/cts/shareduidtests
 ```
 
-分别解释串行与并行用例中哪些项第二次是 delivery=2，为什么新追加项仍是1。
+预期观察：grant 在 `pendingWork.add()` 前建立；complete 或最终清理才撤销。CTS 会在 Job 尚未执行时验证 grant 仍存在。
 
----
-
-## 98. macOS 只读练习七：检查网络估算注释漂移
+### 练习 5：找出网络估算边界
 
 ```bash
-sed -n '876,902p' \
+sed -n '876,910p' \
   frameworks/base/apex/jobscheduler/service/java/com/android/server/job/controllers/JobStatus.java
 ```
 
-手算：基础download=100，pending W1=50、W2=UNKNOWN 时，r48 实际结果为何是150，而不是注释暗示的 UNKNOWN。
+问题：循环遍历 pending、executing，还是两者？
 
----
+答案：只遍历 pending。由此可知 r48 汇总值不包含已领取但未 complete 的 WorkItem 估算。
 
-## 99. 阅读检查题
+### 练习 6：区分追加与替换
 
-1. JobInfo 与 JobWorkItem 分别承载什么？
-2. WorkItem Intent 会自动启动组件吗？
-3. enqueue 与 dequeue 为什么会产生两次跨 Binder 副本？
-4. 哪些字段会写入 Parcel，哪个内部字段不会？
-5. workId 何时分配，从几开始？
-6. deliveryCount 何时增加？
-7. pending 与 executing 的不变量是什么？
-8. 为什么 complete 可以乱序？
-9. 两类非法 complete 分别抛什么？
-10. 为什么 complete 最后一项不自动结束？
-11. dequeue null 在什么条件下自动完成？
-12. 为什么 work 模式不应主动 jobFinished？
-13. failure retry 怎样组合 executing 与 pending？
-14. onStopJob false 如何处理剩余工作和授权？
-15. cancel 与 retry 有何区别？
-16. JobInfo.equals 为什么影响当前 Service 是否被打断？
-17. extras/ClipData 为什么容易触发 replacement？
-18. URI grant 何时建立、何时逐项撤销？
-19. App 崩溃后为什么能重投？
-20. system_server 重启后为什么不能恢复？
-21. r48 网络估算为何不代表全部未完成工作？
-22. delivery=2 为什么要求业务幂等？
-
----
-
-## 100. 一页复习图
-
-```mermaid
-flowchart TB
-    API["App enqueue(JobInfo, WorkItem)"] --> IPC["IJobScheduler：Parcel副本"]
-    IPC --> CHECK["JSS校验：拒绝persisted/null"]
-    CHECK --> ID["分配workId + enqueue时URI grant"]
-    ID --> P["pendingWork FIFO"]
-    P --> D["dequeue：移到executing，delivery++"]
-    D --> APP["应用处理；需业务幂等"]
-    APP --> C["complete(workId)：删除 + revoke"]
-    C --> AGAIN["再次dequeue"]
-    AGAIN -->|"两表空"| FIN["自动完成Job"]
-    D -->|"stop/crash且有效retry"| RED["executing在前 + pending在后，重投"]
-    D -->|"cancel/false"| DROP["撤销全部grant并清队列"]
-    RED --> P
+```bash
+sed -n '1070,1122p' \
+  frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java
 ```
 
----
-
-## 101. 本章结论
-
-JobWorkItem 可以压缩为十八点：
-
-1. JobInfo 决定服务和约束，WorkItem Intent 只是每项数据；
-2. enqueue 与 dequeue 各发生一次 Parcel，应用原始对象不是服务端队列对象；
-3. Parcel 包含 Intent、估算、deliveryCount、workId，不包含 grants；
-4. workId 从1递增，是系统内部确认键；
-5. pending 是未领取，executing 是已领取未确认；
-6. pending FIFO，但 complete 可乱序；
-7. deliveryCount 只在 dequeue 时增加，首次交付为1；
-8. complete 按 workId 删除 executing 项并撤销单项 grant；
-9. complete 最后一项不会结束，必须再 dequeue；
-10. pending 与 executing 同时空才由 JSC 自动完成；
-11. work 模式主动 jobFinished 可能与并发 enqueue 竞态而丢工作；
-12. failure retry 把旧 executing 放前、旧 pending 放后，已确认项不复活；
-13. onStop false/cancel 会清剩余队列和授权；
-14. JobInfo 相同才快速追加，不同会 replacement 并打断旧运行；
-15. URI grant 在 enqueue 时按 WorkItem 独立建立，complete 时逐项撤销；
-16. 队列可跨 App 崩溃，但禁止 persisted、不能跨 system_server/设备重启；
-17. r48 网络估算只累计基础值与 pending 已知项，不是完整剩余流量；
-18. 未确认项可能重复投递，端到端副作用必须由业务幂等。
-
-最值得带走的一句话：
-
-> JobWorkItem 是 system_server 内存中的“带领取回执工作单”：dequeue 只是签出，complete 才是确认；没有确认就可能重投，因此框架保住的是队列协议，不替业务实现 exactly-once。
+预期观察：只有 `old.getJob().equals(job)` 才直接 `enqueueWorkLocked()`；否则创建新 JobStatus，并通过 replacement 路径迁移旧 work。
 
 ---
 
-## 102. 生成后复读：容易误解处的修订
+## 阅读检查题与答案
 
-初稿完成后，对照公开 API、JobWorkItem Parcel、JSS 入队/替换、JobStatus 双队列、JSC 回调、URI grant、JobStore、CTS 与 ApiDemos 反向复读，重点修订：
+### 1. W2 已 dequeue，但没 complete。它在哪张表？
 
-1. 先把 WorkItem Intent 限定为数据载体，不写成系统自动分发指令；
-2. 拆开应用原对象、system_server队列对象和dequeue返回对象三份副本；
-3. 明确隐藏 workId 才是 complete 键，action/extras 不是；
-4. 修正首次 deliveryCount 为1，不把对象初始0当成交付值；
-5. 建立 pending/ executing/complete 三阶段，不把领取当确认；
-6. 补出 complete 最后一项不结束、必须再次 dequeue 的竞态原因；
-7. 分开 stale token 的 SecurityException 与找不到 workId 的 IllegalArgumentException；
-8. 用 A/B/C/D 重算 executing在前、pending在后的重投顺序；
-9. 限定 retry 还需 reschedule=true 且旧 Job 仍在 Store；
-10. 拆开相同 JobInfo 快速追加与不同 JobInfo replacement；
-11. 记录 extras比较风险与JobInfo ClipData总被视为变化的API警告；
-12. 把 grant 精确放到 enqueue 时，并按每项permission owner解释逐项撤销；
-13. 以 CTS storage-low 用例证明 grant 在 pending 阶段已存在；
-14. 用入口拒绝persisted、JobStore不写队列、持久化copy不复制work三层证据证明不跨重启；
-15. 区分 App 进程死亡与 system_server 死亡的权威状态差异；
-16. 依据 r48 实现修正网络估算注释：只累计 pending，unknown work 可被跳过；
-17. 将官方 AsyncTask 示例限定为协议参考，不建议机械复制线程工具；
-18. 将全部练习限定为 macOS 上的 `sed`/`rg` 只读分析，不要求编译或设备。
+在 `executingWork`。dequeue 表示已交付，不表示已完成。
 
-下一章进入 Job 完成后的失败 backoff 与周期重排：比较 linear/exponential、最小/最大钳位、failure count、周期窗口追赶与时钟异常边界，并继续追 Controller 状态怎样迁移。
+### 2. W2 上传成功后进程崩溃，为什么可能再收到 W2？
+
+因为 system_server 只知道没有收到 complete 回执，无法知道远端副作用已经成功。可重试停止会把 executing 项迁回新 pending。
+
+### 3. 为什么完成 W3 后还要再调用 dequeueWork？
+
+因为 complete 只移除 W3；final dequeue 才在服务端原子检查 pending 和 executing 都为空，并结束 Job，也能接住并发追加的新工作。
+
+### 4. 为什么不能保存 enqueue 时的 JobWorkItem，稍后用它 complete？
+
+Binder 入参在 system_server 是另一个对象副本，系统只在服务端副本上分配 workId。应使用 dequeue 返回的对象。
+
+### 5. 设备重启后，WorkItem 为什么不能像 persisted Job 那样恢复？
+
+r48 明确禁止给 enqueue Job 设置 persisted；两张工作表只有内存状态，没有写入 JobStore XML 的恢复协议。
+
+### 6. URI 权限是在何时建立和撤销的？
+
+带读/写 grant flag 的 Intent 在 enqueue 时建立逐项授权；complete 撤销该项授权；取消或不重试时批量撤销剩余项；重试迁移时保持授权。
+
+### 7. `deliveryCount=2` 能证明业务执行了两次吗？
+
+不能。它只证明框架交付了两次。第一次可能尚未开始业务、执行到一半，或已经成功但来不及 complete。
+
+---
+
+## 本章 takeaway
+
+以后看到 WorkItem 队列问题，先写出这条链：
+
+```text
+enqueue
+  → pending
+  → dequeue：pending → executing，deliveryCount++
+  → 业务幂等提交
+  → complete：删除 executing，撤销该项 URI grant
+  → final dequeue：两张表都空，整个 Job 才结束
+```
+
+再用三个问题定位故障：
+
+1. 工作现在属于 pending、executing，还是已经 complete？
+2. 这次停止是否真的生成了 `needsReschedule=true` 的新 JobStatus？
+3. 即使框架正确重投，业务是否用持久化状态和幂等键处理了重复？
+
+只要能回答这三问，就不会再把“领取”“业务完成”“框架确认”和“整个 Job 结束”混成同一件事。
+
+下一章将沿着失败结束继续追踪：第 134 章分析 Job 的 backoff 计算，以及周期 Job 下一执行窗口怎样重排。

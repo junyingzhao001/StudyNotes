@@ -1,883 +1,606 @@
-# 97 Android system_server 线程模型：主 Looper、Binder 线程池、ServiceThread 与 Watchdog
+# 97 Android system_server 线程模型：从一个锁死等到 Watchdog
 
-> 源码版本：Android 11（`android-11.0.0_r48`）  
-> 本章目标：看到任意 system_server 代码时，能判断它实际运行在主线程、Binder 线程、共享 ServiceThread、专用 HandlerThread 还是调用者线程，并能解释消息积压、Binder 线程耗尽、锁等待和 Watchdog 的关系。
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`
+> 本章只做源码静态学习，不伪造设备实测数据
 
----
+想象一个故障：App 同步调用 system_server 里的某个服务。服务的 Binder 线程拿着 `mLock`，向 system_server 主 Handler 投了一个任务，然后等它完成；主线程执行该任务时又要取 `mLock`。
 
-## 1. system_server 不是“一个主线程运行所有服务”
+结果不只是“一个 API 慢”：
 
-许多 Framework 服务都在同一个 system_server 进程，但代码可能运行在完全不同的线程：
+- App 调用线程等 Binder reply；
+- system_server Binder 线程等主线程；
+- system_server 主线程等 Binder 线程手里的锁；
+- 其他依赖主 Looper 或同一 Binder 线程池的服务也可能陆续失去响应；
+- Watchdog 最后报告的可能是“main thread blocked”，但根因是跨线程等待环。
 
-```text
-system_server process
- ├─ main                 SystemServer 主 Looper、部分生命周期
- ├─ Binder:xxxxx_*       Binder 入站事务线程池
- ├─ android.fg           共享前台 ServiceThread
- ├─ android.ui           系统服务 UI 线程
- ├─ android.io           较短 I/O/daemon 通信
- ├─ android.display      显示关键操作
- ├─ android.anim         窗口动画
- ├─ android.anim.lf      Surface animation（真实路径在 WM 包）
- ├─ android.bg           共享后台线程
- ├─ 各服务 HandlerThread 专用线程
- └─ watchdog             监督线程
-```
+**先给结论：system_server 是一个进程，但不是一条执行队列。** 跨进程 Binder 入口默认在 Binder 线程池执行；只有服务显式 `post` 后，后续工作才转到主 Looper、`FgThread` 或专用 Handler 线程。Watchdog 检查的是特定线程与 monitor 能否前进，它不会直接告诉你等待环的第一条边是谁写的。
 
-“这段代码属于 PowerManagerService”不能回答线程问题。线程由**入口和是否 post**决定。
+读完后，你应该能：
 
----
+1. 看一个 system_server 方法时，不靠类名猜线程，而是追入口与 `Handler` 来源；
+2. 画出“谁持锁、谁等谁”，区分消息积压、Binder 线程池饥饿和锁死；
+3. 解释 Watchdog 的 Handler checker、monitor、半超时与全超时分别证明什么；
+4. 看到“Watchdog 报 main”时，继续沿锁主人和 Binder 目标找真正根因。
 
-## 2. 本章最重要的追踪规则
+本章不把 system_server 所有线程列成百科。只保留理解这个等待环必需的主线程、Binder 池、Handler 线程和 Watchdog。App ANR 的超时规则、内核 Binder 完整调度以及进程重启后的恢复顺序不在本章展开。
 
-```text
-普通 Java 调用：继续在调用者线程
-Handler.post/sendMessage：切到该 Handler 绑定的 Looper 线程
-跨进程同步 Binder：服务端在 Binder 线程执行，客户端等待
-oneway Binder：客户端不等 reply，服务端仍在 Binder 线程池排队执行
-LocalServices：普通同进程 Java 直调，不自动切线程
-Executor.execute：切到该 Executor 实际后端
-```
+## 1. 先把故障画成等待环，不要先怪“主线程慢”
 
-不要根据方法名中的 `async`、`Internal`、`Service` 猜线程，要追对象来源。
-
----
-
-## 3. 源码地图
-
-```text
-frameworks/base/services/java/com/android/server/SystemServer.java
-frameworks/base/services/core/java/com/android/server/ServiceThread.java
-frameworks/base/services/core/java/com/android/server/FgThread.java
-frameworks/base/services/core/java/com/android/server/UiThread.java
-frameworks/base/services/core/java/com/android/server/IoThread.java
-frameworks/base/services/core/java/com/android/server/DisplayThread.java
-frameworks/base/services/core/java/com/android/server/AnimationThread.java
-frameworks/base/services/core/java/com/android/server/Watchdog.java
-frameworks/base/core/java/com/android/internal/os/BackgroundThread.java
-frameworks/base/core/java/android/os/HandlerThread.java
-frameworks/base/core/java/android/os/Looper.java
-frameworks/base/core/java/android/os/MessageQueue.java
-frameworks/base/core/jni/android_util_Binder.cpp
-frameworks/native/libs/binder/ProcessState.cpp
-```
-
-SurfaceAnimationThread 位于 WindowManager 源码目录，不要只在 `com/android/server/` 根目录寻找。
-
----
-
-## 4. system_server 主线程如何成为 Looper 线程
-
-SystemServer 早期：
+下面是故障模型伪代码，**不是 AOSP 某个服务的原文**：
 
 ```java
-Process.setThreadPriority(Process.THREAD_PRIORITY_FOREGROUND);
-Process.setCanSelfBackground(false);
-Looper.prepareMainLooper();
-```
-
-完成同步服务启动后：
-
-```java
-Looper.loop();
-throw new RuntimeException("Main thread loop unexpectedly exited");
-```
-
-因此主线程有两个时期：
-
-```text
-早期：直接执行 SystemServer.run/startXxxServices 串行启动代码
-后期：进入 Looper.loop，处理发给 main Handler 的消息
-```
-
-早期慢代码不一定表现为“某条 Looper 消息 dispatch 慢”，因为当时还未进入 loop。
-
----
-
-## 5. 主线程负责什么
-
-常见工作：
-
-- SystemService 构造、`onStart()`、BootPhase 分发的调用线程；
-- 一些服务把 Handler 绑定到 `Looper.getMainLooper()`；
-- system_server Application/Context 相关回调；
-- 部分 AMS/系统生命周期消息；
-- Watchdog main-thread checker 的探针。
-
-但 Binder 客户端调用系统服务通常不会先自动转到 main。AIDL Stub 的 `onTransact()` 默认在 Binder 线程。
-
----
-
-## 6. Looper、MessageQueue、Handler 的关系
-
-```text
-Thread
-  └─ Looper（一个线程最多一个）
-       └─ MessageQueue（时间排序的消息队列）
-            ↑
-         Handler（投递与分发入口，可有多个）
-```
-
-Handler 构造时绑定某个 Looper：
-
-```java
-Handler h = new Handler(looper);
-h.post(runnable);
-```
-
-Runnable 并不是“开启一个新线程”，而是在 looper 所在线程排队。
-
-多个服务共享一个 HandlerThread 时，它们的消息共享同一条串行队列；一个慢消息会推迟后面的其他服务消息。
-
----
-
-## 7. dispatch 慢与 delivery 慢
-
-Android 11 system_server 主 Looper、FgThread、UiThread 等设置慢日志阈值。
-
-```text
-delivery latency：消息应该执行到真正开始执行的等待时间
-dispatch duration：真正开始执行到处理结束的时间
-```
-
-例子：
-
-```text
-消息 A 执行 500ms
-消息 B 在 A 后面，自己只执行 2ms
-```
-
-- A 是 slow dispatch。
-- B 可能是 slow delivery。
-
-因此看到 delivery 慢，不应立即优化 B 的处理代码；真正阻塞者可能是它前面的消息、同步屏障或线程调度。
-
----
-
-## 8. Binder 线程池是什么
-
-客户端跨进程调用 system_server 服务时：
-
-```text
-client thread
-  → Binder driver
-  → system_server Binder thread pool 中某线程
-  → Stub.onTransact
-  → 服务 BinderService 方法
-```
-
-Binder 线程池不是 Java `ExecutorService`，由 Binder 驱动与 libbinder/Java Binder 运行时协作按需管理。
-
-SystemServer 设置：
-
-```java
-private static final int sMaxBinderThreads = 31;
-BinderInternal.setMaxThreads(sMaxBinderThreads);
-```
-
-Android 11 libbinder 一般默认最大值为 15，而 system_server 主动提高为 31，因为它承载大量系统服务。这里是允许驱动请求生成的额外线程上限语义，不能简单当作进程启动时立即创建 31 个常驻 Java 线程。
-
----
-
-## 9. 为什么禁用 Binder 后台调度继承
-
-SystemServer：
-
-```java
-BinderInternal.disableBackgroundScheduling(true);
-```
-
-注释意图是让进入 system_server 的 Binder 调用以重要前台调度处理，避免调用者本身是后台优先级时把服务端关键 Binder 处理线程也压低。
-
-它不代表所有 system_server 工作都以最高实时优先级运行，也不绕过明确的线程 priority/group 设置。
-
-服务若把后续重活 post 到 BackgroundThread，该工作仍采用后台线程自己的调度属性。
-
----
-
-## 10. Binder 入站方法为何不应做重活
-
-如果每个 Binder 方法都阻塞：
-
-```text
-Binder thread 1：等磁盘
-Binder thread 2：等 HAL
-Binder thread 3：等大锁
-...
-Binder thread 31：等另一个进程
-```
-
-新的 IPC 无线程可处理，其他无关系统服务也会受影响，因为它们共享 system_server Binder 线程资源。
-
-常见设计：
-
-1. Binder 线程做参数、权限、calling UID 校验。
-2. 在锁内快速更新状态或复制请求。
-3. post 到专用 Handler 执行串行状态机。
-4. 若 API 必须同步返回，再用受控等待或同步路径，但要审查死锁。
-
-“一律 post”也不正确；同步 API 的返回语义和 ordering 必须保留。
-
----
-
-## 11. Binder 线程池耗尽与高 CPU 不同
-
-池耗尽通常是线程都被占用，可能 CPU 很低：
-
-- 等锁；
-- 等同步 Binder reply；
-- 等条件变量/latch；
-- 阻塞 I/O；
-- sleep；
-- 调用可能反向回 system_server 的外部进程。
-
-症状：多个客户端卡在 Binder 调用，system_server 中许多 Binder 线程栈停在相似等待点。
-
-不能仅看 CPU 低就排除严重 Binder 饥饿。
-
----
-
-## 12. Watchdog 如何检查 Binder 可用性
-
-Watchdog 添加：
-
-```java
-addMonitor(new BinderThreadMonitor());
-```
-
-其 monitor：
-
-```java
-Binder.blockUntilThreadAvailable();
-```
-
-它会等待 Binder 线程可用于处理新入站 IPC，从而检测 system_server 是否仍具备对外响应能力。
-
-这不是统计“31 个线程中用了几个”的监控面板，也不是每个 Binder 调用的超时器。它被 Watchdog 监控链执行；若长时间无法返回，最终表现为 Watchdog 阻塞证据。
-
----
-
-## 13. ServiceThread 在 HandlerThread 上增加了什么
-
-```java
-public class ServiceThread extends HandlerThread {
-    private final boolean mAllowIo;
-
-    public void run() {
-        Process.setCanSelfBackground(false);
-        if (!mAllowIo) {
-            StrictMode.initThreadDefaults(null);
-        }
-        super.run();
+void updateFromBinder(Request request) throws InterruptedException {
+    CountDownLatch done = new CountDownLatch(1);
+    synchronized (mLock) {                 // Binder 线程持锁
+        mMainHandler.post(() -> {
+            try {
+                synchronized (mLock) {     // main 等同一把锁
+                    applyOnMain(request);
+                }
+            } finally {
+                done.countDown();
+            }
+        });
+        done.await();                      // 持锁等 main
     }
 }
 ```
 
-它仍是一个带 Looper 的 HandlerThread，但增加两项 system_server 约束：
-
-- 不允许线程因通用机制自行变成后台调度；
-- `allowIo=false` 时安装 StrictMode 线程默认策略，帮助发现不应发生的磁盘/网络 I/O。
-
-`allowIo=false` 不是内核级绝对禁止 I/O，而是通过 StrictMode 发现违规；具体惩罚取决于策略/build。
-
----
-
-## 14. FgThread
-
-```java
-super("android.fg", THREAD_PRIORITY_DEFAULT, true);
-```
-
-用途：常规前台系统服务操作，不能被共享 BackgroundThread 的长时间保存状态工作拖延。
-
-特征：
-
-- 惰性单例；
-- 默认线程优先级；
-- 允许 I/O；
-- Looper 使用 system_server trace tag；
-- slow dispatch 100ms、slow delivery 200ms；
-- 暴露 Handler 与 HandlerExecutor。
-
-“Fg”表示相对重要和及时，不意味着可以放无限重活。
-
----
-
-## 15. UiThread
-
-```java
-super("android.ui", THREAD_PRIORITY_FOREGROUND, false);
-```
-
-并把线程放入 top-app 调度组，用于 system_server 自己显示的 UI，如系统对话框、部分 Autofill UI 等。
-
-它要求操作只需几毫秒，避免系统 UI 卡顿；不允许 I/O，并有 100/200ms 慢日志。
-
-它不是应用进程的 Android main/UI thread。只是 system_server 中专门服务 UI 操作的线程。
-
----
-
-## 16. IoThread
-
-```java
-super("android.io", THREAD_PRIORITY_DEFAULT, true);
-```
-
-用于可能短暂阻塞的非后台服务 I/O，尤其与网络 daemon 通信。它允许 I/O，但名称不表示可以把任意无限期磁盘扫描、网络下载都堆进去。
-
-共享队列意味着一个服务的长 I/O 会影响 BluetoothManager、EntropyMixer 等其他使用者。长且独立的工作更适合专用线程/Executor。
-
----
-
-## 17. DisplayThread 与 AnimationThread
-
-DisplayThread：
-
-- `android.display`；
-- `THREAD_PRIORITY_DISPLAY + 1`；
-- 不允许 I/O；
-- WMS、DMS、InputManager 的低延迟显示操作。
-
-AnimationThread：
-
-- `android.anim`；
-- `THREAD_PRIORITY_DISPLAY`；
-- 不允许 I/O；
-- 传统窗口动画、starting window、traversal 相关工作。
-
-AnimationThread 比 DisplayThread 高一个优先级等级（数值更小/更重要），因为动画时序更敏感。
-
-这些线程不等于 RenderThread、SurfaceFlinger 主线程或应用 Choreographer 线程。
-
----
-
-## 18. SurfaceAnimationThread
-
-用于 SurfaceControl 层面的动画工作，与传统 AnimationThread 分开，减少一类动画阻塞另一类。
-
-它被 Watchdog 单独检查，说明它对系统视觉响应很关键。
-
-读源码时注意真实包路径通常在：
+这段代码的问题不在 `CountDownLatch` 这个类，而在“等待时仍持有对方必须取得的锁”。把关系改写成等待图：
 
 ```text
-frameworks/base/services/core/java/com/android/server/wm/SurfaceAnimationThread.java
+App 调用线程
+  │ 等同步 Binder reply
+  ▼
+system_server Binder 线程
+  │ 持有 mLock，等 done
+  ▼
+system_server main
+  │ 等 mLock
+  └────────────────┘
 ```
 
-类 package 仍可被 `com.android.server.Watchdog` 引用，但文件不一定和 FgThread 同目录。
+`done.countDown()` 在 main 取到 `mLock` 之后才能执行；`mLock` 只有 Binder 线程结束 `done.await()` 后才能释放。两个条件互相要求对方先完成，所以这是逻辑死锁，不是调高线程优先级就能解决的调度慢。
 
----
+为什么要先画图？因为 Watchdog 最容易观察到的是 main 无法处理探针，而 main 只是等待环中的一个受害者。如果只修“main 这一行拿锁太慢”，却保留 Binder 线程持锁同步等 Handler 的设计，环仍然存在。
 
-## 19. BackgroundThread 为什么不被 Watchdog 默认检查
+## 2. 方法属于哪个服务，不能告诉你它运行在哪个线程
 
-Watchdog 注释明确：BackgroundThread 可能执行较长任务，对及时性没有同等保证，所以没有加入默认 HandlerChecker。
+system_server 把很多 Java 服务装在同一进程，但执行位置由“怎样进入”决定：
 
-这不代表：
+| 入口/转移 | 默认执行位置 | 是否自动切线程 |
+|---|---|---|
+| 其他进程调用 Java Binder Stub | system_server Binder 线程 | 已由 Binder 跨到服务端线程，但不会再自动转 main |
+| `handler.post(runnable)` | handler 绑定的 Looper 线程 | 是，到已存在的目标线程 |
+| system_server 内普通 Java/LocalServices 直调 | 调用者当前线程 | 否 |
+| `executor.execute(runnable)` | executor 真实后端 | 取决于 executor |
+| 同步 Binder 向外调用 | 发起线程等 reply | 对端线程另算，本线程不消失 |
 
-- 后台线程永远不会影响系统；
-- 可以无限阻塞；
-- 持有的锁不会挡住关键线程；
-- 任务丢失无需处理。
+因此读任意方法时，先回答四个问题：
 
-若 BackgroundThread 持有主线程所需锁，主线程仍会被 Watchdog 检测为卡死。Watchdog 关注的是关键线程能否前进，不是给每个线程设统一 SLA。
+1. 它是 Binder Stub 入口、Handler callback，还是普通 Java 直调？
+2. 若有 Handler，它构造时使用的 `Looper` 来自哪里？
+3. 该方法在 `post` 前做了什么，`post` 后又是谁继续执行？
+4. 有没有持锁跨过等待、Binder 调用或线程转移？
 
----
+一个服务完全可以同时出现三种路径：Binder 线程负责入口检查，主 Handler 负责一部分串行状态，专用 `ServiceThread` 负责另一部分工作。“它是 PowerManagerService 的方法”仍然不是线程结论。
 
-## 20. 共享线程还是专用线程
+`oneway` 也不是“在后台 Handler 执行”的注解。它只让客户端不同步等 reply；服务端 Stub 仍由 Binder 线程取出事务。若服务想转到 Handler，仍需自己 `post`。
 
-选择共享线程的优点：
+## 3. SystemServer 主线程有两个阶段：先直接启动，再进入 Looper
 
-- 少创建线程，节省内存；
-- 生命周期统一；
-- 方便 Watchdog/trace；
-- 同类任务天然串行。
-
-风险：
-
-- 一个服务阻塞同队列所有消费者；
-- 隐式耦合难发现；
-- 消息积压归因困难。
-
-专用线程适合：
-
-- 独立长状态机；
-- 可阻塞 I/O；
-- 特定优先级；
-- 与共享队列隔离故障。
-
-但线程过多会增加内存、调度和维护成本。应按延迟、阻塞性、隔离和串行状态需求选择。
-
----
-
-## 21. Handler 不自动提供线程安全
-
-把所有状态只在同一个 Handler 线程访问，可以形成 thread confinement；但 Binder 方法如果在入站线程直接读写相同字段，就打破了这个假设。
-
-常见模式：
-
-```text
-Binder thread：权限检查 → post message
-Handler thread：唯一修改核心状态
-Binder thread：同步 getter 可能加锁读快照
-```
-
-必须明确：
-
-- 哪些字段只属于 Handler；
-- 哪些字段由 lock 保护；
-- callback 是否在锁外发出；
-- dump 是否可能并发读状态。
-
-“我们有 Handler”不等于类天然线程安全。
-
----
-
-## 22. 同步 Handler 跳转的风险
-
-`runWithScissors()`、latch、Future 可让当前线程等待目标 Handler 完成：
-
-```text
-Binder thread → post to main → wait
-main → 处理 runnable → signal
-```
-
-若 main 同时等待这个 Binder transaction 返回，就形成死锁。
-
-```text
-main --sync Binder--> Binder thread
-Binder thread --post+wait--> main
-```
-
-所以同步跨线程执行必须审查调用来源；普通异步 `post` 更安全，但不能满足所有同步返回 API。
-
----
-
-## 23. 锁内 Binder 调用是系统级高风险模式
+SystemServer 早期把当前线程准备成主 Looper 线程：
 
 ```java
-synchronized (mLock) {
-    remote.callback();
+BinderInternal.disableBackgroundScheduling(true);
+BinderInternal.setMaxThreads(sMaxBinderThreads);
+
+Process.setThreadPriority(Process.THREAD_PRIORITY_FOREGROUND);
+Process.setCanSelfBackground(false);
+Looper.prepareMainLooper();
+Looper.getMainLooper().setSlowLogThresholdMs(
+        SLOW_DISPATCH_THRESHOLD_MS,
+        SLOW_DELIVERY_THRESHOLD_MS);
+```
+
+源码：`frameworks/base/services/java/com/android/server/SystemServer.java`，`run()`。Binder 配置与 Looper 准备在同一段早期初始化中，但它们建立的是两套执行机制。
+
+然后 `run()` 直接调用三组服务启动方法：
+
+```java
+startBootstrapServices(t);
+startCoreServices(t);
+startOtherServices(t);
+
+// 前面的同步启动返回后
+Looper.loop();
+throw new RuntimeException(
+        "Main thread loop unexpectedly exited");
+```
+
+这证明主线程有两个阶段：
+
+```text
+阶段 A：Looper 已 prepare，但主线程仍在直接执行启动代码
+阶段 B：启动主线返回，进入 Looper.loop() 消费 MessageQueue
+```
+
+因此，早期 `SystemService.onStart()` 卡住时，不一定能在栈上看到 `Looper.loop()`；它可能正卡在 `startBootstrapServices()` 的直接调用链。系统运行起来后，投到 main Handler 的任务才由同一条主线程在 Looper 中串行处理。
+
+Watchdog 也不是等所有服务完全启动才出现。r48 在 `startBootstrapServices()` 开头就调用：
+
+```java
+final Watchdog watchdog = Watchdog.getInstance();
+watchdog.start();
+```
+
+此时 main Looper 已 prepare，但 `SystemServer.run()` 还没走到最后的 `Looper.loop()`。这让 Watchdog 能覆盖早期启动死锁；同时也解释了为什么 r48 对某些已知的长启动操作提供成对的 pause/resume Watchdog 机制。pause 是精确的例外，不是遮住普通死锁的办法。
+
+## 4. Binder 线程池是入口，不是通往主线程的中转站
+
+App 跨进程调用 system_server 的 Java Binder 对象时，驱动把事务交给 system_server 的 Binder looper 线程。Java Binder 入口最终在这条线程上调 `onTransact()`：
+
+```java
+private boolean execTransactInternal(int code,
+        long dataObj, long replyObj, int flags, int callingUid) {
+    Parcel data = Parcel.obtain(dataObj);
+    Parcel reply = Parcel.obtain(replyObj);
+    boolean res;
+    try {
+        res = onTransact(code, data, reply, flags);
+    } finally {
+        // 省略 Parcel 回收与观测逻辑
+    }
+    return res;
 }
 ```
 
-远端可能：
+源码：`frameworks/base/core/java/android/os/Binder.java`。这是按 r48 调用方向缩减的片段，省略了 AppOps、trace、异常写 reply 和大 Parcel 检查。关键是：`onTransact()` 直接在当前入站线程执行，中间没有隐藏的 `mainHandler.post()`。
 
-- 很慢；
-- 死亡；
-- 反向调用本服务并再次请求 `mLock`；
-- 调用另一个等待本服务的系统组件。
-
-优先做法：锁内复制必要数据/目标 callback，锁外执行 Binder 调用，再在需要时锁内提交结果并校验 generation。
-
-不是所有锁都能机械移除；关键是缩短持锁区并固定全局锁顺序。
-
----
-
-## 24. calling identity 与线程切换
-
-Binder 入站线程可取得真实：
+Android 11 r48 还为 system_server 设置：
 
 ```java
-Binder.getCallingUid()
-Binder.getCallingPid()
+private static final int sMaxBinderThreads = 31;
+
+BinderInternal.setMaxThreads(sMaxBinderThreads);
 ```
 
-如果 Binder 方法 post Runnable 到 Handler 后再在 Handler 线程调用 `getCallingUid()`，通常看到的是 system_server 自己，因为原事务调用上下文没有随普通 Runnable 自动传播。
+JNI 再调用 `ProcessState::setThreadPoolMaxThreadCount(31)`，通过 `BINDER_SET_MAX_THREADS` 配置驱动，调用成功时更新 libbinder 中的 `mMaxThreads`。r48 libbinder 的普通默认值是 15，system_server 主动把配置提到 31。
 
-正确模式：
+同一段早期代码还调用 `disableBackgroundScheduling(true)`。r48 的 SystemServer 注释把目的写成让进入 system_server 的 Binder 调用按前台优先级处理；在 libbinder 中，它关闭了向本地 Binder 对象附加后台调度默认值的行为。它不会把 Binder 方法切到 main，也不能解决逻辑锁死。
+
+但“31”不应解读成：
+
+- 进程启动时已预创建 31 条 Java 线程；
+- 任意时刻 `ps` 都必须精确看到 31 条；
+- 只要还没到 31，就不可能发生锁死；
+- 每个系统服务都有自己的 31 条线程。
+
+这是 system_server 进程 Binder 池的配置上限语义，线程池会按需参与入站处理，还存在显式加入线程池等实现细节。排障时应以实际 tid 和栈为准，不用常量推导现场线程数。
+
+更重要的是，这个池被同一进程中大量 Binder 服务共享。本场景最初只占住一条 Binder 线程；若后续客户端调用也进入同一把锁或同一等待条件，更多 Binder 线程才会堆积。当池中可用执行能力被耗尽时，原本与该服务无关的入站 IPC 也会被拖累。
+
+Binder 线程池饥饿并不等于 CPU 一定很高。线程可能全在等锁、等条件变量、等磁盘/HAL，或等另一个同步 Binder reply。“CPU 很低”只能说没有大量运算，不能排除系统已无法处理新 IPC。
+
+## 5. Handler 是显式的线程切换，ServiceThread 则是可控的 Looper 载体
+
+`Handler.post()` 不会为每个 Runnable 新建线程。它把任务放进 Handler 绑定 Looper 的 `MessageQueue`，由那条已存在的线程串行取出。
+
+所以本场景的 `mMainHandler.post(...)` 产生了一个非常具体的切换点：
+
+```text
+post 前：system_server Binder 线程
+post 本身：只是入队，不是 Runnable 已执行
+dispatch 时：system_server main
+```
+
+服务不想占 main 时，可以使用 system_server 共享线程，或创建服务专用线程。Android 11 的 `ServiceThread` 是面向系统服务的 `HandlerThread` 扩展：
 
 ```java
-int uid = Binder.getCallingUid();
-String packageName = ...校验...;
-mHandler.post(() -> handle(uid, packageName));
+public void run() {
+    Process.setCanSelfBackground(false);
+    if (!mAllowIo) {
+        StrictMode.initThreadDefaults(null);
+    }
+    super.run();
+}
 ```
 
-或者在入站线程完成权限校验后，显式传递可信结果。
+源码：`frameworks/base/services/core/java/com/android/server/ServiceThread.java`。
 
-`clearCallingIdentity()` 也只作用于当前 Binder 调用线程的身份上下文，必须 `finally restoreCallingIdentity(token)`。
+`allowIo=false` 表示在该线程安装 StrictMode 默认策略以暴露不合适的 I/O，不是内核从此禁止它读写文件。`setCanSelfBackground(false)` 也是线程调度约束，不是死锁解决器。
 
----
+`FgThread` 是一个共享 `ServiceThread`：
 
-## 25. oneway 不是后台线程注解
+```java
+private FgThread() {
+    super("android.fg", Process.THREAD_PRIORITY_DEFAULT,
+            true /* allowIo */);
+}
 
-oneway AIDL 的含义：客户端事务提交后不等待 reply，且同一 Binder node 的异步事务有顺序/排队语义。
+private static void ensureThreadLocked() {
+    if (sInstance == null) {
+        sInstance = new FgThread();
+        sInstance.start();
+        sHandler = new Handler(sInstance.getLooper());
+    }
+}
+```
 
-服务端仍由 Binder 线程池取出并执行。如果 oneway 方法耗时：
+源码：`frameworks/base/services/core/java/com/android/server/FgThread.java`，片段省略 trace tag、slow log 阈值和 executor 创建。
 
-- 消耗 Binder 线程；
-- 异步队列可能积压；
-- 客户端感知不到同步异常；
-- 新状态到达延迟。
+要记住的不是每条共享线程的优先级数字，而是三种隔离程度：
 
-服务端可再 post 到 Handler，但要注意 Binder oneway 顺序与 Handler 中其他来源消息的相对顺序。
+| 选择 | 主要优点 | 主要风险 |
+|---|---|---|
+| system_server main | 与主状态/生命周期串行 | 一次阻塞拖住大量 main 任务 |
+| `FgThread` 等共享线程 | 复用线程，与 main 分开 | 一个服务可堆塞共享队列 |
+| 服务专用 `ServiceThread` | 队列和故障隔离更强 | 增加线程、生命周期和监控成本 |
 
----
+无论选哪个 Handler，都不应在持有目标 Runnable 必需的锁时同步等它。把故障从 main 换到专用线程，只是改了等待环里的线程名，不会自动打破环。
 
-## 26. Watchdog HandlerChecker 怎样判断活性
+## 6. 一个局部死锁是怎样扩散成“很多系统服务都异常”的
 
-每个 checker 绑定一个 Handler。周期检查时：
+把贯穿场景按时间排开：
 
-1. 若 Looper 正在 polling 且没有 Monitor，认为线程健康，无需切换。
-2. 否则 `postAtFrontOfQueue(this)`。
-3. 目标线程执行 checker，并依次调用 Monitor。
-4. 执行结束标记 completed。
+```mermaid
+sequenceDiagram
+    participant A as App 调用线程
+    participant B as system_server Binder 线程
+    participant M as system_server main
+    participant W as watchdog
+    A->>B: 同步 Binder update()
+    B->>B: synchronized(mLock)
+    B->>M: post(Runnable)
+    B->>B: 持锁 await(done)
+    M->>M: dispatch Runnable，等 mLock
+    Note over B,M: Binder 等 main；main 等 Binder 持有的锁
+    W->>M: HandlerChecker 探针无法完成
+    W->>W: 半超时采样；全超时进入诊断
+```
 
-状态：
+然后会出现三层扩散：
+
+### 第一层：当前调用无法返回
+
+App 发起的是同步 Binder 事务，因此它等服务端 reply。Binder 驱动没有为所有同步事务统一附加“Watchdog 60 秒超时”；客户端是否最终因 ANR、上层 timeout 或进程死亡结束，是另一层契约。
+
+### 第二层：main 队列不再前进
+
+main 已经开始 dispatch 这个 Runnable，并卡在取锁上。后面的启动阶段、用户生命周期、广播或其他服务投到 main 的工作都不能越过当前 dispatch。`postAtFrontOfQueue()` 也只能放到待处理队列前端，不能抢占已在执行的 Runnable。
+
+### 第三层：Binder 线程可能继续堆积
+
+一条被卡 Binder 线程不等于整个池立即耗尽。但若其他事务也要 `mLock`、要同一主线程结果，或从另一条路径进入同一等待链，占用数才会增长。只有到可用池能力被耗尽时，无关 Binder 服务的新 IPC 才会因共享池而普遍等待。
+
+这也是为什么诊断要分开两个问题：
+
+1. main 是否已因一条具体等待边停止？
+2. Binder 池是否已经饱和，还是只有少量线程受影响？
+
+客户端 App 如果恰好用主线程做这次同步 Binder 调用，它还可能另行触发 App 自己的 input ANR。那是 App 进程的响应性检查；Watchdog 检查的是 system_server 关键线程/锁和 Binder 池是否前进。两者可由同一等待链引发，却不是同一个超时器。
+
+## 7. Watchdog 不是扫描所有线程，而是让指定 checker 和 monitor 证明自己能前进
+
+Android 11 r48 的 Watchdog 有两种检查对象：
+
+| 机制 | 怎样检查 | 本场景能看到什么 |
+|---|---|---|
+| `HandlerChecker` | 让目标 Handler/Looper 执行 checker Runnable | main 卡在 `mLock`，无法回到队列执行探针 |
+| `Monitor` | checker Runnable 在目标线程上调用 `monitor()` | 检查某把关键锁或 Binder 池可用性 |
+
+Handler checker 的调度核心是：
+
+```java
+if ((mMonitors.size() == 0
+        && mHandler.getLooper().getQueue().isPolling())
+        || mPauseCount > 0) {
+    mCompleted = true;
+    return;
+}
+if (!mCompleted) return;
+
+mCompleted = false;
+mCurrentMonitor = null;
+mStartTime = SystemClock.uptimeMillis();
+mHandler.postAtFrontOfQueue(this);
+```
+
+源码：`frameworks/base/services/core/java/com/android/server/Watchdog.java`，`HandlerChecker.scheduleCheckLocked()`。
+
+如果没有 monitor，而目标 Looper 正在 queue polling，这本身就证明线程已处理完先前工作并回到了队列，可以省掉一次探针切换。但有 monitor 时不能跳过：Looper 空闲不能证明 monitor 要取的锁可用。
+
+checker Runnable 真正运行时，会在目标 Handler 的线程上串行调各 monitor：
+
+```java
+for (int i = 0; i < mMonitors.size(); i++) {
+    synchronized (Watchdog.this) {
+        mCurrentMonitor = mMonitors.get(i);
+    }
+    mCurrentMonitor.monitor();
+}
+synchronized (Watchdog.this) {
+    mCompleted = true;
+    mCurrentMonitor = null;
+}
+```
+
+这里的完成点是 `mCompleted = true`：它表示该轮 Handler 探针已运行，且所有 monitor 已返回。它不表示目标服务的所有队列已清空，也不表示所有 Binder 调用都已完成。
+
+r48 默认为 FgThread、main、UI、I/O、display、animation 和 surface-animation 线程建立 checker。这里列出它们是为了界定 Watchdog 范围，不是要背线程百科。
+
+边界是：
+
+- 一个服务新建了专用 HandlerThread，不会因此自动获得 Watchdog checker；
+- 服务要用 `Watchdog.addThread(handler, timeout)` 显式加入关键线程；
+- `addMonitor()` 把 monitor 加到主 monitor checker，该 checker 绑在 FgThread；
+- BackgroundThread 因允许更长工作而没被默认监控，但它持有 main 所需锁时仍可成为根因。
+
+## 8. BinderThreadMonitor 检查的是池可用性，不是每个 Binder 方法的超时
+
+Watchdog 构造时把 `BinderThreadMonitor` 加到 FgThread 上的 monitor checker。它只有一个调用：
+
+```java
+private static final class BinderThreadMonitor
+        implements Watchdog.Monitor {
+    public void monitor() {
+        Binder.blockUntilThreadAvailable();
+    }
+}
+```
+
+Java 方法经 JNI 进入 r48 libbinder。关键条件是：
+
+```cpp
+pthread_mutex_lock(&mProcess->mThreadCountLock);
+while (mProcess->mExecutingThreadsCount
+        >= mProcess->mMaxThreads) {
+    pthread_cond_wait(&mProcess->mThreadCountDecrement,
+            &mProcess->mThreadCountLock);
+}
+pthread_mutex_unlock(&mProcess->mThreadCountLock);
+```
+
+源码：`frameworks/native/libs/binder/IPCThreadState.cpp`，`blockUntilThreadAvailable()`。
+
+因此，Binder monitor 能证明的是：当前 libbinder 记录的执行中线程数是否已达该进程配置上限，以及是否有线程退出执行使它能返回。
+
+它不能单独证明：
+
+- 每一条 Binder 线程都在等同一把锁；
+- 某个具体服务已经死锁；
+- 一条同步 Binder 调用超过 60 秒就会被 Binder 驱动取消；
+- 只卡住一条 Binder 线程时，该 monitor 也一定会卡住。
+
+回到本场景：main checker 可以在只卡住一条 Binder 线程时就超时，因为 main 已经等 `mLock`。只有当更多入站事务堆积到 libbinder 判定池已无可用执行余量时，`BinderThreadMonitor` 才会在 FgThread 上阻塞。这时 Watchdog 可能同时报 main handler 与 Binder monitor，两者是同一等待链的不同观测。
+
+## 9. “等了 30 秒”与“等了 60 秒”分别发生什么
+
+Android 11 r48 此处的常量是：
+
+```java
+private static final long DEFAULT_TIMEOUT =
+        DB ? 10 * 1000 : 60 * 1000;
+private static final long CHECK_INTERVAL =
+        DEFAULT_TIMEOUT / 2;
+
+private static final int COMPLETED = 0;
+private static final int WAITING = 1;
+private static final int WAITED_HALF = 2;
+private static final int OVERDUE = 3;
+```
+
+r48 中 `DB` 是 `false`，所以默认 checker 的 `mWaitMax` 是 60 秒，Watchdog 循环的检查间隔是 30 秒。状态从探针的 `mStartTime` 起算：
+
+```java
+if (mCompleted) return COMPLETED;
+long latency = SystemClock.uptimeMillis() - mStartTime;
+if (latency < mWaitMax / 2) {
+    return WAITING;
+} else if (latency < mWaitMax) {
+    return WAITED_HALF;
+}
+return OVERDUE;
+```
+
+### 半超时：先留现场，不杀进程
+
+第一次进入 `WAITED_HALF` 时，Watchdog 会记录日志并调用 `ActivityManagerService.dumpStackTraces(...)`，然后继续等。
+
+```java
+if (!waitedHalf) {
+    Slog.i(TAG, "WAITED_HALF");
+    ArrayList<Integer> pids =
+            new ArrayList<>(mInterestingJavaPids);
+    ActivityManagerService.dumpStackTraces(
+            pids, null, null,
+            getInterestingNativePids(), null);
+    waitedHalf = true;
+}
+continue;
+```
+
+所以半超时的完成点是“本次现场收集调用返回，Watchdog 继续观察”。它不是死锁被证明，不是 system_server 已被 kill，更不是设备已恢复。长但有界的任务也可能跨过半超时后自行完成。
+
+### 全超时：进入诊断管线，仍不是立即 kill
+
+进入 `OVERDUE` 后，Watchdog 会先取 overdue checkers 和 subject，然后执行诊断，r48 主线包括：
+
+1. 写 Watchdog event，再收集 Java 与关注的 native/HAL 栈；
+2. 额外等待 5 秒，更新 CPU 状态；
+3. 用 SysRq 请求内核输出阻塞任务与 CPU 回溯；
+4. 启动 dropbox 写入线程，最多 `join(2000)` 等它 2 秒；
+5. 询问 activity controller，并检查 debugger 和 `mAllowRestart`；
+6. 只在允许 kill 时运行最后 checker 诊断，再杀 system_server。
+
+最后分支的核心是：
+
+```java
+if (debuggerWasConnected >= 2) {
+    // 记录日志，不 kill
+} else if (debuggerWasConnected > 0) {
+    // 记录日志，不 kill
+} else if (!allowRestart) {
+    // 记录日志，不 kill
+} else {
+    WatchdogDiagnostics.diagnoseCheckers(blockedCheckers);
+    Process.killProcess(Process.myPid());
+    System.exit(10);
+}
+```
+
+因此“默认 60 秒”要加三个边界：
+
+- 60 秒从这轮 checker 探针调度时起算，不是从业务第一行变慢的精确时刻起算；
+- Watchdog 每 30 秒轮询，线程调度、探针投递和诊断本身都会让真实墙钟时间更长；
+- `Process.killProcess()` 被调用只表示 system_server 自杀已发起，不表示 init/zygote 的后续重启与用户可见恢复已经完成。
+
+Watchdog 使用 `uptimeMillis()` 计时，设备休眠时不把同样无法运行的线程误算成超时。服务还可以通过 `addThread(handler, customTimeout)` 获得不同 `mWaitMax`，所以 60 秒是 r48 默认值，不是所有 checker 的不可改参数。
+
+## 10. 看 Watchdog 现场时，应沿哪条线找到最后的锁主人
+
+先看 Watchdog subject，但不要在 subject 停下。`HandlerChecker.describeBlockedStateLocked()` 只区分两类直接现象：
 
 ```text
-COMPLETED
-WAITING       < timeout/2
-WAITED_HALF   >= timeout/2 且 < timeout
-OVERDUE       >= timeout
+Blocked in handler on main thread (...)
+Blocked in monitor XxxMonitor on foreground thread (...)
 ```
 
-检查的本质是：“高优先级探针能否在期限内到达队首并完成 monitor”。
+第一句表示 main checker 没完成；第二句表示 FgThread 已开始 checker，却卡在具体 monitor。它们都是“谁无法证明前进”，不是“谁一定最先写出 bug”。
 
----
+对本场景，应按以下顺序追：
 
-## 27. 为什么 `postAtFrontOfQueue` 仍可能迟迟不执行
+1. 在 main 栈中找 `BLOCKED`、`waiting to lock` 或具体 monitor 地址；
+2. 找出该锁的 owner tid，不只看 main 栈顶的服务名；
+3. 打开 owner Binder 线程的完整栈，看它是在 `await()`、同步 Binder、I/O 还是其他锁上等待；
+4. 若它等 Handler，找 Handler 绑定的 Looper 和那个 Runnable 的完成条件；
+5. 若它在 `BinderProxy.transactNative` 等 reply，沿 Binder 调用链追到目标进程和目标线程；
+6. 对比半超时与全超时栈，看相同线程是否仍在同一等待点。
 
-队首插入不能打断当前正在执行的消息。若目标线程：
+下表可以防止过度推断：
 
-- 正在执行一个超长 Runnable；
-- 卡在 monitor/锁；
-- 同步 Binder 调用不返回；
-- 阻塞 I/O；
-- native 代码死循环；
+| 观察 | 可以说明 | 还不能说明 |
+|---|---|---|
+| main 长期 `BLOCKED` 在 `mLock` | main 无法完成当前 dispatch | main 是最初根因 |
+| 多条 Binder 线程等同一锁 | 存在共同串行瓶颈 | 已精确到达 31 或 monitor 必定超时 |
+| `BinderThreadMonitor` 超时 | libbinder 没等到低于配置上限的执行数 | 每条线程的具体根因一样 |
+| 半/全两份栈位置不变 | 支持“稳定等待/死锁”的判断 | 不需要再找 owner 和完成条件 |
+| 某次 main 在 `nativePollOnce` | 该快照时 main 回到队列/poll | 故障期间它从未被阻塞 |
 
-checker 只能等待当前 dispatch 结束。
+修复原则也应针对等待边：不持锁做同步 Handler 等待，不持业务锁做可回调的 Binder 调用，锁内复制最小快照后锁外通知，必须同步返回时明确超时、取消和状态提交语义。但“全部改成异步”也不是通用答案，公开 API 原有返回与顺序契约不能被静默改掉。
 
-因此它能检测“线程不能回到消息循环”，但不是抢占式 watchdog。
+## 11. 在 macOS 上怎样静态验证，哪些结论必须留给设备现场
 
----
-
-## 28. Watchdog 默认监控哪些线程
-
-Android 11 构造器加入：
-
-```text
-foreground thread
-main thread
-ui thread
-i/o thread
-display thread
-animation thread
-surface animation thread
-```
-
-并在 foreground checker 上运行各种 Monitor，包括 BinderThreadMonitor。
-
-服务也可 `addThread(handler, timeout)` 添加关键线程，或 `addMonitor()` 检查重要锁。
-
-并非所有 system_server 线程自动被监控。
-
----
-
-## 29. Looper polling 为何可视为健康
-
-如果 MessageQueue 正在 native poll，说明线程已经处理完此前消息，正等待新事件。没有额外 Monitor 时，这本身证明线程未卡在 Java 工作或锁中，所以可以跳过实际投递 checker，减少上下文切换。
-
-但若有 Monitor，仍需让 checker 线程执行 monitor，因为 Monitor 可能尝试获取服务锁；Looper 空闲并不能证明其他关键锁可用。
-
----
-
-## 30. pauseWatchingCurrentThread 的边界
-
-SystemServer 在某些已知长操作（PMS main、dexopt 等）暂时 pause 主线程 checker，完成后 resume。
-
-这不是通用性能优化，也不能掩盖未知卡死：
-
-- 必须限定明确操作和原因；
-- 必须 try/finally 成对恢复；
-- pause 有计数，嵌套 resume 次数要匹配；
-- 暂停期间 Watchdog 对该 checker 的保障减弱。
-
-只因代码可能慢就随意 pause，会把真正死锁变成无限挂起。
-
----
-
-## 31. 三种常见卡顿图
-
-### 主 Looper 消息积压
-
-```text
-main: [A 800ms][B][C][D]
-                 ↑ B/C/D delivery late
-```
-
-### Binder 池耗尽
-
-```text
-31 Binder threads → 全部等待 mLock/remote reply
-new clients → driver queue，无法及时处理
-```
-
-### 锁跨线程传播
-
-```text
-BackgroundThread 持 Lock X 做 I/O
-Binder thread 等 X
-main thread 同步调用该 Binder path
-Watchdog 最终看到 main 不前进
-```
-
-根因线程不一定就是最终被 Watchdog 报告的线程。
-
----
-
-## 32. 如何从线程 dump 判断入口
-
-常见栈顶部：
-
-| 栈/线程 | 含义 |
-|---|---|
-| `Looper.loop` / `MessageQueue.nativePollOnce` | Looper 空闲或等待消息 |
-| `Handler.dispatchMessage` | 正在处理 Handler 消息 |
-| `Binder.execTransactInternal` | Binder 入站事务 |
-| `BinderProxy.transactNative` | 正在同步调用远端 Binder |
-| `Object.wait` / `ConditionVariable.block` | 条件等待 |
-| `Blocked` + monitor owner | Java synchronized 锁竞争 |
-
-完整分析要记录：线程名、入口、持锁、等待对象、目标 Binder、谁能唤醒它。
-
----
-
-## 33. Perfetto 线程分析步骤
-
-1. 找 system_server process。
-2. 展开 main、Binder、android.fg/ui/io/display/anim。
-3. 找长 Running slice 或长 Sleeping 区间。
-4. 检查 Looper message/trace 名称。
-5. 沿 Binder flow 找目标进程。
-6. 看线程从 Runnable 到 Running 的调度延迟。
-7. 对照锁竞争/堆栈采样。
-8. 判断是处理慢、排队慢还是跨线程依赖慢。
-
-线程名字只是线索，最终以 tid、调用栈和调度轨迹为准。
-
----
-
-## 34. 线程优先级不能解决逻辑死锁
-
-提高优先级可减少 Runnable 状态的调度等待，但不能解决：
-
-- 等一把永不释放的锁；
-- Binder 环等待；
-- 队列中当前消息无限阻塞；
-- 条件变量永不 signal；
-- I/O 设备无响应。
-
-错误提升大量线程优先级还会抢占真正关键线程。先区分 CPU 调度不足与逻辑等待。
-
----
-
-## 35. 共享 Handler 的消息取消与 token
-
-服务在共享线程投递延迟任务时，应管理：
-
-- Runnable/Message token；
-- userId/session generation；
-- 服务状态变化后的 removeCallbacks；
-- 迟到消息二次校验；
-- callback 对象死亡后的清理。
-
-否则用户切换或服务重连后，旧消息可能在新状态上执行。线程串行只能保证执行顺序，不能保证消息仍然有效。
-
----
-
-## 36. 创建专用 HandlerThread 的检查表
-
-- 名称是否能在 trace/stack 中识别？
-- 线程 priority 是否与延迟需求匹配？
-- 是否允许 I/O，StrictMode 策略是什么？
-- 谁 start、谁 quit？system_server 常驻服务是否确实不退出？
-- 核心状态是否仅此线程访问？
-- 是否需要 Watchdog.addThread？
-- Binder 方法如何切换以及如何返回同步结果？
-- 用户 stop/runtime restart 如何清理队列？
-
-优先考虑 `ServiceThread` 而不是裸 HandlerThread，可继承 system_server 的线程约束。
-
----
-
-## 37. 常见误区纠正
-
-### 误区 1：所有 system_server 服务调用都在主线程
-
-错误。Binder 入站通常在 Binder 线程，Handler 工作在绑定 Looper。
-
-### 误区 2：Handler.post 会创建新线程
-
-错误。它只是向已有 Looper 队列投递。
-
-### 误区 3：oneway 方法不占服务端线程
-
-错误。服务端仍需 Binder 线程执行。
-
-### 误区 4：LocalService 会自动切到服务线程
-
-错误。普通 Java 直调，继续在调用者线程。
-
-### 误区 5：Binder 最大线程数 31 表示启动时已有 31 个线程
-
-错误。Binder 线程按需生成，31 是上限配置语义。
-
-### 误区 6：`allowIo=false` 从内核禁止文件访问
-
-错误。ServiceThread 通过 StrictMode 帮助检测。
-
-### 误区 7：Watchdog 监控 system_server 每一个线程
-
-错误。它监控显式 HandlerChecker 和 Monitor。
-
-### 误区 8：BackgroundThread 没被 Watchdog 检查，所以不影响系统
-
-错误。它持锁或提供依赖时仍可阻塞关键线程。
-
-### 误区 9：提高线程优先级能修死锁
-
-错误。逻辑等待不会因优先级消失。
-
-### 误区 10：线程安全等于所有方法 synchronized
-
-错误。粗锁会扩大竞争与 Binder 环风险，应设计 confinement、快照和锁外调用。
-
----
-
-## 38. 复读：五组最易混线程边界
-
-### 38.1 服务所属进程与代码执行线程
-
-服务对象位于 system_server，但一次方法可以由任意 Binder 线程、主线程或 LocalService 调用者线程执行。
-
-### 38.2 Binder thread 与 Handler thread
-
-Stub 方法先在 Binder thread；只有显式 post 后，后续代码才在 Handler thread。post 前取得 calling UID，post 后不能重新依赖 Binder calling identity。
-
-### 38.3 shared thread 与 service-owned thread
-
-Fg/Io/Background 是多服务共享，阻塞会跨服务传播；专用线程隔离更强但成本更高。
-
-### 38.4 queue idle 与 lock healthy
-
-Looper polling 说明队列线程空闲，不说明服务的所有锁都可取得；有 Monitor 时 Watchdog 仍必须执行锁检查。
-
-### 38.5 reported blocked thread 与 root cause thread
-
-Watchdog 报 main blocked，根因可能是 Binder thread 等后台线程持有的锁。要沿等待链找到最末端 owner。
-
----
-
-## 39. Mac 只读源码练习
-
-### 练习 1：列共享线程属性
+下面的命令只读源码，不要编译 Android：
 
 ```bash
-for f in FgThread UiThread IoThread DisplayThread AnimationThread; do
-  rg -n "super\(|setSlowLogThresholdMs|setTraceTag" \
-    frameworks/base/services/core/java/com/android/server/$f.java
-done
+cd /Users/ninebot/androidSource
 ```
 
-记录线程名、priority、allowIo、trace tag 和 slow threshold。
-
-### 练习 2：追一个 Binder 到 Handler
-
-任选 `PowerManagerService.BinderService` 或 `ClipboardService.ClipboardImpl`：
+### 验证一：主 Looper 和 Binder 池在什么时候配置
 
 ```bash
-rg -n "class BinderService|class ClipboardImpl|mHandler\.(post|sendMessage)" \
-  frameworks/base/services/core/java/com/android/server
+rg -n 'sMaxBinderThreads|setMaxThreads|prepareMainLooper|Looper.loop' \
+  frameworks/base/services/java/com/android/server/SystemServer.java
 ```
 
-标出入站线程、权限检查点、post 点和状态修改线程。
+应看到：先配置 Binder 最大线程数并 prepare 主 Looper，中间直接启动大量服务，最后才进入 `Looper.loop()`。
 
-### 练习 3：检查 calling identity
+### 验证二：Binder 入口是否自动 post main
 
 ```bash
-rg -n "getCallingUid|clearCallingIdentity|restoreCallingIdentity" \
-  frameworks/base/services/core/java/com/android/server | head -100
+rg -n 'execTransactInternal|onTransact\(' \
+  frameworks/base/core/java/android/os/Binder.java
 ```
 
-确认 clear/restore 是否 finally 成对，身份是否在 post 前捕获。
+打开 `execTransactInternal()` 附近，只能看到它在当前入站路径直接调 `onTransact()`。若某服务后续切 main/Fg/专用线程，必须在该服务自己的代码中找到 `post` / `sendMessage` / executor 证据。
 
-### 练习 4：阅读 Watchdog checker
+### 验证三：ServiceThread 与 FgThread 提供了什么
 
 ```bash
-sed -n '130,370p' \
+rg -n 'class ServiceThread|setCanSelfBackground|initThreadDefaults' \
+  frameworks/base/services/core/java/com/android/server/ServiceThread.java
+rg -n 'class FgThread|android.fg|ensureThreadLocked|getHandler' \
+  frameworks/base/services/core/java/com/android/server/FgThread.java
+```
+
+应分清：`ServiceThread` 扩展了 `HandlerThread`；`FgThread` 是惰性创建的共享实例；取到 Handler 不代表调用者已经在该线程，只有投递后 dispatch 才切过去。
+
+### 验证四：Watchdog 的探针、monitor 和两阶段超时
+
+```bash
+rg -n 'DEFAULT_TIMEOUT|scheduleCheckLocked|WAITED_HALF|OVERDUE|killProcess' \
   frameworks/base/services/core/java/com/android/server/Watchdog.java
+rg -n 'BinderThreadMonitor|blockUntilThreadAvailable|mExecutingThreadsCount' \
+  frameworks/base/services/core/java/com/android/server/Watchdog.java \
+  frameworks/native/libs/binder/IPCThreadState.cpp
 ```
 
-解释 polling 快路径、front-of-queue、Monitor 和 BinderThreadMonitor。
+记录四个完成点：checker 被投递、checker/monitor 完成、半超时栈收集返回、全超时诊断后进入允许 kill 的分支。这四者不是同一个时刻。
 
-### 练习 5：找共享线程风险
+### 设备现场的边界
 
-```bash
-rg -n "(FgThread|IoThread|BackgroundThread)\.getHandler" \
-  frameworks/base/services | head -100
-```
+macOS 静态阅读能证明 r48 的机制，却不能证明某台设备此刻的等待图。真实归因还需要同一时段的：
 
-选两个不同服务，判断是否可能因共享队列互相延迟。
+- Watchdog subject 与半/全超时线程栈；
+- system_server 所有相关 tid 的锁 owner/waiter 关系；
+- Binder 调用目标、对端栈与调用时序；
+- 必要时的 Perfetto 调度、Looper 和 Binder 轨迹。
 
----
+普通 user 设备可用权限和 trace 开关可能不足，厂商也可能修改 Watchdog 或服务线程。因此本章能确定的是 `android-11.0.0_r48` 的源码语义；具体设备必须对齐 build 与 commit，不能拿本章的默认数值冒充现场测量。
 
-## 40. 自测题
+## 12. 检查题、答案与读完就能做的事
 
-1. SystemServer 主线程何时进入 Looper.loop？
-2. Binder 入站默认在哪类线程执行？
-3. Android 11 system_server Binder 最大线程配置是多少？
-4. Handler.post 是否创建线程？
-5. delivery 慢与 dispatch 慢有什么区别？
-6. ServiceThread 的 allowIo=false 如何生效？
-7. FgThread 与 BackgroundThread 的用途有何区别？
-8. 为什么 Binder 池耗尽时 CPU 可能很低？
-9. post 后为什么不能重新取得原 calling UID？
-10. Watchdog 为什么在 queue polling 时可跳过无 Monitor 的 checker？
-11. 为什么 BackgroundThread 默认未加入 Watchdog？
-12. LocalService 的线程由谁决定？
+### 1. 一个方法写在 `PowerManagerService` 里，能否断定它在 main 执行？
 
----
+答：不能。Binder Stub 入口默认在 Binder 线程，Handler callback 在 Handler 绑定 Looper，LocalServices/普通 Java 直调继续在调用者线程。必须追入口和切换点。
 
-## 41. 参考答案
+### 2. Binder Stub 为什么不会自动切到服务的 Handler？
 
-1. 三组服务启动和早期初始化完成后，在 SystemServer.run 末尾进入。
-2. system_server Binder 线程池中的线程。
-3. 31；它是上限配置，不是预创建数量。
-4. 不会，只投递到 Handler 绑定的 Looper。
-5. delivery 是排队/调度到开始的延迟；dispatch 是实际处理耗时。
-6. 在线程 run 中初始化 StrictMode 默认线程策略，帮助发现违规 I/O。
-7. Fg 处理需及时的前台系统操作；Background 可处理更长后台任务，及时性保证较低。
-8. 线程可能全部在等待锁、IPC、条件或 I/O，而不是运行 CPU。
-9. Binder calling identity 是当前入站事务线程上下文，不随普通 Runnable 传播。
-10. native poll 证明线程已经回到队列等待，未卡在处理逻辑。
-11. 它设计上允许较长任务，不能用同样及时性 SLA；但仍不能破坏关键锁依赖。
-12. 普通直调由调用者线程决定，除非实现内部再 post。
+答：r48 的 Java Binder 入口直接在当前 Binder 线程调 `onTransact()`。只有服务实现显式 `post/sendMessage/execute` 时才切换。
 
----
+### 3. system_server 把 Binder 最大线程数设为 31，是否表示启动时已有 31 条线程？
 
-## 42. 本章总结
+答：不是。31 是 r48 传给 libbinder/驱动的最大线程配置，不是预创建数量或现场活跃数量的承诺。
+
+### 4. 贯穿场景为什么是死锁，而不只是慢？
+
+答：Binder 线程持有 `mLock` 等 main 的 `done`；main 必须取得 `mLock` 才能到达 `countDown()`。没有外部破坏条件时，两边都不可能自行前进。
+
+### 5. `WAITED_HALF` 与 `OVERDUE` 的主要区别是什么？
+
+答：默认探针约 30 秒未完成时，半超时首次采集栈并继续等；达到默认 60 秒 `OVERDUE` 后进入完整诊断与条件 kill 路径。时间从探针调度起算，kill 也不是超时瞬间必然发生。
+
+### 6. `BinderThreadMonitor` 超时能否直接定位某个服务的锁？
+
+答：不能。它通过 libbinder 等一条可用执行余量，表明进程级 Binder 池可用性出了问题。具体哪些线程等锁、IPC 或 I/O，要继续读所有 Binder 栈。
+
+### 7. Watchdog 报 main blocked，为什么 main 不一定是根因？
+
+答：Watchdog 只证明 main 没完成 checker。main 可能在等 Binder 线程或 BackgroundThread 持有的锁，而锁 owner 又在等另一个 Handler/Binder。必须沿 owner 继续追。
+
+### 8. 服务创建了专用 ServiceThread，Watchdog 会自动监控它吗？
+
+答：不会。r48 Watchdog 只有默认 checker 与后续显式 `addThread()` 的 handler。专用线程还需设计是否加入 Watchdog、用什么 timeout。
+
+### 可立即执行的阅读法
+
+从任意一个 system_server BinderService 方法开始，在纸上只写五列：
 
 ```text
-SystemServer 主线程：启动骨架 + 主 Looper 消息
-Binder 线程池：跨进程入站，最多配置 31，必须避免阻塞耗尽
-ServiceThread：带 Looper、priority、StrictMode 约束的系统服务线程
-Fg/Ui/Io/Display/Anim：按延迟与任务类型分工的共享队列
-专用 HandlerThread：隔离服务状态机与阻塞工作
-Watchdog：向关键 Handler 投探针、运行 Monitor、检查 Binder 可用性
+当前线程 | 持有的锁 | post/execute 到哪 | 同步等什么 | 完成条件在谁手里
 ```
 
-定位线程问题时始终画：
+然后做三件事：
+
+1. 把所有“等”画成有向边，看是否形成环；
+2. 对每个 Handler 追到 Looper/线程的构造处，不根据变量名猜；
+3. 对每个关键线程查 Watchdog 默认列表或 `addThread/addMonitor` 证据。
+
+最后用一句话收住本章：
 
 ```text
-入口线程 → 是否 post → 目标队列 → 是否持锁 → 是否同步 IPC
-        → 谁在等待谁 → 最末端 owner/完成条件
+Binder 只负责把跨进程请求交给服务端 Binder 线程；
+Handler 才是服务显式选择的下一个执行线程；
+Watchdog 报告谁不能前进，根因要沿等待图继续找。
 ```
-
----
-
-## 43. 下一章预告
-
-第 98 章将学习：
-
-**Android Binder 性能与故障：线程池饥饿、同步/oneway 队列、锁与调用链诊断**
-
-会把本章线程模型和第 90～92 章 Binder/Parcel/AIDL 串起来，形成可直接用于 system_server 卡顿、跨进程超时和 Binder 调用慢的排查方法。

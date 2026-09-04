@@ -1,279 +1,554 @@
-# 93 Android ServiceManager：服务注册、查询、通知、SELinux 与 lazy service
+# 93 Android ServiceManager：为什么 `getService()` 找不到，`waitForService()` 却能拉起服务
 
-> 源码版本：Android 11（`android-11.0.0_r48`）  
-> 阅读环境：macOS 只读本地源码，不要求编译或连接设备。  
-> 本章目标：理解 ServiceManager 是“Binder 服务目录”，能从 handle 0 追到服务注册与查询，能解释缓存、权限、死亡清理、通知和 lazy service 的真实边界。  
-> 阅读方式：先建立全景图，再顺着 `main → addService → get/check/wait → callback → SELinux → lazy` 阅读。
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`
+> 贯穿场景：`system_server` 获取按需启动的 `apexservice`
+> 阅读方式：macOS 上静态阅读本地 AOSP，不要求编译或连接设备
 
----
+`system_server` 要调用 `apexservice`，但 `apexd.rc` 把对应进程声明成了 `disabled`。如果直接查服务表，结果可能是 `null`；换成 `waitForService("apexservice")`，servicemanager 却会通知 init 启动 `apexd`，等它完成注册后再返回 Binder。
 
-## 1. 先用一句话认识 ServiceManager
+这类问题最容易被一句“ServiceManager 就是服务注册表”糊弄过去：同一个服务名，`checkService()`、Java `getService()`、Native `getService()` 和 `waitForService()` 在 Android 11 并不具有相同的启动、等待语义。
 
-ServiceManager 是 Binder 世界的**服务名称注册表**：服务端把“名字 + Binder 对象”登记进去，客户端用名字换回 Binder 引用。
+**一句话结论：servicemanager 只负责“名字 → Binder”的发现与生命周期协调；Android 11 只有走到服务端 AIDL `getService` 的路径才会请求启动 lazy service，而真正等待注册发生在客户端 `waitForService` 的通知与重查循环中。**
 
-可以把它想成前台通讯录：
+读完本章，你应该能够：
 
-- 服务端说：“请登记，`activity` 对应这个 Binder 对象。”
-- 客户端问：“`activity` 的 Binder 在哪里？”
-- ServiceManager 返回 Binder 引用。
-- 之后客户端调用 ActivityManager 的业务方法，**不会再经过 ServiceManager**。
+1. 从 `addService` 追到服务表、死亡监听和注册通知；
+2. 准确判断五种查询/等待路径是否触发 lazy start、是否等待、何时返回 `null`；
+3. 区分“能找到服务”的 SELinux 权限与“能调用服务”的 Binder 权限；
+4. 解释 Java 两类缓存、lazy 退出回调以及 Android 11 的版本边界。
 
-```text
-注册阶段：服务进程 ── addService("demo", binder) ──> servicemanager
+本章只讨论 `/dev/binder` 上 Android 11 的 AIDL servicemanager。APEX 业务逻辑、init 完整状态机、Binder 驱动引用计数实现和新版本 ServiceManager API 不在这里展开。
 
-查询阶段：客户进程 ── getService("demo") ─────────> servicemanager
-                                              返回 Binder 引用
+## 1. 问题：同一个 `apexservice`，为什么查询结果不同
 
-业务阶段：客户进程 ═════ transact ════════════════> 服务进程
-                     （不经过 servicemanager）
-```
+Android 11 的 `ApexManager` 没有用普通 `getService()`，而是明确选择等待：
 
-这是本章最重要的边界：ServiceManager 负责“发现”，Binder 驱动负责后续“通信”。
-
----
-
-## 2. 为什么 Binder 必须有一个“第一个服务”
-
-普通服务可以向 ServiceManager 注册，但客户端要先拿到 ServiceManager 才能查询。这里存在“先有鸡还是先有蛋”的问题。
-
-Binder 用一个特殊约定解决它：**handle 0 是 context manager**。
-
-客户端调用：
+`frameworks/base/services/core/java/com/android/server/pm/ApexManager.java`
 
 ```java
-BinderInternal.getContextObject()
+protected IApexService waitForApexService() {
+    // Since apexd is a trusted platform component, synchronized calls are allowable
+    return IApexService.Stub.asInterface(
+            Binder.allowBlocking(ServiceManager.waitForService("apexservice")));
+}
 ```
 
-native 层最终取得 handle 0 的代理。handle 0 不需要先按名称查询，因此它成为进入整个 Binder 服务目录的固定入口。
+这段代码解决的不是“把一个名字转换成 Java 对象”这么简单，而是三个现实问题：
 
-注意三个概念：
+- `apexd` 可能尚未运行；
+- 启动进程和注册 Binder 之间存在时间差；
+- 查询为空后、开始等待前，服务可能恰好完成注册。
 
-| 概念 | 含义 |
-|---|---|
-| context manager | Binder 驱动为当前 Binder context 指定的管理者 |
-| handle 0 | 客户端访问 context manager 的特殊句柄 |
-| `manager` 服务名 | servicemanager 又把自己登记为普通名称；它不是 handle 0 机制本身 |
+`Binder.allowBlocking()` 也不要读反。Java 会先执行 `waitForService()`，拿到 Binder 后才调用 `allowBlocking()` 标记这个代理允许同步调用；它不会让等待变成异步。
 
-不要把 `handle 0` 理解成内核里固定地址为 0 的 Java 对象。它是 Binder 引用命名空间中的特殊入口。
-
----
-
-## 3. Android 不只有一个服务管理器
-
-Android 11 中常见三套 Binder context：
-
-| 管理进程 | 驱动 | 主要接口世界 | 常见用途 |
-|---|---|---|---|
-| `servicemanager` | `/dev/binder` | Framework Binder、stable AIDL | system/system_ext 与 AIDL HAL |
-| `vndservicemanager` | `/dev/vndbinder` | vendor Binder | 旧式 vendor Binder 隔离场景 |
-| `hwservicemanager` | `/dev/hwbinder` | HIDL/HwBinder | HIDL HAL |
-
-它们不是一个全局表的三个名字。每个 Binder 驱动 context 都有自己的 handle、节点和 context manager。
-
-本章正文主要研究：
+把 ServiceManager 想成前台登记簿即可：
 
 ```text
-frameworks/native/cmds/servicemanager/
+apexd：登记“apexservice 对应这个 Binder”
+system_server：按名字领取 Binder
+领取以后：system_server 直接调用 apexd，不再经过前台
 ```
 
-也就是 `/dev/binder` 上的新 AIDL servicemanager。
+这个类比只说明职责。真正需要源码回答的是：谁能登记、查不到是否开店、怎样避免错过开店通知，以及登记簿里的引用何时删除。
 
----
+## 2. 机制起点：客户端怎样找到“第一个目录服务”
 
-## 4. 本章源码地图
-
-建议依次打开：
+普通服务要先向 servicemanager 注册，但客户端若连 servicemanager 也需要按名字查询，就会形成循环。Binder 用 **context manager / handle 0** 解决启动入口：
 
 ```text
-frameworks/native/cmds/servicemanager/main.cpp
-frameworks/native/cmds/servicemanager/ServiceManager.h
-frameworks/native/cmds/servicemanager/ServiceManager.cpp
-frameworks/native/cmds/servicemanager/Access.cpp
-frameworks/native/libs/binder/IServiceManager.cpp
-frameworks/native/libs/binder/aidl/android/os/IServiceManager.aidl
-frameworks/base/core/java/android/os/ServiceManager.java
-frameworks/base/core/java/android/os/ServiceManagerNative.java
-frameworks/native/cmds/servicemanager/servicemanager.rc
-system/sepolicy/private/service_contexts
+固定入口 handle 0
+        ↓
+IServiceManager Binder
+        ↓ 按名字查询
+任意已注册服务 Binder
 ```
 
-把它们分成四层更容易读：
+Android 11 servicemanager 启动时先选择 Binder 驱动并建立 context manager：
 
-```text
-Java 门面       ServiceManager.java
-                     │
-libbinder 兼容层  IServiceManager.cpp / ServiceManagerShim
-                     │
-服务端实现       cmds/servicemanager/ServiceManager.cpp
-                     │
-安全裁决         Access.cpp + service_contexts + sepolicy
-```
-
----
-
-## 5. servicemanager 如何启动
-
-`servicemanager.rc` 由 init 解析并启动 servicemanager。进入 `main.cpp` 后，关键步骤可以压缩成：
+`frameworks/native/cmds/servicemanager/main.cpp`
 
 ```cpp
-const char* driver = argc > 1 ? argv[1] : "/dev/binder";
+const char* driver = argc == 2 ? argv[1] : "/dev/binder";
+
 sp<ProcessState> ps = ProcessState::initWithDriver(driver);
 ps->setThreadPoolMaxThreadCount(0);
 ps->setCallRestriction(ProcessState::CallRestriction::FATAL_IF_NOT_ONEWAY);
 
 sp<ServiceManager> manager = new ServiceManager(std::make_unique<Access>());
-manager->addService("manager", manager, false,
-        IServiceManager::DUMP_FLAG_PRIORITY_DEFAULT);
+if (!manager->addService("manager", manager, false /*allowIsolated*/,
+        IServiceManager::DUMP_FLAG_PRIORITY_DEFAULT).isOk()) {
+    LOG(ERROR) << "Could not self register servicemanager";
+}
 IPCThreadState::self()->setTheContextObject(manager);
-ps->becomeContextManager();
+ps->becomeContextManager(nullptr, nullptr);
 ```
 
-逐句解释：
-
-1. 选择 `/dev/binder`，进入 Framework Binder context。
-2. 最大 Binder 线程数设为 0，不采用普通 Binder 线程池处理模式。
-3. 限制 servicemanager 发出的同步调用，降低互相等待和死锁风险。
-4. 创建真正保存服务表的 `ServiceManager` 对象。
-5. 用名字 `manager` 登记自己。
-6. 设置本进程 context object。
-7. 通过 Binder 驱动把本进程声明为 context manager。
-
-第 5 步和第 7 步目的不同：第 7 步解决 handle 0 的启动入口；第 5 步只是普通名字注册。
-
----
-
-## 6. 它为什么没有普通 Binder 线程池
-
-主函数把 Binder fd 加入 Looper：
+随后，同一个 `main()` 建立 Looper，把 Binder fd 与 lazy-client 检查都接入事件循环：
 
 ```cpp
+sp<Looper> looper = Looper::prepare(false /*allowNonCallbacks*/);
+
 BinderCallback::setupTo(looper);
 ClientCallbackCallback::setupTo(looper, manager);
 
-while (true) {
+while(true) {
     looper->pollAll(-1);
 }
 ```
 
-Binder fd 可读后，callback 调用：
+`becomeContextManager()` 把本进程设为当前 Binder context 的管理者；客户端的 `BinderInternal.getContextObject()` 或 Native `ProcessState::getContextObject()` 因而能取得 handle 0 的代理。
+
+名字 `manager` 与 handle 0 是两件事：
+
+- handle 0 是驱动 context 的特殊入口，解决“先找到谁”；
+- `manager` 是 servicemanager 给自己添加的一条普通名字记录。
+
+本版 servicemanager 也不是普通多线程业务服务。它把 Binder fd 放进单线程 Looper，调用 `handlePolledCommands()`；另一个 timerfd 每 5 秒检查 lazy 服务的客户端状态。因此它应该只做轻量目录工作，真正的 APEX 操作仍在 `apexd`。
+
+还有一个范围边界：Android 11 同时可见 `/dev/binder` 的 servicemanager、`/dev/vndbinder` 的 vndservicemanager，以及 `/dev/hwbinder` 的 hwservicemanager。三者不是共享一张表；本章的 `apexservice` 位于第一套。
+
+## 3. 注册：`apexd` 怎样把 Binder 放进名字表
+
+### 为什么它能按需启动
+
+`apexd` 的 init 配置明确把服务设为不随 class 自动启动，并声明可由 AIDL 接口名触发：
+
+`system/apex/apexd/apexd.rc`
+
+```rc
+service apexd /system/bin/apexd
+    interface aidl apexservice
+    class core
+    user root
+    group system
+    oneshot
+    disabled # does not start with the core class
+    reboot_on_failure reboot,apexd-failed
+```
+
+`disabled` 不等于永远不能启动，而是不能仅靠 class start 自动启动；`interface aidl apexservice` 给 init 留下了“按接口启动”的匹配项。
+
+进程起来后，`apexd` 使用 `LazyServiceRegistrar` 注册真实 Binder：
+
+`system/apex/apexd/apexservice.cpp`
 
 ```cpp
-IPCThreadState::self()->handlePolledCommands();
-```
+static constexpr const char* kApexServiceName = "apexservice";
 
-因此 Android 11 servicemanager 的主要模型是：
+void CreateAndRegisterService() {
+  sp<ProcessState> ps(ProcessState::self());
 
-```text
-单线程 Looper
- ├─ Binder fd：处理注册、查询、通知等事务
- └─ timerfd：每 5 秒检查 lazy service 是否仍有客户端
-```
-
-这也解释了为什么 servicemanager 的实现应保持很轻：它是系统关键目录，不适合执行耗时业务。
-
----
-
-## 7. 服务表的核心数据结构
-
-最核心的成员是：
-
-```cpp
-std::map<std::string, Service> mNameToService;
-```
-
-可将 `Service` 简化理解为：
-
-```text
-Service
- ├─ binder          真正的服务 Binder 对象
- ├─ allowIsolated   是否允许 isolated UID 查询
- ├─ dumpPriority    dumpsys/listServices 的优先级筛选
- ├─ debugPid        注册服务的进程 PID
- ├─ guaranteeClient 防止漏报短命客户端的临时标记
- └─ hasClients      上次观察到的客户端状态
-```
-
-此外还有两类 callback 表：
-
-```text
-mNameToRegistrationCallback  等某个名字注册成功
-mNameToClientCallback        告诉 lazy 服务“有/无客户端”
-```
-
-它们名称相近，但用途完全不同，后面单独对比。
-
----
-
-## 8. `IServiceManager.aidl` 定义了什么
-
-Android 11 的 servicemanager 本身已经使用 AIDL 接口，主要能力包括：
-
-```text
-getService(name)
-checkService(name)
-addService(name, binder, allowIsolated, dumpPriority)
-listServices(dumpPriority)
-registerForNotifications(name, callback)
-unregisterForNotifications(name, callback)
-isDeclared(name)
-getDeclaredInstances(interface)
-registerClientCallback(name, service, callback)
-tryUnregisterService(name, service)
-```
-
-可按职责分组：
-
-- 查目录：`get/check/list/isDeclared`
-- 改目录：`addService`
-- 等注册：registration notification
-- 管理 lazy 生命周期：client callback、try unregister
-
----
-
-## 9. Java 客户端怎样拿到 IServiceManager
-
-`ServiceManager.java` 中：
-
-```java
-private static IServiceManager getIServiceManager() {
-    if (sServiceManager != null) {
-        return sServiceManager;
-    }
-    sServiceManager = ServiceManagerNative.asInterface(
-            Binder.allowBlocking(BinderInternal.getContextObject()));
-    return sServiceManager;
+  // Create binder service and register with LazyServiceRegistrar
+  sp<ApexService> apexService = new ApexService();
+  auto lazyRegistrar = LazyServiceRegistrar::getInstance();
+  lazyRegistrar.forcePersist(true);
+  lazyRegistrar.registerService(apexService, kApexServiceName);
 }
 ```
 
-链路是：
+同一文件稍后用另一个小函数解除“强制常驻”：
 
-```text
-BinderInternal.getContextObject()
-  → native 获取 handle 0
-  → 得到 IBinder 代理
-  → ServiceManagerNative.asInterface()
-  → 得到 IServiceManager 接口
+```cpp
+void AllowServiceShutdown() {
+  LazyServiceRegistrar::getInstance().forcePersist(false);
+}
 ```
 
-`sServiceManager` 缓存的是“ServiceManager 自己的接口代理”，不是所有业务服务。
+先 `forcePersist(true)` 是为了避免启动阶段暂时没有客户端就退出；`apexd_main.cpp` 完成启动工作后再允许 lazy 关闭。它不是所有 lazy 服务都必须复制的固定模板，而是 `apexd` 自己的生命周期选择。
 
----
+### `addService()` 不只是写入 map
 
-## 10. Java `sCache` 到底是什么缓存
+servicemanager 的服务表核心是 `mNameToService`。写入前会检查调用身份、SELinux、参数、名字、稳定性和死亡监听。以下两个代码块来自 `addService()` 中前后相邻的检查段，未把不同分支拼成一段：
 
-`getService()` 先查：
+`frameworks/native/cmds/servicemanager/ServiceManager.cpp`
+
+```cpp
+if (multiuser_get_app_id(ctx.uid) >= AID_APP) {
+    return Status::fromExceptionCode(Status::EX_SECURITY);
+}
+if (!mAccess->canAdd(ctx, name)) {
+    return Status::fromExceptionCode(Status::EX_SECURITY);
+}
+if (binder == nullptr) {
+    return Status::fromExceptionCode(Status::EX_ILLEGAL_ARGUMENT);
+}
+```
+
+```cpp
+if (!isValidServiceName(name)) {
+    LOG(ERROR) << "Invalid service name: " << name;
+    return Status::fromExceptionCode(Status::EX_ILLEGAL_ARGUMENT);
+}
+#ifndef VENDORSERVICEMANAGER
+if (!meetsDeclarationRequirements(binder, name)) {
+    // already logged
+    return Status::fromExceptionCode(Status::EX_ILLEGAL_ARGUMENT);
+}
+#endif  // !VENDORSERVICEMANAGER
+```
+
+检查通过后，它对远端 Binder `linkToDeath()`，再写入服务表并通知已登记的等待者：
+
+```cpp
+mNameToService[name] = Service {
+    .binder = binder,
+    .allowIsolated = allowIsolated,
+    .dumpPriority = dumpPriority,
+    .debugPid = ctx.debugPid,
+};
+
+auto it = mNameToRegistrationCallback.find(name);
+if (it != mNameToRegistrationCallback.end()) {
+    for (const sp<IServiceCallback>& cb : it->second) {
+        mNameToService[name].guaranteeClient = true;
+        cb->onRegistration(name, binder);
+    }
+}
+```
+
+这几行分别解决：
+
+| 机制 | 解决的问题 |
+|---|---|
+| app-id 限制与 SELinux `add` | 防止普通应用冒充全局系统服务 |
+| 名字和 Binder 校验 | 防止目录中出现不可用条目 |
+| VINTF stability 条件检查 | 要求标成 VINTF-stable 的 Binder 有 manifest 声明 |
+| `linkToDeath` | 服务进程死亡后移除目录条目 |
+| registration callback | 唤醒正在等这个名字的客户端 |
+
+`apexservice` 是平台内部 AIDL 服务，不是 VINTF-stable AIDL HAL，因此它的 init `interface aidl` 声明不能等同于 VINTF manifest 声明。只有 Binder 的 stability 要求 VINTF 时，`meetsDeclarationRequirements()` 才强制核对 manifest。
+
+## 4. 五种“查询/等待”路径必须按 Android 11 的真实实现区分
+
+先看结论表。这里的“等待”是等待服务**出现**，不包括一次普通 Binder 查询自身的短暂同步耗时。
+
+| 调用路径 | 查不到时是否请求 lazy start | 是否等待服务注册 | 典型结果 |
+|---|---:|---:|---|
+| Java `ServiceManager.checkService(name)` | 否 | 否 | 一次查询后得到 Binder 或 `null` |
+| Java `ServiceManager.getService(name)` | **否（r48 兼容层行为）** | 否 | Binder 或 `null` |
+| Native `defaultServiceManager()->getService(name)` | 自身不触发 | 最多轮询约 5 秒 | Binder 或 `null` |
+| 服务端 AIDL `IServiceManager.getService(name)` | 是 | 否 | 发启动请求后仍可返回 `null` |
+| Java / platform C++ `waitForService(name)` | 是 | 是，无固定超时 | Binder；权限/致命错误时可能 `null` |
+
+### 最容易写错的一行：Java `getService` 实际调用 `checkService`
+
+Java facade 先通过 handle 0 得到 `ServiceManagerProxy`。Android 11 的兼容代理这样实现：
+
+`frameworks/base/core/java/android/os/ServiceManagerNative.java`
+
+```java
+public IBinder getService(String name) throws RemoteException {
+    // Same as checkService (old versions of servicemanager had both methods).
+    return mServiceManager.checkService(name);
+}
+
+public IBinder checkService(String name) throws RemoteException {
+    return mServiceManager.checkService(name);
+}
+```
+
+所以在 **Android 11 r48 的 Java `ServiceManager` 路径**中，`getService("apexservice")` 不会因为名字缺失而拉起 `apexd`。这也是为什么真实 `ApexManager` 选择 `waitForService()`。
+
+### 服务端两个同名方法只差一个布尔值
+
+`frameworks/native/cmds/servicemanager/ServiceManager.cpp`
+
+```cpp
+Status ServiceManager::getService(const std::string& name, sp<IBinder>* outBinder) {
+    *outBinder = tryGetService(name, true);
+    // returns ok regardless of result for legacy reasons
+    return Status::ok();
+}
+
+Status ServiceManager::checkService(const std::string& name, sp<IBinder>* outBinder) {
+    *outBinder = tryGetService(name, false);
+    // returns ok regardless of result for legacy reasons
+    return Status::ok();
+}
+```
+
+`startIfNotFound=true` 只表示“请求启动”，不表示 servicemanager 会把当前事务挂住等服务注册。它调用启动逻辑后仍返回当前查找结果，此时通常还是 `null`。
+
+### Native 历史 `getService` 是有限轮询，不是 lazy 等待
+
+`ServiceManagerShim::getService()` 先 `checkService()`，找不到才轮询：
+
+`frameworks/native/libs/binder/IServiceManager.cpp`
+
+```cpp
+sp<IBinder> svc = checkService(name);
+if (svc != nullptr) return svc;
+
+const bool isVendorService =
+    strcmp(ProcessState::self()->getDriverName().c_str(), "/dev/vndbinder") == 0;
+const long timeout = uptimeMillis() + 5000;
+```
+
+中间的源码根据系统是否完成启动选择 100 ms 或 1000 ms 的重试间隔；循环本身始终调用 `checkService()`：
+
+```cpp
+while (uptimeMillis() < timeout) {
+    usleep(1000*sleepTime);
+    sp<IBinder> svc = checkService(name);
+    if (svc != nullptr) return svc;
+}
+ALOGW("Service %s didn't start. Returning NULL", String8(name).string());
+return nullptr;
+```
+
+循环里仍是 `checkService`，所以它自己不会发 `ctl.interface_start`。若别的路径已经启动服务，它可能在约 5 秒窗口内碰巧等到；否则最后返回 `null`。
+
+这张表是本章最重要的 Android 11 边界。看到其他版本源码或网络文章时，必须重新核对 facade、兼容 shim 和服务端三层，不能只凭方法名推断。
+
+## 5. 等待：notification 怎样补上“先查后订阅”的竞态
+
+如果客户端按下面的朴素逻辑等待，会丢事件：
+
+```text
+t0  客户端查询：服务不存在
+t1  服务完成注册
+t2  客户端才注册通知
+```
+
+Android 11 的 Native `waitForService()` 先调用真正的服务端 AIDL `getService`，既查询又触发 lazy start；为空时再注册 callback：
+
+`frameworks/native/libs/binder/IServiceManager.cpp`
+
+```cpp
+sp<IBinder> out;
+if (!mTheRealServiceManager->getService(name, &out).isOk()) {
+    return nullptr;
+}
+if (out != nullptr) return out;
+
+sp<Waiter> waiter = new Waiter;
+if (!mTheRealServiceManager->registerForNotifications(
+        name, waiter).isOk()) {
+    return nullptr;
+}
+```
+
+若服务恰好在“首次查询”和“注册 callback”之间出现，服务端注册通知时会检查当前表；已经存在就立即回调：
+
+`frameworks/native/cmds/servicemanager/ServiceManager.cpp`
+
+```cpp
+mNameToRegistrationCallback[name].push_back(callback);
+if (auto it = mNameToService.find(name);
+        it != mNameToService.end()) {
+    const sp<IBinder>& binder = it->second.binder;
+    CHECK(binder != nullptr);
+    callback->onRegistration(name, binder);
+}
+return Status::ok();
+```
+
+因此 t1 的注册不会永久错过。回调把 Binder 保存到 `Waiter`，唤醒条件变量；函数退出前再注销 notification。
+
+等待循环还每秒重新调用一次服务端 `getService`：
+
+```cpp
+while (true) {
+    {
+        std::unique_lock<std::mutex> lock(waiter->mMutex);
+        using std::literals::chrono_literals::operator""s;
+        waiter->mCv.wait_for(lock, 1s, [&] {
+            return waiter->mBinder != nullptr;
+        });
+        if (waiter->mBinder != nullptr) return waiter->mBinder;
+    }
+    if (!mTheRealServiceManager->getService(name, &out).isOk()) {
+        return nullptr;
+    }
+    if (out != nullptr) return out;
+}
+```
+
+这不是普通的“怕 callback 丢了所以轮询”。源码注释给出的特定竞态是：lazy 服务死亡、servicemanager 先处理死亡并请求 init 启动，但 init 尚未处理旧进程死亡，误以为服务仍在运行；下一次 `getService` 会重新发启动请求。
+
+完成点必须说清：
+
+- `checkService/getService` 返回 `null`，只代表这次路径没有交付 Binder；
+- 服务端 AIDL `getService` 返回，不代表 lazy 进程已经启动；
+- `waitForService` 正常返回，才表示客户端已经拿到一次注册回调或补查得到的 Binder；
+- 拿到 Binder 仍不代表第一次业务调用一定成功，服务可能紧接着死亡。
+
+`registerForNotifications` 在 r48 是内部 AIDL 能力。Java `ServiceManagerProxy.registerForNotifications()` 直接抛 `RemoteException`；Java 公共门面没有把它开放成普通注册 API，`ServiceManager.waitForService()` 是经 JNI 复用 Native 实现。不要把新版本 Java API 写回本章。
+
+## 6. lazy service：谁发启动请求，谁决定退出
+
+### 启动端只通知 init，不负责 fork
+
+servicemanager 查无结果且 `startIfNotFound=true` 时执行：
+
+`frameworks/native/cmds/servicemanager/ServiceManager.cpp`
+
+```cpp
+void ServiceManager::tryStartService(const std::string& name) {
+    ALOGI("Since '%s' could not be found, trying to start it as a lazy AIDL service",
+          name.c_str());
+
+    std::thread([=] {
+        (void)base::SetProperty("ctl.interface_start", "aidl/" + name);
+    }).detach();
+}
+```
+
+对贯穿场景，属性值是：
+
+```text
+ctl.interface_start = aidl/apexservice
+```
+
+init 用 `apexd.rc` 的 `interface aidl apexservice` 找到进程配置并启动 `/system/bin/apexd`。servicemanager 不 fork、不执行 APEX 初始化，也不保证一次 miss 只发送一次请求；`waitForService` 的每秒补查可能再次请求，init 的状态机负责处理重复 start。
+
+完整启动时序如下：
+
+```mermaid
+sequenceDiagram
+    participant SS as system_server / ApexManager
+    participant SM as servicemanager
+    participant Init as init
+    participant A as apexd
+
+    SS->>SM: AIDL getService("apexservice")
+    SM->>SM: 表中没有；find 权限通过
+    SM-->>Init: ctl.interface_start=aidl/apexservice
+    SM-->>SS: 当前结果 null
+    SS->>SM: registerForNotifications(name, waiter)
+    Init->>A: 启动 /system/bin/apexd
+    A->>SM: addService(name, ApexService Binder)
+    SM-->>SS: onRegistration(name, Binder)
+    SS->>SS: waitForService 返回；asInterface 得到 Proxy
+    SS->>A: getActivePackages() 等业务事务
+    Note over SS,A: 后续业务调用不经过 servicemanager
+```
+
+图中启动通知与 callback 都是协调动作。真正的 APEX 数据并不由 servicemanager 转发，所以业务调用慢时不要把它误判成“ServiceManager 转发瓶颈”。
+
+### 退出端依靠另一种 callback
+
+platform libbinder 的 C++ `LazyServiceRegistrar.registerService()` 不只调用 `addService`，还登记 `IClientCallback`：
+
+`frameworks/native/libs/binder/LazyServiceRegistrar.cpp`
+
+```cpp
+if (!manager->addService(name.c_str(), service,
+        allowIsolated, dumpFlags).isOk()) {
+    ALOGE("Failed to register service %s", name.c_str());
+    return false;
+}
+if (!reRegister) {
+    if (!manager->registerClientCallback(name, service, this).isOk()) {
+        ALOGE("Failed to add client callback for service %s", name.c_str());
+        return false;
+    }
+    // Only add this when a service is added for the first time, as it is not removed
+    mRegisteredServices[name] = {service, allowIsolated, dumpFlags};
+}
+```
+
+servicemanager 每 5 秒向驱动查询该 Binder node 的强引用数。它自己持有一个引用，因此常规检查用 `count > 1` 判断是否还有外部客户端；`guaranteeClient` 用来避免“刚把 Binder 交给客户端，客户端又在下次采样前释放”导致从未报告过 `true`。
+
+两类 callback 不要混：
+
+| callback | 谁登记 | 通知什么 | 用途 |
+|---|---|---|---|
+| `IServiceCallback` | 等服务的客户端 | 某名字注册了 Binder | 唤醒 `waitForService` |
+| `IClientCallback` | lazy 服务进程 | 该服务有/无外部 Binder 引用 | 决定是否尝试退出 |
+
+收到“无客户端”不等于进程立刻退出。Registrar 先调用 `tryUnregisterService()`；servicemanager 会复核调用 PID、Binder 身份、`guaranteeClient` 和引用数。复核成功后 Registrar 才退出进程；失败则保守存活，避免在新客户端到来时误退出。
+
+强引用数反映 Binder 引用，不等于业务会话数；5 秒也是 r48 servicemanager timer 的采样周期，不是“释放后恰好 5 秒必退出”的 SLA。
+
+## 7. SELinux：能注册、能发现、能调用是三道不同的门
+
+服务名先通过 `service_contexts` 映射为安全 type：
+
+`system/sepolicy/private/service_contexts`
+
+```text
+apexservice    u:object_r:apex_service:s0
+```
+
+相关策略把三个动作分开：
+
+```text
+add_service(apexd, apex_service)
+allow system_server apex_service:service_manager find;
+allow system_server apexd:binder call;
+```
+
+源码分别位于 `system/sepolicy/public/apexd.te` 与 `system/sepolicy/private/system_server.te`。三行含义是：
+
+| 权限 | 主体 → 目标 | 只证明什么 |
+|---|---|---|
+| `service_manager add` | `apexd → apex_service` | apexd 可以用该名字注册 |
+| `service_manager find` | `system_server → apex_service` | system_server 可以取得 Binder |
+| `binder call` | `system_server → apexd` | 可以向真实服务进程发事务 |
+
+`find` 通过不代表业务方法一定成功，后面还可能有 AIDL 参数校验、UID 检查或服务自己的权限逻辑。
+
+`Access.cpp` 的核心不是按字符串硬编码 UID，而是“调用方 SID + 服务名映射出的目标 type + service_manager 权限”：
+
+`frameworks/native/cmds/servicemanager/Access.cpp`
+
+```cpp
+Access::CallingContext Access::getCallingContext() {
+    IPCThreadState* ipc = IPCThreadState::self();
+
+    const char* callingSid = ipc->getCallingSid();
+    pid_t callingPid = ipc->getCallingPid();
+
+    return CallingContext {
+        .debugPid = callingPid,
+        .uid = ipc->getCallingUid(),
+        .sid = callingSid ? std::string(callingSid) : getPidcon(callingPid),
+    };
+}
+```
+
+```cpp
+bool Access::actionAllowedFromLookup(const CallingContext& sctx,
+        const std::string& name, const char *perm) {
+    char *tctx = nullptr;
+    if (selabel_lookup(getSehandle(), &tctx, name.c_str(),
+            SELABEL_CTX_ANDROID_SERVICE) != 0) {
+        return false;
+    }
+    bool allowed = actionAllowed(sctx, tctx, perm, name);
+    freecon(tctx);
+    return allowed;
+}
+```
+
+这里还有一个容易遗漏的默认规则：r48 的 `service_contexts` 最后一项把未显式命中的名字映射为 `default_android_service`，而 `domain.te` 用 `neverallow` 禁止对该 type 的 service-manager 操作。因此新服务仍须添加专用映射；`selabel_lookup` 的失败分支不是设备上“未知名字”最常见的结果。
+
+对 `getService/checkService`，r48 的 `tryGetService()` 在 `canFind` 失败时返回空 Binder，而外层仍因兼容原因返回 OK status；调用者常只看到 `null`，真实原因要看 servicemanager 日志和 SELinux AVC。注册 notification 则会返回 security status，`waitForService` 因此返回 `null`。
+
+`allowIsolated=true` 也只跳过“isolated UID 不得领取该服务”的额外门槛，不会绕过 SELinux `find`，更不会自动获得 `binder call` 或业务权限。
+
+## 8. 缓存与死亡：目录中的 Binder 不是永久对象
+
+Android 11 Java 层有两个常被混为一谈的缓存：
+
+| 成员 | 缓存什么 | 怎样填充 |
+|---|---|---|
+| `sServiceManager` | handle 0 对应的目录服务代理 | 第一次 `getIServiceManager()` |
+| `sCache` | 少量进程启动时注入的 well-known Binder | `ActivityThread` bind application 时调用 `initServiceCache()` |
+
+`getService()` 先查 `sCache`，但普通查询成功后不会自动写回：
+
+`frameworks/base/core/java/android/os/ServiceManager.java`
 
 ```java
 IBinder service = sCache.get(name);
 if (service != null) {
     return service;
+} else {
+    return Binder.allowBlocking(rawGetService(name));
 }
-return Binder.allowBlocking(rawGetService(name));
 ```
-
-容易产生误解：“每次查询成功后都会自动放入 `sCache`。”源码并没有这样做。
-
-`sCache` 是进程启动时一次性注入的 **well-known services 快照**：
 
 ```java
 public static void initServiceCache(Map<String, IBinder> cache) {
@@ -284,823 +559,94 @@ public static void initServiceCache(Map<String, IBinder> cache) {
 }
 ```
 
-结论：
+因此“查过一次就永远从 ServiceManager 缓存取”在 r48 是错的。`waitForService()` 的 JNI/Native 路径也不靠 Java `sCache`；它缓存的是 `defaultServiceManager()` 目录代理，不是所有业务服务。
 
-- `sServiceManager`：缓存目录服务代理。
-- `sCache`：少量已知服务引用，由进程初始化路径一次填入。
-- 普通 `getService()` 成功：Android 11 此处不会自动写入 `sCache`。
-- 因此不能笼统地讨论“所有服务缓存如何自动失效”。
-
-Binder 死亡仍应由具体客户端通过 `linkToDeath`、重查或上层重连策略处理。
-
----
-
-## 11. 三种查询 API 不要混在一起
-
-| API/路径 | 找不到时 | 是否触发 lazy start | 等待行为 |
-|---|---|---|---|
-| `checkService` | 返回 null | 否 | 不主动等待 |
-| Java `ServiceManager.getService` → 新 AIDL 服务端 | 返回 null | 是 | 服务端发启动请求后即可返回 |
-| native `defaultServiceManager()->getService` → 历史 shim | 最终返回 null | **仅自身不会触发** | 用 `checkService` 最多轮询约 5 秒 |
-| `waitForService` | 致命错误/权限问题才返回 null | 是 | 注册通知并持续等待 |
-
-这里必须区分两层实现。
-
-### 11.1 服务端 AIDL `getService`
-
-服务端执行：
-
-```cpp
-return tryGetService(name, true);
-```
-
-`true` 表示找不到时请求启动 lazy service，但当前 Binder 事务本身不在 servicemanager 服务端无限等待。
-
-### 11.2 libbinder 的历史兼容 shim
-
-Android 11 `ServiceManagerShim::getService()` 先 `checkService()`，然后最多轮询约 5 秒：
-
-```cpp
-while (uptimeMillis() < timeout) {
-    usleep(1000 * sleepTime);
-    sp<IBinder> svc = checkService(name);
-    if (svc != nullptr) return svc;
-}
-return nullptr;
-```
-
-这段 shim 在循环中仍调用 `checkService()`，所以**它自身不会请求 lazy start**。如果另一个调用者已经触发启动，它可以在 5 秒窗口内等到结果。
-
-所以说“getService 都会触发 lazy”“getService 完全不等待”或“getService 会永远等到服务出现”都不准确。必须注明是 Java 新 AIDL 路径、native 历史 shim，还是服务端实现。这是 Android 11 迁移期尤其容易踩的同名 API 陷阱。
-
-### 11.3 `waitForService`
-
-它先调用服务端 `getService` 触发 lazy start；若仍为空，就注册 notification，并等待条件变量。每隔一秒还会再次调用 `getService`，修补 init 与服务死亡之间的竞态。
-
----
-
-## 12. 完整查询链路
-
-以 Java `ServiceManager.getService("demo")` 为例：
+服务注册后，servicemanager 对远程 Binder 设置 death recipient。服务进程死亡时，`binderDied()` 删除对应目录项；但已经发给客户端的旧 `IBinder` 变量不会被改成 `null`。下一次业务调用可能得到 `DeadObjectException`，客户端需要：
 
 ```text
-Java ServiceManager.getService
- ├─ 命中 sCache → 直接返回
- └─ 未命中
-      ↓
- rawGetService
-      ↓ Binder transaction
- native servicemanager::getService
-      ↓
- tryGetService(name, startIfNotFound=true)
-      ├─ 查 mNameToService
-      ├─ 检查 isolated UID
-      ├─ SELinux canFind
-      ├─ 找不到：ctl.interface_start = aidl/name
-      └─ 找到：返回 Binder 引用
+发现死亡 → 丢弃旧 Proxy/会话 → 重新 wait/query
+         → 重新注册业务 callback → 恢复状态
 ```
 
-拿到引用后：
+registration callback 只报告“发生注册”，不是服务死亡回调。需要感知已拿到的服务死亡，客户端仍要对业务 Binder 使用 `linkToDeath` 或由上层设计重连。
 
-```java
-IDemoService demo = IDemoService.Stub.asInterface(binder);
-demo.doWork();
-```
+同名服务重新注册也不会把旧 handle 自动改指向新 Binder node。目录表可被新条目覆盖，但旧客户端必须重新查询；迟到的旧 Binder 死亡通知也不会删掉新条目，因为 `binderDied()` 会比较 Binder 身份。
 
-`doWork()` 事务的目标是 demo 服务 Binder 节点，不是 servicemanager。
+## 9. 排障：从 `null` 到根因，按完成点逐层判断
 
----
+继续使用 `apexservice`，一次拿不到服务可拆成下面几层：
 
-## 13. `tryGetService()` 的检查顺序
-
-逻辑可简化为：
-
-```cpp
-auto ctx = mAccess->getCallingContext();
-auto it = mNameToService.find(name);
-
-if (it != end && !it->second.allowIsolated && isIsolated(ctx.uid)) {
-    return nullptr;
-}
-if (!mAccess->canFind(ctx, name)) {
-    return nullptr;
-}
-if (it == end) {
-    if (startIfNotFound) tryStartService(name);
-    return nullptr;
-}
-it->second.guaranteeClient = true;
-return it->second.binder;
-```
-
-顺序背后的含义：
-
-1. 找到候选条目。
-2. 根据注册时的 `allowIsolated` 阻止 isolated UID。
-3. 通过 SELinux `find` 权限裁决调用者能否发现该名字。要注意 r48 的
-   `tryGetService()` 在拒绝时直接返回 `nullptr`，外层 `getService/checkService` 仍为兼容性
-   返回 OK status；调用者通常只看到“没拿到 Binder”，而拒绝原因要从 AVC/servicemanager
-   日志确认，并不会收到这里虚构出的 `SecurityException`。
-4. 不存在且允许启动时，通知 init 启动 lazy service。
-5. 存在时标记“马上可能出现客户端”，避免 lazy 服务过早退出。
-
-`allowIsolated=true` 只放开 isolated UID 这一道门，不会绕过 SELinux，也不会授予业务接口权限。
-
----
-
-## 14. 服务端如何注册服务
-
-Java 常见入口：
-
-```java
-ServiceManager.addService(name, binder, allowIsolated, dumpPriority);
-```
-
-SystemServer 中常见封装则是：
-
-```java
-publishBinderService(name, service);
-```
-
-最终都是跨 Binder 调用 servicemanager 的 `addService()`。
-
-完整思路：
-
-```text
-服务创建 Stub/Binder 对象
-  → addService(name, binder)
-  → servicemanager 获取调用者 SID/PID/UID
-  → 校验调用身份与名字
-  → SELinux canAdd
-  → 对远程 Binder linkToDeath
-  → 写入 mNameToService[name]
-  → 通知等待此名字的 registration callbacks
-```
-
----
-
-## 15. `addService()` 具体检查什么
-
-Android 11 源码包含这些关键检查：
-
-### 15.1 普通应用 UID 不能注册
-
-若调用者 `appid >= AID_APP`，直接拒绝。ServiceManager 不是让任意三方应用发布全局系统服务的公共注册中心。
-
-### 15.2 SELinux `add`
-
-调用者必须对该服务名映射出的 service type 拥有：
-
-```text
-class service_manager permission add
-```
-
-### 15.3 Binder 不能为空
-
-空 Binder 没有可供客户端调用的对象。
-
-### 15.4 名字格式
-
-长度必须为 1～127；允许字母、数字以及 `_ - . /`。AIDL HAL 常用斜线表达：
-
-```text
-android.hardware.foo.IFoo/default
-```
-
-### 15.5 stable AIDL 的 VINTF 声明
-
-如果 Binder 标记为 VINTF stability，实例必须在 device/framework VINTF manifest 中声明，否则拒绝注册。
-
-### 15.6 死亡监听
-
-若注册的是远程 Binder，servicemanager 对它 `linkToDeath`。服务进程死亡后目录条目才能被清理。
-
-### 15.7 同名覆盖
-
-源码会用新 `Service` 直接覆盖 map 中同名旧条目；这个 r48 实现本身在该分支没有额外
-“同名覆盖”警告日志。不要把静默覆盖理解成推荐的热替换协议；客户端已持有的旧 Binder
-引用不会自动变成新对象，而且旧 Binder 的 death notification 后续也可能与新条目产生
-难懂时序，服务设计应避免把同名覆盖当升级机制。
-
----
-
-## 16. 服务名为什么也受 SELinux 管理
-
-`service_contexts` 把服务名字映射成安全 type，例如概念上：
-
-```text
-activity         u:object_r:activity_service:s0
-package          u:object_r:package_service:s0
-demo             u:object_r:demo_service:s0
-```
-
-这不是给某个文件贴标签，而是给“ServiceManager 名字”建立 SELinux 安全上下文。
-
-`Access.cpp` 大致做三件事：
-
-1. 从 Binder 调用取得 calling SID、PID、UID。
-2. 用 `selabel_lookup(..., SELABEL_CTX_ANDROID_SERVICE)` 查服务名的目标上下文。
-3. 检查 `service_manager` class 的 `add/find/list` 权限。
-
-如果名字没有匹配到 `service_contexts`，访问会被拒绝，而不是自动当成安全的默认服务。
-
----
-
-## 17. `add`、`find`、`list` 是三种独立能力
-
-| 权限 | 谁常需要 | 含义 |
+| 完成点 | 失败现象 | 应查证据 |
 |---|---|---|
-| `add` | 服务端 domain | 能以此名字注册服务 |
-| `find` | 客户端 domain | 能按名字取得 Binder |
-| `list` | 调试/系统组件 | 能枚举可见服务 |
+| 找到 servicemanager | handle 0/IPC 异常 | servicemanager 是否运行、Binder context 是否选对 |
+| 名字可发现 | 查询返回 `null` | `service_contexts`、调用 domain、`find` AVC |
+| init 接受 lazy start | 持续等待 | `apexd.rc` 的 `interface aidl apexservice` 与 init 日志 |
+| 进程存活 | 反复启动/死亡 | apexd crash、oneshot 状态、启动依赖 |
+| `addService` 成功 | 进程在但目录无条目 | app-id、`add` 权限、名字、Binder、stability 检查 |
+| notification 到达 | 已注册仍等待 | callback 是否存活、Binder 线程池、每秒补查日志 |
+| 业务 Binder 可调用 | 拿到后仍异常 | `binder call`、服务权限、Binder death、AIDL 协议 |
 
-策略宏常把常见组合包装起来，但思考时应拆开。
+三个典型翻车点：
 
-例如，允许 `demo_client` 发现 `demo_service`，并不代表它能冒充服务端注册同名对象。
+1. **把 `getService` 当等待。** Java r48 路径实际委托 `checkService`；Native 历史路径也只有约 5 秒有限轮询。
+2. **在不能长期阻塞的线程调用 `waitForService`。** 对有合法标签但没有匹配 init 服务、或服务持续注册失败的名字，它没有固定超时。
+3. **只看进程，不看注册。** `apexd` 已启动不代表 `addService` 已通过；registered 才代表目录中已有 Binder。
 
-更重要的是：
+还要明确两项 Android 11 边界：
 
-```text
-service_manager find 权限 ≠ Binder call 权限
-```
+- `isDeclared(name)` 查询的是 VINTF manifest 中的 stable AIDL 实例，不是 init rc 的 `interface aidl`。因此不能用 `waitForDeclaredService("apexservice")` 代替这里的等待。这里的 lazy registrar 是 platform C++ libbinder 能力；r48 的 NDK `AServiceManager` 尚未暴露 wait、isDeclared、lazy 注册或 notification。
+- 本地 platform checkout 能确认 libbinder、servicemanager、init 配置和 sepolicy；具体设备可能有厂商策略、不同 kernel tag 与服务配置。Binder 驱动内部的引用统计细节应以目标设备内核为准。
 
-前者让客户端拿到目录中的引用；后者决定客户端能否向真正的服务 Binder 发事务。Framework 权限、AppOps 和服务内部 UID 检查还可能继续裁决。
+## 10. macOS 上怎样静态验证整条链
 
----
-
-## 18. 为什么 SELinux 要知道 calling SID
-
-UID 只能说明 Linux 身份，不能完整表达 Android SELinux domain。两个进程可能有不同 domain，却不能仅靠一条粗糙的 UID 判断表达策略。
-
-Binder 驱动把调用者安全上下文传给服务端，servicemanager 使用 calling SID 判断：
-
-```text
-源 domain ── find/add/list ──> 目标 service type
-```
-
-排查拒绝时要同时确认：
-
-- 调用方实际 domain 是什么；
-- 服务名实际映射到哪个 type；
-- 被拒绝的是 `find`、`add`、`list` 还是后续 `binder call`。
-
----
-
-## 19. 服务死亡后发生什么
-
-服务注册时，servicemanager 对远程 Binder 设置死亡通知。`binderDied()` 会清除：
-
-- 指向死亡 Binder 的服务表项；
-- 已死亡的 registration callback；
-- 已死亡的 client callback。
-
-但需要分清两个事实：
-
-1. servicemanager 清理的是自己的目录状态。
-2. 客户端手里早已拿到的 Binder 代理不会被“清空变量”；它会在调用时看到 `DeadObjectException`，或收到自己注册的 death recipient。
-
-因此健壮客户端通常需要：
-
-```text
-收到死亡 → 清理本地状态 → 重新查询/等待 → 重建 callback/session
-```
-
----
-
-## 20. 注册通知 `registerForNotifications`
-
-某个客户端希望等待名字 `demo` 出现，可以注册 `IServiceCallback`。
-
-服务端流程：
-
-1. 检查调用者对该名字的 `find` 权限。
-2. 校验名字和 callback 非空。
-3. 对 callback 设置死亡通知。
-4. 保存到 `mNameToRegistrationCallback[name]`。
-5. 如果服务已经存在，立刻调用一次 `onRegistration(name, binder)`。
-
-第 5 点很重要，它缩小“先查询为空、注册 callback 前服务恰好出现”的竞态窗口。
-
-`waitForService()` 仍会在注册后循环补查，因为 lazy service 与 init 死亡处理还存在更复杂时序。
-
----
-
-## 21. registration callback 与 client callback 的区别
-
-| 对比 | registration callback | client callback |
-|---|---|---|
-| 接口 | `IServiceCallback` | `IClientCallback` |
-| 注册者 | 等待服务的客户端 | lazy 服务端自己 |
-| 事件 | 某名字已注册 | 此服务当前有/无外部客户端 |
-| 用途 | 唤醒 `waitForService` 等等待者 | 决定 lazy 服务能否退出 |
-| 触发方式 | `addService` 时立即通知 | 强引用计数变化的周期检查 |
-
-一句话记忆：
-
-```text
-registration callback：客户等“店开门”
-client callback：店家看“还有没有顾客”
-```
-
----
-
-## 22. lazy AIDL service 如何被启动
-
-`tryGetService()` 找不到服务且 `startIfNotFound=true` 时执行：
-
-```cpp
-SetProperty("ctl.interface_start", "aidl/" + name);
-```
-
-注意它是异步线程执行属性设置，避免 servicemanager 自己阻塞。
-
-init 根据 `.rc` 中的 interface 声明寻找对应服务，概念示例：
-
-```rc
-service vendor.demo /vendor/bin/demo_service
-    class hal
-    interface aidl vendor.demo.IDemo/default
-    disabled
-    oneshot
-```
-
-触发值应理解为：
-
-```text
-ctl.interface_start = aidl/vendor.demo.IDemo/default
-```
-
-完整时序：
-
-```text
-客户端 get/wait
-  → servicemanager 查无此名
-  → 写 ctl.interface_start
-  → init 匹配 interface 并启动进程
-  → 服务进程 addService
-  → servicemanager 保存条目并通知等待者
-  → 客户端拿到 Binder
-```
-
-ServiceManager 本身不 fork 服务进程，也不解析完整 init service 生命周期；它只是向 init 发接口启动请求。
-
----
-
-## 23. lazy AIDL 与 lazy HIDL 不要混写
-
-两者理念相似，但服务目录与接口前缀不同：
-
-| 类型 | 服务管理器 | Binder 驱动 | init interface 启动值 |
-|---|---|---|---|
-| lazy AIDL | servicemanager | `/dev/binder` | `aidl/<descriptor>/<instance>` |
-| lazy HIDL | hwservicemanager | `/dev/hwbinder` | `<fqname>/<instance>`，不是 `aidl/` 前缀 |
-
-例如 AIDL 名字可能是：
-
-```text
-android.hardware.foo.IFoo/default
-```
-
-而 HIDL 名字表达类似：
-
-```text
-android.hardware.foo@1.0::IFoo/default
-```
-
-不能因为它们都叫 lazy service 就把注册 API、manifest 格式或 Binder 驱动混为一谈。
-
----
-
-## 24. lazy 服务如何知道“没有客户端了”
-
-lazy 服务端调用 `registerClientCallback()` 登记 `IClientCallback`。servicemanager 会严格校验：
-
-- 调用者拥有该名字的 `add` 权限；
-- 服务已经注册；
-- 调用 PID 与注册服务时记录的 `debugPid` 相同；
-- 传来的 Binder 与表中对象完全一致。
-
-这保证普通客户端不能替服务端操纵退出协议。
-
-servicemanager 每 5 秒通过 Binder 驱动查询节点强引用数：
-
-```cpp
-bool hasClients = count > 1; // servicemanager 自己持有一个强引用
-```
-
-然后向服务端回调：
-
-```text
-onClients(service, true)   有客户端
-onClients(service, false)  已无客户端
-```
-
-这是一种基于驱动引用计数的近似生命周期信号，不是业务会话数，也不是“有几个 App 正在使用”的精准统计。
-
----
-
-## 25. `guaranteeClient` 为什么存在
-
-假设客户端刚取得 Binder 就很快释放：
-
-```text
-t0  ServiceManager 返回 Binder
-t1  客户端短暂使用并释放
-t2  5 秒周期检查到来
-```
-
-仅在 t2 看强引用，可能从未观察到“有客户端”。于是 `tryGetService()` 成功返回时先设置：
-
-```cpp
-service.guaranteeClient = true;
-```
-
-周期处理若发现此前没有记录客户端，会先补发 `hasClients=true`，再在后续周期报告 false。
-
-它保证的是生命周期通知不轻易漏掉一次客户端出现，并不意味着 Binder 引用永久保活，也不保证客户端完成了业务调用。
-
----
-
-## 26. lazy 服务怎样注销自己
-
-`tryUnregisterService(name, binder)` 不是任何进程都能调用。它检查：
-
-1. Binder 非空。
-2. 调用者有 `add` 权限。
-3. 名字确实存在。
-4. 调用 PID 就是登记的服务进程 PID。
-5. Binder 与登记对象完全相同。
-6. 没有 `guaranteeClient` 表示即将到来的客户端。
-7. 驱动引用计数显示没有其他客户端。
-
-事务执行期间，Binder 驱动和 servicemanager 自己都会持有引用，所以源码用 `clients > 2` 判断仍有其他持有者。若驱动不支持统计或发生错误，也保守地认为“还有客户端”，拒绝注销。
-
-这体现了一个安全原则：宁愿服务暂时不退出，也不要在客户端将要使用时误注销。
-
----
-
-## 27. `isDeclared()` 与“正在运行”不同
-
-`isDeclared(name)` 查询 VINTF manifest 中是否声明了 stable AIDL 实例。它不等于：
-
-- 服务进程当前正在运行；
-- 服务已经 `addService`；
-- 当前调用者一定有权限访问；
-- 该服务绝不会启动失败。
-
-可用四个状态区分：
-
-```text
-declared  配置上承诺存在
-started   进程已被 init 启动
-registered 已进入 ServiceManager 表
-reachable 调用者通过权限检查并拿到可用 Binder
-```
-
-`waitForDeclaredService()` 只是先用 declared 过滤，再调用 `waitForService()`。
-
----
-
-## 28. `listServices()` 与 dumpsys 优先级
-
-注册时的 `dumpPriority` 是位掩码，用于筛选服务列表，例如 critical/high/normal/default 等优先级。
-
-`listServices(priority)` 会：
-
-1. 检查调用者的 `service_manager list` 权限；
-2. 遍历服务表；
-3. 仅返回 dump priority 匹配的名字。
-
-它不表示服务运行线程优先级，也不改变 Binder 调度优先级。这里的 priority 主要服务于 `dumpsys` 信息采集策略。
-
----
-
-## 29. `service list`、`service check` 与 `dumpsys`
-
-即使不编译源码，在已有设备或模拟器上也可帮助建立直觉：
+在源码根目录执行这组只读命令：
 
 ```bash
-adb shell service list
-adb shell service check activity
-adb shell dumpsys -l
-adb shell dumpsys activity
-```
-
-概念区别：
-
-- `service list/check` 主要观察 Binder 服务目录。
-- `dumpsys -l` 获取可 dump 服务列表。
-- `dumpsys activity` 拿到 Binder 后调用该服务的 dump 接口。
-
-命令失败时不要立刻认定“服务不存在”；还可能是 shell domain 没有 find/list/call 权限，或设备版本实现不同。
-
----
-
-## 30. 一次完整启动竞态示例
-
-假设 lazy 服务尚未运行，A、B 两个客户端同时等待：
-
-```text
-A: waitForService → getService → 未找到 → 请求 init 启动
-B: waitForService → getService → 未找到 → 再次请求 init 启动
-A/B: 注册 registration callback
-init: 启动服务（重复 start 请求不会产生两份正常实例）
-server: addService
-SM: 写入表并通知 A、B
-A/B: 条件变量唤醒，取得同一 Binder 服务节点的引用
-```
-
-因此 `ctl.interface_start` 请求可能重复，系统正确性不能建立在“只发一次启动请求”的假设上。init 的服务状态管理负责消化重复请求。
-
----
-
-## 31. ServiceManager 是否会转发业务调用
-
-不会。第一次查询返回 Binder 引用时，Binder 驱动为客户端建立 `binder_ref`/handle，目标仍是服务端的 Binder node。
-
-```text
-             只参与名字查询
-Client ───────────────> ServiceManager
-   │                         │
-   │ 返回服务 Binder handle  │
-   <─────────────────────────┘
-   │
-   │ 后续 transaction
-   └───────────────────────> Real Service
-```
-
-这带来两个实际结论：
-
-- servicemanager 不会成为所有 Binder 业务流量的数据中转瓶颈。
-- 服务端死亡后，即使目录很快注册了新对象，旧客户端 handle 仍指向旧节点，必须重新查询。
-
----
-
-## 32. 常见误区逐条纠正
-
-### 误区 1：所有系统服务都运行在 servicemanager 进程
-
-错误。它只保存 Binder 引用。服务可运行在 system_server、独立 native daemon、HAL 进程等。
-
-### 误区 2：ServiceManager 返回 Java Service 实例
-
-错误。跨进程返回的是 Binder 引用；Java `asInterface()` 再包装成 Proxy，只有同进程优化时才可能返回本地接口。
-
-### 误区 3：`getService()` 每次都会缓存结果
-
-错误。Android 11 Java `sCache` 不由普通查询自动填充。
-
-### 误区 4：`checkService()` 也会拉起 lazy 服务
-
-错误。服务端使用 `startIfNotFound=false`。
-
-### 误区 5：能 find 就一定能调用所有方法
-
-错误。后续还受 Binder SELinux、Framework permission、AppOps、UID/package 校验等控制。
-
-### 误区 6：`allowIsolated=true` 等于所有进程可访问
-
-错误。它只取消 isolated UID 的特定阻断，不绕过其他权限。
-
-### 误区 7：lazy 服务无客户端后立刻退出
-
-错误。Android 11 servicemanager 周期观察引用，服务端收到 callback 后再尝试注销；存在时间窗口和保守拒绝。
-
-### 误区 8：AIDL 和 HIDL lazy 服务走同一个管理器
-
-错误。它们分别走 Binder/servicemanager 与 HwBinder/hwservicemanager。
-
----
-
-## 33. 读源码时的线程与进程表
-
-| 代码 | 进程 | 典型线程/上下文 |
-|---|---|---|
-| Java `ServiceManager.getService` | 调用者进程 | 调用它的线程 |
-| `ServiceManagerShim` | 调用者 native 侧 | 调用线程 |
-| native `ServiceManager.cpp` | servicemanager | 单线程 Looper/Binder polling |
-| `Access.cpp` | servicemanager | 同一事务处理上下文 |
-| init property/interface 处理 | init | init 主事件循环相关路径 |
-| `addService` 调用 | 服务进程 → servicemanager | 服务启动线程/Binder 服务端 Looper |
-| registration callback | 等待者进程 | 对方 Binder 线程，再唤醒等待线程 |
-
-不要因为函数名都叫 `ServiceManager` 就默认它们运行在同一个进程。
-
----
-
-## 34. 一张总时序图
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant SM as servicemanager
-    participant I as init
-    participant S as Lazy service
-    C->>SM: waitForService(name) / getService
-    SM->>SM: 查表 + find 权限；当前不存在
-    SM-->>I: ctl.interface_start=aidl/name
-    C->>SM: registerForNotifications(name, callback)
-    I->>S: 启动进程
-    S->>S: 创建 Binder Stub
-    S->>SM: addService(name, binder)
-    SM->>SM: add 权限 + VINTF + linkToDeath + 保存
-    SM-->>C: onRegistration(name, binder)
-    C->>S: 后续业务 transaction（不经过 SM）
-    S-->>C: reply
-```
-
-最后两条业务事务没有经过 servicemanager。
-
----
-
-## 35. 安全排障的分层方法
-
-遇到“拿不到服务”时，按顺序判断：
-
-### 第一层：名字与 Binder context
-
-- 名字拼写和 instance 是否一致？
-- 客户端连接 `/dev/binder`、`/dev/vndbinder` 还是 `/dev/hwbinder`？
-- AIDL/HIDL 是否选错世界？
-
-### 第二层：声明与启动
-
-- stable AIDL 是否在 VINTF manifest 声明？
-- init `.rc` 的 `interface aidl ...` 是否匹配？
-- 服务进程是否启动、崩溃或反复重启？
-
-### 第三层：注册
-
-- 是否真的调用 `addService`？
-- 名字是否合法？
-- 是否被“应用 UID 不准 add”拦截？
-
-### 第四层：SELinux 与身份
-
-- 服务端是否有 `add`？
-- 客户端是否有 `find`？
-- `service_contexts` 映射是否存在且 type 正确？
-
-### 第五层：业务 Binder
-
-- 拿到 Binder 后是否又被 `binder call`、permission 或 AppOps 拒绝？
-- Binder 是否已经死亡？
-- AIDL descriptor/version 是否匹配？
-
-这样能避免看到 `null` 就只盯着 ServiceManager 表。
-
----
-
-## 36. Mac 上的源码阅读练习（无需编译）
-
-### 练习 1：找到 handle 0 入口
-
-```bash
-rg -n "getContextObject|becomeContextManager|setTheContextObject" \
-  frameworks/native frameworks/base/core
-```
-
-目标：分别标出客户端入口、服务端 context object 和驱动 context manager 注册。
-
-### 练习 2：对比三种查询
-
-```bash
-rg -n "getService\(|checkService\(|waitForService\(" \
+cd /Users/ninebot/androidSource
+rg -n "waitForApexService|waitForService\\(\\"apexservice\\"" \
+  frameworks/base/services/core/java/com/android/server/pm/ApexManager.java
+rg -n "waitForService" frameworks/base/core/jni/android_os_ServiceManager.cpp
+sed -n '45,80p' frameworks/base/core/java/android/os/ServiceManagerNative.java
+sed -n '115,165p' frameworks/native/cmds/servicemanager/ServiceManager.cpp
+rg -n "ctl.interface_start|tryStartService" frameworks/native/cmds/servicemanager/ServiceManager.cpp
+rg -n "interface aidl apexservice|disabled|oneshot" system/apex/apexd/apexd.rc
+rg -n "CreateAndRegisterService|registerService|forcePersist" system/apex/apexd
+rg -n "registerForNotifications|onRegistration|wait_for" \
   frameworks/native/libs/binder/IServiceManager.cpp \
+  frameworks/native/cmds/servicemanager/ServiceManager.cpp
+rg -n "apexservice|apex_service" system/sepolicy/private/service_contexts \
+  system/sepolicy/public/apexd.te \
+  system/sepolicy/private/system_server.te
+rg -n "registerClientCallback|guaranteeClient|count > 1" \
   frameworks/native/cmds/servicemanager/ServiceManager.cpp \
-  frameworks/base/core/java/android/os/ServiceManager.java
+  frameworks/native/libs/binder/LazyServiceRegistrar.cpp
 ```
 
-目标：写出每个 API 的“是否启动、是否等待、何时返回 null”。
+验证时只抓四个结论：Java `get` 落到 `check`；wait 经 JNI 进入 platform C++；lazy start 只是写 init 控制属性；注册通知、客户端通知和 SELinux add/find/call 各有独立源码。
 
-### 练习 3：追服务名标签
+macOS 静态阅读能证明代码分支和默认配置，不能证明某台设备何时启动、实际等待多久、AVC 是否发生或厂商是否修改策略。要回答这些运行时问题，仍需目标设备的 init/servicemanager 日志、`service list/check`、`dumpsys` 与 SELinux audit。
 
-```bash
-rg -n "activity_service|package_service" system/sepolicy
-rg -n "SELABEL_CTX_ANDROID_SERVICE|canFind|canAdd" \
-  frameworks/native/cmds/servicemanager
-```
+## 11. 检查题、答案与可立即执行的结论
 
-目标：把 `名字 → type → add/find` 串成一条链。
+先用八个问题检查自己是否真正读懂：
 
-### 练习 4：追 lazy 协议
+1. **为什么不用名字查询 servicemanager？** handle 0 是 context manager 的特殊入口；`manager` 只是普通名字记录。
+2. **Java `getService("apexservice")` 会拉起 `apexd` 吗？** r48 不会，它经兼容代理调用 `checkService()`；拉起并等待应使用 `waitForService()`。
+3. **服务端 AIDL `getService()` 为何仍可返回 `null`？** 它只异步写 `ctl.interface_start`，不等待 init、进程初始化与 `addService`。
+4. **wait 怎样避免丢通知？** 注册 callback 后服务端重查表，已有服务就立即 `onRegistration()`；等待端还每秒补查。
+5. **有 `find` 为何仍可能调用失败？** 实际事务还需 `binder call`，并受服务内权限、UID 与参数校验约束。
+6. **`sCache` 会缓存每次成功查询吗？** 不会，它只在进程绑定时一次性注入少量 well-known Binder。
+7. **没有客户端为何不等于马上退出？** 强引用不是业务会话；Registrar 还要通过 `tryUnregisterService` 的竞态复核。
+8. **`isDeclared("apexservice")` 能证明 init 声明吗？** 不能；VINTF stable AIDL 声明与 rc 的 `interface aidl` 是两套机制。
 
-```bash
-rg -n "ctl.interface_start|registerClientCallback|tryUnregisterService|guaranteeClient" \
-  frameworks/native/cmds/servicemanager \
-  frameworks/native/libs/binder
-```
-
-目标：解释为什么 `guaranteeClient` 和 `clients > 2` 同时存在。
-
----
-
-## 37. 建议亲手画的两张图
-
-第一张只画查询：
+实战排查“服务拿不到”时，至少记录：
 
 ```text
-Java API → handle 0 IServiceManager → service map → returned Binder → real service
+[ ] 服务名、instance、Binder context 与实际 API 路径
+[ ] lazy start 需求、rc 接口名，以及 addService 是否成功
+[ ] SELinux type 与 add/find/call 三项权限
+[ ] 缓存、等待完成点、线程与超时策略
+[ ] 死亡后是否丢弃旧 Proxy 并重建 callback/session
 ```
 
-第二张只画 lazy 生命周期：
-
-```text
-not found → interface_start → addService → onRegistration
-         → client ref count → onClients(false) → tryUnregister
-```
-
-不要一开始把 SELinux、init、VINTF、死亡通知全挤进同一张图。先拆开，再叠加，理解会稳很多。
-
----
-
-## 38. 自测题
-
-1. 为什么客户端不需要先查询就能拿到 ServiceManager？
-2. `manager` 服务名和 handle 0 是不是同一机制？
-3. Java `sCache` 是否在每次 `getService` 成功后更新？
-4. `checkService`、`getService`、`waitForService` 的差异是什么？
-5. 为什么查询业务服务成功后，后续调用不再经过 ServiceManager？
-6. `allowIsolated` 能否绕过 SELinux `find`？
-7. `service_manager find` 与 `binder call` 有何区别？
-8. registration callback 和 client callback 分别由谁注册？
-9. lazy AIDL 服务由 servicemanager 直接 fork 吗？
-10. 为什么客户端拿着旧 Binder 时，同名重新注册不能自动修复它？
-11. `isDeclared=true` 为什么不代表服务当前已注册？
-12. lazy 服务为什么不能只用一次瞬时强引用计数决定退出？
-
----
-
-## 39. 自测题参考答案
-
-1. Binder 约定 handle 0 指向当前 context manager。
-2. 不是；前者是普通名字登记，后者是驱动层特殊入口。
-3. 不会；Android 11 普通查询路径不把结果写入 `sCache`。
-4. check 非触发、非主动等待；Java 新 AIDL get 会请求 lazy start，native 历史 shim get 只用 check 轮询约 5 秒；wait 用通知持续等待并反复补触发。
-5. 返回的 Binder handle 直接指向真实服务节点，驱动直接路由业务事务。
-6. 不能，它只处理 isolated UID 这一项注册属性。
-7. find 控制能否从目录发现；call 控制能否向服务节点发 Binder 事务。
-8. 等待者注册前者；lazy 服务端注册后者。
-9. 不会；它写 `ctl.interface_start`，由 init 启动进程。
-10. 旧 handle 仍指向已死亡的旧 Binder node，客户端必须重查。
-11. declared 是 VINTF 配置承诺，不是运行和注册状态。
-12. 检查有周期窗口，短命客户端可能出现后消失；还要处理事务自身和 servicemanager 持有的引用。
-
----
-
-## 40. 本章复读：最容易不理解的五个地方
-
-### 40.1 “getService 会不会等待”不能脱离层次回答
-
-Java 新 AIDL 路径进入服务端 `getService`，它负责触发 lazy start 后返回；Android 11 libbinder 历史 shim 只用 `checkService` 做最多约 5 秒轮询，本身不触发 lazy；`waitForService` 则调用真实 AIDL get 触发启动，并在注册通知后持续等待。看到同名函数时先确认 Java、shim 还是服务端实现。
-
-### 40.2 两个缓存不是一回事
-
-`sServiceManager` 缓存目录代理，`sCache` 保存一次性注入的少量服务快照。普通查询并未形成一个自动更新的全服务缓存。
-
-### 40.3 两种 callback 的方向相反
-
-registration callback 从服务端目录通知等待客户“服务出现了”；client callback 从目录通知 lazy 服务端“客户出现/消失了”。
-
-### 40.4 “服务存在”有多重含义
-
-manifest 声明、进程启动、完成注册、客户端有权限、Binder 仍存活是五个不同状态。排障时必须指出你说的是哪个完成点。
-
-### 40.5 ServiceManager 不是代理转发层
-
-它只参与发现。一旦返回 Binder，业务事务由 Binder 驱动直达真实服务，因此服务调用慢通常不能归咎于 servicemanager 转发。
-
----
-
-## 41. 本章结论
-
-把整章压缩成一条主线：
-
-```text
-handle 0 找到 servicemanager
-  → 服务端经 add + SELinux + VINTF 检查写入名字表
-  → 客户端经 find 检查用名字换 Binder
-  → 后续业务事务直接到真实服务
-  → 死亡通知清理目录
-  → registration callback 解决等待注册
-  → client callback + 引用计数支持 lazy 服务退出
-  → ctl.interface_start 把真正的进程启动交给 init
-```
-
-读懂这一章后，再看 `SystemServiceRegistry` 就会清楚：`Context.getSystemService()` 返回的通常是 Java Manager 门面，而它底层如何取得 Binder、如何按 Context 缓存、服务端又如何 publish，是 ServiceManager 之上的另一层抽象。
-
----
-
-## 42. 下一章预告
-
-第 94 章将学习：
-
-**Android SystemServiceRegistry：Context.getSystemService、Manager 缓存与服务发布链路**
-
-重点回答：
-
-- `getSystemService(Class)` 如何映射服务名和 Manager 类型；
-- `CachedServiceFetcher`、`StaticServiceFetcher` 有何区别；
-- 一个 Context 为什么有自己的 Manager 缓存；
-- `SystemService.publishBinderService()` 与本章 ServiceManager 怎样接上；
-- 为什么拿到 `WifiManager`、`PowerManager` 不等于直接拿到 Binder Stub。
+回到开头：`ApexManager` 选择 `waitForService("apexservice")`，不是因为它比 `getService` “更保险”，而是因为协议需求不同——该调用必须负责请求启动、跨过注册时间窗并只在拿到 Binder 后继续。随后 `IApexService` 的业务事务由 Binder 驱动直接送到 `apexd`，servicemanager 的任务已经结束。

@@ -1,1315 +1,430 @@
-# 90 Android Binder 驱动：进程、线程、节点、事务与死亡通知内核链路
+# 90 Android Binder 驱动：一次同步调用遇上服务进程死亡
 
-> 源码版本：Android 11 / API 30 / `android-11.0.0_r48`
+> 平台源码基线：Android 11 / API 30 / `android-11.0.0_r48`
 >
-> 本地源码边界：当前 AOSP checkout 包含 `frameworks/native/libs/binder` 和 Binder UAPI，
-> 但不包含配套 Linux kernel 的 `drivers/android/binder.c`。因此用户态部分可直接逐行阅读；
-> 内核部分以 Android Binder 驱动的稳定对象模型和与 UAPI 命令的对应关系讲解。若以后
-> 补齐设备匹配的 kernel source，再按本章检索词定位具体版本实现。
+> 内核参考基线：Android common 5.4 / `android11-5.4.86_r00`
 
----
+App 已经拿到远端服务的 Binder 代理，调用一个同步方法。请求刚发出去，服务进程却被杀了：调用方可能收到 `DEAD_OBJECT`；如果之前注册过死亡监听，还会执行 `binderDied()`。
 
-## 1. 本章要打通的链路
+**先给结论：这是同一次进程死亡的两种观察，不是重复通知。** `DEAD_OBJECT` 处理一次调用的失败，`binderDied()` 宣告这份远端能力已经死亡。
 
-```text
-BpBinder::transact()
-  → IPCThreadState::transact()
-  → BC_TRANSACTION 写入 mOut
-  → ioctl(BINDER_WRITE_READ)
-  → binder driver 解析 transaction
-  → 找到目标 proc/node/thread
-  → 翻译 Binder object 和复制 transaction buffer
-  → BR_TRANSACTION 唤醒服务端线程
-  → BBinder::transact()/onTransact()
-  → BC_REPLY
-  → driver 沿 transaction stack 找回 caller
-  → BR_REPLY
-  → client Parcel reply
-```
+要解释两者为什么能并发出现，才需要认识驱动里的五个对象：它们分别记录谁在调用、哪个线程在等、目标对象属于谁、调用方用哪个 handle 引用它，以及当前事务该怎样结束。
 
-完成本章后应能回答：
+读完本章，你应该能在 Binder 故障中分清：
 
-- handle 为什么只在一个进程内有意义？
-- server 的本地对象如何变成 client 的 `BpBinder`？
-- Binder 为什么不是简单 socket send/recv？
-- 同步调用在等待 reply 时能否处理嵌套事务？
-- oneway 为什么不等于无限吞吐？
-- 进程死亡怎样触发 `binderDied()`？
-- Binder buffer 为什么可能耗尽？
-- `BR_TRANSACTION_COMPLETE` 为什么不等于业务完成？
+- `handle`、远端对象和服务进程分别是什么；
+- 请求已被驱动接收、远端方法执行完、同步调用返回、死亡通知处理完，各发生在什么时候；
+- 为什么“持有强引用”仍挡不住服务进程死亡；
+- 为什么遇到 `DEAD_OBJECT` 后不能无条件重试有副作用的操作。
 
----
+本章只追驱动对象、同步等待和死亡通知。AIDL 生成代码、Parcel 完整布局、线程池启动等用户空间链路已在前文讲过，这里不再铺开。
 
-## 2. 源码地图
+## 1. 问题：`handle = 7` 为什么不能直接代表远端对象
 
-| 路径 | 作用 |
-|---|---|
-| `frameworks/native/libs/binder/ProcessState.cpp` | 每进程 driver fd、mmap、handle→proxy cache、线程池 |
-| `frameworks/native/libs/binder/IPCThreadState.cpp` | 每线程命令缓冲、ioctl、transaction/reply、命令执行 |
-| `frameworks/native/libs/binder/BpBinder.cpp` | 远端对象代理、handle、死亡监听 |
-| `frameworks/native/libs/binder/Binder.cpp` | 本地 `BBinder` 与 `onTransact` |
-| `frameworks/native/libs/binder/Parcel.cpp` | 数据与 Binder/FD 对象序列化 |
-| `frameworks/native/libs/binder/include/binder/*.h` | 用户态类和 API |
-| `frameworks/native/libs/binder/include/private/binder/binder_module.h` | Binder UAPI include/兼容入口 |
-| `bionic/libc/kernel/uapi/linux/android/binder.h` | ioctl、BC/BR、transaction data 等 UAPI |
-| `frameworks/native/cmds/servicemanager` | context manager/service registry 用户态实现 |
-| `system/libhwbinder` | HwBinder 对照实现，不是本章普通 Binder主线 |
-
-若有匹配 kernel tree，检索：
+先固定一个贯穿场景：
 
 ```text
-drivers/android/binder.c
-drivers/android/binder_internal.h
-drivers/android/binder_alloc.c
-drivers/android/binderfs.c
+Client App 进程 C
+  └─ BpBinder(handle = 7)
+       └─ 同步调用 saveSetting(requestId = 42)
+
+Server 进程 S
+  └─ BBinder/Stub 对象 O
 ```
 
-不同 kernel 版本结构和锁实现会变化，概念对象基本保持。
+`BpBinder` 并不装着服务端对象 O。它只装着一个整数 handle，例如 7。这个数字像“本公司的工牌号”：在进程 C 的 Binder 引用表里能找到人，拿到另一个进程里未必指向同一对象。
 
----
+驱动中的真实关系是：
 
-## 3. 六个核心对象先建立直觉
+```text
+C 的 binder_proc
+  handle 7 → binder_ref R ─────────────┐
+                                       ▼
+S 的 binder_proc ──拥有── binder_node N ──对应── 服务端对象 O
+```
 
-| 概念 | 所属 | 一句话 |
+因此要把三个概念拆开：
+
+- `handle 7`：进程 C 的局部编号；
+- `binder_ref R`：进程 C 对节点 N 的一份引用记录；
+- `binder_node N`：服务端本地 Binder 对象 O 在驱动中的代表。
+
+同一个 N 在另一个客户端进程里可以是 handle 19。把整数 7 用普通 socket 发给那个进程，并不会传递 Binder 能力；只有 Binder 驱动在事务中翻译 Binder 对象，才能为接收进程建立或找到它自己的 `binder_ref`。
+
+Android 11 UAPI（用户空间和内核共同遵守的接口协议）里的事务结构也证明，普通调用把“本进程的 handle”交给驱动，而不是把服务端地址交给驱动：
+
+```c
+struct binder_transaction_data {
+  union {
+    __u32 handle;
+    binder_uintptr_t ptr;
+  } target;
+  binder_uintptr_t cookie;
+  __u32 code;
+  __u32 flags;
+  pid_t sender_pid;
+  uid_t sender_euid;
+  binder_size_t data_size;
+  binder_size_t offsets_size;
+```
+
+源码位置：`bionic/libc/kernel/uapi/linux/android/binder.h`。这里只摘了目标和事务元数据；后面还有数据缓冲区地址等字段。
+
+## 2. 机制：五个驱动对象各自回答一个问题
+
+不要把这些结构背成名词表。把它们放回这次调用，职责就很直观：
+
+| 驱动对象 | 属于谁 / 活多久 | 在场景中回答什么 |
 |---|---|---|
-| `ProcessState` | userspace/process | 一个 Binder driver 连接和 proxy cache |
-| `IPCThreadState` | userspace/thread | 当前线程的 BC 输出、BR 输入与 calling identity |
-| `BpBinder` | userspace/client | 某个远端 Binder handle 的代理 |
-| `BBinder` | userspace/server | 本进程真正接收 `onTransact` 的对象 |
-| `binder_proc` | kernel/process | 打开 Binder driver 的进程状态 |
-| `binder_thread` | kernel/thread | 进入 driver 的线程、等待队列和 transaction stack |
-| `binder_node` | kernel/object owner | 某个进程拥有的本地 Binder object 的内核代表 |
-| `binder_ref` | kernel/client reference | 某进程对远端 node 的引用，并给出本地 handle |
-| `binder_transaction` | kernel/in-flight call | 一次同步/异步事务及回复关系 |
-| `binder_buffer` | kernel/target allocation | 目标进程映射区中的 transaction 数据块 |
+| `binder_proc` | 与一次 Binder 设备打开建立的进程侧状态；正常 Android 进程通常共享这一连接 | C 和 S 各自有哪些线程、节点、引用和待办工作？ |
+| `binder_thread` | 某个进入 Binder 驱动的线程在该 `binder_proc` 下的记录 | C 的哪个线程在等回复？S 的哪个线程领取请求？ |
+| `binder_node` | 活着时归拥有本地 Binder 对象的 `binder_proc`；对象死亡后可暂留为 dead node | 服务端对象 O 的内核身份是什么、拥有者还活着吗？ |
+| `binder_ref` | 归引用方 `binder_proc`，内部连向一个 `binder_node` | C 的 handle 7 到底指向哪个节点？引用计数和死亡订阅是什么？ |
+| `binder_transaction` | 一次在途事务；完成或失败后清理 | 数据发往哪里、同步调用者是谁、回复该送回哪个线程？ |
 
-最重要的对应：
+这里有两条容易混淆的“所有权”：
 
-```text
-server BBinder ↔ kernel binder_node
-client BpBinder(handle) ↔ kernel binder_ref(handle) → binder_node
-```
+1. **节点所有权**：N 归服务进程 S，因为本地对象 O 在 S 中；
+2. **引用所有权**：R 归客户端进程 C，因为 handle 7 是 C 的局部名字。
 
----
+`binder_transaction` 则不是远端对象的永久身份。它更像一张正在流转的快递单：记录这一次发送、接收和回复关系，事务结束后就不该继续拿它代表服务。
 
-## 4. handle 不是全局服务 ID
+### 强引用能保什么，不能保什么
 
-假设 Service A 的本地对象在 kernel 中对应 node N：
+客户端的强 Binder 引用可以参与维持服务端 Binder 对象的引用状态，但它**不能把服务进程变成不可杀死**。进程仍可能崩溃、被 `kill`、被低内存回收机制（LMK）终止，或因系统策略退出。进程一死，原对象所在的用户地址空间已经消失；驱动只能把节点转为死亡状态并通知引用方，不能替服务端继续执行方法。
 
-```text
-Client P1: handle 7  → ref → node N
-Client P2: handle 19 → ref → node N
-Server A: local ptr/cookie ↔ node N
-```
+## 3. 方案：同步事务怎样从 ref 找到 node，再交给服务线程
 
-handle 是 client `binder_proc` 命名空间里的小整数，只在该 Binder driver context 和进程
-中有意义。把 handle 通过普通文件/socket 发给另一个进程没有意义。
+客户端调用 `BpBinder::transact()` 后，Android 11 的 `IPCThreadState::writeTransactionData()` 把 `BC_TRANSACTION` 和 `binder_transaction_data` 写进线程的输出缓冲。进入 `BINDER_WRITE_READ` ioctl 后，驱动才开始处理 handle。
 
-Binder driver 在 Parcel 中发现 Binder object 时负责翻译：向接收进程创建或查找合适
-`binder_ref`，把对象改写为接收方可用 handle。这是 Binder“传递对象能力”的核心。
+驱动主线可以压缩成六步：
 
----
+1. 在 C 的 `binder_proc` 中按 handle 7 查 `binder_ref R`；
+2. 从 R 得到 `binder_node N`，并在构造事务期间取得临时引用，避免并发释放；
+3. 从 N 得到仍存活的目标 `binder_proc S`；若节点已无拥有者，走 `BR_DEAD_REPLY` 错误分支；
+4. 在 S 的 Binder 接收区分配 buffer，复制普通数据，并翻译其中的 Binder/FD 对象；
+5. 建立 `binder_transaction T`，为同步调用记录来源线程和目标；
+6. 把 T 放进选定服务线程的待办队列，或放进 S 的进程待办队列并唤醒可用 Binder 线程。
 
-## 5. 本地对象与远端代理
+这几步解释了为什么 Binder 不只是一次 `memcpy`：驱动还要做对象寻址、生命周期保护、对象翻译、排队和回复路由。
 
-```text
-同进程：sp<IBinder> 实际可能是 BBinder
-跨进程：sp<IBinder> 通常是 BpBinder(handle)
-```
+服务端领取到 `BR_TRANSACTION` 后，才会在**服务端 Binder 线程**进入 `BBinder::transact()` / Stub 的 `onTransact()`。驱动不会因为它是跨进程请求，就自动切到服务进程主线程；如果业务必须串行到某个 Handler 线程，那是服务实现的下一次主动投递。
 
-generated AIDL Stub 继承/包装 `BBinder`，Proxy 持有 remote `IBinder`，通常最终是
-`BpBinder`。调用代码看起来相同，是否 IPC 取决于对象是 local 还是 proxy。
+> 完成点 A：事务进入目标待办队列，表示驱动已经建立了可投递工作；不表示服务端方法已经执行。
 
-因此“调用 AIDL method”并不总发生 Binder transaction；同进程优化可能直接调用。
+## 4. 同步为什么要“记住原线程”，又在什么地方真正返回
 
----
+同步调用要求回复回到发起调用的那个线程。仅知道进程 C 不够：C 中可能有许多 Binder 线程同时调用同一服务。`binder_transaction` 和 `binder_thread::transaction_stack` 因而要保存调用关系，回复时沿关系找到原调用线程。
 
-## 6. ProcessState：每进程的大管家
-
-Android 11 `ProcessState::self()` 用全局锁创建单例，并选择 driver：
+用户空间也明确区分“发送已处理”和“同步回复已到达”。Android 11 的 `waitForResponse()` 有如下分支：
 
 ```cpp
-#ifdef __ANDROID_VNDK__
-const char* kDefaultDriver = "/dev/vndbinder";
-#else
-const char* kDefaultDriver = "/dev/binder";
-#endif
+case BR_TRANSACTION_COMPLETE:
+    if (!reply && !acquireResult) goto finish;
+    break;
+
+case BR_DEAD_REPLY:
+    err = DEAD_OBJECT;
+    goto finish;
+
+case BR_FAILED_REPLY:
+    err = FAILED_TRANSACTION;
+    goto finish;
 ```
 
-也可通过 `initWithDriver()` 明确指定，但一旦初始化就不能切换到另一个 driver。
+源码位置：`frameworks/native/libs/binder/IPCThreadState.cpp`。对于带 `reply` 的同步调用，收到 `BR_TRANSACTION_COMPLETE` 后并不退出等待；后续 `BR_REPLY` 分支才把回复 Parcel 接进来并结束等待。若目标死亡，则 `BR_DEAD_REPLY` 以 `DEAD_OBJECT` 结束等待。
 
-`ProcessState` 持有：
+所以几个词要严格区分：
 
-- driver fd；
-- Binder mmap 地址；
-- handle 到 `BpBinder` 的缓存；
-- thread pool 配置与计数；
-- context object；
-- call restriction 等进程级策略。
+| 观察 | 它能证明什么 | 它不能证明什么 |
+|---|---|---|
+| `BR_TRANSACTION_COMPLETE` | 本次发送命令已被驱动处理 | 服务方法已运行、业务成功、回复已回来 |
+| 服务端 `onTransact()` 返回 | 服务端用户代码已给出一次处理结果 | 回复一定已送达客户端 |
+| 客户端收到 `BR_REPLY` | 回复 Parcel 或远端状态已经到达，本次同步等待结束 | 业务一定成功、远端以后不会死亡 |
+| 客户端收到 `BR_DEAD_REPLY` | 本次同步 IPC 因目标/回复链死亡而终止 | 服务端在死前绝对没有产生任何业务副作用 |
 
----
+最后一行尤其重要。假设 `saveSetting(requestId = 42)` 已把设置写入持久层，服务却在发出 reply 前崩溃，客户端仍可能只看到 `DEAD_OBJECT`。Binder 的传输错误不能替业务回答“设置是否已经保存”。有副作用的请求若要安全重试，应带唯一请求 ID，并由服务端或持久层去重；不能把 `DEAD_OBJECT` 简单等同于“服务什么都没做”。
 
-## 7. open_driver 做什么
+### 等待线程是不是只会睡眠
 
-主线：
+`IPCThreadState::waitForResponse()` 遇到非回复命令会转给 `executeCommand()`。因此同步等待期间可能处理 Binder 驱动返回的其他工作，嵌套调用也可能发生。这里只需记住诊断边界：
 
-```text
-open(/dev/binder, O_RDWR | O_CLOEXEC)
-  → ioctl(BINDER_VERSION)
-  → 检查 protocol version
-  → ioctl(BINDER_SET_MAX_THREADS)
+- 调用 API 的线程是同步等待主体；
+- 服务端执行线程是另一个进程的 Binder 线程；
+- “同步”描述调用方何时返回，不表示两个进程共用线程，也不保证等待期间毫无重入。
+
+## 5. 驱动为什么分三把主锁，而不是一把“大锁”
+
+handle 查找、节点死亡和线程排队会并发发生。如果所有状态都用一把全局锁，互不相关的进程也会争用；如果完全不加锁，客户端查 ref 时服务端可能正好释放 node，得到悬空指针。
+
+Android common 5.4 驱动把核心保护范围拆成三层。源码开头的锁说明可归纳为：
+
+```c
+/* Locking order in the Binder driver: */
+/* 1) proc->outer_lock : protects binder_ref */
+/* 2) node->lock       : protects most binder_node fields */
+/* 3) proc->inner_lock : protects thread/node lists, */
+/*                       todo lists and transaction_stack */
 ```
 
-打开 fd 时 kernel 为该打开实例/进程建立 Binder process state。协议版本不匹配会关闭
-driver，避免用错误 struct layout 通信。
+这是对 `drivers/android/binder.c` 锁说明的精简摘录；原注释还规定，不能在进程 A 的某一层锁下再取得进程 B 的同层或更低层锁。
 
-`DEFAULT_MAX_BINDER_THREADS` 在该源码为 15，但它不是“进程最多 15 个线程”，而是 driver
-协助管理的 Binder pool 上限配置之一；调用线程也可参与 Binder transaction。
+把锁与本场景对应起来：
 
----
+- 查 C 的 handle 7、读取/修改 R：先受 C 的 `outer_lock` 保护；
+- 检查 N 的拥有者、遍历 N 的引用方、处理 R 上的死亡订阅：受 `node->lock` 保护；
+- 把事务放入 C/S 的 proc/thread todo、维护线程树和事务栈：受相应 `inner_lock` 保护。
 
-## 8. mmap 映射的真实意义
+目标 buffer 由 `binder_alloc` 管理，它还有自己的分配器锁与生命周期规则，不能笼统算进上述三把 spinlock。文章读到 `binder_alloc_new_buf()`、`binder_alloc_free_buf()` 时，应继续以对应内核版本的 `binder_alloc.c/.h` 为准。
 
-Android 11 `ProcessState`：
+### “状态提交”发生在哪里
+
+驱动通常在持有相应锁时完成查找和队列状态修改。对应线程的选择与唤醒也可能属于 `inner_lock` 保护下的同一次状态转换；例如 `binder_wakeup_thread_ilocked()` 就要求调用者持有这把锁。部分数据复制、对象释放和后续清理才会在相应锁外继续。
+
+不要把“解锁”解释成“业务完成”：它只说明某一段内核共享状态已经一致。真正的同步 API 完成点仍是 `BR_REPLY` 或终止该等待的错误返回。
+
+## 6. 死亡监听为什么挂在 ref 上，而不是 transaction 上
+
+`binder_transaction` 只代表一次调用；死亡监听关心的是“我持有的这个远端能力以后还可不可用”。所以驱动把 `binder_ref_death` 关联到客户端的 `binder_ref`，而不是关联到某次事务。Android common 5.4 中，关键关系直接写在结构里：
+
+```c
+struct binder_ref {
+    struct binder_ref_data data;  /* data.desc 是 handle */
+    struct rb_node rb_node_desc;
+    struct rb_node rb_node_node;
+    struct hlist_node node_entry;
+    struct binder_proc *proc;     /* 引用方 */
+    struct binder_node *node;     /* 被引用节点 */
+    struct binder_ref_death *death;
+};
+```
+
+源码位置：内核 `drivers/android/binder.c`。这是字段摘录，行尾中文注释是本文标注。结构前的原注释还明确写着：ref 从进程 A 指向进程 B 的目标 node，访问 ref 要持有 A 的 `outer_lock`，`death` 指针受 `node->lock` 保护。
+
+Android 11 中，`BpBinder::linkToDeath()` 只在加入第一条 obituary（本地保存的死亡回调记录）时向驱动注册一次：
 
 ```cpp
-#define BINDER_VM_SIZE ((1 * 1024 * 1024) - page_size * 2)
-mmap(nullptr, BINDER_VM_SIZE, PROT_READ,
-     MAP_PRIVATE | MAP_NORESERVE, driverFd, 0);
+if (!mObituaries) {
+    mObituaries = new Vector<Obituary>;
+    getWeakRefs()->incWeak(this);
+    IPCThreadState* self = IPCThreadState::self();
+    self->requestDeathNotification(mHandle, this);
+    self->flushCommands();
+}
+ssize_t res = mObituaries->add(ob);
+return res >= (ssize_t)NO_ERROR ? (status_t)NO_ERROR : res;
 ```
 
-这里经常被误说成“client 和 server 共享同一块内存”，这是错的。
+源码位置：`frameworks/native/libs/binder/BpBinder.cpp`。片段省略了外层锁、空指针和内存失败检查。多个 `DeathRecipient` 可以保存在同一个 `BpBinder` 中，但内核只需为这份 ref 保存一项死亡订阅。
 
-更准确：
-
-- 每个 Binder 进程单独 mmap 自己的接收区；
-- driver 为目标 transaction 从目标进程 Binder allocator 分配 buffer；
-- driver 从发送方用户 Parcel 复制数据到目标 buffer；
-- 接收进程通过自己的映射地址读取；
-- sender 和 receiver 并不共同 mmap 同一任意用户页；
-- object/FD 仍需 driver 校验和翻译。
-
-“一次拷贝”是常见性能概括，不代表零拷贝、共享可写内存或无需校验。
-
----
-
-## 9. 为什么用户映射是 PROT_READ
-
-接收端不应随意写 driver 管理的 transaction buffer。用户态读取 Parcel，处理完通过
-`BC_FREE_BUFFER` 告知 driver 释放。
-
-若需要真正共享大数据，应传递 fd/ashmem/memfd/GraphicBuffer/FMQ 等描述符，让双方按
-专门协议 mmap；不要把普通 Binder transaction buffer 当长期共享内存。
-
----
-
-## 10. IPCThreadState：每线程状态机
-
-`IPCThreadState::self()` 通过 TLS 为线程创建实例。主要字段：
-
-```text
-mOut：待写给 driver 的 BC_* commands
-mIn：driver 返回的 BR_* commands
-mCallingPid/mCallingUid/mCallingSid
-mStrictModePolicy/mWorkSource
-mLastError
-mProcess：所属 ProcessState
-```
-
-同一进程多个 Binder thread 共享 `ProcessState` fd/mapping，却各有 `IPCThreadState`、命令
-缓冲和 calling identity。这是理解嵌套调用与身份恢复的关键。
-
----
-
-## 11. BC 与 BR 像双向指令集
-
-userspace → driver：
-
-```text
-BC_TRANSACTION
-BC_REPLY
-BC_FREE_BUFFER
-BC_ACQUIRE / BC_RELEASE
-BC_INCREFS / BC_DECREFS
-BC_REQUEST_DEATH_NOTIFICATION
-BC_CLEAR_DEATH_NOTIFICATION
-BC_ENTER_LOOPER / BC_REGISTER_LOOPER / BC_EXIT_LOOPER
-```
-
-driver → userspace：
-
-```text
-BR_TRANSACTION
-BR_REPLY
-BR_TRANSACTION_COMPLETE
-BR_DEAD_REPLY / BR_FAILED_REPLY
-BR_ACQUIRE / BR_RELEASE / BR_INCREFS / BR_DECREFS
-BR_DEAD_BINDER
-BR_SPAWN_LOOPER
-BR_NOOP
-```
-
-它们不是 Binder service 的 method code。AIDL transaction code 位于
-`binder_transaction_data.code`，BC/BR 则是 driver protocol command。
-
----
-
-## 12. 一次 ioctl 同时写和读
-
-`talkWithDriver()` 填充：
+发给驱动的内容很小：
 
 ```cpp
-binder_write_read bwr;
-bwr.write_size = mOut.dataSize();
-bwr.write_buffer = mOut.data();
-bwr.read_size = mIn.dataCapacity();
-bwr.read_buffer = mIn.data();
-ioctl(driverFd, BINDER_WRITE_READ, &bwr);
+status_t IPCThreadState::requestDeathNotification(
+        int32_t handle, BpBinder* proxy) {
+    mOut.writeInt32(BC_REQUEST_DEATH_NOTIFICATION);
+    mOut.writeInt32((int32_t)handle);
+    mOut.writePointer((uintptr_t)proxy);
+    return NO_ERROR;
+}
 ```
 
-同一 syscall 可先提交 BC commands，再等待/读取 BR commands，减少 syscall 次数。
-`write_consumed/read_consumed` 表示实际消费字节数，不是业务 payload 长度。
+源码位置：`IPCThreadState::requestDeathNotification()`。
 
-被信号打断 `EINTR` 时用户态重试；driver fd 关闭则返回错误。
+这里的 proxy 地址是一个**不透明 cookie**：可以把它理解成驱动代存、随后原样退回的取件号。驱动不解引用这个用户空间地址；客户端拿回它后，才用它定位自己的 `BpBinder`。
 
----
+为什么这个取件号回来时不容易变成悬空地址？`linkToDeath()` 配套增加了一份弱引用，使 proxy 在注册与清理握手期间保持可定位。
 
-## 13. BpBinder::transact 的入口
+这个 cookie 也不是 `binder_node` 中服务端本地对象的 ptr/cookie。前者属于客户端的死亡通知登记，后者代表服务端对象，不能混为一谈。
 
-```text
-BpBinder::transact(code, data, reply, flags)
-  → 检查 mAlive
-  → 检查 Binder stability
-  → IPCThreadState::transact(mHandle, code, ...)
-  → DEAD_OBJECT 时 mAlive=0
+`flushCommands()` 使注册命令尽快进入 ioctl，但 `linkToDeath()` 没有等待一个“服务仍存活”的正向确认。注册与死亡可以并发：若驱动处理注册时节点已经死亡，它会直接排入死亡工作。因此 `linkToDeath()` 返回 `NO_ERROR` 不等于“刚刚探活成功”。
+
+## 7. 服务进程在同步调用中死亡，会产生两条独立结果
+
+现在让服务进程 S 在处理 `saveSetting(requestId = 42)` 时退出。驱动清理该 `binder_proc` 时，会处理两类关系：
+
+### 第一条：结束仍在等待的同步事务
+
+T 记录着 C 的来源线程。S 或承接事务的线程消失后，事务不能再产生正常 reply，驱动向等待方返回 `BR_DEAD_REPLY`。Android 11 用户空间把它转成 `DEAD_OBJECT`，`BpBinder::transact()` 还会把代理的 `mAlive` 置为 0。
+
+这条路径只在“确实有一次相关调用正在等待”时存在。若 C 此刻没有调用远端，就没有等待需要用 `BR_DEAD_REPLY` 结束。
+
+还有另一种同名结果：一旦 `BpBinder::transact()` 因 `DEAD_OBJECT` 把 `mAlive` 置为 0，后续再调用这个旧代理时，`BpBinder` 会在用户空间直接返回 `DEAD_OBJECT`，这一次尝试根本没有进入驱动。于是只看最终错误码，通常无法判断它来自“在途事务收到 `BR_DEAD_REPLY`”，还是“对已知死亡代理的本地快速失败”；排障时还要结合 trace、服务日志或连接状态。
+
+### 第二条：通知所有已订阅该节点死亡的引用方
+
+驱动让 N 脱离原拥有者，并检查 N 上来自各客户端的 ref。某个 ref 若注册了 `binder_ref_death`，驱动就向该 ref 所属的客户端进程排入 `BINDER_WORK_DEAD_BINDER`。满足领取进程级工作的 Binder looper/线程池线程，随后会读到 `BR_DEAD_BINDER(cookie)`；普通线程不会仅因为正同步等待另一次 IPC，就自动取得这份进程 todo。
+
+Android 11 用户空间的处理代码很直接：
+
+```cpp
+case BR_DEAD_BINDER: {
+    BpBinder *proxy = (BpBinder*)mIn.readPointer();
+    proxy->sendObituary();
+    mOut.writeInt32(BC_DEAD_BINDER_DONE);
+    mOut.writePointer((uintptr_t)proxy);
+} break;
 ```
 
-`BpBinder` 的 `mAlive` 是本地已知状态缓存，不是远端健康探针。远端可能已死但通知/下次
-transaction 尚未到达；也可能进程活着但业务线程死锁。
+源码位置：`frameworks/native/libs/binder/IPCThreadState.cpp`。短短两次调用背后还有一段容易被省略的清理握手：
 
----
+1. `sendObituary()` 先把代理标为死亡，并发送、flush `BC_CLEAR_DEATH_NOTIFICATION`；
+2. 然后依次调用已保存的 `DeathRecipient::binderDied()`；
+3. 回调返回后，外层代码才把 `BC_DEAD_BINDER_DONE` 放入输出缓冲；
+4. 驱动消费 DONE 后，确认这次 `BR_DEAD_BINDER` 已被用户空间处理；若 clear 流程仍未收尾，后面还可能有 `BR_CLEAR_DEATH_NOTIFICATION_DONE`，libbinder 再据此释放配套弱引用。
 
-## 14. writeTransactionData 装了什么
+因此 `BC_DEAD_BINDER_DONE` 不是“整个死亡订阅和资源清理全部结束”，只确认本次死亡投递已处理。
 
-核心 `binder_transaction_data`：
+两条路径可以同时发生，也可以只发生一条：
 
-```text
-target.handle：目标 remote handle（BC_TRANSACTION）
-target.ptr：目标本地对象地址信息（BR_TRANSACTION 时由 driver 给 server）
-cookie：本地 BBinder cookie
-code：AIDL method transaction code
-flags：TF_ONE_WAY、TF_ACCEPT_FDS 等
-sender_pid/sender_euid：接收侧看到的 caller identity
-data_size/offsets_size
-data.ptr.buffer/offsets
-```
+- 正在同步调用，但没注册死亡监听：通常只从这次调用看到 `DEAD_OBJECT`；
+- 注册了死亡监听，但当前没有调用：仍可收到 `binderDied()`；
+- 两者都有：既要结束当前等待，又要宣告这份远端能力死亡。
 
-普通 bytes 与 Binder/FD objects 分开：offset array 告诉 driver Parcel 哪些位置包含需要
-检查和翻译的 `flat_binder_object` 等对象。
+协议没有给业务层提供一个值得依赖的“`DEAD_OBJECT` 必定先于 `binderDied()`”顺序：同步等待线程与领取死亡工作的 Binder looper 可以并发调度。恢复逻辑应允许两条路径以任意先后抵达，并做到幂等。
 
----
-
-## 15. driver 收到 BC_TRANSACTION
-
-内核概念链：
-
-```text
-binder_ioctl(BINDER_WRITE_READ)
-  → binder_thread_write()
-  → parse BC_TRANSACTION
-  → binder_transaction(proc, thread, tr, reply=false)
-```
-
-driver 要做的工作远多于复制 bytes：
-
-1. 通过 sender proc 的 handle 查 `binder_ref`；
-2. 找到目标 `binder_node` 和 owner `binder_proc`；
-3. 校验 transaction size、offset、flags 和对象边界；
-4. 在 target proc allocator 分配 `binder_buffer`；
-5. 复制普通数据；
-6. 翻译 Binder object、handle、fd 等；
-7. 建立同步 transaction stack 关系；
-8. 选择目标 thread 或 proc todo；
-9. 入队 work 并唤醒目标。
-
-任何一步失败都要回滚已创建引用、fd、buffer 和 transaction，错误路径是 Binder 安全
-审计的重要部分。
-
----
-
-## 16. binder_proc 表示什么
-
-概念字段包括：
-
-```text
-pid/task identity
-opened binder context
-threads tree/list
-nodes owned by process
-refs held by process
-todo queue
-waiting threads
-allocator/mapped buffers
-max/requested/started threads
-locks and death state
-```
-
-它不是 Linux `task_struct` 的替代，而是 Binder driver 为一个 userspace Binder 进程维护
-的 IPC 状态。一个进程退出时，driver 要清理 node/ref/transaction/death notification。
-
----
-
-## 17. binder_thread 表示什么
-
-概念字段：
-
-```text
-tid/task
-thread todo queue
-transaction_stack
-looper state
-waiting state
-return_error/reply_error
-process pointer
-```
-
-同一进程可有多个 `binder_thread`。它们不是在进程启动时全部预建，而是在对应线程进入
-Binder driver/ioctl 时建立和维护。
-
-`transaction_stack` 对同步调用、嵌套调用、回复路由和优先级继承非常关键。
-
----
-
-## 18. binder_node：对象的内核身份
-
-server 将本地 `BBinder` 写入 Parcel 时，userspace `flat_binder_object` 携带用于识别本地
-对象的 pointer/cookie。driver 在 owner proc 中创建或复用 `binder_node`。
-
-node 记录：
-
-- owner proc；
-- userspace ptr/cookie；
-- strong/weak 引用状态；
-- 接受 fd、安全上下文、调度相关 flags；
-- 指向该 node 的 refs；
-- async transaction queue；
-- death/cleanup 状态。
-
-ptr/cookie 只在 owner process address space 有意义，driver 不把它当可在 client 解引用的
-地址。
-
-在 Android 11 libbinder 的本地对象编码中，可以进一步把两者理解为：`ptr` 帮助找
-`RefBase` weak-reference bookkeeping，`cookie` 指回真正的 `BBinder`。服务端处理
-`BR_TRANSACTION` 时先通过 weak refs 安全提升强引用，再调用 cookie 对应
-`BBinder::transact()`；不能只拿 cookie 裸指针直接调用而忽略对象生命周期。
-
----
-
-## 19. binder_ref：每进程 handle 表
-
-当 node 被传给另一个 proc：
-
-```text
-target proc
-  → find existing ref for node
-  → or allocate binder_ref
-  → assign descriptor/handle
-  → rewrite Parcel object as handle
-```
-
-client `ProcessState::getStrongProxyForHandle(handle)` 再创建或复用 `BpBinder`。
-
-一个 node 可被许多 proc 引用；每个 proc handle 可能不同。一个 proc 内同一 handle 通常
-复用 proxy，避免同一远端对象出现多个无关本地代理和死亡列表。
-
----
-
-## 20. handle 0 为什么特殊
-
-`ProcessState::getContextObject()` 调 `getStrongProxyForHandle(0)`。handle 0 代表当前 Binder
-context 的 context manager：普通 Binder 是 servicemanager。
-
-servicemanager 自己调用 `BINDER_SET_CONTEXT_MGR_EXT`（失败时回退旧 ioctl）成为 manager。
-
-```text
-handle 0
-  → servicemanager
-  → getService/checkService/addService
-  → 返回其他 service Binder object
-  → driver 为 client 创建对应普通 handle
-```
-
-handle 0 不是“所有服务共用的 handle”，而是进入名字注册中心的入口。
-
----
-
-## 21. 目标线程怎样选择
-
-同步 transaction 的常见选择逻辑：
-
-- 若是嵌套调用并满足关系，可能定向回某个 transaction stack 上的线程；
-- 否则选择目标 proc 中正在等待的 Binder thread；
-- 没有可用线程时放入 proc todo；
-- driver 可发 `BR_SPAWN_LOOPER` 请求 userspace 增加 pool thread（受上限约束）。
-
-因此 Binder 不保证同一 service method 总在同一线程执行。服务对象必须线程安全，或者
-显式投递到单线程 Handler。
-
----
-
-## 22. 服务端怎样进入等待
-
-线程池线程调用：
-
-```text
-IPCThreadState::joinThreadPool()
-  → BC_ENTER_LOOPER / BC_REGISTER_LOOPER
-  → getAndExecuteCommand()
-  → talkWithDriver()
-  → ioctl blocks until work
-```
-
-收到 `BR_SPAWN_LOOPER` 时，`IPCThreadState::executeCommand()` 调
-`ProcessState::spawnPooledThread(false)`。
-
-max threads 并不等于每次并发都有线程；所有 pool thread 被慢调用占满时，新事务只能
-排队，最终造成级联等待或 ANR。
-
----
-
-## 23. BR_TRANSACTION 到 BBinder
-
-用户态 `executeCommand(BR_TRANSACTION)`：
-
-```text
-读取 binder_transaction_data
-  → Parcel::ipcSetDataReference(driver buffer)
-  → 保存原 calling identity/work source
-  → 设置 mCallingPid/Uid/Sid
-  → 根据 ptr/cookie 找本地 BBinder
-  → BBinder::transact(code, data, reply, flags)
-  → generated Stub::onTransact / service method
-  → 同步则 sendReply()
-  → 恢复原 calling identity
-```
-
-保存和恢复 identity 是为了嵌套调用：当前线程处理 A 的请求时又调用 B，B 的来电身份不能
-覆盖 A 的身份；整次 A 的分发返回后还要回到分发前的线程身份。这里描述的是 transaction
-栈的成对恢复，不是说任一内层调用都会永久污染线程。
-
----
-
-## 24. generated Stub 在哪里工作
-
-driver 只知道 transaction code 和 bytes，不理解 Java method、AIDL interface token 或
-业务参数。generated Stub/user library 负责：
-
-```text
-校验 interface descriptor/token
-按 code 选择 method
-反序列化参数
-执行权限/稳定性或 generated checks
-调用 implementation
-序列化 reply/exception
-```
-
-驱动提供身份、对象能力和 transport；业务协议由 AIDL/Parcel 层定义。
-
----
-
-## 25. 同步 reply 如何找回原线程
-
-发送同步 transaction 时，driver 创建 `binder_transaction` 并挂入 caller thread 的
-transaction stack；目标处理完成提交 `BC_REPLY` 后，driver 沿 from/stack 关系把
-`BR_REPLY` 投递给原等待线程。
+## 8. 一张时序图看清四个完成点
 
 ```mermaid
 sequenceDiagram
-    participant C as Client thread
-    participant D as Binder driver
-    participant S as Server thread
-    C->>D: BC_TRANSACTION
-    D->>S: BR_TRANSACTION
-    Note over C,D: caller transaction stack waits
-    S->>D: BC_REPLY
-    D->>C: BR_REPLY
+    participant CU as Client 用户线程
+    participant CB as Client Binder looper
+    participant CD as Client 侧驱动状态
+    participant SD as Server 侧驱动状态
+    participant SU as Server Binder线程
+
+    Note over CU,CD: 先前 linkToDeath(handle 7, cookie)
+    CU->>CD: BC_TRANSACTION(handle 7)
+    CD->>SD: ref → node → target proc，建立 transaction
+    par Client 消费发送完成
+        CD-->>CU: BR_TRANSACTION_COMPLETE
+    and Server 消费请求
+        SD-->>SU: BR_TRANSACTION
+    end
+    Note over CU,SU: 两边谁先获得调度没有保证
+    SU->>SU: 执行业务，尚未 BC_REPLY
+    Note over SD,SU: Server 进程退出
+    SD-->>CU: BR_DEAD_REPLY → DEAD_OBJECT
+    Note right of CU: 结束本次同步等待
+    CD-->>CB: BR_DEAD_BINDER(cookie)
+    CB->>CD: BC_CLEAR_DEATH_NOTIFICATION
+    CB->>CB: binderDied()
+    CB->>CD: BC_DEAD_BINDER_DONE
+    Note right of CD: 只确认本次死亡投递已处理
 ```
 
-reply 不是按 PID 广播，也不是任意 client pool thread领取。
+图中并行块强调：事务入队后，服务线程可能先开始执行，客户端也可能先读到 `BR_TRANSACTION_COMPLETE`；图不承诺实际观察顺序。`BR_DEAD_REPLY` 与 `BR_DEAD_BINDER` 同样是两条独立逻辑。把四个完成点写成一句话：
 
----
+1. `BR_TRANSACTION_COMPLETE`：发送命令的驱动处理完成；
+2. `BR_REPLY` / `BR_DEAD_REPLY`：回复或死亡状态到达，这次同步等待结束；业务是否成功还要继续检查 reply；
+3. `binderDied()` 返回：应用的死亡回调这一次执行完；
+4. 驱动消费 `BC_DEAD_BINDER_DONE`：本次 `BR_DEAD_BINDER` 得到确认，clear-death 清理仍可能继续。
 
-## 26. 等 reply 时线程是不是完全睡死
+第 4 点不代表重连成功，更不代表系统已经启动新服务。Binder 驱动只报告死亡，不负责替业务找新实例。
 
-`waitForResponse()` 循环读取 BR commands。除了 `BR_REPLY`，default 分支还会调用
-`executeCommand(cmd)`，因此等待同步 reply 的 Binder 线程可能处理驱动交付的嵌套事务、
-引用命令或死亡通知。
+## 9. 翻车点：收到死亡后，怎样避免重复清理和错误重试
 
-这使双向/嵌套 Binder 调用可前进，但带来 reentrancy：
+`binderDied()` 运行在领取该进程死亡工作的 Binder looper/线程池线程上。它不保证是注册监听的线程，更不保证是主线程。回调里直接更新 UI、长时间阻塞或拿着业务大锁重连，都可能制造新的线程问题。
 
-```text
-Client holds lock L → sync call Server
-Server callback Client → callback needs L
+更稳妥的恢复顺序是：
+
+1. 用连接代际号（generation）、原子比较替换（CAS）或短临界区，把当前代理标记为失效；
+2. 让 `DEAD_OBJECT` 分支与 `binderDied()` 共用同一个幂等失效入口；
+3. 把耗时重连投递到明确的工作线程，并保证同一时刻最多只有一个重连任务（single-flight），避免十个调用同时重连；
+4. 从 ServiceManager 或上层连接管理器重新获取 Binder，不能继续复用已经死亡的 `BpBinder`；
+5. 对有副作用的业务请求，用 request ID、查询确认或服务端去重决定能否重试。
+
+下面是应用层伪代码，表达的是状态机，不是 AOSP 源码：
+
+```kotlin
+fun onRemoteLost(observed: IBinder) {
+    if (!remote.compareAndSet(observed, null)) return
+    reconnectExecutor.execute {
+        val fresh = lookupService() ?: return@execute
+        fresh.linkToDeath(deathRecipient, 0)
+        remote.compareAndSet(null, fresh)
+    }
+}
 ```
 
-即使 callback 被同一等待线程处理，也可能死锁或破坏“不重入”假设。原则仍是远端调用
-前释放关键锁。
+还要留意 `unlinkToDeath()` 与死亡投递的竞态：取消监听时，死亡工作可能已经在路上。不能把“unlink 已调用”当成历史回调绝不可能再出现的证明；具体返回值和回调是否已经发送，应以该版本 `BpBinder::unlinkToDeath()`、`mObitsSent` 和驱动 clear-death 分支共同判断。
 
----
+## 10. 在 macOS 上怎样只读验证，并检查自己是否真的懂了
 
-## 27. BR_TRANSACTION_COMPLETE 是什么
-
-它表示 driver 已接收/处理发送命令到相应阶段，不等于：
-
-- 服务端 method 执行完成；
-- 硬件完成；
-- oneway 业务成功；
-- reply 已返回。
-
-同步 transaction 最终要等 `BR_REPLY`；oneway 没有业务 reply，sender通常只得到
-transaction transport 层确认，后续业务错误不能通过返回 Parcel 传回。
-
----
-
-## 28. oneway 的内核队列
-
-`TF_ONE_WAY` transaction 不建立同步 reply 等待。对同一 node，driver 维护 async
-transaction serialization/queue，避免同一对象的异步调用任意并发破坏顺序。
-
-但 oneway 不是“立即执行”：
-
-```text
-sender returns earlier
-  → transaction may still wait in async queue
-  → target pool/CPU/driver buffer 都有限
-```
-
-生产速度长期大于消费速度会积压、耗尽 Binder allocation，甚至触发 failed transaction。
-高频数据应 batch/FMQ/shared memory。
-
----
-
-## 29. Binder buffer 不是无限的
-
-进程 mmap 区约 1 MiB 量级，但可用空间还受：
-
-- 同时未释放的 incoming transactions；
-- async transactions；
-- buffer metadata/alignment；
-- reply；
-- Parcel object offsets；
-- fragmentation。
-
-一次大 Parcel 或大量并发中等 Parcel 都可能失败。Java 常见映射为
-`TransactionTooLargeException`，但该异常有时无法准确判断是 request 还是 reply 过大。
-
-不要把接近上限的 payload 当可靠设计。
-
----
-
-## 30. BC_FREE_BUFFER 生命周期
-
-接收 Parcel 的数据指向 driver 管理的目标 buffer。处理完成后 Parcel release callback
-最终向 driver 发 `BC_FREE_BUFFER`。
-
-若服务长期持有直接引用而不复制所需数据，可能延长 buffer 占用或访问失效数据。Parcel
-和 native object 生命周期必须遵循 API；异步处理应提取/复制必要字段或持有受支持的
-独立对象。
-
----
-
-## 31. Binder object 翻译
-
-Parcel offsets 指向对象，例如：
-
-```text
-BINDER_TYPE_BINDER：发送方本地 Binder object
-BINDER_TYPE_HANDLE：发送方已有 remote handle
-BINDER_TYPE_FD/FDA：file descriptor
-BINDER_TYPE_PTR：buffer object（特定 scatter-gather 场景）
-```
-
-driver 根据发送/接收关系：
-
-- local binder → target handle/ref；
-- remote handle → 解析原 node，再给 target 创建自己的 ref；
-- fd → 安装到 target fd table（需 flags/权限/资源）；
-- buffer → 校验父子关系、范围和 fixup。
-
-不能只 memcpy `flat_binder_object`，否则 handle 和 fd 在目标进程无意义且不安全。
-
----
-
-## 32. 强弱引用的两层
-
-userspace 有 `RefBase/sp/wp`；driver 有 node/ref 的 strong/weak 计数与通知。两层协作：
-
-```text
-BpBinder strong ref change
-  → BC_ACQUIRE / BC_RELEASE
-
-weak ref change
-  → BC_INCREFS / BC_DECREFS
-
-driver asks owner userspace
-  → BR_ACQUIRE / BR_RELEASE / BR_INCREFS / BR_DECREFS
-```
-
-`IPCThreadState` 在命令写出被 driver 消费前会保留临时引用，避免 proxy 提前释放。这也是
-为何引用命令被缓存在 `mOut` 后不能忽略 flush 时机。
-
----
-
-## 33. 引用计数不等于服务业务生命周期
-
-Binder strong ref 为零可以辅助 lazy service 判断没有 client，但：
-
-- service 可能有内部 worker/硬件请求；
-- callback object 可能形成引用环；
-- servicemanager 持有注册引用；
-- fd/driver state 不属于 Binder ref 自动管理；
--业务“session 已结束”需要显式协议。
-
-不能只靠 C++ `sp<>` 数量决定安全关机。
-
----
-
-## 34. linkToDeath 用户态主线
-
-`BpBinder::linkToDeath()`：
-
-```text
-校验 recipient
-  → 第一个 obituary 时
-  → IPCThreadState::requestDeathNotification(handle, this)
-  → BC_REQUEST_DEATH_NOTIFICATION + handle + proxy cookie
-  → 保存 Obituary list
-  → flushCommands（需要时）
-```
-
-cookie 是返回给本进程用户态以找到 `BpBinder` 的值，不是远端进程可解引用对象。
-
-这里的 death cookie 与前面 `binder_node` 的 ptr/cookie 不是同一个角色：
-
-```text
-node cookie
-  → 对象 owner 进程用于找本地 BBinder
-
-death notification cookie
-  → 订阅死亡的 client 进程用于找本地 BpBinder
-```
-
-共同点只是 driver 将用户态提供的不透明值在正确事件中送回原所属进程；driver 和另一端
-业务进程都不应把它当通用跨进程地址。
-
-多个 DeathRecipient 可挂在同一个 proxy，本地 `sendObituary()` 负责逐个通知。
-
----
-
-## 35. 内核死亡通知对象
-
-driver 为 client `binder_ref` 关联 death notification。当 owner proc/node 死亡：
-
-```text
-mark node/ref dead
-  → queue death work to requesting proc/thread
-  → BR_DEAD_BINDER(cookie)
-```
-
-用户态 `executeCommand()`：
-
-```cpp
-case BR_DEAD_BINDER:
-    BpBinder* proxy = readPointer();
-    proxy->sendObituary();
-    write BC_DEAD_BINDER_DONE;
-```
-
-`binderDied()` 运行在接收该命令的 Binder thread 上，不能假设是注册线程或主线程。
-
----
-
-## 36. clearDeathNotification 的竞态
-
-client 取消死亡监听时发 `BC_CLEAR_DEATH_NOTIFICATION`，driver 最终返回
-`BR_CLEAR_DEATH_NOTIFICATION_DONE`。但远端可能正好同时死亡。
-
-实现需正确处理：
-
-- death 已排队；
-- clear 已请求但未完成；
-- proxy 正在析构；
-- obituary callback 与 unlink 并发；
-- callback 内再次操作 proxy。
-
-不要在 DeathRecipient 中持有会形成永久环的强引用，也不要认为 unlink 返回后历史回调
-在所有竞态下都从未发生。
-
----
-
-## 37. DEAD_OBJECT 与 BR_DEAD_BINDER
-
-两条相关但不同路径：
-
-```text
-transaction 返回 DEAD_OBJECT
-  → 当前调用直接发现目标死亡
-
-BR_DEAD_BINDER
-  → 先前 linkToDeath 的异步死亡通知
-```
-
-应用恢复逻辑应幂等：二者可能先后触发同一 proxy invalidation。用 generation/CAS/锁保证
-只执行一次主清理，再允许一次 single-flight reconnect。
-
----
-
-## 38. caller identity 从哪里来
-
-driver 从实际 transaction sender 提供 pid/euid（及可选 security context），接收线程在
-`BR_TRANSACTION` 中把它保存到 `IPCThreadState`：
-
-```text
-getCallingPid()
-getCallingUid()
-getCallingSid()
-```
-
-这比相信 Parcel 内由 client 自填的 uid 安全。Framework service 以此做 permission/
-AppOps/user 检查。
-
-但 native service 若把请求转发到另一个服务，后者看到的默认 caller 是转发进程。需要
-明确 `clearCallingIdentity()/restoreCallingIdentity()` 的策略，不能混淆原始调用者与当前
-Binder hop 身份。
-
----
-
-## 39. clearCallingIdentity 的正确理解
-
-它不是“临时获得 root”。它把当前线程从远端 caller identity 切回本进程 identity，并
-返回 token 供恢复。
-
-典型场景：system_server 接收 App 调用后，以系统自身身份访问内部资源。但必须：
-
-```text
-先按原 caller 做 permission/AppOps 检查
-token = clearCallingIdentity()
-try { internal operation }
-finally { restoreCallingIdentity(token) }
-```
-
-忘记恢复首先会污染**当前 Binder 方法尚未结束的代码和它发起的嵌套调用**；过早 clear 会绕过应针对 App 的安全检查。Android 11 native `IPCThreadState::executeCommand()` 在入站 transaction 分发返回后会恢复分发前保存的 pid/uid，所以不应把它夸大成“必然永久污染该线程池线程以后所有独立请求”。但业务代码仍必须用 `finally` 恢复：底层退栈只能在整个 Binder 分发返回后兜底，不能保护方法内部尚未结束的敏感操作、回调和嵌套 Binder 调用。
-
----
-
-## 40. 安全上下文与 SELinux Binder hooks
-
-Binder driver 在 transaction、node/ref 和 context manager 操作中配合 LSM/SELinux hooks，
-实现 domain 间 `call`、`transfer`、service add/find 等控制。
-
-`FLAT_BINDER_FLAG_TXN_SECURITY_CTX` 可请求 transaction security context，普通
-servicemanager context object 会设置相关 flag。用户态不能伪造一个 SID 字符串替代
-driver/LSM 提供的 caller context。
-
-Binder permission 与 service method 自身 permission 是纵深两层，不应互相替代。
-
----
-
-## 41. 嵌套同步调用与事务栈
-
-```text
-A thread → B thread（同步）
-B thread → A object（同步回调）
-A thread → C（再嵌套）
-```
-
-driver transaction stack 用于：
-
-- 找到 reply destination；
-- 支持嵌套 call chain；
-- 某些目标线程选择；
-- 调度优先级/身份相关处理；
-- 检测非法 reply 或断裂链。
-
-深层跨服务同步链会放大延迟和死锁风险。架构上减少 A→B→C→A 环，异步化时又要增加
-requestId、超时和取消。
-
----
-
-## 42. Binder priority inheritance
-
-Binder driver 可在 transaction 期间传播/调整调度优先级，避免高优先级 caller 永久被
-低优先级 server 阻塞。但它不是实时性万能药：
-
-- server 可能等待另一个锁/IO；
-- nested calls 形成复杂链；
-- policy/RT inheritance 受 node flags 和权限约束；
-- CPU 饱和、内存回收仍会延迟；
-- oneway 排队不等同同步 inheritance。
-
-不要用 Binder priority inheritance 替代有界工作和正确线程设计。
-
----
-
-## 43. FD 传递的语义
-
-Binder 可以传 fd，但 driver 是在目标进程安装一个新 fd 引用，不保证数字相同：
-
-```text
-sender fd 12 → same file object → receiver fd 47
-```
-
-风险与规则：
-
-- 接收者必须关闭自己的 fd；
-- `TF_ACCEPT_FDS`/对象 flags 决定是否接受；
-- 每次传递消耗目标 fd table 资源；
-- fd 指向的资源仍受其自身 SELinux/operation checks；
-- 不可信 client 可尝试 fd exhaustion；
-- close-on-exec 与 ownership 必须明确。
-
-fd number 不能作为跨进程稳定 ID。
-
----
-
-## 44. 错误怎样跨层
-
-| 层 | 例子 | 上层表现 |
-|---|---|---|
-| 参数/Parcel | offsets 越界、对象非法 | failed transaction/driver error |
-| allocator | 无 buffer/过大 | `FAILED_TRANSACTION` 等 |
-| target | node/proc 已死 | `DEAD_OBJECT`/`BR_DEAD_REPLY` |
-| thread | 无可用线程 | 排队、延迟、最终上层超时 |
-| Stub | unknown code/token 错 | `UNKNOWN_TRANSACTION`/exception |
-| service | permission/argument/business | AIDL exception/status |
-| hardware | timeout/disconnect | HAL/Framework 稳定错误语义 |
-
-“Binder 调用失败”必须继续区分 transport 与业务错误，不能统一重试；非法参数重试只会
-制造负载，dead object 才可能触发重新获取服务。
-
----
-
-## 45. ServiceManager 不在业务数据路径上
-
-```text
-首次发现：client → handle 0/service manager → 获取 service object/handle
-业务调用：client handle → driver → service node/进程
-```
-
-servicemanager 不转发每个业务 Parcel。它崩溃会严重影响服务注册/发现，但已持有 handle
-的 client/server transaction 是另一条直接 driver 路径；实际系统恢复仍取决于 context、
-引用和服务生命周期。
-
----
-
-## 46. binder、hwbinder、vndbinder 的隔离
-
-不同 Binder device/context 拥有独立 context manager、handle namespace 和对象图：
-
-```text
-/dev/binder    → servicemanager
-/dev/hwbinder  → hwservicemanager
-/dev/vndbinder → vendor Binder context（具体产品）
-```
-
-一个 context 的 handle 不能用于另一个 context。`ProcessState` 一旦选定 driver 后不能随意
-切换，也正是为了避免混用对象命名空间。
-
-现代 kernel 还可用 binderfs 动态提供 Binder devices，但 Android 11 产品实际挂载和命名
-应以设备配置为准。
-
----
-
-## 47. 常见性能瓶颈
-
-```text
-大 Parcel → copy/validation/allocator 压力
-高频小 transaction → syscall/调度/序列化开销
-同步长链 → tail latency 累加
-pool exhaustion → 所有 client 排队
-持锁远调 → lock inversion/deadlock
-oneway flood → async queue/buffer 积压
-proxy 泄漏 → binder_ref/BpBinder/死亡监听增长
-fd 泄漏 → target fd table 耗尽
-慢 onTransact → Binder thread 长时间占用
-```
-
-优化前先用 trace、binder stats、线程栈和调用计数找瓶颈，不要盲目增加 pool size。
-
----
-
-## 48. Binder freeze 相关返回
-
-Android 11 用户态 `waitForResponse()` 已处理 `BR_FROZEN_REPLY`，映射为失败。冻结 cached
-进程时 Binder 对同步/异步事务有额外管理，避免无限向冻结进程堆积。
-
-本章不展开 freezer 内核版本细节，但要知道：process alive 不等于它当前能及时处理
-transaction。调用方仍需 API 级 timeout/生命周期策略。
-
----
-
-## 49. mower Binder 调用示例
-
-```text
-App thread
-  → IMowerManager Proxy/BpBinder(handle 23)
-  → BC_TRANSACTION code=START
-  → driver ref23 → system_server MowerService node
-  → system_server Binder thread BR_TRANSACTION
-  → Stub.onTransact → permission/AppOps/validate
-  → post to MowerService Handler / call HAL outside lock
-  → reply accepted(requestId)
-  → driver BR_REPLY to original App thread
-```
-
-异步完成：
-
-```text
-HAL callback → service state machine
-  → authorized listener BpBinder
-  → oneway callback(requestId, generation, result)
-```
-
-若 App 死亡，service 对 listener token 的 DeathRecipient 清理订阅和该 uid 的资源。若
-system_server 死亡，App proxy 收到 death，但通常整个 framework 正在重启，不能假设一次
-重连即可无缝恢复。
-
----
-
-## 50. 锁设计示例
-
-错误：
-
-```text
-lock(serviceState)
-  → remoteListener.onChanged()
-      → client callback reenters service
-          → waits serviceState lock
-```
-
-正确模式：
-
-```text
-lock
-  → update state
-  → snapshot listeners/data
-unlock
-for each listener
-  → remote call with failure handling
-```
-
-但 unlock 后状态可能变化，所以 callback 数据带 version/generation；删除 listener 与回调
-并发也要定义“可能有一条 in-flight callback”的语义。
-
----
-
-## 51. 常见误解复盘
-
-1. **Binder 是共享内存直接调用**：错，driver 分配目标 buffer、复制并翻译对象。
-2. **sender 与 receiver mmap 同一块 transaction memory**：错，各进程有自己的映射。
-3. **handle 是全系统唯一**：错，它属于进程和 Binder context。
-4. **BpBinder 就是远端对象本体**：错，它是 handle proxy。
-5. **binder_node 在 client 中**：错，node 属于对象 owner proc；client 持 ref。
-6. **一个 service 固定一个 Binder thread**：错，pool 中多线程可处理。
-7. **max threads 是进程总线程数**：错，仅涉及 Binder pool 管理。
-8. **BR_TRANSACTION_COMPLETE 是 method 完成**：错，只是 transport command 阶段。
-9. **oneway 立即执行且不会失败**：错，它会排队、占 buffer，且无业务 reply。
-10. **同步等待时线程什么都不做**：错，可能执行嵌套 BR commands。
-11. **reply 返回任意 client thread**：错，driver 按 transaction stack 路由。
-12. **Parcel offsets 只是性能索引**：错，它标记需安全翻译的对象。
-13. **传 fd 后数字相同**：错，目标获得新 fd number。
-14. **linkToDeath 会重启远端**：错，只提供死亡通知。
-15. **DEAD_OBJECT 和 binderDied 只能发生一个**：错，清理应幂等。
-16. **死亡回调在注册线程**：错，通常在 Binder thread。
-17. **clearCallingIdentity 获得 root**：错，恢复本进程身份。
-18. **ServiceManager 转发所有业务调用**：错，发现后 client 直接调用 service handle。
-19. **加大线程池能修复死锁**：错，只可能延后耗尽。
-20. **Binder transport 安全后业务参数可不校验**：错，Stub/service/driver 仍须校验。
-
----
-
-## 52. Mac 上十二轮只读练习
-
-### 第一轮：ProcessState 初始化
+当前源码树不需要编译。先在 AOSP 根目录执行：
 
 ```bash
-sed -n '1,440p' frameworks/native/libs/binder/ProcessState.cpp
-```
-
-找到 driver 选择、BINDER_VERSION、SET_MAX_THREADS、mmap 和 context manager。
-
-### 第二轮：handle→proxy cache
-
-```bash
-rg -n 'getStrongProxyForHandle|expungeHandle|handleToObject' \
-  frameworks/native/libs/binder/ProcessState.cpp
-```
-
-解释同进程为什么复用 BpBinder。
-
-### 第三轮：transact 入口
-
-```bash
-sed -n '620,735p' frameworks/native/libs/binder/IPCThreadState.cpp
-```
-
-区分同步和 TF_ONE_WAY 两条 wait 路径。
-
-### 第四轮：BINDER_WRITE_READ
-
-```bash
-sed -n '920,1025p' frameworks/native/libs/binder/IPCThreadState.cpp
-```
-
-画 mOut→write_buffer 与 read_buffer→mIn。
-
-### 第五轮：transaction data
-
-```bash
-sed -n '1025,1085p' frameworks/native/libs/binder/IPCThreadState.cpp
-rg -n 'struct binder_transaction_data|enum binder_driver' \
+cd /Users/ninebot/androidSource
+rg -n 'BC_REQUEST_DEATH_NOTIFICATION|BC_DEAD_BINDER_DONE|BR_DEAD' \
   bionic/libc/kernel/uapi/linux/android/binder.h
-```
-
-列出 handle、code、flags、data 和 offsets。
-
-### 第六轮：服务端执行
-
-```bash
-sed -n '1070,1275p' frameworks/native/libs/binder/IPCThreadState.cpp
-```
-
-追 `BR_TRANSACTION`、calling identity、BBinder 和 sendReply。
-
-### 第七轮：同步 reply
-
-```bash
-sed -n '830,925p' frameworks/native/libs/binder/IPCThreadState.cpp
-```
-
-解释为何 wait loop 还会 executeCommand。
-
-### 第八轮：线程池
-
-```bash
-rg -n 'startThreadPool|spawnPooledThread|joinThreadPool|BR_SPAWN_LOOPER' \
-  frameworks/native/libs/binder/ProcessState.cpp \
+rg -n 'waitForResponse|BR_TRANSACTION_COMPLETE|BR_DEAD_REPLY|BR_REPLY' \
   frameworks/native/libs/binder/IPCThreadState.cpp
 ```
 
-画 main looper、registered looper 和 driver spawn request。
+预期观察：UAPI 同时定义了“事务失败”和“对象死亡通知”两组命令；`waitForResponse(reply)` 不会把 `BR_TRANSACTION_COMPLETE` 当同步 reply。
 
-### 第九轮：BpBinder 死亡
+再追死亡回调：
 
 ```bash
-sed -n '180,380p' frameworks/native/libs/binder/BpBinder.cpp
-rg -n 'BR_DEAD_BINDER|BC_DEAD_BINDER_DONE|CLEAR_DEATH' \
-  frameworks/native/libs/binder/IPCThreadState.cpp
+rg -n 'linkToDeath|unlinkToDeath|sendObituary|binderDied' \
+  frameworks/native/libs/binder/BpBinder.cpp
+sed -n '1248,1280p' frameworks/native/libs/binder/IPCThreadState.cpp
 ```
 
-追 obituary 注册、内核命令和回调线程。
+预期观察：第一个 obituary 触发内核注册；`BR_DEAD_BINDER` 调用 `sendObituary()` 后写入 `BC_DEAD_BINDER_DONE`，回调没有自动切到主线程。
 
-### 第十轮：Parcel Binder object
+### 为什么本地找不到 `drivers/android/binder.c`
 
-```bash
-rg -n 'writeStrongBinder|flattenBinder|unflattenBinder|flat_binder_object' \
-  frameworks/native/libs/binder
-```
+`android-11.0.0_r48` 是 Android 平台源码标签，不唯一指定某台设备的 Linux kernel。这个 checkout 有 libbinder 和 Binder UAPI，但没有配套驱动目录。因此本文的用户空间结论按本地 r48 逐行核对；内核对象和锁按 2021 年 Android common 5.4 的固定标签核对：
 
-解释 local binder 和 remote handle 的编码差异。
+- [`android11-5.4.86_r00` 的 Binder 驱动目录](https://android.googlesource.com/kernel/common/+/refs/tags/android11-5.4.86_r00/drivers/android/)
+- [`android-11.0.0_r48` 的 IPCThreadState.cpp](https://android.googlesource.com/platform/frameworks/native/+/refs/tags/android-11.0.0_r48/libs/binder/IPCThreadState.cpp)
+- [`android-11.0.0_r48` 的 BpBinder.cpp](https://android.googlesource.com/platform/frameworks/native/+/refs/tags/android-11.0.0_r48/libs/binder/BpBinder.cpp)
 
-### 第十一轮：ServiceManager context
-
-```bash
-rg -n 'becomeContextManager|getContextObject|addService|checkService' \
-  frameworks/native/libs/binder frameworks/native/cmds/servicemanager
-```
-
-画 handle 0 到普通 service handle 的获得过程。
-
-### 第十二轮：补 kernel source 后继续
-
-若以后取得与设备完全匹配的 kernel tree：
+如果以后拿到目标设备匹配的 kernel tree，再执行：
 
 ```bash
+cd /path/to/matching-kernel-tree
 rg -n 'struct binder_(proc|thread|node|ref|transaction)' drivers/android
-rg -n 'binder_transaction\(|binder_thread_(write|read)' drivers/android/binder.c
-rg -n 'BINDER_WRITE_READ|BR_DEAD_BINDER|TF_ONE_WAY' drivers/android
+rg -n 'binder_transaction\(|binder_deferred_release' drivers/android/binder.c
+rg -n 'REQUEST_DEATH|DEAD_BINDER|DEAD_REPLY' drivers/android/binder.c
 ```
 
-逐项把本章对象图对应到该版本字段和锁；不要用不匹配的新 kernel 行号解释旧设备。
+应记录三件事：结构定义在哪个文件、字段由哪把锁保护、进程退出时 transaction error 与 death work 分别在哪个分支排队。厂商 backport 可能改变字段和辅助函数，不能拿另一个内核版本的行号硬套；本文能确定的是所列参考基线的实现，具体设备仍需匹配其 kernel commit。
 
----
+### 检查题与答案
 
-## 53. 可选设备只读观察
+**1. Client C 的 handle 7 能否直接拿给 Client D 使用？**
 
-权限和版本允许时：
+不能。handle 属于 C 的 `binder_proc` 与 Binder context 的局部命名空间。Binder 对象必须通过 Binder 事务传递，由驱动在 D 中建立/查找对应 ref 和 handle。
 
-```bash
-adb shell ls -lZ /dev/binder /dev/hwbinder /dev/vndbinder
-adb shell service list
-adb shell dumpsys -l
-adb shell ps -AT -o PID,TID,NAME,LABEL | head -n 100
-adb shell cat /sys/kernel/debug/binder/stats 2>/dev/null
-adb shell cat /sys/kernel/debug/binder/state 2>/dev/null
-adb shell find /dev/binderfs -maxdepth 2 -type f 2>/dev/null
-adb shell logcat -b all | grep -E 'DeadObject|TransactionTooLarge|binder:'
-```
+**2. 收到 `BR_TRANSACTION_COMPLETE` 后，能否认为 `saveSetting()` 已执行成功？**
 
-debugfs/binderfs 节点因内核、构建和权限而异。不要为了观察在生产设备上放宽 SELinux。
+不能。同步调用仍要等 `BR_REPLY`；若等待链上的目标死亡，则可能以 `BR_DEAD_REPLY` / `DEAD_OBJECT` 结束。
 
----
+**3. 客户端一直持有强 Binder 引用，服务进程是否不会死？**
 
-## 54. 故障排查顺序
+不是。引用维护对象/节点的 Binder 生命周期关系，不是进程保活契约。服务进程仍可能崩溃或被系统终止。
+
+**4. 为什么一次死亡既可能出现 `DEAD_OBJECT`，又可能调用 `binderDied()`？**
+
+前者终止当前同步事务，后者来自此前挂在 `binder_ref` 上的能力生命周期订阅。它们服务不同目的，恢复入口要幂等。
+
+**5. `DEAD_OBJECT` 能否证明服务端没有执行过有副作用的代码？**
+
+不能只靠错误码判断。在途事务可能在服务完成副作用后、reply 送达前收到 `BR_DEAD_REPLY`；对 `mAlive == 0` 的旧代理，后续尝试则会在本地直接失败、根本不发送。是否重试要靠连接证据、业务幂等、request ID 或状态查询决定。
+
+**6. `BC_DEAD_BINDER_DONE` 表示什么？**
+
+它确认用户空间已处理这次 `BR_DEAD_BINDER`。clear-death 和弱引用清理仍可能继续；它更不表示新服务已启动或代理已重连。
+
+### 可立即执行的 takeaway
+
+回到源码，用一张纸只画这两条线：
 
 ```text
-1. service 是否注册/能发现？
-   servicemanager、名称、SELinux add/find
-
-2. proxy 是否 alive、handle 是否属于正确 driver context？
-   binder/hwbinder/vndbinder 不混用
-
-3. transaction 是 transport error 还是 business error？
-   DEAD_OBJECT/FAILED_TRANSACTION vs AIDL exception
-
-4. Parcel 是否过大或含错误 object/fd？
-   size、offsets、并发未释放 buffer
-
-5. target pool 是否耗尽？
-   服务线程栈、等待锁/IO/下游 Binder
-
-6. 是否存在同步调用环或持锁远调？
-   A→B→C→A、callback reentrancy
-
-7. oneway 是否洪泛？
-   async queue、buffer、消费速率
-
-8. death 恢复是否幂等？
-   DEAD_OBJECT + binderDied、generation、single-flight reconnect
+handle → binder_ref → binder_node → owner binder_proc
+sync binder_transaction → BR_REPLY 或 BR_DEAD_REPLY
 ```
 
----
-
-## 55. 设计检查表
-
-```text
-[ ] 不把 handle 当跨进程/跨 context 稳定 ID
-[ ] local BBinder 与 remote BpBinder 已区分
-[ ] transaction code 与 BC/BR command 已区分
-[ ] Parcel 大小和对象数量有界
-[ ] 高频数据使用 batch/shared memory/FMQ
-[ ] oneway 有速率、队列和丢弃/合并策略
-[ ] Binder pool thread 不做无限阻塞
-[ ] 不持关键锁调用远端 Binder
-[ ] callback 允许重入或先投递到序列化线程
-[ ] calling UID/PID/SID 来自 Binder，不信任 Parcel 自报
-[ ] clearCallingIdentity 前先检查原 caller，finally 恢复
-[ ] transport error 与业务 error 分开
-[ ] linkToDeath/unlink/death callback 竞态已考虑
-[ ] DEAD_OBJECT 与 binderDied 清理幂等
-[ ] proxy death 后重新 lookup，而非复用旧对象
-[ ] fd ownership/close-on-exec/数量有定义
-[ ] 异步请求有 requestId/generation/timeout/cancel
-[ ] dumpsys/trace 能显示等待链、队列和最近错误
-[ ] kernel source 分析使用与设备匹配的版本
-```
-
----
-
-## 56. 自测题
-
-1. ProcessState 与 IPCThreadState 为什么分别是进程级和线程级？
-2. BBinder、BpBinder、binder_node、binder_ref 如何对应？
-3. handle 为什么不能发给另一个进程复用？
-4. Binder mmap 为什么不是 sender/receiver 普通共享内存？
-5. BINDER_WRITE_READ 如何一次完成写命令和读返回？
-6. BC/BR command 与 AIDL transaction code 有何区别？
-7. driver 收到 BC_TRANSACTION 后做哪八类工作？
-8. binder_proc 维护哪些进程级对象？
-9. binder_thread 的 transaction stack 有什么用？
-10. binder_node 为什么必须记录 owner proc？
-11. binder_ref 怎样产生本地 handle？
-12. handle 0 表示什么？
-13. driver 如何选择目标 Binder thread？
-14. BR_TRANSACTION 怎样到达 BBinder::onTransact？
-15. 同步 reply 为什么回到原调用线程？
-16. 等待 reply 时为何可能处理嵌套 transaction？
-17. BR_TRANSACTION_COMPLETE 为什么不是业务完成？
-18. oneway 的 async queue 为什么会积压？
-19. Binder buffer 耗尽有哪些来源？
-20. BC_FREE_BUFFER 为什么重要？
-21. Parcel object offsets 为什么需要 driver 校验？
-22. local Binder object 传给远端时怎样被翻译？
-23. userspace 与 kernel 引用计数如何协作？
-24. linkToDeath 的 BC/BR 命令链是什么？
-25. DEAD_OBJECT 与 BR_DEAD_BINDER 有何区别？
-26. DeathRecipient 在什么线程执行？
-27. clearCallingIdentity 为什么必须 finally restore？
-28. fd 跨 Binder 后为什么数字可能变化？
-29. servicemanager 是否转发业务 transaction？
-30. 增加 Binder pool size 为什么不一定修复卡死？
-
----
-
-## 57. 最终记忆图
-
-```text
-【对象】
-Server BBinder
-  ↕ owner proc ptr/cookie
-kernel binder_node
-  ← Client proc binder_ref(handle)
-  ↕
-Client BpBinder(handle)
-
-【发送】
-BpBinder.transact
-  → IPCThreadState BC_TRANSACTION
-  → BINDER_WRITE_READ ioctl
-  → driver handle→ref→node→target proc
-  → allocate target binder_buffer
-  → copy bytes + translate binder/fd objects
-  → target thread/proc todo
-
-【执行与回复】
-BR_TRANSACTION
-  → Parcel reference
-  → calling identity
-  → BBinder.transact/onTransact
-  → BC_REPLY
-  → transaction stack
-  → BR_REPLY original caller thread
-
-【死亡】
-BpBinder.linkToDeath
-  → BC_REQUEST_DEATH_NOTIFICATION
-  → kernel death work
-  → BR_DEAD_BINDER(proxy cookie)
-  → sendObituary/binderDied
-  → BC_DEAD_BINDER_DONE
-
-【边界】
-handle is per proc/context
-buffer is finite
-oneway is queued, not free
-sync wait may be reentrant
-transport success is not business success
-death notification triggers recovery, not recovery itself
-```
-
----
-
-## 58. 本章总结
-
-1. `ProcessState` 管进程级 driver/mmap/proxy/threadpool，`IPCThreadState` 管线程级命令、身份和调用栈；
-2. server 本地 `BBinder` 对应 kernel `binder_node`，client `BpBinder(handle)` 对应本进程 `binder_ref`；
-3. handle 只在某进程和 Binder context 中有效，driver 在跨进程传对象时创建/翻译引用；
-4. `BINDER_WRITE_READ` 用 BC/BR 指令在一次 ioctl 中提交命令并取得工作或回复；
-5. driver 会定位目标、分配 buffer、复制数据、翻译 Binder/FD 对象、选择线程并建立同步 transaction stack；
-6. `BR_TRANSACTION` 在用户态恢复 calling identity 后进入 `BBinder::onTransact`，同步 `BC_REPLY` 沿事务栈返回原线程；
-7. 同步等待可处理嵌套事务，服务必须防重入、避免持锁远调和 Binder pool exhaustion；
-8. oneway 没有业务 reply，但仍排队、占 buffer、受消费速率限制，不适合无界高频流；
-9. `linkToDeath` 经 BC/BR death commands 通知 `BpBinder`，`DEAD_OBJECT` 与 death callback 清理必须幂等；
-10. Binder transport、AIDL Stub、Framework 权限和业务/硬件错误是不同层，诊断与恢复必须逐层区分。
-
-下一章：**第 91 章——Android Parcel 深入：数据布局、对象偏移、Binder/FD 序列化、异常与大事务源码链路**。
+然后在 `binder_ref` 旁再加一条 `death → BR_DEAD_BINDER → binderDied → DONE`。只要能解释为什么后两条会同时发生、却没有固定业务顺序，这一章最重要的模型就建立起来了。

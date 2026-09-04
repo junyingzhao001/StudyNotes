@@ -1,165 +1,89 @@
-# 131 Android JobConcurrencyManager：Pending 队列、动态并发与同 UID 抢占
+# 131 JobConcurrencyManager：Job 已经 ready，为什么还在等执行槽？
 
-> 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
-> 学习方式：macOS 只读源码，不要求编译、不要求连接设备  
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`
+>
+> 学习方式：macOS 静态阅读，不要求编译或连接设备
+>
 > 前置章节：第 43、121—130 章
 
----
+## 先说问题、结论和读完收获
 
-## 1. 本章研究“已经 ready，为什么还没有运行”
+上一章已经把 Job 的各种约束都验完了。现在假设两个 Job 都是 `ready=true`，但系统的执行槽已经占满：
 
-前几章已经把 Job 的约束拆得很细：网络、电量、时间、存储、idle、Doze、后台限制与 quota 都可能挡住 `JobStatus.isReady()`。
+- `B-urgent` 优先级很高，来自 calling UID B，并且更早进入 Pending；
+- `A-urgent` 同样优先级很高，来自 calling UID A，但排在后面；
+- 当前运行槽里恰好有一个 UID A 的低优先级 `A-low`，却没有 UID B 的低优先级 Job。
 
-但即使一个 Job 已经完整 ready，它也不一定马上进入应用的 `onStartJob()`。还要经过最后一层资源竞争：
+结果可能很反直觉：排在前面的 `B-urgent` 继续等待，后面的 `A-urgent` 反而触发对 `A-low` 的抢占；而且抢占这一轮只要求旧 Job 停止，新 Job 要等槽真正清理后，在下一轮才有机会启动。
 
-```text
-ready Job
-→ 进入 mPendingJobs
-→ JobConcurrencyManager 规划执行槽
-→ JobServiceContext 绑定应用服务
-→ 应用主线程收到 onStartJob()
-```
+先给结论：
 
-本章的核心问题不是“约束是否满足”，而是：
+> Android 11 r48 的 `JobConcurrencyManager` 不是“把所有 ready Job 按优先级从高到低排序”的全局调度器。`mPendingJobs` 主要按 shell override 和入队时间排序；JCM 按这个顺序逐个找槽。空槽启动要同时通过 FG/BG 动态容量和 `preferredUid` 检查；无空槽时，只能用严格更高的 evaluated priority 抢占同一 `callingUid` 的最低优先级 Job。停止与替代启动分属两轮分配。
 
-> 当多个 ready Job 同时争夺有限执行槽时，Android 11 怎样决定能再启动几个、启动谁，以及是否抢占已有 Job。
+读完本章，你应该能：
 
----
+- 区分 `JobStore`、ready、Pending、`JobServiceContext` 占用和应用 `onStartJob()` 五个完成点；
+- 解释为什么源码里有 16 个 context，默认并发却常是 5、8 或 10；
+- 用 `total / maxBg / minBg` 手算本轮 FG、BG 实际容量；
+- 说明 Pending 顺序、evaluated priority 和抢占各自负责什么；
+- 推演同 UID 抢占为何需要 `preferredUid` 和第二轮分配；
+- 知道怎样从 `dumpsys jobscheduler` 的 Pending、Active、Concurrency 三部分定位等待层次。
 
-## 2. 先固定版本：r48 没有新版 WorkType 模型
+本章只追到 `JobServiceContext` 接受一个 Job 并开始绑定。绑定、`onStartJob()` 回执、停止超时与代际清理，是第 132 章的主线。
 
-在本仓库搜索：
+## 先分清五个完成点：ready 离执行还有多远
 
-```bash
-rg -n '\bWorkType\b|\bWORK_TYPE_' frameworks/base/apex/jobscheduler
-```
+可以把 JobScheduler 想成一个机场：
 
-预期没有与并发 `WorkType` 有关的匹配。这里刻意加单词边界和下划线，避免把 `NETWORK_TYPE` 之类的无关符号误判成新版并发模型。
-
-Android 11 r48 的并发模型是：
-
-```text
-16 个固定 JobServiceContext 物理槽
-+ FG / BG 两类计数
-+ total / maxBg / minBg 三个策略值
-```
-
-后续 Android 版本出现的多 WorkType、expedited job、TOP/EJ/FGS/BGUSER 等模型不能直接套回本章。读网上文章时，第一步必须先核对源码版本。
-
----
-
-## 3. 本章要回答什么
-
-1. `JobStore`、`mPendingJobs`、`mActiveServices` 与应用 `JobService` 分别是什么？
-2. 为什么“有16个槽”不等于“默认同时运行16个 Job”？
-3. 屏幕开关与内存 trim 怎样选择并发矩阵？
-4. `mPendingJobs` 是否按 Job priority 排序？
-5. JCM 所说的 FG Job 为什么不等于前台服务 Job？
-6. `total/maxBg/minBg` 怎样变成实际 FG/BG 上限？
-7. 分配为何分成“投影规划”和“应用到真实槽”两阶段？
-8. 哪些 Job 可以抢占，为什么只允许同 calling UID？
-9. `preferredUid` 是永久保留槽位吗？
-10. `prepareForExecutionLocked()` 与 `executeRunnableJob()` 谁先发生？
-
----
-
-## 4. 源码地图
-
-并发主算法：
-
-```text
-frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobConcurrencyManager.java
-```
-
-队列、配置、优先级与触发入口：
-
-```text
-frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java
-frameworks/base/apex/jobscheduler/service/java/com/android/server/job/controllers/JobStatus.java
-frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobPackageTracker.java
-```
-
-真实执行槽与应用回调：
-
-```text
-frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobServiceContext.java
-frameworks/base/apex/jobscheduler/framework/java/android/app/job/IJobService.aidl
-frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobServiceEngine.java
-```
-
-测试与 dump schema：
-
-```text
-frameworks/base/services/tests/servicestests/src/com/android/server/job/JobCountTrackerTest.java
-frameworks/base/services/tests/servicestests/src/com/android/server/job/PrioritySchedulingTest.java
-frameworks/base/core/proto/android/server/jobscheduler.proto
-```
-
----
-
-## 5. 先分清四种“容器”
-
-| 容器 | 保存什么 | 是否等于正在执行 |
-|---|---|---|
-| `JobStore mJobs` | 系统当前登记的 JobStatus 全集 | 否 |
-| `ArrayList mPendingJobs` | 已被挑出、准备竞争执行槽的 Job | 否 |
-| `List mActiveServices` | 固定的16个 JobServiceContext 对象 | 否，空槽也在列表里 |
-| 应用 `JobService` | 真正执行业务回调的组件实例 | 只有 Binder/主线程回调到达后才是应用执行 |
-
-“scheduled”“ready”“pending”“context 已占用”“应用已进入 `onStartJob()`”是五个不同完成点。
-
----
-
-## 6. 一张总链图
+- `JobStore` 是所有已登记旅客；
+- ready 是证件与出发条件已满足；
+- Pending 是已经来到登机口等待分配座位；
+- `JobServiceContext` 是有限的座位/执行槽；
+- `onStartJob()` 才是旅客真的登上飞机。
 
 ```mermaid
 flowchart LR
-    API["schedule/enqueue 或持久 Job 恢复"] --> STORE["JobStore：全部已登记 Job"]
-    CTRL["Controllers 更新约束"] --> READY["JSS 完整 ready / 用户 / 组件 / restriction 检查"]
-    STORE --> READY
-    READY --> PENDING["mPendingJobs：等待竞争槽"]
-    PENDING --> JCM["JobConcurrencyManager：容量与抢占规划"]
-    JCM --> CTX["16 个 JobServiceContext 之一"]
-    CTX --> BIND["bindServiceAsUser + IJobService"]
-    BIND --> APP["应用主线程 onStartJob"]
-    CTX -. "完成/停止后回调" .-> STORE
+    A[schedule / persisted restore] --> B[JobStore: 已登记]
+    B --> C[约束与系统门检查]
+    C -->|ready| D[mPendingJobs]
+    D --> E[JobConcurrencyManager 分配]
+    E --> F[JobServiceContext]
+    F --> G[bindServiceAsUser]
+    G --> H[IJobService.startJob]
+    H --> I[应用主线程 onStartJob]
 ```
 
-JCM 不重新计算每种业务约束。它接收 JSS 已经放进 pending 的候选者，解决最后的“有限执行资源怎样分配”。
+| 状态 | 能证明什么 | 不能证明什么 |
+|---|---|---|
+| 在 `JobStore` | Job 仍被系统登记 | 当前 ready |
+| `JobStatus.isReady()` | Job 约束与几项隐式门满足 | 已进入 Pending |
+| 在 `mPendingJobs` | 已成为本轮槽位候选 | 一定能拿到槽 |
+| context 的 `mRunningJob=job` | system_server 已让该槽承担此 Job，包括绑定阶段 | 应用已进入 `onStartJob()` |
+| 应用收到 `onStartJob()` | 跨进程开始通知已到应用主线程 | Job 已完成 |
 
----
+“ready 但没运行”要继续问：它没进 Pending，还是进了 Pending但没有容量，还是已经绑定但应用回调未到？
 
-## 7. 16 是物理槽上限
+## 16 个物理槽不等于默认并行 16 个 Job
 
-JSS 定义：
+### `mActiveServices` 保存的是槽对象，不是活跃 Job 列表
+
+JSS 的物理上限是：
 
 ```java
 static final int MAX_JOB_CONTEXTS_COUNT = 16;
 ```
 
-到 `PHASE_THIRD_PARTY_APPS_CAN_START` 才一次创建：
+系统进入可启动第三方应用的 boot phase 后，一次创建 16 个 `JobServiceContext`：
 
 ```java
 for (int i = 0; i < MAX_JOB_CONTEXTS_COUNT; i++) {
-    mActiveServices.add(new JobServiceContext(...));
+    mActiveServices.add(new JobServiceContext(
+            this, mBatteryStats, mJobPackageTracker,
+            getContext().getMainLooper()));
 }
 ```
 
-这些 context 之后循环复用，正常运行时不会随内存状态增删对象。
-
----
-
-## 8. `mActiveServices` 这个名字容易误导
-
-它始终保存16个 context，包括：
-
-```text
-空闲槽：getRunningJobLocked() == null
-绑定中：BINDING
-启动回执等待中：STARTING
-执行中：EXECUTING
-停止回执等待中：STOPPING
-```
+变量名 `mActiveServices` 很容易误导。这个 List 始终装着 16 个可复用 context，其中既有空槽，也有处于 BINDING、STARTING、EXECUTING 或 STOPPING 的槽。
 
 因此：
 
@@ -167,411 +91,139 @@ for (int i = 0; i < MAX_JOB_CONTEXTS_COUNT; i++) {
 mActiveServices.size() == 16
 ```
 
-不能推出当前有16个 Job 正在执行。真实占用要逐槽看 `getRunningJobLocked()`。
+只证明有 16 个槽对象，不证明正并行 16 个 Job。真实占用要逐个查看 `getRunningJobLocked()` 是否为 null。
 
----
+### 物理上限、策略上限和候选需求是三层限制
 
-## 9. 物理槽与策略容量是两层上限
+仍用机场类比：
 
-可以把它想成停车场：
+| 层次 | 源码含义 | 问的问题 |
+|---|---|---|
+| 物理槽 | 固定 16 个 `JobServiceContext` | 最多有多少个执行容器？ |
+| 策略容量 | 屏幕状态、内存 trim、配置共同选出的 `total/maxBg/minBg` | 当前最多允许放多少？ |
+| 实际容量 | 再结合已有和待运行的 FG/BG 数量计算 | 这一轮各类还需要多少座位？ |
 
-```text
-物理车位：最多16个，代码对象固定存在
-当日开放车位：由屏幕状态、内存压力和配置决定，常见为5、8或10
-```
+有空 context 不代表策略允许启动；策略允许 8 个也不代表当前一定凑得出 8 个 ready Job。
 
-即使还有空 context，只要 `JobCountTracker.canJobStart()` 判 false，也不能启动新 Job。
+## r48 如何根据屏幕和内存选择并发矩阵
 
-反过来，配置变小后已有 Job 数超过新策略上限，也不会只因“超额”立即被清掉；策略主要限制后续新增。
+### 默认矩阵
 
----
-
-## 10. r48 默认并发矩阵
-
-每格写成：
-
-```text
-total / maxBg / minBg
-```
+每一格按 `total / maxBg / minBg` 表示：
 
 | effective 屏幕状态 | NORMAL | MODERATE | LOW | CRITICAL |
 |---|---:|---:|---:|---:|
-| screen ON | 8 / 6 / 2 | 8 / 4 / 2 | 5 / 1 / 1 | 5 / 1 / 1 |
-| screen OFF | 10 / 6 / 2 | 10 / 4 / 2 | 5 / 1 / 1 | 5 / 1 / 1 |
+| ON | 8 / 6 / 2 | 8 / 4 / 2 | 5 / 1 / 1 | 5 / 1 / 1 |
+| OFF | 10 / 6 / 2 | 10 / 4 / 2 | 5 / 1 / 1 | 5 / 1 / 1 |
 
-这些是 `android-11.0.0_r48` 基线默认值，可被 `Settings.Global.JOB_SCHEDULER_CONSTANTS` 覆盖，不应写成所有设备永恒不变的硬件能力。
+三个值的含义是：
 
----
+- `total`：FG 与 BG 合计的策略容量；
+- `maxBg`：BG 能占用的最多容量；
+- `minBg`：有 BG 候选时，尽量给 BG 留出的软容量。
 
-## 11. 三个配置值分别是什么
+这些是 r48 默认值，不是硬件能力，也不是所有厂商不可修改的常量。它们可以通过 `Settings.Global.JOB_SCHEDULER_CONSTANTS` 对应 key 调整，解析后还会被钳制：`total` 在 1—16，`maxBg` 在 1—`total`，`minBg` 不小于 0、不大于 `maxBg`，并且小于 `total`。
 
-```text
-total
-  本轮允许的 FG+BG 总策略容量
+### 熄屏后为何默认还等 30 秒
 
-maxBg
-  BG 同时运行的策略上限
-
-minBg
-  有 BG 候选时，算法尽量为 BG 保留的软容量
-```
-
-`minBg` 不是“系统必须随时运行这么多个后台 Job”，也不是一个独立进程池。
-
-它只参与本轮 `actualMaxFg/actualMaxBg` 计算。
-
----
-
-## 12. 配置 key 与钳位
-
-例如 screen-on + normal：
-
-```text
-max_job_total_on_normal
-max_job_max_bg_on_normal
-max_job_min_bg_on_normal
-```
-
-screen off 或其他 trim level 使用对应的 `off/moderate/low/critical` 后缀组合。
-
-解析后还会钳位：
-
-```text
-total：1 ～ 16
-maxBg：1 ～ total
-minBg：至少0，至多maxBg，并且严格小于total
-```
-
-所以配置字符串不能突破16个物理 context，也不能构造 `minBg > maxBg` 的有效状态。
-
----
-
-## 13. 屏幕状态有 current 与 effective 两份
-
-JCM 保存：
+JCM 保存两份交互状态：
 
 ```text
 mCurrentInteractiveState
-  当前 PowerManager/SCREEN_ON/OFF 观察到的交互状态
+  刚收到的当前屏幕交互状态
 
 mEffectiveInteractiveState
-  当前选择 on/off 并发矩阵时使用的状态
+  当前选择 ON/OFF 并发矩阵所使用的状态
 ```
 
-屏幕亮起时两者立即为 true；屏幕熄灭时 current 立即 false，effective 默认继续保持 true 30 秒。
-
----
-
-## 14. 为什么屏幕熄灭后不立即提升并发
-
-默认延迟配置：
+亮屏时两者立即变为 true；运行期间从 ON 转为 OFF 时，current 立即变 false，但 effective 默认延迟 30 秒才变 false：
 
 ```java
-screen_off_job_concurrency_increase_delay_ms = 30_000;
+mHandler.postDelayed(mRampUpForScreenOff,
+        mConstants.SCREEN_OFF_JOB_CONCURRENCY_INCREASE_DELAY_MS.getValue());
 ```
 
-从这段延迟与亮屏取消逻辑可以推断，它让系统先确认屏幕确实持续关闭，再扩大后台并发，从而减少短暂灭屏/亮屏时的容量抖动；这是基于实现的设计意图解释，不是额外的调度保证。
+这样可以避免短暂锁屏又亮屏时频繁扩缩并发。这里用的是 `BackgroundThread` 的 Handler，不是 wakeup Alarm；如果 CPU 已休眠，它不会为了“扩大 Job 并发”保证在第 30 秒整唤醒。
 
-30 秒后才：
+30 秒后，Runnable 还会复核屏幕确实持续关闭，再设置：
 
 ```text
 mEffectiveInteractiveState=false
 → maybeRunPendingJobsLocked()
-→ 用 screen-off 矩阵重新分配
+→ 用 OFF 矩阵重新分配
 ```
 
----
+还有一个启动边界：两个 boolean 的 Java 初值都是 false。若 `onSystemReady()` 首次查询就发现设备不 interactive，`onInteractiveStateChanged(false)` 会因 current 已为 false 而直接返回，effective 也保持 false；这种“开机时本就灭屏”的路径不会额外等一次 ON→OFF 的 30 秒。
 
-## 15. 屏幕状态时间线
+### 内存 trim 不是持续推送给 JCM 的开关
 
-```mermaid
-sequenceDiagram
-    participant R as "SCREEN Receiver / system_server"
-    participant J as "JobConcurrencyManager"
-    participant B as "BackgroundThread Handler"
-    participant S as "JobSchedulerService"
-
-    R->>J: SCREEN_OFF
-    J->>J: current=false，effective仍为true
-    J->>B: postDelayed(默认30秒)
-    alt 30秒内重新亮屏
-        R->>J: SCREEN_ON
-        J->>J: current=true，effective=true
-        J->>B: removeCallbacks
-    else 持续熄屏且CPU有机会执行
-        B->>J: rampUpForScreenOff
-        J->>J: 校验时间与状态，effective=false
-        J->>S: maybeRunPendingJobsLocked
-    end
-```
-
-屏幕亮起不需要反向等待，立即回到 screen-on 配置。
-
----
-
-## 16. 这不是 wakeup alarm
-
-延迟使用：
+每次分配前，JCM 最多每秒刷新一次：
 
 ```java
-BackgroundThread.getHandler().postDelayed(...)
+if (nowUptime < mNextSystemStateRefreshTime) return;
+mNextSystemStateRefreshTime = nowUptime + 1000;
+mLastMemoryTrimLevel = ActivityManager.getService()
+        .getMemoryTrimLevel();
 ```
 
-不是 AlarmManager wakeup alarm。Handler 本身不会为了扩大并发把休眠设备唤醒；CPU 有机会继续运行时才处理消息。
+然后用 effective 屏幕状态选择 ON/OFF 组，再用 trim 选择 NORMAL/MODERATE/LOW/CRITICAL 行。
 
-源码注释的假设是：若有 pending Job，通常也有运行中的 Job 维持设备工作。但这不是一条“30秒整必定唤醒并启动”的承诺。
+这说明：
 
----
+- trim 值是在 assignment 时按需查询并缓存，不是每次变化都立即触发一次 JCM 分配；
+- 从 NORMAL 变成 LOW 后，策略容量可以从 8/10 降到 5；
+- 这个变化主要限制后续启动，不会只因为“当前运行数超过新的 5”就在此方法中跨 UID 批量驱逐已有 Job。
 
-## 17. 不是每个 trim level 都会在熄屏后提升
+## ready Job 怎样进入 Pending，Pending 又怎样排序
 
-看默认矩阵：
+### `mPendingJobs` 不是 JobStore 的别名
+
+`JobStore mJobs` 保存系统登记的 JobStatus 全集；`mPendingJobs` 只保存已经被 JSS 选为执行候选的子集。
+
+Controller 状态变化触发 `MSG_CHECK_JOB` 后，JSS 会重新检查 ready、用户、组件和 restriction 等条件。当 JSS 没有走“已有 Job 活跃时立即重建全部 ready 队列”的路径，而是进入 `maybeQueueReadyJobsForExecutionLocked()` 时，它还可能对非 ACTIVE bucket 的 Job 做批处理：默认达到一定数量，或等待达到上限，才把候选整体放入 Pending。这里的“non-ACTIVE bucket”是应用待机分桶，不是“屏幕关闭”的同义词。
+
+所以：
 
 ```text
-NORMAL：8 → 10
-MODERATE：8 → 10
-LOW：5 → 5
-CRITICAL：5 → 5
+scheduled 不等于 ready
+ready 不一定已 pending
+pending 不等于正在运行
 ```
 
-所以方法名/注释里的“increase concurrency”是常见目标，不是所有内存状态的必然数值变化。LOW/CRITICAL 下 screen on/off 默认完全相同。
+这也是为什么只看到 `isReady()==true`，仍要检查 Pending queue。
 
----
+### Pending 的比较器没有 evaluated priority
 
-## 18. 开机时本来就是灭屏的边界
-
-两个 boolean 的 Java 初值都是 false。`onSystemReady()` 调：
-
-```java
-onInteractiveStateChanged(mPowerManager.isInteractive());
-```
-
-若此时设备本就不 interactive，传入 false 与 current 初值相同，方法直接 return，effective 也保持 false。
-
-因此这种启动场景直接使用 off 矩阵，不额外等待30秒。30秒延迟针对运行期间观察到的 ON→OFF 转换。
-
----
-
-## 19. 内存压力怎样进入选择
-
-每次 assignment 前：
-
-```text
-updateMaxCountsLocked()
-→ refreshSystemStateLocked()
-→ ActivityManager.getService().getMemoryTrimLevel()
-```
-
-结果映射到：
-
-```text
-ADJ_MEM_FACTOR_NORMAL
-ADJ_MEM_FACTOR_MODERATE
-ADJ_MEM_FACTOR_LOW
-ADJ_MEM_FACTOR_CRITICAL
-```
-
-再与 effective screen on/off 组合，选出上表的一格。
-
----
-
-## 20. 内存 trim 查询最多每秒刷新一次
-
-JCM 用 uptime 节流昂贵查询：
-
-```java
-SYSTEM_STATE_REFRESH_MIN_INTERVAL = 1000;
-```
-
-在下一刷新时刻之前重复 assignment，会沿用 `mLastMemoryTrimLevel`。因此它不是每次分配都一定跨 Binder 获取新值，而是“最多每1秒刷新一次”。
-
-查询前先把字段置 NORMAL；若 Binder 抛 `RemoteException`，本轮回退 NORMAL。
-
----
-
-## 21. JCM 没有单独监听 trim 变化
-
-这里没有注册“内存从 NORMAL 变 LOW”后立即回调 JCM 的 listener。新值要等下一次 assignment 时读取。
-
-所以内存压力变化本身不会通过 JCM：
-
-- 立即唤起一次分配；
-- 立即停止现有 Job；
-- 动态删除 JobServiceContext。
-
-它改变的是下一次分配使用的策略容量。真正的进程回收、OOM 调整属于 AMS/lmkd 等其他链路。
-
----
-
-## 22. 配置或 trim 收紧不会自动压停已有 Job
-
-假设原来运行8个 Job，随后矩阵变成 total=5。
-
-JCM 会统计到已有运行数，但没有“因为 8>5 就任选3个停止”的循环。`canJobStart()` 会阻止更多空槽启动；同 UID 严格高优先级替换仍可能发生，因为替换不增加同时运行数。
-
-约束丢失、Doze、后台限制或 JobRestriction 导致的停止由 JSS 另行处理，不能与并发上限收紧混为一谈。
-
----
-
-## 23. `mPendingJobs` 到底是什么
-
-JSS 注释把它定义为：
-
-```text
-JobServiceContext 将从中取得 Job 去执行的 pending queue
-```
-
-它不是：
-
-- 所有已 schedule Job；
-- 所有 persisted Job；
-- 所有未来某天会 ready 的 Job；
-- 应用 API `getAllPendingJobs()` 名称所指的完整存储概念。
-
-本章里的 `mPendingJobs` 是 system_server 内部“已经挑出、准备竞争槽”的短期队列。
-
-公共 API 的 `getAllPendingJobs()` / `getPendingJob()` 虽然也叫 pending，r48 服务端实际从 `JobStore.getJobsByUid()` 返回调用 UID 已登记的 JobInfo；它不是把内部 `mPendingJobs` 原样暴露给应用。这是同名 API 与内部调度态之间的版本语义差异。
-
----
-
-## 24. Job 怎样进入 pending
-
-常见两条路径：
-
-```text
-新 schedule 的 Job 已完整可执行
-→ 直接 addOrderedItem()
-→ maybeRunPendingJobsLocked()
-
-Controller 状态变化
-→ JSS Main Handler 收到 CHECK/GREEDY/EXPIRED
-→ 扫描 JobStore
-→ 把当前可执行 Job 加入 pending
-```
-
-`isReadyToBeExecutedLocked()` 除 `job.isReady()` 外，还检查 Job 仍在 Store、相关用户已启动、source UID 不在备份、无 JobRestriction、未 pending/active，以及目标 Service 仍可用。
-
----
-
-## 25. 普通检查还可能先批处理
-
-当 `mReportedActive=false` 时，普通 `MSG_CHECK_JOB` 走 `maybeQueueReadyJobsForExecutionLocked()`：
-
-- 非 RESTRICTED Job 中，ACTIVE bucket、失败重试等可不受普通 non-ACTIVE 凑批规则等待；
-- 非 ACTIVE ready Job 默认可能凑到5个；
-- 某个 Job 累计被 force-batch 达到默认31分钟后，**下一次普通检查**不再因为这条 non-ACTIVE 凑批规则继续等待；
-- RESTRICTED Job 始终属于 force-batched 一组。
-
-这里的31分钟是 `MAX_NON_ACTIVE_JOB_BATCH_DELAY_MS` 的默认阈值，不是 Alarm 或 Handler 的准点唤醒期限：源码只在以后再次进入 `maybeQueueReadyJobsForExecutionLocked()` 时比较时间，所以不能理解成“第31分钟一定自动运行”。这一步决定“本次检查是否进入 pending”；JCM 只决定“进入 pending 后能否获得槽”。两层不要合并。
-
----
-
-## 26. pending 队列不按 priority 排序
-
-精确 comparator：
+r48 的比较器只有两层：
 
 ```java
 if (o1.overrideState != o2.overrideState) {
     return o2.overrideState - o1.overrideState;
 }
-return Long.compare(o1.enqueueTime, o2.enqueueTime);
+if (o1.enqueueTime < o2.enqueueTime) return -1;
+return o1.enqueueTime > o2.enqueueTime ? 1 : 0;
 ```
 
-也就是：
+排序规则是：
 
-1. shell/debug override 更高的排前；
-2. 然后按 `enqueueTime` 更早的排前；
-3. comparator 没有比较 `lastEvaluatedPriority`。
+1. shell/debug override 更高的在前；
+2. override 相同，`enqueueTime` 更早的在前。
 
-“高 priority 一定排在 pending 队首”在 r48 是错误结论。
+`enqueueTime` 是 Job 开始被 JSS 跟踪时记录的 elapsed realtime；`madePending` 则由 `JobPackageTracker.notePending()` 记录 uptime，用于统计它真正进入 Pending 后等了多久。两者用途不同。
 
----
+JCM 后面确实会计算 priority，但不会据此重新排列整个 Pending List。这带来一个直接结果：
 
-## 27. `enqueueTime` 与 `madePending` 也不同
+> 当空槽和类别容量有限时，前面的低 priority Job 可能先拿到空槽；后面的高 priority Job 不能据此对其他 UID 做全局抢占。
 
-```text
-enqueueTime
-  Job 开始被 JSS tracking 时记录的 elapsed realtime；用于 pending 排序
+### override 排在前面，也不等于绕过所有门
 
-madePending
-  JobPackageTracker 在真正进入 pending 时记录的 uptime；用于统计等待时长
-```
+Pending comparator 里的 `overrideState` 主要服务 shell 测试/调试。一个 Job 能来到 Pending 之前和真正执行之前仍有各层检查。不能仅从“override 排第一”推出组件失效、用户未启动或物理槽限制都被取消。
 
-名字都像“入队时间”，但时钟、写入时机和用途不同。排序读的是 `enqueueTime`，不是 `madePending`。
+## evaluated priority 与 FG/BG 到底是什么
 
----
+### JCM 的 FG 只认一个数值阈值
 
-## 28. override 排前不等于绕过完整 ready 门
-
-debug override 只影响普通约束比较和 pending comparator。Job 在进入 pending 前仍要通过 JSS 的外层资格，例如：
-
-```text
-quota/dynamic
-not-dozing
-background-not-restricted
-NEVER bucket
-用户与组件有效
-JobRestriction
-```
-
-所以“FULL override 排第一”描述的是已经成为候选后的队列顺序，不是强制越过所有系统门。
-
----
-
-## 29. 优先级何时计算
-
-assignment 第一遍遍历 pending：
-
-```java
-final int priority = mService.evaluateJobPriorityLocked(pending);
-pending.lastEvaluatedPriority = priority;
-```
-
-随后用这个保存值做 FG/BG 分类。
-
-优先级不是 pending comparator 的排序字段，而主要用于：
-
-- 本轮 FG/BG 类别；
-- 同 UID 运行 Job 的抢占比较；
-- dumpsys 与统计。
-
----
-
-## 30. `evaluateJobPriorityLocked()` 的精确顺序
-
-可读成：
-
-```text
-若 Job 自身 priority >= BOUND_FOREGROUND_SERVICE(30)
-  → 直接使用自身值，再做负载调整
-否则若 source UID 有 proc-state priority override
-  → 使用 override，再做负载调整
-否则
-  → 使用 Job 自身值，再做负载调整
-```
-
-JSS 的 UID override 来自自己的 proc-state observer：TOP→40、FGS→35、BFGS→30。它不是上一章 `JobStatus.uidActive` 字段。
-
----
-
-## 31. 包的 active+pending 占用比例还会降低 priority
-
-若当前 priority 小于 TOP_APP(40)：
-
-```text
-JobPackageTracker load factor >= HEAVY_USE_FACTOR    → -80
-否则 >= MODERATE_USE_FACTOR                          → -40
-```
-
-TOP=40 不做这项下调。
-
-这里的 load factor 是 `JobPackageTracker` 对当前与上一统计 DataSet 中“active 时间 + pending 时间”占总观察时间的比例，不是单纯的运行中负载，更不是 CPU 使用率或电池耗电百分比。两个阈值默认分别为 `0.9` 和 `0.5`，但可由 `JOB_SCHEDULER_CONSTANTS` 的 `heavy_use_factor`、`moderate_use_factor` 调整；因此它们是 r48 默认值，不是不可变常量。
-
-因此 priority 是“Job 声明/内部值 + source UID 当前状态 + JobScheduler 自己观察到的 active/pending 负载”的合成结果，不只是 Builder 中一个整数。
-
----
-
-## 32. JCM 的 FG 实际只认 TOP 类
+JCM 的分类函数是：
 
 ```java
 private boolean isFgJob(JobStatus job) {
@@ -579,322 +231,239 @@ private boolean isFgJob(JobStatus job) {
 }
 ```
 
-r48 常量：
+r48 中 `PRIORITY_TOP_APP=40`。因此 JCM 所称 FG 的准确含义是“本轮 evaluated priority 至少为 TOP_APP”，不是泛指：
 
-```text
-BOUND_FOREGROUND_SERVICE = 30
-FOREGROUND_SERVICE       = 35
-TOP_APP                  = 40
-```
+- 应用有前台 Service；
+- Job 将来会调用 `startForeground()`；
+- 用户肉眼觉得它很重要。
 
-所以并发计数里的：
+例如 `PRIORITY_FOREGROUND_SERVICE=35` 仍低于 40，在 JCM 这套二分类里仍算 BG。
 
-```text
-FG = evaluated priority >= 40
-BG = 其余所有值
-```
+### evaluated priority 不是只看 JobInfo 原值
 
-前台服务来源的35、绑定前台服务的30，在 JCM 二分类中仍是 BG。这里的 FG 是算法术语，不是组件类型。
-
----
-
-## 33. 运行 Job 的类别是启动时快照
-
-统计已有运行 Job 时，JCM 直接读：
-
-```text
-status.lastEvaluatedPriority
-```
-
-不会先为每个 running Job 重写该字段。若 source UID proc-state 后来变化，它在本轮 running FG/BG 计数中可能仍保留启动前评估结果。
-
-但寻找抢占候选时，代码会对 running Job 重新调用 `evaluateJobPriorityLocked()`。因此：
-
-```text
-并发类别计数：保存值快照
-抢占高低比较：当前重新计算值
-```
-
-这是两个不同时间语义。
-
----
-
-## 34. JobCountTracker 需要哪些输入
-
-设：
-
-```text
-T    = 配置 maxTotal
-Bmax = 配置 maxBg
-Bmin = 配置 minBg
-RF   = 已运行 FG 数
-RB   = 已运行 BG 数
-PF   = pending FG 数
-PB   = pending BG 数
-```
-
-Tracker 先统计 running，再统计不与 running 重复的 pending，之后才计算本轮实际上限。
-
----
-
-## 35. JobCountTracker 的精确公式
-
-```text
-reserve0    = min(Bmin, RB + PB)
-reservedBg  = min(reserve0, T - RF)
-
-maxFg0      = T - max(RB, reservedBg)
-actualMaxFg = min(maxFg0, RF + PF)
-
-maxBg0      = min(Bmax, T - actualMaxFg)
-actualMaxBg = min(maxBg0, RB + PB)
-```
-
-新启动门：
-
-```text
-FG：RF + startingFG < actualMaxFg
-BG：RB + startingBG < actualMaxBg
-```
-
-`startingFG/BG` 是本轮规划到真实空槽、尚未实际调用 execute 的数量。
-
----
-
-## 36. 手算例一：为什么是4个 FG + 2个 BG
-
-给定：
-
-```text
-T/Bmax/Bmin = 6/4/2
-RF/RB       = 0/0
-PF/PB       = 10/3
-```
-
-计算：
-
-```text
-reserve0    = min(2, 3) = 2
-reservedBg  = min(2, 6) = 2
-maxFg0      = 6 - max(0, 2) = 4
-actualMaxFg = min(4, 10) = 4
-maxBg0      = min(4, 6 - 4) = 2
-actualMaxBg = min(2, 3) = 2
-```
-
-本轮最多规划：
-
-```text
-4 FG + 2 BG
-```
-
-这与 `JobCountTrackerTest.testBasic()` 的例子一致。
-
----
-
-## 37. `minBg` 为什么只是软预留
-
-同样配置 `6/4/2`，若已经有6个 FG 正在运行，另有 BG pending：
-
-```text
-reservedBg = min(2, 6 - 6) = 0
-```
-
-算法不会为了兑现 `minBg=2` 主动抢占两个 FG。结果是 BG 仍然等槽。
-
-因此 `minBg` 的准确含义是：
-
-> 在本轮仍有可分配总容量时，尽量别让新的 FG 把 BG 机会全部吃完。
-
-它不是对 running FG 的硬性驱逐规则。
-
----
-
-## 38. actual max 会随候选构成变化
-
-`actualMaxFg` 和 `actualMaxBg` 不只是配置常量，还受：
-
-```text
-当前已经运行多少 FG/BG
-本轮究竟有多少 pending FG/BG
-```
-
-影响。
-
-若只有1个 FG 候选，算法不会为了“凑满 FG 上限”虚构 Job；剩余容量可在 `maxBg` 允许范围内给 BG。反之，BG 数量不足时也不会空造保留任务。
-
----
-
-## 39. assignment 为什么分两阶段
-
-JCM 没有一边遍历 pending、一边立刻修改所有真实 context，而是：
-
-```text
-阶段一：把真实槽复制成投影数组，在数组里完成整轮规划
-阶段二：根据 slotChanged，把最终规划应用到真实 JobServiceContext
-```
-
-这样后面的 pending Job 可以看到前面已经占用的“规划后槽位”，避免多个候选都以为自己拿到了同一个空槽。
-
-整个过程仍在 JSS `mLock` 下，不是多个线程并行做无锁调度。
-
----
-
-## 40. 三个复用数组分别做什么
-
-```text
-contextIdToJobMap[16]
-  每个槽最终计划放哪个 Job
-
-slotChanged[16]
-  该槽的投影是否相对真实状态发生变化
-
-preferredUidForContext[16]
-  抢占后该槽短期偏好的 calling UID 快照
-```
-
-数组放在成员字段里循环复用，是为了减少频繁 assignment 的 GC churn，不代表结果跨轮永久有效。
-
----
-
-## 41. 规划前先排除“已经运行”的重复候选
-
-无论 pending 怎样构建，JCM 都防御性地检查候选是否已经占用 context；这也覆盖快速重评、队列状态变化等时序下可能出现的重复视野。它用：
+JSS 的计算顺序可压缩为：
 
 ```java
-findJobContextIdFromMap(pending, contextIdToJobMap)
+int priority = job.getPriority();
+if (priority < PRIORITY_BOUND_FOREGROUND_SERVICE) {
+    int uidOverride = mUidPriorityOverride.get(job.getSourceUid(), 0);
+    if (uidOverride != 0) priority = uidOverride;
+}
+return adjustJobPriority(priority, job);
 ```
 
-按 `(callingUid, jobId)` 的 `matches()` 找是否已有运行槽；找到就跳过计数和再次分配。
+其中 UID override 来自 source UID 当前进程状态：TOP 映射 40，前台服务映射 35，绑定前台服务映射 30。对于低于 TOP 的 priority，`JobPackageTracker` 的历史负载因子还可能施加负向调整，避免长期占用 Job 的包持续得到同等优先级。
 
-这是一道防重复执行门。不能仅看到 pending list 中有对象，就断言系统会为它再绑定一个 JobServiceContext。
+所以 dump 中应该看 `Evaluated priority`，不能只看最初的 `JobInfo` priority。
 
----
+### 两个 UID 概念在抢占处会分叉
 
-## 42. 每个 pending Job 怎样寻找槽
+`JobStatus` 同时保存：
 
-按 pending comparator 顺序，候选依次扫描16个投影槽：
+- `sourceUid`：Job 代表的来源应用身份，用于优先级、待机、配额和记账等政策；
+- `callingUid`：向 JobScheduler 请求调度的调用者；`getUid()` 返回它。
+
+普通 App 自己调度时二者通常相同；SyncManager 等系统组件代表其他包调度时可以不同。
+
+这里最容易漏掉的边界是：
 
 ```text
-遇到空槽
-  → preferredUid允许？
-  → canJobStart(FG/BG)允许？
-  → 是则选择第一个可用空槽
-
-遇到非空槽
-  → 是否同 calling UID？
-  → running priority 是否严格更低？
-  → 是则记录为抢占候选
+evaluated priority 的 UID override：按 sourceUid 查
+能否互相抢占：比较 getUid()，也就是 callingUid
 ```
 
-若同 UID 有多个可抢占槽，最终选择当前 priority 最低的那个。
+后面的例子使用不同 evaluated priority，是为了推演 r48 内部算法；不代表普通第三方 App 可以自由调用隐藏 API 给 Job 任意设置系统级 priority。
 
----
+## `total / maxBg / minBg` 怎样变成本轮实际容量
 
-## 43. 空槽启动必须同时过两道门
+`JobCountTracker` 先统计：
 
-```java
-preferredUidOkay && mJobCountTracker.canJobStart(isPendingFg)
+- 当前 running FG/BG；
+- Pending 中尚未运行的 FG/BG；
+- 配置的 total、maxBg、minBg。
+
+然后依次计算：
+
+```text
+reservedBg = min(configMinBg, runningBg + pendingBg)
+reservedBg = min(reservedBg, total - runningFg)
+
+maxFg = total - max(runningBg, reservedBg)
+actualMaxFg = min(maxFg, runningFg + pendingFg)
+
+maxBg = min(configMaxBg, total - actualMaxFg)
+actualMaxBg = min(maxBg, runningBg + pendingBg)
 ```
 
-第一道门是抢占后的短期槽位亲和；第二道门是 FG/BG 本轮实际容量。
+### 手算一个 screen ON + NORMAL 的例子
 
-因此“槽在物理上为空”仍不等于它现在对任意 Job 开放。
+配置为 `8 / 6 / 2`，当前：
 
----
+```text
+running：5 FG + 1 BG
+pending：2 FG + 3 BG
+```
 
-## 44. 抢占只发生在同 calling UID
+第一步，BG 软预留：
 
-核心判断：
+```text
+reservedBg = min(2, 1 + 3) = 2
+再受 total-runningFg 限制：min(2, 8-5) = 2
+```
+
+第二步，FG 实际上限：
+
+```text
+maxFg = 8 - max(runningBg=1, reservedBg=2) = 6
+actualMaxFg = min(6, runningFg+pendingFg=7) = 6
+```
+
+第三步，BG 实际上限：
+
+```text
+maxBg = min(configMaxBg=6, total-actualMaxFg=2) = 2
+actualMaxBg = min(2, runningBg+pendingBg=4) = 2
+```
+
+所以这一轮还能启动：
+
+```text
+1 个 FG：5 → 6
+1 个 BG：1 → 2
+合计：6 → 8
+```
+
+这个例子同时说明 `minBg` 为什么叫软预留：如果根本没有 running/pending BG，`reservedBg` 会降到 0，容量可以给 FG；它不是“系统无论如何必须运行两个 BG Job”。
+
+实际 FG/BG 上限还会随候选构成变化，所以 dumpsys 中的 `Actual max` 不是简单照抄配置原值。
+
+## assignment 为什么先“纸上排座”，再修改真实槽
+
+### 第一阶段建立投影
+
+每次 `assignJobsToContextsLocked()` 都在 JSS `mLock` 下运行。JCM 复用三组长度为 16 的数组：
+
+```text
+contextIdToJobMap[i]
+  纸面上第 i 个槽最终应对应哪个 Job
+
+slotChanged[i]
+  纸面结果与本轮开始时是否不同
+
+preferredUidForContext[i]
+  本轮开始时槽的短期 UID 偏好
+```
+
+它先把真实 context 的 running Job 和 preferred UID 抄入数组，统计 running 数量；再扫描 Pending，计算每个候选的 `lastEvaluatedPriority` 和 FG/BG 数量，得到 actual max。
+
+随后它按 Pending 原顺序逐个寻找槽。某个候选被放入投影后，`contextIdToJobMap` 立即更新，所以后面的候选看到的是已经规划过的纸面结果，不能再次占用同一个槽。
+
+这样做的意义是：先得到一轮内部一致的整体方案，再区分哪些槽要启动、哪些槽只需发出抢占停止，减少一边扫描一边真实异步停止导致的混乱。
+
+### 第二阶段才把投影应用到真实 context
+
+JCM 再遍历 16 个槽：
+
+- `slotChanged=false`：保持原状，必要时清理过期 preferred UID；
+- 纸面要变且真实槽为空：先让 Controller prepare，再 `executeRunnableJob()`；
+- 纸面要变但真实槽仍有 Job：只调用 `preemptExecutingJobLocked()`，等待旧 Job 异步退出。
+
+投影中的“替代 Job 已占位”不等于真实 Job 已启动。抢占路径恰恰需要下一轮才能兑现。
+
+## 空槽启动要同时通过两道门
+
+扫描某个空槽时，r48 检查：
 
 ```java
-if (job.getUid() != nextPending.getUid()) {
+boolean uidOkay = preferredUid == nextPending.getUid()
+        || preferredUid == NO_PREFERRED_UID;
+
+if (uidOkay && mJobCountTracker.canJobStart(isPendingFg)) {
+    selectedContextId = j;
+    startingJob = true;
+    break;
+}
+```
+
+两道门分别是：
+
+1. 该空槽没有 UID 偏好，或偏好正好等于候选的 calling UID；
+2. running + 本轮已规划 starting 尚未达到该 FG/BG 的 actual max。
+
+“物理上是空槽”只能证明第一层资源存在，不能绕过策略容量。
+
+每规划一个真正从空槽启动的 Job，Tracker 立即增加本轮 `startingFg` 或 `startingBg`。后面的候选据此看到已经被本轮前序候选占掉的容量，避免纸面超发。
+
+## 没有可用空槽时，为何只允许同 calling UID 抢占
+
+### 源码条件
+
+遇到已占用槽时，JCM 先比较 UID：
+
+```java
+if (running.getUid() != nextPending.getUid()) {
+    continue;
+}
+int runningPriority = mService.evaluateJobPriorityLocked(running);
+if (runningPriority >= nextPending.lastEvaluatedPriority) {
     continue;
 }
 ```
 
-`JobStatus.getUid()` 返回 calling UID，不是 `getSourceUid()`。
+只有两个条件都成立才是候选：
 
-所以：
+- running 与 pending 的 `callingUid` 相同；
+- pending 的 evaluated priority **严格大于** running。
 
-- 普通应用为自己 schedule 时，两者通常相同；
-- `scheduleAsPackage()` 时可能不同；
-- priority override 按 source UID；
-- 抢占与 preferred affinity 按 calling UID。
+如果同 UID 有多个较低优先级 running Job，算法选择其中 priority 最低的一个。
 
-身份字段必须沿每条公式分别追，不能笼统写“按 UID”。
+这里说“没有可用空槽”，不一定等于 16 个物理槽都非空。即使存在物理空槽，只要它因 FG/BG 容量已满或 preferred UID 不匹配而不能接收当前候选，扫描仍会继续寻找同 UID 的可抢占 running 槽。
 
----
+严格大于意味着同优先级不抢占，避免没有收益的停止—重启抖动。从结果上看，只限同 calling UID 把抢占影响控制在同一调度责任主体内部：一个 UID 的高优先级工作不能仅凭这个局部算法踢掉另一个 UID 已经获得的槽。
 
-## 45. 为什么不允许跨 UID 抢占
+这不是一份完整的跨应用公平性证明，但源码能确定的边界很清楚：r48 这里没有实现任意跨 UID 的全局优先级抢占。
 
-从实现效果看，若任意 UID 的高 priority Job 都能踢掉其他 UID 的低 priority Job，一个持续制造高 priority 工作的调用者会扩大跨应用干扰与饥饿风险。源码没有在此处写出完整设计论证，下面是依据实际规则作出的公平性解释。
+### 满载场景：为什么排在前面的 B 反而继续等
 
-r48 选择更保守的规则：
+为便于手算，假设 screen ON + NORMAL，8 个策略槽已经满：
 
 ```text
-同 calling UID 内
-  允许更重要的新 Job替换该 UID自己的低优先级 Job
+running：5 FG + 3 BG = 8
+其中有 UID A 的 A-low，evaluated priority=0
 
-不同 calling UID间
-  不通过 priority 抢占，等待正常容量释放
+Pending 顺序：
+1. B-urgent：callingUid=B，priority=40
+2. A-urgent：callingUid=A，priority=40
 ```
 
-这是公平性边界，不代表不同 UID 的业务优先级完全相等；它们仍受 pending 顺序、FG/BG容量和其他系统政策影响。
+这是一个用于阅读内部算法的构造场景；priority 数值和代理身份可来自系统内部调度，不把它当作第三方公开 API 示例。
 
----
+JCM 扫描 `B-urgent`：
 
-## 46. 必须“严格更高”才抢占
+- 没有空槽；
+- running 中没有 calling UID B 的更低优先级 Job；
+- 它不能跨 UID 抢占 A 或其他 UID；
+- 结果是本轮没有选中槽。
 
-```java
-if (jobPriority >= nextPending.lastEvaluatedPriority) {
-    continue;
-}
-```
+再扫描 `A-urgent`：
 
-所以：
+- 发现同 calling UID A 的 `A-low`；
+- `0 < 40`，满足严格更高；
+- 将那个槽的纸面映射改成 `A-urgent`，标记 `slotChanged=true`。
 
-```text
-pending priority > running priority → 可成为候选
-pending priority = running priority → 不抢
-pending priority < running priority → 不抢
-```
+于是，“Pending 更早 + priority 同样高”的 B 仍等着，A 却触发抢占。原因不是 A 的全局排名更高，而是只有 A 满足同 UID 替换条件。
 
-同优先级只按 pending/完成后的正常槽位周转，不会互相强制打断。
+### 抢占分支为何不调用 `canJobStart()`
 
----
+规划抢占时，源码没有走空槽的类别容量检查，也不增加 `starting` 计数，因为这一轮并不启动替代 Job，只请求旧 Job 停止。
 
-## 47. 抢占不受 `canJobStart()` 限制的原因
+当槽真正空出来、下一轮尝试启动 A 时，空槽分支仍会重新计算当前 running/pending 构成，并执行 `canJobStart()`。所以不能把“已决定抢占”理解为“替代 Job 已绕过 FG/BG 容量”。
 
-抢占路径没有调用 FG/BG 新启动门，因为本意是：
+## 抢占为何需要两轮，以及 `preferredUid` 在保护什么
 
-```text
-停止一个已有 Job
-以后在同一个槽启动另一个 Job
-```
+### 第一轮只发停止请求
 
-最终同时运行数并不增加。
-
-但“以后”很关键：r48 并不会在本轮同步把新 Job 塞进仍在停止中的槽。
-
----
-
-## 48. 规划数组不是立即执行结果
-
-第一阶段把：
-
-```text
-contextIdToJobMap[i] = nextPending
-slotChanged[i] = true
-```
-
-只表示“最终希望槽 i 给这个候选”。
-
-此时真实 `JobServiceContext` 可能仍在运行旧 Job，应用也完全没有收到新任务。日志或调试时要分清投影 map 与真实 context。
-
----
-
-## 49. 第二阶段遇到真实忙槽：只发抢占停止
+把投影应用到真实槽时，如果旧 Job 仍在运行：
 
 ```java
 if (activeServices.get(i).getRunningJobLocked() != null) {
@@ -903,599 +472,335 @@ if (activeServices.get(i).getRunningJobLocked() != null) {
 }
 ```
 
-本轮不会接着执行投影中的替代 Job。旧 Job 要先经过取消状态机、可能的 `onStopJob()`、回执或 timeout、cleanup 和完成回调。
+`JobServiceContext` 将停止原因设为 `REASON_PREEMPT`。如果旧 Job 已处于 EXECUTING，会跨进程请求应用执行 `onStopJob()`；如果还在 BINDING/STARTING，取消状态机的处理不同。无论哪种，都可能经历回调或超时，槽不会在当前调用栈里瞬间变空。
 
-替代 Job 仍保留在 pending，等下一轮分配。
+此时：
 
----
+- `A-urgent` 仍留在 Pending；
+- 旧 `A-low` 仍是 context 的真实 running Job；
+- JCM 没有在本轮调用 `executeRunnableJob(A-urgent)`。
 
-## 50. 抢占完成为什么要再跑一轮
+### `preferredUid` 防止刚让出的槽被其他 UID 插队
 
-旧 Job 清理时，JSS `onJobCompletedLocked()` 最后发送：
+发起 PREEMPT 时，JSC 保存旧 running Job 的 calling UID：
 
-```text
-MSG_CHECK_JOB_GREEDY
+```java
+if (reason == JobParameters.REASON_PREEMPT) {
+    mPreferredUid = mRunningJob != null
+            ? mRunningJob.getUid() : NO_PREFERRED_UID;
+}
 ```
 
-下一轮才看到：
+由于抢占前已经要求新旧 Job calling UID 相同，这个值也正是替代 Job A 的 UID。
 
-```text
-真实槽已经空闲
-+ preferredUid 指向旧 Job 的 calling UID
-+ 高优先级替代 Job仍在 pending
-```
-
-然后它才可能真正启动。
-
----
-
-## 51. preferredUid 的完整时序
+旧 Job 完成清理后，JSS 发送 `MSG_CHECK_JOB_GREEDY`，下一轮重新建立 Pending 并分配。即使 `B-urgent` 仍排在前面，它看到这个空槽的 preferred UID 是 A，也不能使用；轮到 `A-urgent` 时才匹配。
 
 ```mermaid
 sequenceDiagram
-    participant P as "pending B：uid=X，高优先级"
-    participant J as "JobConcurrencyManager"
-    participant C as "槽 i / 正在运行 A：uid=X，低优先级"
-    participant A as "应用 JobService A"
-    participant S as "JobSchedulerService"
+    participant B as B-urgent uid=B
+    participant J as JobConcurrencyManager
+    participant C as Slot i / A-low uid=A
+    participant A as A-urgent uid=A
+    participant S as JobSchedulerService
 
-    P->>J: 参与本轮规划
-    J->>C: preemptExecutingJobLocked(REASON_PREEMPT)
-    C->>C: preferredUid=X
-    C->>A: 若已EXECUTING，发送onStopJob
-    A-->>C: 停止回执/或等待超时
-    C->>S: cleanup回调onJobCompletedLocked
-    S->>S: post MSG_CHECK_JOB_GREEDY并重建pending
-    S->>J: 下一轮进入assignment
-    J->>C: 空槽只接受uid=X或无偏好
-    J->>C: prepare B → execute B
-    C->>C: execute入口清preferredUid=-1
+    B->>J: 先被扫描
+    J-->>B: 无空槽，也不能跨 UID 抢占
+    A->>J: 后被扫描
+    J->>C: PREEMPT A-low，preferredUid=A
+    Note over J,C: 第一轮只请求停止
+    C-->>S: 停止回执/超时后完成清理
+    S->>J: MSG_CHECK_JOB_GREEDY，开始第二轮
+    B->>C: preferredUid 不匹配，跳过
+    A->>C: 匹配 UID 且容量允许
+    J->>C: prepare + executeRunnableJob(A-urgent)
 ```
 
-这是一种短期 affinity，目的是让刚被抢占出来的槽优先服务同一 calling UID。
+### preferred UID 不是永久专属槽
 
----
+它只是一条短期交接提示：
 
-## 52. preferredUid 不是永久资源保留
+- 新 Job 真正进入 `executeRunnableJob()` 时会清成 `NO_PREFERRED_UID`；
+- 如果后续一轮没有合适的同 UID Job占用，JCM 在无需继续保留时也会清掉；
+- 它不是 UID 独占线程池，不是长期 quota，也不是可跨多次任务永久继承的权重。
 
-如果下一轮没有该 UID 的可运行 Job，其他 UID 会因 preferred 不匹配而跳过这个空槽；本轮应用阶段末尾在无需继续保留时会：
+还有一个小边界：若本轮前面的其他 UID 已因 preferred 不匹配而跳过，JCM 在轮末清掉 preferred 后不会回头重扫那些候选；通常要等下一次调度触发。可见它是一条短期交接提示，不是一个完整的长期公平队列。
+
+抢占只保证“先给同一责任主体完成替换机会”，不保证被抢占的旧 Job 自动再次执行。旧 Job 是否请求 reschedule，还取决于停止阶段和应用的 `onStopJob()` 返回语义。
+
+## 真正拿到空槽后，也还没有进入应用代码
+
+### Controller 先做执行前交接
+
+真实槽为空时，JCM 先调用每个 Controller：
 
 ```java
-clearPreferredUid();
+for (StateController controller : controllers) {
+    controller.prepareForExecutionLocked(pendingJob);
+}
+activeServices.get(i).executeRunnableJob(pendingJob);
 ```
 
-下一轮槽又向其他 UID 开放。
+这一步允许 Controller 在执行前冻结或转移状态。例如 ContentObserverController 把本轮聚合的 URI/authority 交给即将执行的 Job；QuotaController 开始相应的执行记账。
 
-所以它不是：
+所以“分配一个槽”不是只改数组，它还是 Controller 从等待态到执行态的交接点。
 
-- UID 专属线程池；
-- 跨多轮的容量配额；
-- 永久的公平权重。
+### `executeRunnableJob()` 先进入 BINDING
 
----
+JSC 随后：
 
-## 53. 抢占 reason 与是否重排是两回事
+1. 确认 context available；
+2. 清掉 preferred UID；
+3. 保存 `mRunningJob`，创建 callback 和参数快照；
+4. 把状态设成 `VERB_BINDING` 并安排超时；
+5. 调用 `bindServiceAsUser()`。
 
-JSC 设置：
+`bindServiceAsUser()` 返回 true 也只表示系统接受绑定请求，不表示 Service 已连接。连接成功后，JSC 才取得 `IJobService`，调用 `startJob(params)`。
 
-```text
-JobParameters.REASON_PREEMPT
-```
-
-若旧 Job 已在 EXECUTING，会进入应用 `onStopJob()`；应用返回 true 才请求失败式 reschedule，返回 false 则不要求重排。
-
-因此：
-
-```text
-被抢占
-≠ 旧 Job 自动保证再次执行
-```
-
-而且若仍处 BINDING/STARTING，取消只先标记，回调路径也与 EXECUTING 不同。第132章会专门展开。
-
----
-
-## 54. 第二阶段遇到真实空槽：先 prepare
-
-真实槽为空时，JCM 先对所有 Controller 调：
+应用进程里的 `JobServiceEngine.JobInterface.startJob()` 又只是把消息发给由 `service.getMainLooper()` 创建的 Handler：
 
 ```java
-controllers.get(ic).prepareForExecutionLocked(pendingJob);
+public void startJob(JobParameters params) {
+    Message.obtain(service.mHandler,
+            MSG_EXECUTE_JOB, params).sendToTarget();
+}
 ```
 
-再调：
+最后由应用主线程执行 `onStartJob()`。因此要保留下面几个边界：
+
+```text
+从 Pending 移除
+≠ bind 请求完成
+≠ Service 已连接
+≠ startJob Binder 已到达
+≠ onStartJob 已在应用主线程执行
+```
+
+### r48 的 bind 立即失败边界
+
+如果 `bindServiceAsUser()` 返回 false 或抛出 `SecurityException`，JSC 会清掉 `mRunningJob` 等现场并返回 false。但 JCM 随后仍会把该 Job 从 `mPendingJobs` 移除并记为 nonpending：
 
 ```java
-executeRunnableJob(pendingJob);
+if (!context.executeRunnableJob(pendingJob)) {
+    Slog.d(TAG, "Error executing " + pendingJob);
+}
+if (pendingJobs.remove(pendingJob)) {
+    tracker.noteNonpending(pendingJob);
+}
 ```
 
-例如：
+Job 的定义并没有在这里从 JobStore 正常完成删除；后续是否再入 Pending 依赖新的 JSS 检查。更值得注意的是，Controller 的 `prepareForExecutionLocked()` 已先发生，而 r48 没有一套统一、对称的 rollback 回调由这个 false 分支调用。
 
-- QuotaController 开始记录 TOP-started 或 package timer；
-- ContentObserverController 把本轮聚合 URI/authority 转移为执行快照。
+因此准确结论是：**这个失败分支不是“事务性恢复到原 Pending 状态”**。不要在没有继续追 Controller 状态和后续检查的情况下，假定所有准备动作都已自动撤销。
 
-“获得槽”不只是一条 bind 调用，Controller 还要先完成执行前交接。
+## 并发策略收紧、优先级变化和线程边界
 
----
+### 新上限主要限制新增，不保证立刻把 running 压到新值
 
-## 55. execute 的第一步也还不是 `onStartJob()`
+假设 trim 从 NORMAL 变 LOW，total 从 8 变 5，而此刻已有 8 个 Job。`JobCountTracker` 的 dump 可能用 `*` 标出超限，但 JCM 不会单纯为了匹配新矩阵就挑三个其他 UID 的 Job 停掉。
 
-`executeRunnableJob()` 会：
+已有 Job仍可能因为约束失效、Doze、restriction、执行超时等其他原因被停止；那是相应控制链的结果，不应与“并发配置变小”混为一谈。
 
-1. 检查 context available；
-2. 清 preferred UID；
-3. 建立新的 `JobCallback` 与 `JobParameters`；
-4. 保存 deadline、URI、authority、network 快照；
-5. 进入 `VERB_BINDING` 并挂18秒 timeout；
-6. `bindServiceAsUser()`。
+同样，running Job 的当前 evaluated priority 可能变化，而 `lastEvaluatedPriority` 还保留它被纳入某轮统计时的分类快照。诊断一瞬间的 category 数量时，要结合 dump 时机和重新分配时机，不把所有字段当作原子快照。
 
-只有 Service 真正连接后，才经 `IJobService.startJob()` 到应用。
+### 正确不变量是 `mLock`，不是“所有代码都在同一线程”
 
----
+常见 assignment 来自 JSS 主 Handler，但并非唯一入口：
 
-## 56. bind 请求被接受后才记统计 active，但槽更早已被占用
+- schedule Binder 路径可在持锁后把立即 ready 的 Job 放入 Pending并调用分配；
+- screen-off 延迟 Runnable 在 system_server `BackgroundThread` 上持锁调用；
+- 应用的 `IJobCallback` 可从 system_server Binder 线程进入完成清理；
+- JSC 的超时 Handler 和默认 ServiceConnection 使用 system_server 主 Looper。
 
-JSC 在调用 `bindServiceAsUser()` **之前**就把 `mRunningJob` 指向当前 Job。因此从 JobScheduler 自己的活动槽判断看，这个 context 已经被占用；不能把这段窗口描述成“空槽”。
+这些入口通过同一 JSS `mLock` 保护共享的 Pending、context 和状态，不是通过“它们天生都在主线程”获得串行性。
 
-`bindServiceAsUser()` 返回 true 只代表系统接受了绑定请求，并不代表 Service 已连接。这个返回值为 true 后，JSC 才：
+内存 trim 查询也发生在 assignment 的锁内。r48 中 AMS 与 JSS 同在 system_server，`IActivityManager` 调用通常会走同进程 Binder 短路；但它仍是锁内进入另一个服务的同步查询，`StatLogger` 因此单独记录 `refreshSystemState` 与整体 `assignJobsToContexts` 耗时。
 
-- `JobPackageTracker.noteActive(job)`；
-- 写 statsd/BatteryStats/UsageStats；
-- `mAvailable=false`。
+## 怎样诊断“ready 但没运行”
 
-ServiceConnection 到来时又创建 PARTIAL_WAKE_LOCK，并将 WorkSource 归因到 source UID，然后进入 STARTING。
+有设备时，`adb shell dumpsys jobscheduler` 要分三块看，不能只搜 Job ID：
 
-这解释了为何“从 pending 移除”“bind 请求被接受”“Service 已连接”“应用开始执行”仍是不同时间点。
+| dump 区域 | 主要问题 | 关键观察 |
+|---|---|---|
+| Pending queue | 是否已经成为候选，排在什么位置？ | override、enqueue、evaluated priority |
+| Active jobs / Slot | 16 个 context 谁空、谁在绑定/运行/停止？ | running Job、运行时长、timeout、最近停止原因 |
+| Concurrency | 当前为何只允许这些 FG/BG 数量？ | current/effective screen、trim、Config、Actual max、Running/Pending/Starting |
 
----
-
-## 57. bind 立即失败的 r48 边界
-
-若 `bindServiceAsUser()` 返回 false 或抛 SecurityException：
+建议按这个顺序判断：
 
 ```text
-JSC 清 mRunningJob/callback/params
-恢复 FINISHED
-executeRunnableJob() 返回 false
+1. Job 还在 Store 吗？
+2. 完整 ready 吗？
+3. 已进入 Pending 吗？
+4. Pending 前面有哪些候选？
+5. current/effective screen 与 trim 选了哪组配置？
+6. actual FG/BG 是否还有容量？
+7. 最近是否发生过 PREEMPT，使空槽可能暂时带有 preferred UID？
+8. 满槽时，是否有同 calling UID 且更低 priority 的 running Job？
+9. 抢占是否正在等待旧 Job 停止/超时？
+10. context 是否已在 BINDING/STARTING，而不是根本没分配？
 ```
 
-但 JCM 随后仍执行：
+在 macOS 静态阅读环境里，可以证明代码规则和默认值，但不能声称某台设备当前 trim、厂商配置或运行时槽位已经实测。
 
-```java
-pendingJobs.remove(pendingJob);
-tracker.noteNonpending(pendingJob);
-```
+r48 还有一个可观测性限制：默认文本 dump 没有直接输出 `JobServiceContext.mPreferredUid`。因此第 7 步只能先结合 `stopped because: cancelled due to preemption`、Pending 仍等待和源码时序做推断；若要直接确认，需要增加日志或插桩，不能把推断写成已观测事实。
 
-JobStatus 没从 JobStore 删除，但也不会“原地留在 pending”。后续是否再次入队依赖新的 JSS 检查。并且 Controller 的 `prepareForExecutionLocked()` 已经先发生；这个 false 分支不调用 completed listener，r48 `StateController` 也没有与 prepare 对称的统一 rollback/unprepare 回调。因此最稳妥的结论只是“它不是一次正常完成，定义仍在 Store 等待后续检查”，不能假定所有 Controller 的准备状态已经被事务性回滚。
+## macOS 静态验证：四组命令建立证据链
 
-这是 r48 值得记录的失败边界，不能把 execute 返回 false 想成事务性回滚到原 pending 状态。
+在 AOSP 根目录执行。
 
----
-
-## 58. JSC 五态只作本章接口预览
-
-```mermaid
-stateDiagram-v2
-    [*] --> FINISHED
-    FINISHED --> BINDING: "executeRunnableJob"
-    BINDING --> STARTING: "Service connected / startJob"
-    STARTING --> EXECUTING: "onStartJob returned true"
-    STARTING --> FINISHED: "ack false：服务端内部先切EXECUTING再立即cleanup"
-    EXECUTING --> STOPPING: "constraint/preempt/timeout cancel"
-    EXECUTING --> FINISHED: "jobFinished"
-    STOPPING --> FINISHED: "onStopJob result / timeout"
-```
-
-r48 固定超时：
-
-```text
-BINDING：18秒
-STARTING/STOPPING 回执：8秒
-EXECUTING timeslice：10分钟
-```
-
-10分钟从 `onStartJob(true)` 的 start ack 被服务端处理后重新计时，不包含前面的 BINDING/STARTING；它不是“从 bind 请求到最终 cleanup 总共只能10分钟”。
-
-本章只关心“槽何时真正释放”；Binder token、竞态与每条 timeout 后果留到第132章。
-
----
-
-## 59. 约束停止与 priority 抢占要分开
-
-```text
-约束/隐式门/JobRestriction 失效
-  JSS stopNonReadyActiveJobsLocked 或 restriction 检查决定停止
-
-同 UID更高 priority pending Job
-  JCM preemptExecutingJobLocked 决定抢占
-```
-
-两者最后都进入 JSC cancel 状态机，但：
-
-- 触发原因不同；
-- stop reason 不同；
-- replacement 槽位 affinity 只属于 PREEMPT；
-- “并发不足”本身不会随意停止跨 UID Job。
-
----
-
-## 60. pending 顺序如何影响分配结果
-
-JCM 按 pending 数组从前向后规划，较早候选先看见空槽和容量。
-
-因为 comparator 先看 override、再看 tracking `enqueueTime`，所以普通无 override Job 大体体现“更早被系统登记的候选先规划”，不是全局严格 priority queue。
-
-priority 较高的 Job若没有同 UID可抢占对象，也可能排在较早普通 Job之后继续等待。
-
----
-
-## 61. 同一轮投影会影响后续候选
-
-前一个 pending 拿到空槽后：
-
-```text
-contextIdToJobMap[slot] = 前一个Job
-startingFG/BG++
-```
-
-后一个 pending 再扫描时：
-
-- 该槽已在投影视角中非空；
-- `canJobStart()` 已计入前一个 starting；
-- 若同 UID且更高 priority，甚至可能改写前一个投影。
-
-因此这不是“每个候选独立算一次再合并”，而是一轮有顺序的贪心规划。
-
----
-
-## 62. 抢占投影的一个微妙结果
-
-若后面的更高优先级 Job 改写前面已经规划的同 UID 候选槽，最终应用阶段只看最后的 `contextIdToJobMap`。
-
-这正是先完整规划、再应用的价值：系统不会先启动较低候选，马上又为后面的更高候选停止它。
-
-但算法仍是按队列顺序的局部贪心，不应泛化成对所有 Job 做全局最优数学匹配。
-
----
-
-## 63. 为什么运行数可能暂时超过新 actual max
-
-Tracker 的 `toString()` 会在超出配置/actual max 时显示 `*`。这不必然是 bug：
-
-- 配置或内存状态刚收紧；
-- running category 快照与当前 priority 已变化；
-- `minBg` 软预留不能驱逐已有 FG；
-- 正处在异步停止/清理阶段。
-
-并发策略是启动准入与有限同 UID抢占，不是每次都强制把现状瞬间投影成矩阵精确数字。
-
----
-
-## 64. 线程模型不能简化成“只在主线程”
-
-常见路径确实是 JSS Main `JobHandler`：Controller 发消息，Handler 持 `mLock` 重建 pending 并 assignment。
-
-但还有：
-
-- schedule Binder 入口可持锁直接把立即 ready Job 入队并运行；
-- screen-off ramp Runnable 在 system_server `BackgroundThread` 持锁调用；
-- 应用 `IJobCallback` 可从 system_server Binder 线程持锁完成清理；
-- JSC timeout 与默认 ServiceConnection 使用 system_server 主 Looper。
-
-正确不变量是共享状态受 JSS `mLock` 串行化，而不是所有入口都来自同一线程。
-
----
-
-## 65. 锁内还有一次受节流的 Binder 查询
-
-assignment 在 `mLock` 内通过 `IActivityManager` 接口调用：
-
-```java
-ActivityManager.getService().getMemoryTrimLevel()
-```
-
-AMS 与 JSS 在本版本都位于 system_server，因此本地 Binder 接口通常会在同进程短路执行，不能误画成必然跨进程 IPC；但它仍是在 JSS 锁内进入另一个服务的同步查询。阅读性能 trace 时，如果 assignment 偶发变慢，需要把 `refreshSystemState` 单独观察，不能只盯数组循环。
-
-`StatLogger` 正好分别记录：
-
-```text
-assignJobsToContexts
-refreshSystemState
-```
-
----
-
-## 66. dumpsys 怎样区分三层状态
+### 1. 确认 16 个物理 context 与默认矩阵
 
 ```bash
-adb shell dumpsys jobscheduler
-```
-
-有设备时重点看：
-
-```text
-Pending queue
-  当前候选、Evaluated priority、Enq
-
-Active jobs / Slot #
-  16个真实 context 的空闲/运行、时长与 timeout
-
-Concurrency
-  current/effective screen、最后开关屏、JobCountTracker、memory trim、统计耗时
-```
-
-Mac 纯源码学习无需执行 adb；这里只是建立将来读输出的字段地图。
-
----
-
-## 67. `Current max jobs` 不是配置文件原值抄写
-
-Concurrency dump 中的 `JobCountTracker` 同时展示：
-
-- 本轮选中的配置 total/maxBg/minBg；
-- running/pending/starting 统计；
-- 计算后的 actual max；
-- reserved BG；
-- 超额 `*` 标记。
-
-它是最近一次 assignment 的计算快照。若系统很久没有再分配，不能把它误当成每毫秒实时刷新值。
-
----
-
-## 68. 常见误解一：Android 11 默认可并行16个 Job
-
-错误。16只是固定物理 context 上限；默认策略容量按屏幕/trim 常为5、8或10，并继续受 FG/BG 实际容量限制。
-
----
-
-## 69. 常见误解二：pending 就是所有 schedule 的 Job
-
-错误。全量定义在 JobStore；pending 只是已被挑出竞争槽的短期候选集合。
-
----
-
-## 70. 常见误解三：pending 按 priority 从高到低
-
-错误。r48 comparator 先看 debug override，再看 tracking `enqueueTime`。priority 主要用于类别和同 UID抢占。
-
----
-
-## 71. 常见误解四：JCM 的 FG 就是前台服务
-
-错误。这里只认 evaluated priority >= TOP_APP(40)；FGS=35、BFGS=30 都归 BG 类。
-
----
-
-## 72. 常见误解五：`minBg=2` 保证始终运行2个 BG
-
-错误。它只是新分配时的软预留，受实际 BG 候选、已有 FG、总容量和空槽影响，不会为兑现数字主动抢占已有 FG。
-
----
-
-## 73. 常见误解六：内存变 LOW 会立刻停止超额 Job
-
-错误。JCM 在下一次 assignment 读取 trim，主要阻止新增；不因矩阵缩小单独压停已有 Job。
-
----
-
-## 74. 常见误解七：高 priority 可踢掉任何应用 Job
-
-错误。r48 priority preemption 只比较相同 `getUid()`，即 calling UID，并且必须严格更高。
-
----
-
-## 75. 常见误解八：抢占后替代 Job 在同一调用栈立即启动
-
-错误。本轮只停止旧 Job并保存 preferred UID；cleanup 后的下一轮才可能在空槽启动替代者。
-
----
-
-## 76. 常见误解九：preferred UID 永久占住一个槽
-
-错误。它是抢占后的短期 affinity；无合适候选时会清除，execute 新 Job入口也会清除。
-
----
-
-## 77. 常见误解十：bind false 会把 Job 原样留在 pending
-
-错误。r48 JCM 仍把它从 pending 移除，JobStore 定义尚在，等待后续其他检查才可能重新入队；prepare 已发生且没有统一回滚回调。
-
----
-
-## 78. macOS 只读练习一：确认物理槽与默认矩阵
-
-```bash
-rg -n "MAX_JOB_CONTEXTS_COUNT|MAX_JOB_COUNTS_SCREEN_ON|MAX_JOB_COUNTS_SCREEN_OFF|SCREEN_OFF_JOB" \
+rg -n -C 8 'MAX_JOB_CONTEXTS_COUNT|MAX_JOB_COUNTS_SCREEN_(ON|OFF)' \
   frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java
 ```
 
-回答：
+预期观察：物理数组/对象上限是 16，但 NORMAL 默认策略是 ON=8、OFF=10，LOW/CRITICAL 默认 total=5。
 
-1. 16在哪里定义、在哪里创建？
-2. NORMAL 下 screen on/off 各是多少？
-3. LOW 下为何熄屏没有默认提升？
-
----
-
-## 79. macOS 只读练习二：手算 Tracker
+### 2. 确认 Pending 不按 evaluated priority 排序
 
 ```bash
-sed -n '538,680p' \
-  frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobConcurrencyManager.java
-
-sed -n '289,345p' \
-  frameworks/base/services/tests/servicestests/src/com/android/server/job/JobCountTrackerTest.java
-```
-
-自行计算三组：
-
-```text
-6/4/2，RF/RB=0/0，PF/PB=10/0
-6/4/2，RF/RB=0/0，PF/PB=10/3
-6/4/2，RF/RB=6/0，PF/PB=10/3
-```
-
-重点解释第三组为什么不会为 BG 抢占 FG。
-
----
-
-## 80. macOS 只读练习三：逐行模拟一次 assignment
-
-```bash
-sed -n '258,445p' \
-  frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobConcurrencyManager.java
-```
-
-在纸上画16格：
-
-1. 复制真实运行 Job；
-2. 复制 preferredUid；
-3. 统计 running/pending；
-4. 按 pending 顺序改投影；
-5. 标出哪些槽是空槽启动，哪些是抢占；
-6. 最后才把 slotChanged 应用到真实 JSC。
-
----
-
-## 81. macOS 只读练习四：证明 pending 不按 priority
-
-```bash
-sed -n '783,800p' \
+rg -n -A 16 'sPendingJobComparator' \
   frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java
-
-rg -n "enqueueTime =|notePending|madePending" \
-  frameworks/base/apex/jobscheduler/service/java/com/android/server/job
 ```
 
-把 `overrideState`、`enqueueTime`、`madePending`、`lastEvaluatedPriority` 各写成一行用途，禁止用同一个“入队优先级”概括。
+预期观察：比较器只看 overrideState 和 enqueueTime，没有调用 `evaluateJobPriorityLocked()`。
 
----
-
-## 82. macOS 只读练习五：追同 UID 抢占闭环
+### 3. 确认空槽门和同 UID 抢占门
 
 ```bash
-rg -n "preemptExecutingJobLocked|mPreferredUid|REASON_PREEMPT|MSG_CHECK_JOB_GREEDY" \
-  frameworks/base/apex/jobscheduler/service/java/com/android/server/job
+rg -n -C 18 'preferredUidOkay|job.getUid\(\) != nextPending.getUid' \
+  frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobConcurrencyManager.java
 ```
 
-画出：
+预期观察：空槽要求 preferred UID 与 `canJobStart()` 同时通过；占用槽只在 calling UID 相同且 incoming priority 严格更高时成为抢占候选。
+
+### 4. 确认抢占和应用启动不在同一轮
+
+```bash
+rg -n -C 18 'preemptExecutingJobLocked|executeRunnableJob' \
+  frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobConcurrencyManager.java \
+  frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobServiceContext.java
+```
+
+预期观察：真实忙槽分支只发 PREEMPT；真实空槽分支才 prepare + execute；JSC 的 execute 先进入 BINDING。
+
+版本核对还可以执行：
+
+```bash
+rg -n '\bWorkType\b|\bWORK_TYPE_' \
+  frameworks/base/apex/jobscheduler || true
+```
+
+r48 这套并发实现没有后续版本的多 WorkType 模型。网上涉及 EJ、TOP、FGS、BGUSER 等新版槽型的文章不能直接套用到本章。
+
+## 检查题与答案
+
+### 1. 有 16 个空的 `JobServiceContext`，为什么配置 total=8 时第 9 个 Job 仍不能启动？
+
+因为 16 是物理容器上限，`canJobStart()` 还会执行策略准入。running + 本轮 starting 达到 actual max 后，即使数组里还有物理空槽，也不会把第 9 个 Job 放进去。
+
+### 2. priority=40 的 Job 一定排在 priority=0 的 Job 前面吗？
+
+不一定。r48 Pending comparator 不按 evaluated priority 排序，而是先看 overrideState，再看 enqueueTime。priority 主要用于 FG/BG 分类和同 UID 抢占判断。
+
+### 3. `PRIORITY_FOREGROUND_SERVICE=35` 在 JCM 中属于 FG 吗？
+
+不属于。`isFgJob()` 使用 `>= PRIORITY_TOP_APP`，阈值是 40。这里的 FG 是 JCM 内部计数类别，不是所有 Android “前台”概念的统称。
+
+### 4. UID B 的 priority=100 Job 能抢占 UID A 的 priority=0 Job 吗？
+
+不能通过 r48 的这条 JCM 抢占路径。源码先要求 `running.getUid()==pending.getUid()`，比较的是 calling UID；跨 UID 会直接跳过。
+
+### 5. 为什么抢占后不直接在同一轮启动替代 Job？
+
+旧 Job 可能正在应用进程执行，需要 `onStopJob()` 回执、清理或超时。第一轮只能发停止请求并保留 preferred UID；槽真正变空后由完成回调触发下一轮，再按空槽规则启动。
+
+### 6. `minBg=2` 是否保证系统永远同时运行两个 BG Job？
+
+不保证。预留值还受实际 running+pending BG 数量与已有 FG 数量限制。没有 BG 候选时会降为 0，它是候选存在时的软容量分配，不是强制制造工作。
+
+### 7. `executeRunnableJob()` 返回 true，应用的 `onStartJob()` 已经执行了吗？
+
+没有。它表示 JSC 接受 Job 并成功发起绑定，状态先进入 BINDING；还要等待 ServiceConnection、`IJobService.startJob()`，再由应用 `JobServiceEngine` 投递到主线程。
+
+### 8. 抢占比较的 UID 与 priority override 查询的 UID 是同一个字段吗？
+
+不一定。抢占比较 `getUid()`，即 calling UID；JSS 查询前台进程带来的 priority override 时使用 source UID。普通自调度 App 二者通常相同，代理调度可以不同。
+
+## 一次可操作练习：手工跑完两轮分配
+
+请在纸上建立 8 行槽位表：
 
 ```text
-规划抢占
-→ JSC cancel
-→ 应用停止回执或 timeout
-→ cleanup
-→ onJobCompletedLocked
-→ greedy check
-→ preferred slot再次分配
+Slot | 真实 running | callingUid | evaluated priority | FG/BG | preferredUid
 ```
 
-并标注 `getUid()` 是 calling UID。
+条件使用本章满载场景：
 
----
-
-## 83. macOS 只读练习六：确认 r48 无 WorkType
-
-```bash
-rg -n '\bWorkType\b|\bWORK_TYPE_' frameworks/base/apex/jobscheduler
+```text
+配置：screen ON + NORMAL = total 8 / maxBg 6 / minBg 2
+running：5 FG + 3 BG
+Slot 7：A-low，uid=A，priority=0，BG
+pending：先 B-urgent(uid=B,p=40)，后 A-urgent(uid=A,p=40)
 ```
 
-没有与并发 WorkType 相关的输出本身就是版本证据。边界写法能避免 `NETWORK_TYPE` 一类误命中。若未来换源码分支出现真正匹配，必须重写本章并发分类，不应继续沿用 FG/BG 二分结论。
+按源码顺序完成：
 
----
+1. 计算第一轮 reservedBg、actualMaxFg、actualMaxBg；
+2. 扫 B，记录为何无槽；
+3. 扫 A，记录纸面映射与 `slotChanged`；
+4. 应用纸面结果，记录第一轮真实动作；
+5. 假设 A-low 完成清理且不请求 reschedule，重新计算第二轮容量；
+6. 解释为何 B 仍不能先拿 Slot 7；
+7. 写出从 `executeRunnableJob(A-urgent)` 到应用回调还差的步骤。
 
-## 84. 阅读检查题
+参考答案：
 
-1. JobStore、pending、activeServices、应用 JobService 四者有何区别？
-2. 为什么 `mActiveServices.size()==16` 不等于16个 Job正在执行？
-3. 默认 NORMAL screen-on/off 的三元组各是什么？
-4. total、maxBg、minBg 各约束什么？
-5. screen off 后为何默认等30秒？它会唤醒设备吗？
-6. 开机本来灭屏为什么无需等待30秒？
-7. memory trim 多久最多刷新一次？失败回退什么值？
-8. trim 收紧为何不自动停止超额 Job？
-9. pending comparator 的两个键是什么？
-10. `enqueueTime` 与 `madePending` 有何不同？
-11. JCM 的 FG 阈值是多少？FGS=35 被归哪类？
-12. priority override 来自 source UID 还是 calling UID？
-13. 抢占比较又使用哪个 UID？
-14. 为什么 equal priority 不抢占？
-15. `minBg` 为什么是软预留？
-16. `startingFG/BG` 在何时递增？
-17. 规划阶段为何使用投影数组？
-18. 抢占当轮为什么不启动替代 Job？
-19. preferredUid 在什么情况下清除？
-20. prepare 与 bind 谁先发生？
-21. bind false 后 Job 在 Store/pending 中分别是什么状态？
-22. 哪些入口可能不在 JSS 主线程，但仍由什么锁串行化？
+```text
+第一轮：
+reservedBg = min(2, 3+0) = 2
+actualMaxFg = min(8-max(3,2), 5+2) = 5
+actualMaxBg = min(6, 8-5, 3+0) = 3
 
----
+B：满槽，且没有同 calling UID 的低优先级 running → 等待
+A：找到同 UID 的 A-low，0<40 → 纸面替换 Slot 7
+真实动作：只 PREEMPT A-low，preferredUid=A；A-urgent 仍在 Pending
 
-## 85. 一页复习图
+第二轮（A-low 已清理）：
+running=5 FG+2 BG，pending=2 FG
+reservedBg=min(2,2)=2
+actualMaxFg=min(8-max(2,2),5+2)=6
+actualMaxBg=min(6,8-6,2)=2
 
-```mermaid
-flowchart TB
-    READY["JSS完整可执行检查"] --> P["pending：override降序，再按enqueueTime"]
-    P --> REFRESH["选effective screen × memory trim矩阵"]
-    REFRESH --> COUNT["统计running/pending FG与BG"]
-    COUNT --> FORMULA["计算reservedBg、actualMaxFg/Bg"]
-    FORMULA --> PLAN["在16槽投影数组中按顺序规划"]
-    PLAN --> EMPTY{"找到投影空槽？"}
-    EMPTY -->|"是"| GATE["preferredUid + canJobStart"]
-    GATE --> PREP["Controllers prepare"]
-    PREP --> EXEC["JSC bind/execute"]
-    EMPTY -->|"否"| SAME{"同calling UID且严格更高priority？"}
-    SAME -->|"是"| PREEMPT["本轮只PREEMPT旧Job"]
-    PREEMPT --> CLEAN["stop/cleanup + preferredUid"]
-    CLEAN --> NEXT["下一轮greedy分配"]
-    SAME -->|"否"| WAIT["继续等待"]
+B：Slot 7 preferredUid=A，不匹配 → 跳过
+A：UID 匹配，FG 5<6 → prepare + execute
+之后：BINDING → ServiceConnection → IJobService.startJob
+     → 应用主线程 JobService.onStartJob
 ```
 
----
+如果能解释“为什么第一轮 actual FG 已满仍可发起抢占，但第二轮启动仍要重新通过 FG 容量”，就真正理解了这段算法。
 
-## 86. 本章结论
+## 最后带走这六句话
 
-JobConcurrencyManager 可以压缩为十二点：
+1. ready 只代表约束层通过；Pending 和执行槽是后续两层。
+2. r48 固定创建 16 个 context，但动态策略默认常只开放 5、8 或 10 个总容量。
+3. Pending 主要按 override 与 enqueueTime 排序，不是 evaluated priority 全局排序。
+4. 空槽启动要同时满足 preferred UID 和 FG/BG actual max；priority 还用于 TOP 类别划分。
+5. 无空槽时只允许严格更高 priority 抢占同 calling UID 的低优先级 Job，不做任意跨 UID 抢占。
+6. 抢占第一轮只停旧 Job；`preferredUid` 保护第二轮交接，真正执行还要经过 prepare、绑定、Binder 和应用主线程。
 
-1. r48 没有新版 WorkType，采用16个固定 context 与 FG/BG 二类计数；
-2. 16是物理上限，屏幕×trim矩阵给出5/8/10等策略容量；
-3. screen off 默认30秒后才切 off 矩阵，Handler不是 wakeup alarm；
-4. trim 最多每秒查询一次，只影响下一次分配，不主动压停既有 Job；
-5. pending 是已挑出的执行候选，不是 JobStore 全集；
-6. pending 先按 override、再按 tracking enqueueTime，不按 priority；
-7. 并发 FG 只认 evaluated priority>=TOP_APP(40)，FGS/BFGS 仍归 BG；低于40时还会按包的 active+pending 占用比例下调，0.9/0.5只是可配置默认阈值；
-8. JobCountTracker 用 running/pending 构成动态计算 actual FG/BG上限，minBg只是软预留；
-9. assignment 先在16槽投影中规划，再应用到真实 context；
-10. priority preemption 只允许同 calling UID且严格更高，本轮只停止旧 Job；
-11. preferredUid 是抢占后的短期 affinity，cleanup 后下一轮才可能启动替代者；
-12. 空槽启动先调用 Controller prepare，再由 JSC bind；bind false 仍从 pending 移除、没有 completed listener或统一 prepare回滚，但 JobStore 定义尚在。
+## 源码索引
 
-最值得带走的一句话：
+| 目的 | Android 11 r48 文件 |
+|---|---|
+| 并发矩阵、Pending comparator、优先级计算、消息入口 | `frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java` |
+| 容量选择、JobCountTracker、槽位规划与抢占 | `frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobConcurrencyManager.java` |
+| calling/source UID、priority 与时间字段 | `frameworks/base/apex/jobscheduler/service/java/com/android/server/job/controllers/JobStatus.java` |
+| context 占用、preferred UID、绑定与抢占停止 | `frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobServiceContext.java` |
+| 应用 Binder 到主线程 `onStartJob()` | `frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobServiceEngine.java` |
+| priority 常量与 Job 参数 | `frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobInfo.java` |
+| Pending/Active 时间与包负载统计 | `frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobPackageTracker.java` |
+| JobCountTracker 单元测试 | `frameworks/base/services/tests/servicestests/src/com/android/server/job/JobCountTrackerTest.java` |
 
-> ready 只说明 Job 有资格参加比赛；pending 是候场区，JobConcurrencyManager 才按动态容量、类别和同 UID 抢占规则分配真正的执行槽。
-
----
-
-## 87. 生成后复读：容易误解处的修订
-
-初稿完成后，对照 `JobConcurrencyManager`、JSS、JSC、JobStatus、JobPackageTracker 与两组测试反向复读，重点修订：
-
-1. 把16个物理 context 与5/8/10策略容量拆开，避免把常量直接当默认运行数；
-2. 先声明 r48 无 WorkType，防止混入后续版本多工作类型规则；
-3. 逐格核对 screen on/off × NORMAL/MODERATE/LOW/CRITICAL 默认三元组，并注明可配置；
-4. 将 current/effective interactive 分开，补出30秒非 wakeup Handler与启动时本来灭屏例外；
-5. 限定 memory trim 为 assignment 时、最多每秒一次的 Binder快照，且不会主动停止超额 Job；
-6. 分开 JobStore、pending、固定 context 和应用回调四层，并补普通非 ACTIVE batch 门；
-7. 依据 comparator 修正“按 priority 排队”误解，继续区分 enqueueTime 与 madePending；
-8. 把并发 FG 精确限定为 priority>=40，说明 FGS=35/BFGS=30仍算 BG；
-9. 完整展开 JobCountTracker 公式和6/4/2算例，说明 minBg 不能驱逐已有 FG；
-10. 将 running 类别快照与抢占时实时重评 priority 分开；
-11. 证明抢占只按 `getUid()` 即 calling UID，priority override 却按 source UID；
-12. 拆开投影规划与真实应用，明确抢占当轮只 stop、替代者下一轮才 start；
-13. 将 preferredUid 限定为短期 affinity，无合适同 UID候选时会清除；
-14. 补出 Controller prepare 先于 bind，以及 bind立即失败仍从 pending 移除、不走 completed listener、没有统一 prepare回滚但不删除 JobStore 的 r48 边界；
-15. 以 JSS `mLock` 为线程不变量，不把 assignment 错写成只发生在主线程；
-16. 修正“31分钟后准点运行”的误读：它只改变下一次普通检查的 batch 判断，没有对应的准点唤醒；
-17. 分开 `mRunningJob` 提前占槽、bind 请求返回 true、ServiceConnection 到达三个时间点。
-
-下一章进入 `JobServiceContext`：把本章略过的执行槽内部状态机展开，研究绑定、oneway start/stop、应用主线程、WakeLock、18秒/8秒/10分钟 timeout、stale callback token，以及完成/取消后如何清理并决定重调度。
+下一章从本章最后的交接点继续：`executeRunnableJob()` 已把槽推进 BINDING，但应用还没有开始工作。接下来要看 `JobServiceContext` 怎样用状态机、callback 身份和 timeout 保证一个复用槽不会被旧回调误完成。

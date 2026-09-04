@@ -1,612 +1,284 @@
 # 143 Android JSS：常量热更新与运行期生效边界
 
-> 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
-> 学习方式：macOS只读源码，不要求编译、不要求连接设备  
-> 前置章节：第122、123、131、134、136、141章
+> 源码版本：Android 11 / API 30 / `android-11.0.0_r48`
+>
+> 学习方式：macOS 静态阅读；不在 Mac 上编译或连接设备
+>
+> 前置阅读：第 131、134、136、141 章
 
----
+## 先看问题：把并发数从 10 改成 2，为什么正在运行的 6 个 Job 不会立刻停
 
-## 1. 本章要解决什么
+Android 11 把 JSS 的批处理、负载降权、并发矩阵、退避下限、网络比例与 schedule API quota 放在 `Settings.Global.job_scheduler_constants` 这一条逗号分隔字符串中。ContentObserver 能在 system_server 运行时重新解析它，但“字段已经变更”不等于“已有 Job 立即重算”。
 
-JobScheduler很多策略并非写死在Java常量里。Android 11把一组总控参数放进
-`Settings.Global.job_scheduler_constants`，system_server运行中收到设置变化便重新解析。
+有的消费者在下一轮扫描现场读取新值；有的值只在创建下一代 JobStatus 时使用；并发限制等到下一次分槽才收敛；只有 API quota 更新会主动改独立 CountQuotaTracker。坏配置还可能让 Constants 已更新、quota 账本已清空，而 Tracker 新窗口未提交。
 
-“热更新”容易让人误以为新值会立即重算一切。本章要精确回答：谁监听、在哪个线程和锁里更新、哪些调用下一次自然读到新值、
-哪些已有状态不会被主动重建，以及坏配置怎样造成默认回退、钳位或部分提交。
+本章回答：**一条配置变化从解析到消费者实际生效要经过哪些完成点，缺失、拼错、越界与异常分别会保留默认、钳位还是留下部分提交？**
 
----
+## 1. 先分清三套配置入口
 
-## 2. 源码地图
+| 配置 | Settings.Global 键 | 主要消费者 |
+|---|---|---|
+| JSS 总控 | `job_scheduler_constants` | JSS、JCM、Connectivity 与 API schedule quota |
+| quota controller | `job_scheduler_quota_controller_constants` | QuotaController 执行配额 |
+| time controller | `job_scheduler_time_controller_constants` | TimeController 延迟/截止时间报警策略 |
 
-```text
-frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java
-frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobConcurrencyManager.java
-frameworks/base/apex/jobscheduler/service/java/com/android/server/job/controllers/StateController.java
-frameworks/base/apex/jobscheduler/service/java/com/android/server/job/controllers/ConnectivityController.java
-frameworks/base/core/java/android/util/KeyValueListParser.java
-frameworks/base/services/core/java/com/android/server/utils/quota/CountQuotaTracker.java
-frameworks/base/services/core/java/com/android/server/utils/quota/QuotaTracker.java
-frameworks/base/core/java/android/provider/Settings.java
-```
+三者有不同 URI、parser 和 observer。本章只讲第一条；修改总控串不会顺带修改 QuotaController 或 TimeController 的专用常量。
 
----
+JSS 到 `PHASE_SYSTEM_SERVICES_READY` 才启动 `ConstantsObserver`。`start()` 注册观察者后立即调用一次 `updateConstants()`，所以初值来自当时 Settings，而不必等待第一次变化通知。
 
-## 3. 先分清三套配置
+## 2. 更新在哪个线程、哪个锁域发生
 
-本章只讲JSS总控串 `JOB_SCHEDULER_CONSTANTS`。QuotaController另有
-`job_scheduler_quota_controller_constants`，TimeController也有自己的设置与Observer。
-
-它们属于同一子系统，却是不同URI、不同parser、不同回调，不能看见“JobScheduler常量”就假设一次写入能修改全部Controller。
-
----
-
-## 4. Settings键的真实名字
+ConstantsObserver 绑定 JSS `mHandler`，也就是 system_server 主 Looper。变化回调在主线程进入，并在 `mLock` 中依次执行：
 
 ```java
-public static final String JOB_SCHEDULER_CONSTANTS = "job_scheduler_constants";
+                try {
+                    mConstants.updateConstantsLocked(Settings.Global.getString(mResolver,
+                            Settings.Global.JOB_SCHEDULER_CONSTANTS));
+                    for (int controller = 0; controller < mControllers.size(); controller++) {
+                        final StateController sc = mControllers.get(controller);
+                        sc.onConstantsUpdatedLocked();
+                    }
+                    updateQuotaTracker();
+                } catch (IllegalArgumentException e) {
+                    // Failed to parse the settings string, log this and move on
+                    // with defaults.
+                    Slog.e(TAG, "Bad jobscheduler settings", e);
+                }
 ```
 
-值是一条逗号分隔的字符串，例如：
+源码路径：`frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java`
 
-```text
-min_ready_non_active_jobs_count=5,max_non_active_job_batch_delay_ms=1860000
-```
+在 r48 当前 controllers 树中，没有类 override `StateController.onConstantsUpdatedLocked()`；这轮循环只是空扩展点，不会重扫 Job 或主动重算 Connectivity 条件。更新方法也不发送 `MSG_CHECK_JOB`。
 
-这不是结构化表，也没有跨字段schema校验器。
+因此锁只能保证 JSS 共享字段不会被同锁读者看到半段更新，不代表跨 Constants、Controller、CountQuotaTracker 的事务，更不保证产生一次调度事件。
 
----
+## 3. 新字符串是完整快照，不是增量 patch
 
-## 5. 启动注册时点
-
-JSS构造时只创建 `Constants` 和 `ConstantsObserver`；到
-`PHASE_SYSTEM_SERVICES_READY` 才：
+`KeyValueListParser.setString()` 每次先执行 `mValues.clear()`，再逐项 `put()`：
 
 ```java
-mConstantsObserver.start(getContext().getContentResolver());
-```
-
-`start()` 注册ContentObserver后立刻调用一次 `updateConstants()`，所以启动初值来自当时Settings，而非必须等下一次通知。
-
----
-
-## 6. 线程模型
-
-Observer构造参数是JSS的 `mHandler`，因此Settings变化回调被投递到JSS主Handler所在线程。更新方法再获取JSS `mLock`。
-
-```mermaid
-flowchart LR
-    A["SettingsProvider写Global值"] --> B["ContentObserver通知"]
-    B --> C["JSS Handler执行onChange"]
-    C --> D["获取JSS mLock"]
-    D --> E["解析并改Constants"]
-    E --> F["逐Controller回调"]
-    F --> G["更新API CountQuotaTracker"]
-```
-
-没有专用配置线程，也不经过应用进程。
-
----
-
-## 7. 更新主链
-
-```java
-synchronized (mLock) {
-    mConstants.updateConstantsLocked(Settings.Global.getString(...));
-    for (StateController sc : mControllers) {
-        sc.onConstantsUpdatedLocked();
+    public void setString(String str) throws IllegalArgumentException {
+        mValues.clear();
+        if (str != null) {
+            mSplitter.setString(str);
+            for (String pair : mSplitter) {
+                int sep = pair.indexOf('=');
+                if (sep < 0) {
+                    mValues.clear();
+                    throw new IllegalArgumentException(
+                            "'" + pair + "' in '" + str + "' is not a valid key-value pair");
+                }
+                mValues.put(pair.substring(0, sep).trim(), pair.substring(sep + 1).trim());
+            }
+        }
     }
-    updateQuotaTracker();
-}
 ```
 
-三个阶段共享JSS锁：改字段、通知Controller、把API配额参数复制进独立QuotaTracker。
+源码路径：`frameworks/base/core/java/android/util/KeyValueListParser.java`
 
----
+由此得到四个基础规则：
 
-## 8. Controller回调在r48实际上是空钩子
+- null 或空串使 map 为空，所有 getter 返回代码默认值；
+- 新串未写的旧键不会保留，而是回默认；
+- 未知键可进入 map，但没有消费者就静默无效；
+- 重复键以后一次 `put()` 覆盖前一次。
 
-`StateController.onConstantsUpdatedLocked()` 默认空实现；在当前JSS controllers树中没有override。
+所以运维命令若只写一个键，实际会把同一总控串的其他键全部恢复默认。拼错键通常也不报错，只让真正字段缺失并回默认。
 
-所以“逐Controller通知”在r48提供扩展点，但并不会主动重算Connectivity约束或扫描所有Job。ConnectivityController以后评估时直接读取
-共享 `mConstants` 的新比例。
+## 4. 整串语法错与单字段类型错的失败范围不同
 
----
+裸字段没有 `=` 时，`setString()` 清空 map 并抛异常。`Constants.updateConstantsLocked()` 在内部捕获后仍继续逐字段 getter，于是整套 JSS 总控值按空 map 重写为默认。
 
-## 9. Parser每次先清空
-
-`KeyValueListParser.setString()` 第一行是：
-
-```java
-mValues.clear();
-```
-
-因此新字符串是完整配置快照，不是增量patch。旧串有A和B，新串只写A，则B恢复代码默认值，不会保留旧值。
-
----
-
-## 10. 空值的语义
-
-Settings值为null或空串时，map保持空，随后每个getter返回默认值。删除这条Global setting相当于整体恢复默认。
-
----
-
-## 11. 未知键与重复键
-
-未知键会进入map但没人读取，静默忽略；同名键重复时 `ArrayMap.put()` 后者覆盖前者。
-
-这意味着拼错键通常不会报错，而会令目标字段回到默认值，是排查配置“不生效”时最常见的陷阱之一。
-
----
-
-## 12. 语法错误与类型错误不同
-
-缺少等号属于整串语法错误：parser清空map并抛异常，`Constants`内部catch后继续从空map读取，因此全部字段恢复默认。
-
-某个值类型错误则getter只让该字段回默认，其他合法字段仍更新。例如 `heavy_use_factor=abc` 不会使整串失败。
-
----
-
-## 13. Boolean有一个反直觉边界
-
-`Boolean.parseBoolean()` 对除忽略大小写的`true`之外任何字符串都返回false，并不会抛异常。因此：
+数字或 Duration 类型错误则由单个 getter 捕获，只让该字段回默认，其他合法字段继续解析。例如：
 
 ```text
-enable_api_quotas=tru   → false
-```
-
-它不会使用默认true。配置拼写错误可能真的关闭API quota。
-
----
-
-## 14. Duration支持两种格式
-
-`getDurationMillis()`接受毫秒整数，也接受Java `Duration` 的ISO-8601形式：
-
-```text
-min_linear_backoff_time=30000
-min_linear_backoff_time=PT30S
-```
-
-非法Duration仅让该字段回默认。
-
----
-
-## 15. 总控字段分组
-
-```text
-批处理：min_ready_non_active_jobs_count、max_non_active_job_batch_delay_ms
-负载降权：heavy_use_factor、moderate_use_factor
-并发：screen on/off × normal/moderate/low/critical × total/max_bg/min_bg
-熄屏：screen_off_job_concurrency_increase_delay_ms
-失败退避：min_linear_backoff_time、min_exp_backoff_time
-网络：conn_congestion_delay_frac、conn_prefetch_relax_frac
-API配额：enable、count、window、throw_exception、return_failure
-```
-
----
-
-## 16. 批处理参数何时生效
-
-第141章的 `maybeQueueReadyJobsForExecutionLocked()` 每次扫描现场读取最小数量和最大等待时间。改值后并不自动post CHECK，
-但下一次普通CHECK会使用新值。
-
-因此“字段立即变了”和“已有Job立即被扫描”是两回事。
-
----
-
-## 17. 31分钟参数没有配套Alarm
-
-把最大batch delay从31分钟改成1分钟，不会为已经等待的Job补一个1分钟Alarm；仍要等Controller变化、schedule/cancel或其他消息触发扫描。
-
-热更新本身也没有 `MSG_CHECK_JOB`，所以不能把它当精确定时器。
-
----
-
-## 18. 负载阈值何时生效
-
-`evaluateJobPriorityLocked()` 下次计算优先级时读取heavy/moderate阈值。已经写入
-`JobStatus.lastEvaluatedPriority` 的快照不会仅因配置变化自动刷新；下一轮候选评估/JCM分配才收敛。
-
----
-
-## 19. 并发矩阵的钳位
-
-每个矩阵格解析后执行：
-
-```text
-total ∈ [1, 16]
-maxBg ∈ [1, total]
-minBg ∈ [0, maxBg]
-minBg < total
-```
-
-这里16来自固定 `MAX_JOB_CONTEXTS_COUNT`。配置无法凭空创建第17个JobServiceContext。
-
----
-
-## 20. 并发值不是立即抢占命令
-
-新矩阵对象字段立刻可见，但只有下一次 `assignJobsToContextsLocked()` 调用
-`updateMaxCountsLocked()` 时选择当前screen/memory格。降低total不会在Observer里遍历并停止超额active Job。
-
-它主要约束下一轮分配，而不是强制把正在执行数瞬间压到新上限。
-
----
-
-## 21. 内存状态还有1秒缓存
-
-JCM `refreshSystemStateLocked()` 对memory trim查询设置最短刷新间隔。即使矩阵热更新，下一次分配也可能继续使用缓存的
-`mLastMemoryTrimLevel`，但会从新矩阵选择该缓存级别对应的格子。
-
----
-
-## 22. 熄屏延迟的“在途Runnable”边界
-
-屏幕熄灭时按当时的delay执行 `postDelayed(mRampUpForScreenOff, oldDelay)`。配置改变不会remove并重投这个Runnable。
-
-Runnable真正运行时又用新delay检查：若新delay更长，它会提前return，且代码不重新post，可能一直等到其他事件触发；若新delay更短，
-旧投递仍可能晚到。故它不是无缝可重定时的Alarm。
-
----
-
-## 23. 退避下限只影响新一代Job
-
-失败完成时，JSS用当前 `MIN_LINEAR_BACKOFF_TIME` / `MIN_EXP_BACKOFF_TIME` 创建reschedule JobStatus。
-
-已经计算出earliest runtime并放入JobStore的失败Job不会被常量更新回溯重写。新值从下一次失败重排开始生效。
-
----
-
-## 24. 网络比例是下一次评估生效
-
-ConnectivityController的拥塞延迟与prefetch计量放宽逻辑，每次 `isSatisfied()` 读取共享Constants。
-
-但Observer空钩子不主动重算所有tracked jobs；要等网络能力回调、UID规则变化或JSS其他评估路径。
-
----
-
-## 25. 比例没有范围钳位
-
-两个float没有限制在0～1。负数、2、甚至 `NaN` 都可进入字段。
-
-`NaN`参与 `<`/`>` 比较通常都为false，会产生很不直观的分支结果。这里只能靠配置纪律，不能假设parser提供业务校验。
-
----
-
-## 26. API schedule次数有最低250钳位
-
-```java
-API_QUOTA_SCHEDULE_COUNT = Math.max(250, parsedCount);
-```
-
-把它设成10仍得到250；可以调高，不能通过该键调低到250以下。
-
----
-
-## 27. API quota为什么要复制
-
-JSS字段不是实际账本。`updateQuotaTracker()`调用：
-
-```java
-mQuotaTracker.setEnabled(enable);
-mQuotaTracker.setCountLimit(category, count, window);
-```
-
-CountQuotaTracker随后使缓存统计失效并schedule quota check。这里是真正带主动后续动作的一组热更新。
-
----
-
-## 28. 关闭quota会清历史
-
-`QuotaTracker.setEnabled(false)` 会调用 `clear()`，丢弃事件和内部tracking数据。之后再开启不会恢复关闭前的schedule事件。
-
-所以enable不是单纯暂停判断，而有不可逆的内存账本清空语义。
-
----
-
-## 29. window会在Tracker二次钳位
-
-JSS parser本身允许任意long；CountQuotaTracker把window限制到其 `MIN_WINDOW_SIZE_MS..MAX_WINDOW_SIZE_MS`。
-
-因此JSS dump可显示原始请求值，而Tracker实际使用值可能已被二次钳位；观察时要明确你dump的是哪一层。
-
----
-
-## 30. 负window会造成部分提交风险
-
-负数通过 `getDurationMillis()`进入Constants。`setCountLimit()`发现负window后抛
-`IllegalArgumentException`，外层Observer catch记录“Bad jobscheduler settings”。
-
-但此前Constants字段、Controller空回调乃至 `setEnabled()` 已经执行，没有事务回滚。于是一次坏配置可能留下“Constants新值 +
-Tracker旧limit/window”，甚至enable变化已清账本的部分提交状态。
-
----
-
-## 31. 为什么外层catch不等于恢复默认
-
-外层catch只记录错误，没有重新调用默认配置，也没有保存旧Constants快照。必须区分：
-
-```text
-setString语法错 → 内层清map后各字段读默认
-后续业务校验抛错 → 前面字段可能已经提交，外层只日志
-```
-
-“Bad jobscheduler settings”这行日志不足以判断最终状态。
-
----
-
-## 32. 热更新不是原子的跨对象事务
-
-对持有JSS锁的读者，Constants字段更新过程不会并发可见；但JSS锁无法为CountQuotaTracker自己的对象状态提供回滚事务。
-
-```mermaid
-sequenceDiagram
-    participant O as ConstantsObserver
-    participant C as Constants
-    participant S as StateControllers
-    participant Q as CountQuotaTracker
-    O->>C: 逐字段写新值
-    O->>S: onConstantsUpdatedLocked
-    O->>Q: setEnabled
-    O->>Q: setCountLimit
-    Q--xO: 非法负window抛异常
-    Note over C,Q: 已完成步骤不会自动回滚
-```
-
----
-
-## 33. throw与return两个开关的组合
-
-schedule API超额后的行为由两个布尔控制。生产/调试路径还受JSS现有逻辑约束，不能只读键名推断优先级。
-
-热更新只改变后续schedule调用；已经返回成功并存入JobStore的Job不会被追溯取消。
-
----
-
-## 34. deprecated键为何还列着
-
-Constants保留多组deprecated key名称，但 `updateConstantsLocked()` 已不读取它们。旧文档或旧设备命令写这些键，在r48通常静默无效。
-
-Settings.java附近注释也仍列出旧键，阅读时应以消费者代码“有没有get/parse”为准，而非只相信配置项注释。
-
----
-
-## 35. dump看见的是解析后字段
-
-`dumpsys jobscheduler` 的Settings段输出Constants当前值，包括并发矩阵钳位后的值和API count最低250后的值。
-
-它不原样回显Settings字符串，也不展示每个字段是默认、合法解析还是错误回退而来。
-
----
-
-## 36. 文本dump与Proto
-
-两者都覆盖核心字段；Proto适合机器采集，文本适合人工对照。但Tracker二次window钳位、是否清过历史等运行过程仍需结合对应Tracker dump/日志。
-
----
-
-## 37. 一张生效边界表
-
-| 参数 | 字段何时变 | 已有状态是否主动重建 | 真正使用时点 |
-|---|---|---|---|
-| batch数量/时长 | Observer回调 | 否，不post CHECK | 下一次maybe扫描 |
-| load factor | Observer回调 | 否 | 下一次优先级评估 |
-| 并发矩阵 | Observer回调 | 不主动停active | 下一次JCM分配 |
-| 熄屏delay | Observer回调 | 不重投在途Runnable | 后续熄屏/在途二次检查 |
-| backoff下限 | Observer回调 | 不改已有窗口 | 下一次失败重排 |
-| 网络比例 | Observer回调 | Controller空钩子 | 下一次网络约束评估 |
-| API quota | Observer后复制 | Tracker使统计失效/检查 | 后续schedule调用 |
-
----
-
-## 38. 配置流不是调度触发流
-
-```mermaid
-flowchart TD
-    U["常量字段已更新"] --> A{"是否有主动动作?"}
-    A -->|"API quota tracker"| B["invalidate stats + quota check"]
-    A -->|"大部分JSS策略"| C["等待下一次自然事件"]
-    C --> D["Controller变化 / schedule / completion / 屏幕事件"]
-    D --> E["下一轮读取新值"]
-```
-
-这是本章最重要的模型。
-
----
-
-## 39. 场景一：把batch数量5改1
-
-字段立即为1，但若系统没有新消息，已等待Job仍可继续pending外等待。下一次普通CHECK时，一个完整ready的非ACTIVE Job即可达到门槛。
-
----
-
-## 40. 场景二：把total从10改2
-
-正在运行6个Job不会被Observer直接停掉。下一轮分配读取上限2，不再扩张；随着现有Job自然完成，active数逐步收敛。
-
----
-
-## 41. 场景三：降低backoff
-
-已经安排在20分钟后的失败Job保持原窗口；另一个Job在更新后失败，才按新下限计算。相同配置时刻前后两代Job可以拥有不同窗口。
-
----
-
-## 42. 场景四：写错布尔
-
-`enable_api_quotas=yes` 解析为false并清空Tracker历史，不是回默认true。改回true后从空账本重新统计。
-
----
-
-## 43. 场景五：整串有裸单词
-
-```text
-heavy_use_factor=.8,oops,min_ready_non_active_jobs_count=2
-```
-
-`oops`无等号使parser清空整张map，所有总控字段随后按默认重写，而不是仅忽略oops。
-
----
-
-## 44. 场景六：未知拼写
-
-```text
-min_ready_non_active_job_count=1
-```
-
-少了 `jobs` 的s。语法合法、未知键静默存放，真正字段缺失并回默认5；日志可能完全安静。
-
----
-
-## 45. 安全审计清单
-
-1. 是否整串覆盖而误删其他键；
-2. 键名是否仍被r48消费者读取；
-3. 数字是否有本层或下游钳位；
-4. 负数、NaN与乱写boolean怎样处理；
-5. 更新是否主动触发重扫；
-6. 已有Job保存的是派生快照还是运行时读取；
-7. 异常前是否已发生不可回滚副作用；
-8. dump展示原始值、解析值还是下游有效值。
-
----
-
-## 46. macOS只读练习一：列出所有真实消费者
-
-```bash
-rg -n "mConstants\\." \
-  frameworks/base/apex/jobscheduler/service/java/com/android/server/job
-```
-
-按“扫描时读取、创建新Job时读取、分配时读取、复制到Tracker”四类给结果做标记。
-
----
-
-## 47. macOS只读练习二：验证空回调
-
-```bash
-rg -n "onConstantsUpdatedLocked" \
-  frameworks/base/apex/jobscheduler/service/java/com/android/server/job
-```
-
-不要从循环调用推断Controller一定做了工作，要继续找override。
-
----
-
-## 48. macOS只读练习三：手算parser
-
-分别推演：
-
-```text
-null
-heavy_use_factor=.8
 heavy_use_factor=abc,min_ready_non_active_jobs_count=2
-heavy_use_factor=.8,oops
-enable_api_quotas=tru
 ```
 
-写出每种情况下map、默认回退与副作用。
+结果是 heavy 阈值回默认 0.9，而 batch 数得到 2。
 
----
+Boolean 更反直觉：`Boolean.parseBoolean()` 只有忽略大小写等于 `true` 才返回 true，其他拼写都返回 false，不抛异常。因此 `enable_api_quotas=tru` 会真的关闭 API quota，而不是回默认 true。
 
-## 49. macOS只读练习四：追并发钳位
+`getDurationMillis()` 接受毫秒整数或 Java Duration 字符串，例如 `30000` 与 `PT30S`；非法值只回退该字段。float 则没有 0—1 业务钳位，负数、2 或 `NaN` 都可能进入网络比例和负载阈值，后续比较会出现非常规结果。
 
-```bash
-sed -n '370,482p' \
-  frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java
+## 5. 不同常量何时真正生效
+
+| 参数组 | 字段更新后是否主动重建 | 真正读取新值的时点 |
+|---|---|---|
+| batch 数量/最长等待 | 否，也不设新 Alarm | 下一次普通 maybe 扫描 |
+| heavy/moderate load 阈值 | 否 | 下一次 `evaluateJobPriorityLocked()` |
+| 并发矩阵 | 不主动停止 active | 下一次 JCM 分槽 |
+| screen-off ramp delay | 不重投在途 Runnable | 下一次屏幕转场或旧 Runnable 执行时复查 |
+| linear/exp backoff 下限 | 不改已有运行窗口 | 下一次失败创建新 JobStatus |
+| connectivity 比例 | Controller 空回调 | 下一次网络约束评估 |
+| API schedule quota | 主动复制到 Tracker | 后续 quota 判断；Tracker 同时失效统计并安排检查 |
+
+第 141 章的 31 分钟 batch 阈值没有专用 Alarm。把它改成 1 分钟，只会让下一次扫描把已等待够 1 分钟的 Job 归为 unbatched；若没有新消息，时间流逝本身不会唤醒 JSS。
+
+已经写入 `JobStatus.lastEvaluatedPriority` 的值也不会由 observer 刷新；已有失败 Job 的 earliest runtime 不会因 backoff 下限改变而重算。热更新改变未来决策，不回写历史派生状态。
+
+## 6. 并发矩阵会钳位，但不会立即抢占
+
+r48 为 screen on/off × normal/moderate/low/critical 各维护一组 `total/maxBg/minBg`。解析后依次约束：
+
+```text
+total  ∈ [1, 16]
+maxBg  ∈ [1, total]
+minBg  ∈ [0, maxBg]
+minBg  < total
 ```
 
-手算 `total=0,maxBg=99,minBg=99` 最终分别是多少，并解释为何minBg必须小于total。
+16 来自固定的 `MAX_JOB_CONTEXTS_COUNT`，配置不能创建第 17 个 JobServiceContext。若输入 `total=1,maxBg=99,minBg=99`，最终是 `1,1,0`。
 
----
+把 total 从 10 调成 2 时，observer 不遍历并停止现有 6 个 active Job。下一次 `assignJobsToContextsLocked()` 才用新矩阵限制继续分配，已有执行随完成/停止逐步收敛。
 
-## 50. macOS只读练习五：追部分提交
+JCM 的内存 trim 级别还有 1 秒刷新缓存：下一次分槽会读取新矩阵，但可能仍用缓存的 trim 档位选择其中一格。配置字段更新与外部系统状态刷新是两个时钟。
 
-同时打开ConstantsObserver、`updateQuotaTracker()`、QuotaTracker `setEnabled()`与CountQuotaTracker `setCountLimit()`，推演：
+## 7. screen-off delay 的在途 Runnable 不能无缝改期
+
+屏幕熄灭时，JCM 按当时值 `postDelayed(mRampUpForScreenOff, delay)`。常量更新不会 remove 并重新 post。
+
+旧 Runnable 执行时会用当前新 delay 再检查 `lastScreenOff + delay > now`。若新 delay 变长，旧回调可能提前到达后直接 return，且该分支不补发剩余时间的 Runnable；effective interactive 状态可能一直等到后续屏幕事件才改变。若新 delay 变短，旧回调仍按旧投递时间晚到。
+
+这是典型的“消费时二次读新值，却没有重定时机制”：既不能简单归类成立即生效，也不能说完全沿用旧值。
+
+## 8. API quota 是少数主动更新下游对象的参数
+
+JSS 先把 count 做 `Math.max(250, parsedCount)`，所以可调高但不能低于 250。随后：
+
+```java
+    void updateQuotaTracker() {
+        mQuotaTracker.setEnabled(mConstants.ENABLE_API_QUOTAS);
+        mQuotaTracker.setCountLimit(QUOTA_TRACKER_CATEGORY_SCHEDULE_PERSISTED,
+                mConstants.API_QUOTA_SCHEDULE_COUNT,
+                mConstants.API_QUOTA_SCHEDULE_WINDOW_MS);
+    }
+```
+
+`CountQuotaTracker.setCountLimit()` 再把非负 window 钳到自己的 `MIN_WINDOW_SIZE_MS..MAX_WINDOW_SIZE_MS`，失效 execution stats 并安排 quota check。因此 JSS dump 中的 window 可能是 parser 字段，而 Tracker 真正使用的是二次钳位值。
+
+`QuotaTracker.setEnabled(false)` 不是暂停开关：状态从 enabled 变成 disabled 时调用 `clear()`，丢弃事件与跟踪数据；以后重新开启不会恢复旧 schedule 历史。
+
+第 139 章的 throw/return 两个超额开关只影响后续 API 调用，已经成功注册的 Job 不会被追溯取消。
+
+## 9. 负 quota window 怎样造成部分提交
+
+`getDurationMillis()` 可解析负整数，Constants 没有先钳位。假设写入：
 
 ```text
 enable_api_quotas=false,aq_schedule_window_ms=-1
 ```
 
-注意先clear账本，后因负window抛错，catch并不会复原账本。
+执行顺序是：
 
----
+```text
+Constants 全部字段已写入
+→ Controller 空回调完成
+→ Tracker.setEnabled(false)，清空历史
+→ Tracker.setCountLimit(..., -1) 抛 IllegalArgumentException
+→ ConstantsObserver 外层 catch 只记录日志
+```
 
-## 51. 常见误解纠正
+外层 catch 不恢复旧 Constants、不重新加载默认，也不复原已清账本。最终可以是 Constants 显示新值，而 Tracker 仍保留旧 limit/window，enable 副作用却已发生。
 
-- 误解：热更新后所有Job立即重算。纠正：大多数只在下一自然事件读取。
-- 误解：新串没写的键保留旧值。纠正：parser清空，缺失键回默认。
-- 误解：任意坏值使整串回默认。纠正：语法错与单字段类型错不同。
-- 误解：boolean拼错回默认。纠正：多数拼写解析为false。
-- 误解：Controller循环会重扫。纠正：r48钩子没有override。
-- 误解：并发降低会立即stop。纠正：只影响下一轮分配收敛。
-- 误解：catch提供事务回滚。纠正：可能已部分提交并产生副作用。
+这与 parser 的裸字段语法错不同：语法错在 Constants 内部清空 map 后整体读默认；负 window 是下游业务校验晚失败，前面步骤已经部分提交。日志同样写“Bad jobscheduler settings”，却不能据此推断最终状态一致。
 
----
+## 10. dump 能证明什么，不能证明什么
 
-## 52. 面试式自测
+`dumpsys jobscheduler` 的 Settings 段显示 Constants 解析、默认回退和 JSS 层钳位后的当前字段，不原样回显整条 Settings 字符串，也不标注每项来自显式值还是默认。
 
-1. Observer在哪个boot phase启动？
-2. 为什么配置串是完整快照而非patch？
-3. 裸单词和错误数字的失败范围有何不同？
-4. 为什么 `enable_api_quotas=tru` 比想象中危险？
-5. batch时长改小为何不保证一分钟后运行？
-6. 并发矩阵有哪些钳位？
-7. backoff新值为何不改已有失败Job？
-8. 哪组更新会主动invalidate统计？
-9. 负quota window怎样形成部分提交？
-10. dump为何不能单独证明下游有效值？
+它不能单独证明：
 
----
+- Tracker 的 window 是否又被二次钳位；
+- quota 是否曾关闭并清过历史；
+- 已有 Job 的 backoff/priority 派生快照是否重算；
+- 在途 screen-off Runnable 按哪个旧投递时点到达；
+- 新 batch 值是否已经经历一次扫描。
 
-## 53. 本章结论
+文本与 Proto 都是当前快照，不是配置提交事务日志。诊断必须同时看消费者状态、相关时间戳、Handler/Alarm 是否触发，以及必要的错误日志。
 
-1. JSS总控常量由Global Settings字符串、ContentObserver和KeyValueListParser组成；
-2. Observer在SYSTEM_SERVICES_READY注册并立即读初值；
-3. 更新运行在JSS Handler线程并持mLock；
-4. 每条新字符串替换整张parser map，缺失键回默认；
-5. 语法错误清空整串，单字段数字错误通常只回退该字段；
-6. boolean非法拼写通常变false；
-7. 未知键静默忽略，重复键后者覆盖；
-8. r48 Controller常量回调是空扩展点，不主动重算约束；
-9. batch、load、网络参数多在下一轮评估生效；
-10. backoff只影响下一次失败产生的新JobStatus；
-11. 并发矩阵有1～16及bg关系钳位，不立即停止active Job；
-12. 熄屏在途Runnable不会因新delay完整重定时；
-13. API count最低250，Tracker window另有二次钳位；
-14. 关闭API quota会清空内存事件账本；
-15. 外层catch没有事务回滚，坏window可造成跨对象部分提交；
-16. 热更新改变政策，不等于制造一次调度事件。
+## 11. 公开面与版本边界
 
-一句话记忆：
+- `JOB_SCHEDULER_CONSTANTS`、内部键、JCM 矩阵与 API quota Tracker 都不是普通应用的稳定调参 API。
+- r48 保留若干 deprecated key 名称，却不在 `updateConstantsLocked()` 读取；键名存在不等于仍有消费者。
+- 默认 5/31 分钟、矩阵数值、最低 250 与 Tracker window 上下限都可能随版本变化。
+- 设置修改属于有副作用的系统操作；本章练习只读源码与已有 dump，不要求在设备上写 Global Settings。
+- 静态阅读能证明生效边界与可能的部分提交，不能给出具体设备的调度延迟或竞态概率。
 
-> Android 11 JSS常量热更新是一套“共享字段先替换、各消费点随后收敛”的机制，不是一场原子、全量、立即的重新调度。
+## 12. 从源码验证一次热更新
 
----
+在 Android 11 r48 源码根目录只读执行：
 
-## 54. 生成后复读修订
+1. 读 observer、更新顺序与 quota 复制：
 
-初稿后重新逐行核对JSS、KeyValueListParser、JCM与CountQuotaTracker，重点补强：
+   ```bash
+   sed -n '325,380p' \
+     frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java
+   ```
 
-1. 更正新配置是完整快照而非增量覆盖；
-2. 区分整串语法错与单值类型错；
-3. 补出Boolean.parseBoolean拼错会变false；
-4. 核实当前Controller树没有常量回调override；
-5. 区分字段更新和post调度消息；
-6. 限定batch时长没有配套Alarm；
-7. 明确并发下降不主动停止active Job；
-8. 补出熄屏在途Runnable不重投且新delay变长时可return；
-9. 区分已有失败窗口与下一代backoff；
-10. 记录float无0～1钳位及NaN边界；
-11. 区分JSS原始window与Tracker二次钳位；
-12. 发现disable quota会清账本；
-13. 发现负window异常前字段和enable可能已部分提交；
-14. 限定outer catch只有日志、没有回滚；
-15. 全部练习保持macOS只读，不要求写Settings或编译系统。
+2. 核对字段默认、parser、钳位与 dump：
 
----
+   ```bash
+   sed -n '380,780p' \
+     frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java
+   ```
 
-## 55. 下一章
+3. 验证完整快照、boolean 与 Duration 解析：
 
-第144章继续追JobScheduler的dump与Proto可观测性：从权限入口、过滤参数、JobStatus/controller/JCM/历史输出到文本与Proto差异，
-建立“看到的状态属于哪个时刻、哪层缓存、是否足以证明Job为何没跑”的系统化诊断方法。
+   ```bash
+   sed -n '30,220p' frameworks/base/core/java/android/util/KeyValueListParser.java
+   ```
+
+4. 验证 Tracker disable 清账与 window 二次校验：
+
+   ```bash
+   sed -n '240,270p' \
+     frameworks/base/services/core/java/com/android/server/utils/quota/QuotaTracker.java
+   sed -n '220,260p' \
+     frameworks/base/services/core/java/com/android/server/utils/quota/CountQuotaTracker.java
+   ```
+
+5. 追 screen-off Runnable 与 1 秒内存状态缓存：
+
+   ```bash
+   sed -n '140,250p' \
+     frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobConcurrencyManager.java
+   ```
+
+## 13. 练习与参考答案
+
+### 练习一：完整快照
+
+旧串显式设置 batch count=2 与 heavy factor=0.7，新串只写 batch count=1。heavy factor 最终是多少？
+
+参考答案：回到默认 0.9。parser 先清空，更新不是增量 patch。
+
+### 练习二：错误范围
+
+比较 `heavy_use_factor=abc,min_ready_non_active_jobs_count=2` 与 `heavy_use_factor=.8,oops`。
+
+参考答案：前者仅 heavy 回默认、batch 得到 2；后者因裸字段清空整张 map，所有字段按默认重写。
+
+### 练习三：并发收敛
+
+当前运行 6 个 Job，把 total 从 10 改 2。observer 返回时应剩几个？
+
+参考答案：仍可能是 6 个；更新不主动 stop，下一次分配只是不再按旧上限扩张，随后自然收敛。
+
+### 练习四：在途 screen-off
+
+熄屏时 delay=30 秒，10 秒后改成 60 秒。旧 Runnable 在 30 秒到达会怎样？
+
+参考答案：它用新值复查，发现尚未满 60 秒并 return；该分支不自动补发剩余 30 秒。
+
+### 练习五：错误 boolean 与负 window
+
+`enable_api_quotas=tru` 和 `enable_api_quotas=false,aq_schedule_window_ms=-1` 的风险分别是什么？
+
+参考答案：前者被解析成 false 并清 Tracker；后者同样可能先清 Tracker，再因负 window 抛错，留下 Constants/Tracker 部分提交。
+
+## 本章带走什么
+
+JSS 常量热更新是一条“完整字符串覆盖 parser → 共享字段更新 → 空 Controller 钩子 → 部分参数复制到独立 Tracker”的链。语法错会清 map 后整体回默认，单值类型错通常只回该字段，错误 boolean 却常变成 false；数值还可能在 JSS 或下游再次钳位。
+
+判断生效不能停在 observer 已回调：batch、load、网络和 backoff 要等各自下一消费点；并发要等分槽且不主动停止已有任务；screen-off 在途 Runnable 不会无缝改期；quota disable 会立即清历史，而负 window 又可能在之后失败且无回滚。热更新改变政策字段，不等于一次原子、全量、即时的重新调度。

@@ -1,298 +1,152 @@
 # 150 Android AlarmManager：投递、InFlight、WakeLock 与完成协议
 
 > 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
-> 学习方式：macOS 只读源码，不要求编译、不要求连接设备  
+> 学习方式：macOS 静态阅读源码，不编译、不连接设备  
 > 前置章节：第 145～149 章
 
 ---
 
-## 1. 本章从哪里继续
+## 1. 本章只回答一个问题
 
-前几章已经讲到：
+一枚 broadcast PendingIntent 和一枚 `OnAlarmListener` 几乎同时到期。AlarmManagerService 怎样保证：
 
-```text
-Alarm set
-→ 时间换算与Batch
-→ Doze / App Standby / 后台限制
-→ kernel到期
-→ triggerList
-```
+- 目标确实发出去后才持 WakeLock；
+- 两枚 Alarm 共享一把锁，却各自完成一次账；
+- listener 卡住五秒后不把锁永久占住；
+- 某一枚先完成时，不会误释放仍保护另一枚的锁？
 
-本章从 `triggerList` 继续，追到：
+核心链是：
 
 ```text
-PendingIntent或Listener真正发出
-→ InFlight建立
-→ 共享WakeLock保持CPU运行
-→ 完成回调或超时
-→ 统计与引用归零
-→ WakeLock释放
+triggerList
+  → PendingIntent.send(OnFinished) 或 IAlarmListener.doAlarm(completion)
+  → 成功发起后建立 InFlight、共享 ref++
+  → 第一个 InFlight 获取 PARTIAL_WAKE_LOCK
+  → finished / alarmComplete / listener timeout 删除一个 InFlight
+  → ref--，最后一个完成才 release
 ```
 
-最核心的问题不是“怎么调用回调”，而是所有成功、取消、异常、超时和迟到路径能否只建立一次账、只销一次账。
+一句话结论：
 
----
+> AlarmManager 的 WakeLock 保护的是一次受控“交付协议”，不是应用全部业务生命周期；只有成功进入 InFlight 的投递才记账，并由目标类型对应的完成信号销账。
 
-## 2. 本章核心结论
+## 2. 先分清三类计数
 
-> AlarmManagerService 只为已经成功发出并建立 InFlight 的投递持有一个共享 PARTIAL_WAKE_LOCK。PendingIntent 依靠 `OnFinished`，Listener 依靠 `IAlarmCompleteListener` 或 5 秒默认超时销账；每完成一个 InFlight 就减少共享引用，引用归零才释放 WakeLock。
+| 计数 | 代表什么 | 生命周期 |
+|---|---|---|
+| `mAlarmsPerUid` | 尚在 Batch/pending 结构中的登记数 | set 到到期取出或取消 |
+| `mBroadcastRefCount` | 已成功发起、尚未完成的全部 InFlight 数 | 建立 InFlight 到完成/超时 |
+| `BroadcastStats/FilterStats.nesting` | 同账户/同 tag 至少一项在飞的嵌套层数 | 第一项开始到最后一项结束 |
 
-这里的“完成”含义依目标类型而不同：
+`mBroadcastRefCount` 的名字具有历史色彩：它也统计 activity/service PendingIntent 和 direct listener，不只统计广播。
 
-- broadcast PendingIntent：通常等广播完成；
-- activity/service PendingIntent：通常只等启动请求交接完成；
-- listener：等 App callback 主动报告完成，或系统超时。
+Alarm 从等待态进入执行态时，第一张账减少，后两张账增加。`cancel()` 管等待项，finished/complete/timeout 管执行项，不能拿一个 counter 解释另一阶段。
 
-因此不能把 Alarm WakeLock 理解为“保护 App 后续全部业务一直执行完”。
-
----
-
-## 3. 源码地图
+核心源码：
 
 ```text
 frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
 frameworks/base/services/core/java/com/android/server/AlarmManagerInternal.java
 frameworks/base/core/java/android/app/AlarmManager.java
 frameworks/base/core/java/android/app/PendingIntent.java
+frameworks/base/core/java/android/app/IAlarmListener.aidl
+frameworks/base/core/java/android/app/IAlarmCompleteListener.aidl
 frameworks/base/services/core/java/com/android/server/am/PendingIntentRecord.java
 frameworks/base/services/core/java/com/android/server/am/BroadcastDispatcher.java
-frameworks/base/apex/jobscheduler/service/java/com/android/server/DeviceIdleController.java
-frameworks/base/services/tests/mockingservicestests/src/com/android/server/AlarmManagerServiceTest.java
 ```
 
----
+## 3. 外层投递先结束哪张等待账
 
-## 4. 先区分三类“计数”
-
-| 计数 | 代表什么 | 生命周期 |
-|---|---|---|
-| `mAlarmsPerUid` | 尚在 Alarm 调度/暂存结构中的登记数 | set 到到期取出或取消 |
-| `mBroadcastRefCount` | 已成功发出、尚未完成的投递数 | InFlight 建立到完成/超时 |
-| `BroadcastStats/FilterStats.nesting` | 同包/同tag并发执行层数 | 第一个开始到最后一个结束 |
-
-Alarm 从等待态进入执行态时，第一种计数减少，第二、三种计数增加。它们不是同一张账。
-
----
-
-## 5. 外层 `deliverAlarmsLocked()`
-
-简化源码：
+`deliverAlarmsLocked()` 遍历已经通过到期与政策门的 `triggerList`：
 
 ```java
-void deliverAlarmsLocked(ArrayList<Alarm> triggerList, long nowELAPSED) {
-    mLastAlarmDeliveryTime = nowELAPSED;
-    for (Alarm alarm : triggerList) {
-        try {
-            ActivityManager.noteAlarmStart(...);
-            mDeliveryTracker.deliverLocked(alarm, nowELAPSED, allowWhileIdle);
-        } catch (RuntimeException e) {
-            Slog.w(TAG, "Failure sending alarm.", e);
-        }
-        decrementAlarmCount(alarm.uid, 1);
+for (Alarm alarm : triggerList) {
+    try {
+        ActivityManager.noteAlarmStart(...);
+        mDeliveryTracker.deliverLocked(alarm, nowElapsed, allowWhileIdle);
+    } catch (RuntimeException e) {
+        Slog.w(TAG, "Failure sending alarm.", e);
     }
+    decrementAlarmCount(alarm.uid, 1);
 }
 ```
 
-无论投递成功、token 已取消还是内部抛 RuntimeException，已经从等待结构取出的这一代 Alarm 最后都会递减 `mAlarmsPerUid`。
+无论目标成功、PendingIntent 已取消，还是内部出现 RuntimeException，这一 occurrence 已从等待结构取出，最后都按登记 `alarm.uid` 扣 `mAlarmsPerUid`。
 
-Repeating Alarm 的下一代已经在触发阶段提前重新 set，因此它有自己的登记计数。
+repeating Alarm 的下一 occurrence 已在 `triggerAlarmsLocked()` 中提前重新登记。它拥有自己的一份等待计数；当前 occurrence 的完成协议不会替它销账。
 
----
-
-## 6. 两条投递协议总图
-
-```mermaid
-flowchart TD
-    A["triggerList中的Alarm"] --> B["DeliveryTracker.deliverLocked"]
-    B --> C{"PendingIntent还是Listener？"}
-    C -- "PendingIntent" --> D["operation.send + OnFinished"]
-    C -- "Listener" --> E["IAlarmListener.doAlarm + timeout消息"]
-    D --> F{"成功发出？"}
-    E --> G{"Binder调用成功？"}
-    F -- "否：CanceledException" --> H["finish计数就地闭合，不建InFlight"]
-    G -- "否：Exception" --> H
-    F -- "是" --> I["Acquire/共享WakeLock + 建InFlight"]
-    G -- "是" --> I
-    I --> J{"如何结束？"}
-    J -- "PI OnFinished" --> K["移除InFlight"]
-    J -- "Listener alarmComplete" --> K
-    J -- "Listener 5秒默认超时" --> K
-    K --> L["统计nesting--，refCount--"]
-    L --> M{"refCount == 0？"}
-    M -- "是" --> N["释放WakeLock，报告alarms inactive"]
-    M -- "否" --> O["把WakeLock重新归因给队首InFlight"]
-```
-
----
-
-## 7. `DeliveryTracker` 同时扮演两个角色
+`DeliveryTracker` 同时实现两个回调接口：
 
 ```java
-class DeliveryTracker extends IAlarmCompleteListener.Stub
-        implements PendingIntent.OnFinished
+IAlarmCompleteListener.Stub
+PendingIntent.OnFinished
 ```
 
-它既是：
+两种目标最终都汇入同一套 InFlight 与共享 WakeLock 逻辑。
 
-- Listener 回调收到的跨 Binder 完成接口；
-- PendingIntent.send 使用的 `OnFinished` 回调。
+## 4. PendingIntent 路径怎样发起并附带完成回调
 
-两条入口最终都调用 `updateTrackingLocked()`，共享同一份 InFlight、WakeLock 和统计销账逻辑。
-
----
-
-## 8. 什么情况下才建立 InFlight
-
-顺序非常重要：
-
-```text
-先尝试 operation.send 或 listener.doAlarm
-如果同步失败 → 直接返回，不建InFlight，不拿WakeLock
-如果调用成功返回 → 获取/共享WakeLock，创建InFlight，refCount++
-```
-
-这避免为根本没有发出去的 Alarm 持有 WakeLock。
-
-但也意味着“send 已经开始”和“InFlight 记账完成”之间需要防止完成回调抢先销账，后文会说明 Handler、oneway 和共同的 `mLock` 如何解决。
-
----
-
-## 9. PendingIntent 投递传入了什么
+发送参数的核心是：
 
 ```java
 alarm.operation.send(
-        getContext(),
+        context,
         0,
-        mBackgroundIntent.putExtra(
-                Intent.EXTRA_ALARM_COUNT, alarm.count),
+        mBackgroundIntent.putExtra(EXTRA_ALARM_COUNT, alarm.count),
         mDeliveryTracker,
         mHandler,
         null,
         allowWhileIdle ? mIdleOptions : null);
 ```
 
-参数中值得注意：
+其中：
 
 - fill-in Intent 带 `FLAG_FROM_BACKGROUND`；
-- `EXTRA_ALARM_COUNT` 告诉 repeating Alarm 漏过了几次；
-- 完成回调是 `mDeliveryTracker`；
-- 完成回调投递到 AlarmManagerService 的 Handler；
-- 普通 AWI 可携带临时白名单 BroadcastOptions。
+- `EXTRA_ALARM_COUNT` 是这枚 repeating Alarm 合并的 occurrence 数，通常一次性 Alarm 为 1；
+- `mDeliveryTracker` 是 `OnFinished`；
+- finished callback 明确投到 Alarm Handler；
+- 普通 AWI 才带上一章所述临时白名单 options。
 
----
-
-## 10. `EXTRA_ALARM_COUNT` 不等于本次队列长度
-
-它来自单个 `Alarm.count`：
+若 token 已 canceled，`PendingIntent.send()` 抛 `CanceledException`：
 
 ```text
-一次性 Alarm → 通常为1
-重复 Alarm 晚了多个interval → 1 + 漏过的完整周期数
+mSendCount++
+  → send 失败
+  → repeating 则按 token 删除已安排的下一 occurrence
+  → mSendFinishCount++
+  → 不建 InFlight、不拿 WakeLock
 ```
 
-它不是当前 `triggerList.size()`，也不是 App 历史累计触发次数。
+`mSendCount - mSendFinishCount` 因此是 PendingIntent 未完成交付的诊断近似值，而不是当前等待 Alarm 数。
 
-App 可以据此知道这次交付代表了多少个合并的 repeating tick，但应避免一次补做无限量非幂等工作。
+## 5. PendingIntent 的“完成”因目标类型而异
 
----
+`PendingIntent.FinishedDispatcher` 是 `IIntentReceiver.Stub`。收到 `performReceive()` 后，它把 `onSendFinished()` post 到 AMS 传入的 Handler。
 
-## 11. PendingIntent `OnFinished` 如何跨 Binder
+`PendingIntentRecord.sendInner()` 的具体完成点取决于 sender type：
 
-`PendingIntent.sendAndReturnResult()` 把 `OnFinished` 包成：
+| PendingIntent 类型 | AlarmManager 何时通常收到 OnFinished |
+|---|---|
+| broadcast | 成功进入 serialized broadcast 流后，等广播链最终完成 |
+| activity | 启动请求交接后立即回调 |
+| service / foreground service | 启动请求交接后立即回调 |
+| activity result | result 请求交接后立即回调 |
 
-```java
-FinishedDispatcher extends IIntentReceiver.Stub
-```
+broadcast 分支在 `broadcastIntentInPackage()` 返回成功时把 `sendFinish=false`，由 BroadcastQueue 以后回调；若未成功入队但结果也不是 canceled，则走立即 finished。
 
-`performReceive()` 收到完成后：
-
-```java
-if (mHandler == null) run();
-else mHandler.post(this);
-```
-
-AlarmManagerService 明确传入 `mHandler`，所以完成处理会排进 Handler，而不会在 PendingIntent Binder 发送尚未返回时同步执行 `onSendFinished()`。
-
-这保证正常路径先建 InFlight，再处理完成消息。
-
----
-
-## 12. 不同 PendingIntent 类型的“完成”不同
-
-`PendingIntentRecord.sendInner()` 对不同 type 处理：
-
-### Broadcast
-
-传了 finishedReceiver 时，广播按 serialized/ordered 完成协议运行；若广播成功入队，最终 Receiver 链结束时回调。
-
-### Activity / Service / ActivityResult
-
-启动请求发出后，`sendInner()` 通常直接调用 `finishedReceiver.performReceive()`。
-
-所以 Alarm WakeLock 对 activity/service 主要保护“启动请求已交接”，并不等待 Activity 销毁或 Service 完成全部业务。
-
----
-
-## 13. Broadcast PendingIntent 的完成链
-
-```mermaid
-sequenceDiagram
-    participant AMSvc as AlarmManagerService
-    participant PI as PendingIntentRecord
-    participant BQ as BroadcastQueue
-    participant App as Receiver
-    AMSvc->>PI: send(finishedReceiver=FinishedDispatcher)
-    PI->>BQ: broadcastIntentInPackage(serialized=true)
-    PI-->>AMSvc: send返回
-    AMSvc->>AMSvc: acquire + add InFlight
-    BQ->>App: deliver receiver(s)
-    App-->>BQ: finishReceiver / ordered完成
-    BQ->>AMSvc: FinishedDispatcher.performReceive
-    AMSvc->>AMSvc: Handler → onSendFinished
-    AMSvc->>AMSvc: remove InFlight / release或reattribute
-```
-
-这里的 `AMSvc` 最后两步都在 system_server，但通过 Binder/Handler 协议明确分开。
-
----
-
-## 14. PendingIntent 已取消时的同步失败
-
-若 `sendAndReturnResult()` 返回负值，`PendingIntent.send()` 抛 `CanceledException`。
-
-DeliveryTracker 处理：
-
-```java
-mSendCount++;
-try {
-    operation.send(...);
-} catch (CanceledException e) {
-    if (repeatInterval > 0) removeImpl(operation, null);
-    mSendFinishCount++;
-    return;
-}
-```
-
-它不建立 InFlight，也不获取 WakeLock。
-
-Repeating Alarm 的下一代已提前登记，因此还要按 token 删除下一代。
-
----
-
-## 15. PendingIntent 发送计数如何理解
+因此：
 
 ```text
-mSendCount       = 尝试operation.send的次数
-mSendFinishCount = 收到OnFinished或同步CanceledException的次数
+Alarm WakeLock release
+≠ Activity 生命周期结束
+≠ Service.onStartCommand() 或异步业务完成
 ```
 
-在无 bug、无重复/丢失 callback 时，两者差值应接近当前未完成 PendingIntent InFlight 数。
+broadcast 的完成更接近 receiver 链收口，但具体 receiver timeout/ANR 由 BroadcastQueue 负责；AlarmManagerService 没有给所有 PendingIntent 再统一设置一个五秒 timeout。
 
-它们是自 system_server 本次运行以来的单调诊断计数，不是当前队列大小。
+## 6. listener 路径为什么需要 completion 加 timeout
 
----
-
-## 16. Listener 投递第一步
+`IAlarmListener.aidl` 声明为 `oneway`。服务端调用：
 
 ```java
 mListenerCount++;
@@ -302,20 +156,11 @@ mHandler.sendMessageDelayed(
         mConstants.LISTENER_TIMEOUT);
 ```
 
-`this` 是 DeliveryTracker 的 `IAlarmCompleteListener` Binder。App listener 完成后必须把自己的 wrapper token 回传给它。
+`this` 是 `DeliveryTracker` 的 `IAlarmCompleteListener`。oneway 调用返回只表示异步事务已提交，不表示 App 的 `onAlarm()` 已运行完。
 
-`IAlarmListener.aidl` 本身声明为 `oneway interface`，所以 `doAlarm()` 成功返回只表示异步 Binder 事务已成功提交，不表示 App 已执行 `onAlarm()`。这正是后续必须依赖 completion/timeout 的原因。
-
----
-
-## 17. 客户端 ListenerWrapper 做什么
+客户端 `ListenerWrapper` 收到后保存 completion，并把自身 post 到目标 Handler：
 
 ```java
-public void doAlarm(IAlarmCompleteListener alarmManager) {
-    mCompletion = alarmManager;
-    mHandler.post(this);
-}
-
 public void run() {
     try {
         mListener.onAlarm();
@@ -325,1004 +170,274 @@ public void run() {
 }
 ```
 
-即使 `onAlarm()` 抛 RuntimeException，`finally` 仍尝试报告完成，然后异常可以继续导致 App 崩溃。
+即使 `onAlarm()` 抛异常，`finally` 仍尝试完成回报，然后异常可以继续使 App 崩溃。
 
-系统等的是 wrapper 报告，不是直接观察 Java 方法栈。
+r48 默认 listener timeout 为五秒，可由 `listener_timeout` 修改。计时从 oneway 提交成功后开始，覆盖 App Binder 排队、目标 Handler 排队和 callback 执行；主线程堵塞时，可能在 `onAlarm()` 真正开始前就超时。
 
----
+若 `doAlarm()` 本身在提交阶段抛异常，服务只把 listener send/finish 计数就地闭合，不安排 timeout、不建立 InFlight。
 
-## 18. Listener timeout 从何时开始
+## 7. 成功后怎样建立共享 InFlight
 
-timeout 消息在 `listener.doAlarm()` Binder 调用成功返回后安排，然后 system_server 建立 InFlight。
-
-默认：
-
-```java
-DEFAULT_LISTENER_TIMEOUT = 5 * 1000;
-```
-
-可由 `Settings.Global.ALARM_MANAGER_CONSTANTS` 的 `listener_timeout` 修改。
-
-由于 `doAlarm()` 是 oneway，计时从异步事务成功提交后开始，覆盖 App Binder 事务等待/处理、目标 Handler 排队和 `onAlarm()` 执行时间；若 App 主线程堵塞，可能在回调真正开始前就超时。
-
----
-
-## 19. Listener 调用同步失败
-
-若 `doAlarm()` 抛异常：
-
-```text
-mListenerCount++
-→ mListenerFinishCount++
-→ return
-```
-
-因为异常发生在 timeout 消息和 InFlight 建立之前，所以无需移 timeout、无需释放 WakeLock。
-
-Listener Alarm 在 Android 11 只能 one-shot，也没有 repeating 下一代需要取消。
-
----
-
-## 20. 成功后的统一 InFlight 建立顺序
+两条发送分支成功返回后才执行：
 
 ```java
 if (mBroadcastRefCount == 0) {
     setWakelockWorkSource(...);
     mWakeLock.acquire();
-    post REPORT_ALARMS_ACTIVE(true);
+    postAlarmsActive(true);
 }
-InFlight inflight = new InFlight(...);
-mInFlight.add(inflight);
+InFlight f = new InFlight(..., nowElapsed);
+mInFlight.add(f);
 mBroadcastRefCount++;
 ```
 
-第一项成功投递获取 WakeLock；后续并发投递共享它，只增加引用和列表项。
-
-变量名叫 `mBroadcastRefCount`，但实际同时计 PendingIntent activity/service/broadcast 和 direct listener，不能按字面只理解为广播。
-
----
-
-## 21. Alarm WakeLock 是什么
+WakeLock 创建为：
 
 ```java
-pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "*alarm*");
+newWakeLock(PARTIAL_WAKE_LOCK, "*alarm*")
 ```
 
-PARTIAL_WAKE_LOCK 保持 CPU 可运行，不要求屏幕点亮。
+它保证 CPU 可运行，不点亮屏幕。第一个 InFlight 从 0→1 时 acquire；并发项只增加服务自己的 ref/list，不再重复 acquire。最后一个完成才 release。
 
-服务只在内部引用从 0 变 1 时调用一次 `acquire()`，从 1 变 0 时调用一次 `release()`；并发数量由自己的 `mBroadcastRefCount` 管，而不是每个 Alarm 都 acquire/release 一次。
-
----
-
-## 22. 为什么先 send 再 acquire 仍能工作
-
-看起来先 `operation.send()` 再 acquire 有竞态，但正常 PendingIntent 回调被 `FinishedDispatcher` post 到 Alarm Handler；Listener 的 `doAlarm()` 是 oneway，App wrapper 又先 post 到目标 Handler。
-
-更关键的是 `deliverLocked()` 全程持有 `mLock`：即使 App 极快地同步反向调用 `alarmComplete()`，服务端完成入口也必须等到建完 InFlight、退出临界区后才能取得同一把锁销账。
-
-更准确地说，这是异步协议、Handler 排队与锁共同保证，不是“目标代码绝不可能开始运行”。目标进程可能已被调度，但完成销账不会正常地同步抢在 InFlight 之前。
-
----
-
-## 23. InFlight 保存哪些快照
-
-```java
-final PendingIntent mPendingIntent;
-final long mWhenElapsed;
-final IBinder mListener;
-final WorkSource mWorkSource;
-final int mUid;
-final int mCreatorUid;
-final String mTag;
-final BroadcastStats mBroadcastStats;
-final FilterStats mFilterStats;
-final int mAlarmType;
-```
-
-`mWhenElapsed` 在构造时写入 `nowELAPSED`，表示投递开始时刻，不是最初请求的 deadline。
-
-InFlight 保存完成阶段所需的最小身份、归因和统计引用，不再依赖原 Alarm 仍留在等待队列。
-
----
-
-## 24. PendingIntent 与 Listener 的统计账户
-
-PendingIntent：
-
-```java
-getStatsLocked(operation)
-→ operation.getCreatorUid / getCreatorPackage
-```
-
-Listener：
-
-```java
-getStatsLocked(alarm.uid, alarm.packageName)
-```
-
-因此代理登记 PendingIntent 时，登记数按 calling UID，投递统计按 PendingIntent creator；Listener 两者一致。
-
----
-
-## 25. statsTag 怎样区分 Alarm
-
-`Alarm.makeTag()`：
+`InFlight` 保存完成阶段所需快照：
 
 ```text
-wakeup PendingIntent → *walarm*: + PendingIntent tag
-non-wakeup PI        → *alarm*:  + PendingIntent tag
-Listener             → 相同前缀 + listenerTag
+PendingIntent 或 listener Binder
+投递开始 nowElapsed
+WorkSource
+登记 uid / creatorUid
+stats tag、Alarm type
+BroadcastStats / FilterStats 引用
 ```
 
-`BroadcastStats` 先按 UID/package 聚合，内部 `filterStats` 再按 tag 区分。
+其中 `mWhenElapsed` 是建立 InFlight 的实际投递时刻，不是 App 请求的 deadline。
 
-这也是 `dumpsys alarm` 中 Top Alarms 和统计条目的主要来源。
+## 8. 为什么“先 send、后 acquire”没有正常抢跑
 
----
+顺序看似危险：目标请求先发出，InFlight 和 WakeLock 后建立。但正常完成回调仍不能先把账销掉：
 
-## 26. nesting 统计的含义
+- PendingIntent 的 `FinishedDispatcher` 被要求 post 到 Alarm Handler；
+- listener 的 `doAlarm()` 是 oneway，App 还会再 post 到自己的 Handler；
+- `deliverLocked()` 全程在 AMS `mLock` 下，反向 `alarmComplete()` 也必须先取得同一把锁。
 
-开始时：
+目标进程可能已经开始调度，但“完成销账”会在 InFlight 建立并退出临界区后进行。安全来自异步回调与同一把锁的组合，不是来自“App 绝不可能提前运行”。
 
-```java
-count++;
-if (nesting == 0) {
-    nesting = 1;
-    startTime = now;
-} else {
-    nesting++;
-}
-```
+listener timeout 消息虽然也在建 InFlight 前入队，但默认延迟五秒，且处理时同样要拿 `mLock`。
 
-完成时 `nesting--`；只有降到 0 才增加：
+## 9. 交付归因和统计在何时建立
+
+目标调用外围先设置线程局部归因：
 
 ```text
-aggregateTime += now - startTime
+有非空 WorkSource → WorkSource attribution UID
+否则              → creatorUid
 ```
 
-所以同一账户多个投递重叠时，aggregateTime 记录近似“至少一个投递在飞”的并集时长，而不是把各次并发时长简单相加。
+`finally` 中恢复，避免污染 system_server 线程之后的工作。这与 WakeLock 自身的 WorkSource 是两层账。
 
----
+共享 WakeLock 第一次 acquire 时优先使用 Alarm 的完整 WorkSource，否则使用 creator UID。某项完成但仍有其他 InFlight 时，服务用 `mInFlight[0]` 的 WorkSource/creator UID 重新归因；其他项仍被同一把锁保护，只是瞬时电量 blame 由队首代表。
 
-## 27. wakeup 统计何时增加
-
-只有已经成功发出并走到 InFlight 建立后的：
-
-```java
-RTC_WAKEUP 或 ELAPSED_REALTIME_WAKEUP
-```
-
-才执行：
+统计账户也按目标类型区分：
 
 ```text
-BroadcastStats.numWakeup++
-FilterStats.numWakeup++
-ActivityManager.noteWakeupAlarm(...)
+PendingIntent → creator UID + creator package
+listener      → Alarm.uid + Alarm.packageName
 ```
 
-token 已取消或 listener 同步不可达，不会计为成功 wakeup 投递。
+`BroadcastStats` 和 tag 级 `FilterStats` 开始时 `count++/nesting++`，第一层记录 startTime；完成时 `nesting--`，只有归零才把 `now-startTime` 加入 aggregateTime。因此重叠交付记录的是“至少一项在飞”的并集时长，不是每项时长简单求和。
 
----
+成功建立 InFlight 后还会记录：
 
-## 28. App Standby history 也在这里记
+- 普通 AWI 的 creator-UID last dispatch；
+- 非豁免 App Standby 的 source package/user history；
+- wakeup type 的 wakeup 统计与 `noteWakeupAlarm()`。
 
-成功建立 InFlight 后，非豁免 Alarm 才调用：
+这些记录点代表“成功发起并纳入跟踪”，不等待应用业务成功。
 
-```java
-mAppWakeupHistory.recordAlarmForPackage(
-        sourcePackage, creatorUser, nowELAPSED);
-```
+## 10. 两种完成入口怎样找到一个 InFlight
 
-所以第 147 章的配额历史是“成功发出并进入 InFlight”的交付点，不是 kernel 到期次数，也不是 App callback 最终正常完成次数。
-
-即使 Listener 随后超时，这次历史已经记入。
-
----
-
-## 29. AllowWhileIdle 节流也在成功后更新
-
-成功建立 InFlight 后才写：
-
-```text
-mLastAllowWhileIdleDispatch[creatorUid]
-mUseAllowWhileIdleShortTime[creatorUid]
-```
-
-如果 token 已取消或 listener 调用同步失败，不消耗这次 AWI 成功交付间隔。
-
-前台与后台状态决定下一次采用短间隔还是长间隔。
-
----
-
-## 30. ThreadLocalWorkSource 的作用
-
-投递调用外围：
-
-```java
-long token = ThreadLocalWorkSource.setUid(
-        getAlarmAttributionUid(alarm));
-try {
-    ... send/doAlarm ...
-} finally {
-    ThreadLocalWorkSource.restore(token);
-}
-```
-
-归因 UID：
-
-```text
-有非空WorkSource → WorkSource attribution UID
-否则            → creatorUid
-```
-
-它给当前 system_server 调用链提供线程局部归因，和下面实际 WakeLock 上设置 WorkSource 是两层机制。
-
----
-
-## 31. WakeLock WorkSource 的选择
-
-```java
-if (ws != null) {
-    mWakeLock.setWorkSource(ws);
-} else if (knownUid >= 0) {
-    mWakeLock.setWorkSource(new WorkSource(knownUid));
-} else {
-    mWakeLock.setWorkSource(null);
-}
-```
-
-第一项 InFlight 使用 Alarm 显式 WorkSource，否则 creator UID。
-
-设置失败时 catch 后归因回 OS，宁可丢失精细 blame，也不让投递因归因异常失败。
-
----
-
-## 32. historyTag 为什么只有第一次保留
-
-```java
-mWakeLock.setHistoryTag(first ? tag : null);
-```
-
-从 0→1 首次 acquire 时保留第一个 Alarm tag；后续队首重归因传 `first=false`，history tag 被清为 null。
-
-因此共享 WakeLock 的历史标签不能完整表达其间每一个并发 Alarm，精细诊断仍要看 InFlight 和 FilterStats。
-
----
-
-## 33. PendingIntent 完成怎样查 InFlight
+PendingIntent 回调：
 
 ```java
 if (inflight.mPendingIntent == pi) {
-    ...
     return mInFlight.remove(i);
 }
 ```
 
-这里用 Java 引用 `==`，不是 `PendingIntent.equals()`。
+这里用 Java 引用 `==`，不是第 149 章等待阶段的 token `equals()`。`FinishedDispatcher` 保存并回传的正是本次 `operation.send()` 使用的 PendingIntent 对象，因此正常协议可命中。
 
-这是可行的，因为 `FinishedDispatcher` 保存并回传的正是本次 `operation.send()` 使用的同一个 PendingIntent Java 对象。
-
-它与第 149 章等待 Alarm 的 token equals 匹配是不同层次。
-
----
-
-## 34. Listener 完成怎样查 InFlight
+listener 回调：
 
 ```java
-if (mInFlight.get(i).mListener == listener) {
+if (inflight.mListener == who) {
     return mInFlight.remove(i);
 }
 ```
 
-`alarmComplete(IBinder who)` 传回 ListenerWrapper 自己的 Binder。服务用 Binder 对象引用寻找第一个匹配项。
+它按 ListenerWrapper Binder 对象找第一个匹配项。
 
-正常设计中同一个 listener 等待项会被 replacement，因而通常只有一个；重叠 InFlight 属于稍后讨论的微妙边界。
+PendingIntent `onSendFinished()` 不根据 resultCode 判断业务成败；回调到达就表示 AlarmManager 的交付协议结束。listener `alarmComplete()` 则先移除同 token 的 timeout 消息，再查 InFlight；若已经超时，找不到就按 late completion 忽略，不会二次销账。
 
----
+timeout 路径同样只有找到 InFlight 才调用统一销账。r48 留有 `TODO: implement ANR policy for the target`，所以这里的五秒超时只终止 AlarmManager 跟踪，不直接产生 ANR，也不会强行停止稍后才运行或仍在运行的 App callback。
 
-## 35. PendingIntent 完成路径
+## 11. `updateTrackingLocked()` 怎样维护共享不变量
 
-```java
-public void onSendFinished(...) {
-    synchronized (mLock) {
-        mSendFinishCount++;
-        updateTrackingLocked(removeLocked(pi, intent));
-    }
-}
-```
-
-它不检查 resultCode 决定是否销账。只要 PendingIntent 完成协议回调到达，本次 AlarmManager 交付就结束。
-
-目标业务成功、失败或返回什么 ordered broadcast result，是更高层语义。
-
----
-
-## 36. Listener 正常完成路径
-
-```java
-alarmComplete(who):
-    clearCallingIdentity
-    lock
-    removeMessages(LISTENER_TIMEOUT, who)
-    remove InFlight(who)
-    if found:
-        updateTrackingLocked
-        mListenerFinishCount++
-    else:
-        treat as late completion
-```
-
-它先移除 timeout，再找 InFlight，防止已正常完成后 timeout 又二次销账。
-
-Binder identity 在 finally 中恢复，避免用 App 调用身份执行 system_server 内部清理。
-
----
-
-## 37. Listener timeout 路径
-
-Handler 收到 `LISTENER_TIMEOUT`：
-
-```java
-InFlight inflight = removeLocked(who);
-if (inflight != null) {
-    updateTrackingLocked(inflight);
-    mListenerFinishCount++;
-}
-```
-
-Android 11 r48 留有：
-
-```java
-// TODO: implement ANR policy for the target
-```
-
-所以此 timeout 负责释放 AlarmManager 的 WakeLock/统计，不会在这里直接把目标 App 判为 ANR。
-
----
-
-## 38. 超时后迟到的完成回调
-
-timeout 已移除 InFlight 并销账。稍后 App 调 `alarmComplete(who)`：
-
-- `removeLocked(who)` 找不到；
-- 记录为 late callback（debug 时）；
-- 不再调用 `updateTrackingLocked()`；
-- 不再增加 finish count。
-
-这使“一次成功 listener send”最终只完成一次账。
-
----
-
-## 39. 超时不停止 App 的 listener 代码
-
-系统 timeout 只表示：
-
-> AlarmManager 不再为它持有 InFlight/WakeLock。
-
-若 App Handler 后来恢复，`onAlarm()` 仍可能开始或继续执行；最终回调只会被当成 late。
-
-因此长任务不能依赖 AlarmManager 的 5 秒 WakeLock。App 应把工作交给合适的持久执行机制，并遵守后台执行限制。
-
----
-
-## 40. 统一 `updateTrackingLocked()` 做什么
+正常完成一个 InFlight 时：
 
 ```text
-若找到InFlight：
-  更新BroadcastStats / FilterStats
-  可选noteAlarmFinish
-
-无论是否找到：
-  mBroadcastRefCount--
-
-若变0：
-  报告alarms inactive
-  release WakeLock
-  防御性检查/清空残留InFlight
-否则：
-  用mInFlight[0]重新归因WakeLock
+更新 stats nesting 和可选 noteAlarmFinish
+  → mBroadcastRefCount--
+  ├─ 仍大于 0：按 mInFlight[0] 重设 WakeLock 归因
+  └─ 等于 0：报告 alarms inactive，释放 WakeLock
 ```
 
-“无论是否找到都减 ref”是 r48 一个重要的防御假设：正常协议绝不应出现 unmatched PendingIntent callback。
-
----
-
-## 41. 引用计数手算
-
-假设连续成功发出 A、B、C：
+假设 A、B、C 依次成功，B、A、C 依次完成：
 
 ```text
-开始 A：0→1，acquire，InFlight[A]
-开始 B：1→2，InFlight[A,B]
-开始 C：2→3，InFlight[A,B,C]
-完成 B：3→2，InFlight[A,C]，归因给A
-完成 A：2→1，InFlight[C]，归因给C
-完成 C：1→0，InFlight[]，release
+A 开始：ref 0→1，list[A]，acquire
+B 开始：ref 1→2，list[A,B]
+C 开始：ref 2→3，list[A,B,C]
+B 完成：ref 3→2，list[A,C]，归因 A
+A 完成：ref 2→1，list[C]，归因 C
+C 完成：ref 1→0，list[]，release
 ```
 
-完成顺序不必和发出顺序一致；只要每个完成恰好匹配一次，WakeLock 生命周期仍闭合。
-
----
-
-## 42. 为什么完成后归因给 `mInFlight[0]`
-
-共享 WakeLock 只能挂一份当前 WorkSource/历史归因，无法同时表达全部并发项。
-
-服务选择列表第一个剩余 InFlight 作为代表。它不意味着其他 InFlight 不再受 WakeLock 保护，只是电量 blame 暂时指向队首代表。
-
-因此并发 Alarm 的瞬时 WakeLock 归因是近似策略，不等于逐纳秒公平分摊。
-
----
-
-## 43. 引用归零但列表非空的防御
-
-```java
-if (mBroadcastRefCount == 0) {
-    mWakeLock.release();
-    if (mInFlight.size() > 0) {
-        log remaining;
-        mInFlight.clear();
-    }
-}
-```
-
-正常不变量应是：
+正常不变量是：
 
 ```text
 mBroadcastRefCount == mInFlight.size()
 ```
 
-若 ref 已归零却列表还有项，说明协议/计数失配。r48 选择记录问题、释放锁并清空残留，防止永久 WakeLock 泄漏。
+若 ref 已归零而 list 仍有项，r48 会记录错误、释放锁并清空残留，优先避免永久 WakeLock。若 ref 仍非零但 list 为空，只记录问题并把 WorkSource 清回 OS；它不会擅自把 ref 改零。
 
----
+## 12. 广播和 Doze 为什么需要 InFlight 边沿通知
 
-## 44. ref 非零但列表为空的防御
-
-若完成后 ref 仍大于 0，却没有 InFlight：
-
-```java
-mLog.w("Alarm wakelock still held but sent queue empty");
-mWakeLock.setWorkSource(null);
-```
-
-它不会强行把 ref 改 0 或释放锁，因为代码相信还会有对应完成；这里只把错误归因清回 OS。
-
-若协议已经损坏，这条路径存在 WakeLock 延迟释放风险。
-
----
-
-## 45. unmatched PendingIntent callback 的危险边界
-
-`onSendFinished()` 即使 `removeLocked(pi)` 返回 null，仍调用 `updateTrackingLocked(null)`，而后者照样 `mBroadcastRefCount--`。
-
-所以重复、伪造或对象引用不匹配的 PendingIntent 完成 callback 会破坏引用计数。
-
-正常情况下 finishedReceiver 是 system_server 自己构造并由 PendingIntent 协议回调，外部 App 不能任意取得该对象；代码依赖这个受控协议，而不是做强防御校验。
-
----
-
-## 46. Listener unmatched callback 更安全
-
-`alarmComplete()` 与 `alarmTimedOut()` 都只在找到 InFlight 时调用 `updateTrackingLocked()`。
-
-因此：
-
-- late listener completion 不减 ref；
-- spurious listener timeout 不减 ref；
-- null `who` 直接拒绝。
-
-这比 PendingIntent `onSendFinished()` 的 null-match 路径更防御。
-
----
-
-## 47. 同 listener 重叠 InFlight 的 r48 边界
-
-等待队列中同 listener 会 replacement，但旧一次已经 InFlight 后，App 可以再次 set 同 listener，形成时间上重叠的两个 InFlight。
-
-二者共享同一个 Binder token。`alarmComplete(who)` 会：
-
-```java
-mHandler.removeMessages(LISTENER_TIMEOUT, who);
-```
-
-这会移除该 token 的所有 timeout 消息，而不是只移除本次代际；随后只删除第一个匹配 InFlight。
-
-若另一项仍在飞，它可能失去 timeout 保护。这说明同一个 listener 对象不适合并行复用为多个尚未完成的 Alarm 代际。
-
----
-
-## 48. ListenerWrapper 自身也有共享可变字段
-
-客户端 wrapper 保存单个：
-
-```java
-Handler mHandler;
-IAlarmCompleteListener mCompletion;
-```
-
-同 listener 再 set 可修改 Handler；第二次 `doAlarm()` 也会覆盖 `mCompletion`。r48 的 completion 服务对象通常仍是同一个 DeliveryTracker，但 Handler/并行 Runnable 的语义仍会变得模糊。
-
-最佳实践是一个 listener 实例在前一次完成前不要并行承载下一代。
-
----
-
-## 49. `noteAlarmStart/Finish` 的另一张账
-
-外层投递前：
-
-```java
-ActivityManager.noteAlarmStart(...)
-```
-
-成功 InFlight 完成时：
-
-```java
-ActivityManager.noteAlarmFinish(...)
-```
-
-它最终进入 BatteryStats 的 Alarm 计时，不等同于本类 `BroadcastStats.aggregateTime`。
-
-一张用于系统耗电/历史记账，一张用于 AlarmManager 自身 dump 统计。
-
----
-
-## 50. 同步投递失败可能漏 `noteAlarmFinish`
-
-r48 外层在调用 DeliveryTracker 前已经 `noteAlarmStart()`。
-
-如果：
-
-- PendingIntent 立即抛 `CanceledException`；或
-- listener.doAlarm 同步抛异常；
-
-DeliveryTracker 不建 InFlight，因而以后也不会通过 `updateStatsLocked()` 调 `noteAlarmFinish()`。
-
-这形成 start/finish 不对称的实现缺口。继续追 `BatteryStatsImpl.noteAlarmStartOrFinishLocked()` 可见，它在 `mRecordAllHistory` 开启时更新 `mActiveEvents` 并写 Alarm start/finish history；缺少 finish 可能留下该 tag/UID 的 active history 状态，直到其他同身份事件改变或统计重置。它不是这里另有一只 Alarm 时长 Timer，所以不要泛化成“必然多记一段耗电时长”。不能因本类 send/finish 计数闭合，就断言所有外部历史也闭合。
-
----
-
-## 51. 更晚的 RuntimeException 风险
-
-`deliverAlarmsLocked()` 会 catch DeliveryTracker 抛出的 RuntimeException，并继续递减登记数。
-
-如果异常发生在目标请求已经成功发出、但 InFlight 尚未完整建立的窄窗口，完成 callback 以后可能找不到对应 InFlight，而 PendingIntent 路径还会错误递减共享 ref。
-
-正常依赖这些内部操作不抛异常；这是一条故障注入/健壮性边界，不应误说成日常必现问题。
-
----
-
-## 52. Broadcast alarm in-flight 通知
-
-只有：
-
-```java
-inflight.isBroadcast()
-```
-
-才通知 `AlarmManagerInternal.InFlightListener`：
+只有 `PendingIntent.isBroadcast()` 的 InFlight 会通知 `AlarmManagerInternal.InFlightListener`：
 
 ```text
 broadcastAlarmPending(uid)
 broadcastAlarmComplete(uid)
 ```
 
-Activity、Service PendingIntent 和 direct listener 不触发这组通知，即使它们也增加 `mBroadcastRefCount`。
+`BroadcastDispatcher` 按 UID 维护 `mAlarmUids`。当某 UID 正在接收 Alarm 广播时，它会把该 UID 已被慢 receiver 策略延迟的广播临时放进 `mAlarmBroadcasts` 快速队列；全部 Alarm 广播完成后再回普通 deferral。
 
----
+接口参数名叫 `recipientUid`，但 r48 实际传的是 `alarm.uid`，即登记 calling UID，不一定是 PendingIntent creator/真实 receiver UID。普通自调度两者相同；代理设置场景中 fast-track 归属可能落在登记者。这是实现身份边界，不是理想化命名。
 
-## 53. BroadcastDispatcher 为什么关心它
+所有类型的共享 ref 从 0→1、1→0 时还会经 Alarm Handler 向 `DeviceIdleController` 报告 `setAlarmsActive(true/false)`。DIC 只在 alarms、jobs 和 active idle ops 都空闲时尝试提前结束 maintenance；这组反馈不等同于 broadcast UID 通知。
 
-BroadcastDispatcher 维护：
+## 13. r48 最值得警惕的三类协议边界
 
-```text
-mAlarmUids[uid] = 当前广播Alarm in-flight数
-```
-
-某 UID 成为 Alarm 广播目标后，被慢 Receiver 退避的后续广播会临时迁入 `mAlarmBroadcasts` 快速队列；全部 Alarm 广播完成后再回普通 deferral。
-
-这就是第 115 章“Alarm 优先”信号的来源。
-
----
-
-## 54. “recipientUid” 与实际传值的边界
-
-接口参数名是 `recipientUid`，但 AlarmManager 实际传：
+第一类是 unmatched PendingIntent callback：
 
 ```java
-inflight.mUid == alarm.uid
+updateTrackingLocked(removeLocked(pi, intent));
 ```
 
-即登记 calling UID，不一定是 PendingIntent creator/真正 Receiver UID。
+`removeLocked()` 返回 null 时，`updateTrackingLocked(null)` 仍会无条件 `mBroadcastRefCount--`。重复或不匹配 callback 会破坏 ref/list 不变量，甚至使 ref 变成负数，影响后续 0→1 acquire 判断。正常 finishedReceiver 由 system_server 自己构造并在受控协议中传递，代码依赖这一可信前提。
 
-普通 App 为自己创建 PI 并 set 时二者相同；代理登记场景可能不同，BroadcastDispatcher 的 fast-track 归属会按登记者而不是 PI creator。这是 r48 身份命名与实现的边界。
+listener 更防御：late completion、spurious timeout 或 null token 都不会在找不到 InFlight 时减 ref。
 
----
+第二类是同 token 重叠：等待队列中同 listener 会 replacement，但旧 occurrence 已 InFlight 后仍可再 set 并触发下一次。`alarmComplete(who)` 会移除所有 `LISTENER_TIMEOUT` 且 `obj == who` 的消息，却只删除第一个匹配 InFlight；另一代可能失去 timeout。客户端 wrapper 还共享可变 `mHandler` 和 `mCompletion`。同一个 listener 对象不适合作为多个并行未完成代际。
 
-## 55. alarms active 反馈给 DeviceIdleController
+同一个 PendingIntent 对象也可有多个 InFlight；callback 没有 generation ID，服务删除第一个 `== pi` 的项。次数平衡时总 ref 能闭合，但单项投递时刻与完成的代际配对可能不精确。
 
-共享 ref 0→1 时 post：
+第三类是外部记账失败：外层在尝试发送前已调用 `ActivityManager.noteAlarmStart()`，而 `noteAlarmFinish()` 只在找到 InFlight 的完成路径执行。CanceledException 或 listener 同步失败不建 InFlight，可能留下 BatteryStats active-event start/finish 不对称；这不应直接夸大成“必然多记一段具体耗电时长”，但它是 r48 的诊断边界。
+
+## 14. 用三个场景检验模型
+
+场景一：service PendingIntent 成功启动。
 
 ```text
-REPORT_ALARMS_ACTIVE(true)
+send 请求交接 → FinishedDispatcher post OnFinished
+  → 建立 InFlight/WakeLock
+  → Handler 销账并可能很快 release
+  → Service 后续业务仍按组件规则继续
 ```
 
-1→0 时 post false。Handler 再调用：
+不能依赖 Alarm WakeLock 覆盖 Service 的全部异步工作。
 
-```java
-mLocalDeviceIdleController.setAlarmsActive(active)
-```
-
-DeviceIdleController 在 false 时尝试提前结束 maintenance window，但还要同时满足 jobs、active idle ops 等均不活跃。
-
----
-
-## 56. active 消息为什么走 Handler
-
-DeliveryTracker 在 `mLock` 内更新 InFlight；DeviceIdleController 有自己的内部锁和状态机。
-
-通过 Handler 报告边沿，可以避免持 Alarm 锁直接跨服务进入另一把锁。
-
-代价是 true/false 是异步消息。若短时间快速从 0→1→0，两个消息都会排队，接收端可能短暂观察中间状态，但最终按队列顺序收敛。
-
----
-
-## 57. 完成回调与 Alarm cancel 的边界
-
-第 149 章的 `cancel()` 清等待容器，不清 `mInFlight`。
-
-因此已经发送的 Alarm：
-
-- PI 仍等 OnFinished；
-- listener 仍等 alarmComplete/timeout；
-- WakeLock 仍按完成协议释放；
-- cancel 不会提前伪造 finish。
-
-这避免因取消下一次 repeating Alarm而误释放当前正在执行的投递锁。
-
----
-
-## 58. PendingIntent 回调为什么没有 Alarm timeout
-
-AlarmManagerService 只为 direct listener 设置显式 5 秒 timeout。
-
-PendingIntent broadcast 的生命周期由 BroadcastQueue 自己的 Receiver timeout/ANR 机制管理；activity/service 的 OnFinished 又在请求交接后很快返回。
-
-所以不能在本类中寻找一个统一的“所有 PendingIntent Alarm 5 秒超时”。
-
----
-
-## 59. Broadcast 超时与 Alarm WakeLock 的关系
-
-若广播 Receiver 卡住：
+场景二：listener 主线程堵塞六秒。
 
 ```text
-BroadcastQueue持有该有序广播流程
-→ 自己的10/60秒等timeout政策处理Receiver
-→ 广播最终finish/skip
-→ PendingIntent finishedReceiver回AlarmManager
-→ AlarmManager释放共享WakeLock引用
+oneway 事务提交成功 → 建 InFlight，启动五秒 timeout
+  → timeout 找到 InFlight，ref--/release
+  → 主线程以后执行 onAlarm 并回 completion
+  → completion 找不到，按 late 忽略
 ```
 
-AlarmManager 不负责判断哪个 Receiver ANR，但其 InFlight/WakeLock 会等广播完成协议收口。
+timeout 不是取消 App Runnable，也不是 ANR 判定。
 
----
-
-## 60. Service PendingIntent 不等 Service 工作完成
-
-`PendingIntentRecord` 调用 `startServiceInPackage()` 后，通常直接触发 finishedReceiver。
-
-因此：
+场景三：broadcast A 和 listener B 同时在飞。
 
 ```text
-Alarm WakeLock release
-≠ Service.onStartCommand返回
-≠ Service异步业务完成
+A：ref 0→1，acquire；另通知 BroadcastDispatcher UID pending
+B：ref 1→2，不重复 acquire
+B timeout：ref 2→1，WakeLock 归因给 A
+A broadcast 完成：UID complete，ref 1→0，release
 ```
 
-Service 之后能否运行、是否需要 foreground service、自有 WakeLock 或 JobScheduler，属于组件执行政策。
+广播 UID 计数、全局 ref 和两类 send/finish counter 是相关但不同的账。
 
----
+## 15. 静态阅读与诊断方法
 
-## 61. Listener timeout 不是 ANR
-
-r48 代码明确留 TODO，没有从 `alarmTimedOut()` 调 AppErrors/ANR。
-
-所以 dumpsys 中 listener send-finish 差值或 timeout 日志是 Alarm 交付诊断；不能单凭它声称 Framework 已生成 ANR traces 或弹出 ANR 对话框。
-
-App 进程可能因自己 `onAlarm()` 抛异常崩溃，那是另一条 crash 处置链。
-
----
-
-## 62. `mInFlight` 列表的顺序
-
-成功发出后按到达 DeliveryTracker 的顺序 append。
-
-完成 PendingIntent 时按同一 Java PI 对象找第一个；Listener 按 Binder token找第一个。不同目标可乱序完成，列表会从中间移除。
-
-列表第 0 项只是当前剩余项中的最早插入代表，不是按 deadline 重新排序的调度队列。
-
----
-
-## 63. 同 PendingIntent 多个 InFlight
-
-等待队列同 token 会 replacement，但 repeating 或在前一次尚未完成时再次 set/触发，仍可能让同一个 PI Java 对象出现多个 InFlight。
-
-完成回调只携带 PI，不携带 Alarm generation ID，所以服务删除第一个匹配项。只要每次 callback 数量正确：
-
-- 总 ref 仍闭合；
-- 相同 PI 的 creator/包统计账户通常相同；
-- 单项 `mWhenElapsed` 与完成的精确配对可能不是真实代际。
-
-这是用粗身份换取简单协议的边界。
-
----
-
-## 64. Broadcast pending/complete 的同 PI 并发
-
-对每次成功 broadcast InFlight 都 pending `+1`；每次 PI callback remove 一个匹配项并 complete `-1`。
-
-BroadcastDispatcher 自己也用 UID 计数，因此不要求每个代际有独立 token；只要求 pending 与 complete 次数平衡。
-
-若 unmatched PI callback 导致 Alarm ref 错减，却没找到 InFlight，`notifyBroadcastAlarmCompleteLocked()` 不会调用，两个子系统计数会产生分歧。
-
----
-
-## 65. `dumpsys alarm` 该看什么
-
-核心输出：
-
-```text
-Broadcast ref count
-PendingIntent send count
-PendingIntent finish count
-Listener send count
-Listener finish count
-Outstanding deliveries / InFlight
-Top Alarms
-BroadcastStats / FilterStats
-```
-
-诊断原则：
-
-```text
-refCount 应等于 InFlight.size
-send - finish 应与对应未完成项大致匹配
-listener长期差值通常指向未完成或timeout消息尚未处理
-PI长期差值先看BroadcastQueue是否卡住
-```
-
-“大致”是因为读 dump 的瞬间以及 Handler 消息排队会有短暂过渡。
-
----
-
-## 66. InFlight dump 的 `when` 是什么
-
-`InFlight.toString()` 输出：
-
-```text
-when=mWhenElapsed
-```
-
-它是 `new InFlight(..., nowELAPSED)` 时的实际投递开始 elapsed 时间。
-
-若要看原始 expected/actual deadline，要在等待 Alarm dump 或历史链中找；不要把 InFlight `when` 当成 App 请求时间。
-
----
-
-## 67. macOS 只读练习一：画两条完成链
+先定位发送、完成和归因：
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '4550,4835p' \
+rg -n "deliverAlarmsLocked|class DeliveryTracker|updateTrackingLocked" \
   frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
-```
 
-分别画：
-
-```text
-PI send → InFlight → onSendFinished
-Listener doAlarm → InFlight → alarmComplete / timeout
-```
-
-在每个箭头旁标出四个诊断 counter 何时 `++`。
-
----
-
-## 68. macOS 只读练习二：手算共享引用
-
-假设：
-
-```text
-t0 A broadcast成功发出
-t1 B listener成功发出
-t2 C service PI成功发出
-t3 C立即finish
-t4 B timeout
-t5 A broadcast finish
-```
-
-手算：
-
-| 时刻 | ref | InFlight | WakeLock |
-|---|---:|---|---|
-| t0 | 1 | A | acquire |
-| t1 | 2 | A,B | held |
-| t2 | 3 | A,B,C | held |
-| t3 | 2 | A,B | reattribute A |
-| t4 | 1 | A | reattribute A |
-| t5 | 0 | 空 | release |
-
-再解释为什么 B 后来的 late completion 不再减 ref。
-
----
-
-## 69. macOS 只读练习三：追 PendingIntent 完成语义
-
-```bash
-sed -n '385,485p' \
+rg -n "FinishedDispatcher|sendFinish|finishedReceiver.performReceive" \
+  frameworks/base/core/java/android/app/PendingIntent.java \
   frameworks/base/services/core/java/com/android/server/am/PendingIntentRecord.java
-sed -n '200,260p' \
-  frameworks/base/core/java/android/app/PendingIntent.java
+
+rg -n "LISTENER_TIMEOUT|alarmComplete|alarmTimedOut" \
+  frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
+
+rg -n "broadcastAlarmPending|mAlarmUids|mAlarmBroadcasts" \
+  frameworks/base/services/core/java/com/android/server/AlarmManagerService.java \
+  frameworks/base/services/core/java/com/android/server/am/BroadcastDispatcher.java
 ```
 
-回答：
-
-- broadcast 成功入队时为何不立即 performReceive？
-- activity/service 为什么通常立即完成 Alarm handoff？
-- FinishedDispatcher 为什么要 post 到传入 Handler？
-
----
-
-## 70. macOS 只读练习四：验证归因
-
-```bash
-sed -n '1290,1385p' \
-  frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
-sed -n '4128,4160p' \
-  frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
-```
-
-构造代理场景 A 登记 B 的 PendingIntent，填写：
+`dumpsys alarm` 中优先建立这组不变量：
 
 ```text
-mAlarmsPerUid → A
-InFlight.mUid → A
-InFlight.mCreatorUid → B
-BroadcastStats → B
-默认WakeLock WorkSource → B
-BroadcastDispatcher alarm UID信号 → A（r48）
+Broadcast ref count ≈ Outstanding deliveries 数量
+PendingIntent send - finish ≈ 未完成 PI InFlight
+Listener send - finish ≈ 未完成 listener InFlight
+InFlight.when = 实际发起时间，不是请求 deadline
+WakeLock WorkSource = 当前队首代表，不是所有并发项逐项展开
 ```
 
-如果显式 WorkSource 存在，再改写 ThreadLocal 与 WakeLock 的归因结果。
+若 PI 差值长期不归零，先看 target type：broadcast 要继续追 BroadcastQueue；service/activity 只应等待请求 handoff。若 listener 差值持续超过 timeout，检查 Handler 是否处理 timeout、token 是否重叠，以及 ref/list 是否已经失配。
 
----
+## 16. 结论与下一章
 
-## 71. macOS 只读练习五：找健壮性边界
-
-```bash
-rg -n "updateTrackingLocked|removeLocked\(PendingIntent|removeLocked\(IBinder|noteAlarmStart|noteAlarmFinish" \
-  frameworks/base/services/core/java/com/android/server/AlarmManagerService.java
-```
-
-检查：
-
-1. PI remove 返回 null 后是否仍减 ref？
-2. listener remove 返回 null 后是否减 ref？
-3. CanceledException 前是否已 noteAlarmStart？
-4. 没建 InFlight 时谁调用 noteAlarmFinish？
-
-这些问题能训练“从正常链反查异常账本”的能力。
-
----
-
-## 72. 初学者常见误解
-
-### 72.1 “Alarm 到期后系统会替 App 一直持锁到业务做完”
-
-错。锁只持到对应 PendingIntent/Listener 完成协议收口；Service/Activity 的 handoff 很快完成。
-
-### 72.2 “mBroadcastRefCount 只统计广播”
-
-错。它统计所有成功 InFlight。
-
-### 72.3 “Listener 5 秒超时会产生 ANR”
-
-错。r48 这里只释放追踪，ANR policy 仍是 TODO。
-
-### 72.4 “cancel 当前 Alarm 会立刻释放执行中的 WakeLock”
-
-错。cancel 管等待项，InFlight 按完成协议独立收尾。
-
-### 72.5 “wakeup Alarm 的 WakeLock 会点亮屏幕”
-
-错。这里是 PARTIAL_WAKE_LOCK，只保证 CPU 运行。
-
-### 72.6 “sendFinishCount 相等就证明所有统计都闭合”
-
-错。同步失败路径仍可能漏 BatteryStats `noteAlarmFinish`。
-
----
-
-## 73. 复读后的重点修订
-
-第一遍很容易把 PendingIntent OnFinished 一律写成“目标组件工作完成”。对照 `PendingIntentRecord` 后应改为：
-
-- broadcast 等广播完成链；
-- activity/service/result 通常在启动请求交接后回调；
-- Alarm WakeLock 不覆盖组件后续全部生命周期。
-
-第二遍从异常路径反推，补出：
-
-- PI unmatched callback 仍会减 ref，而 listener unmatched 不会；
-- 同 listener 重叠 InFlight 时 `removeMessages(timeout, who)` 会移除全部同 token timeout；
-- outer `noteAlarmStart` 早于 send，同步发送失败不走 InFlight finish，BatteryStats 可能失配；
-- broadcast in-flight 接口名叫 recipientUid，r48 实传登记 `alarm.uid`；
-- 同 PI 并发完成只按对象找第一个，不携带 generation ID。
-
----
-
-## 74. 本章检查清单
-
-读完应能回答：
-
-- `mAlarmsPerUid` 与 `mBroadcastRefCount` 的生命周期有何不同？
-- 什么条件下才建立 InFlight？
-- 为什么完成 callback 不会正常抢在 InFlight 建立之前？
-- broadcast、activity、service PendingIntent 的完成语义有什么不同？
-- Listener 默认 timeout 从何时计时、做什么、不做什么？
-- late listener callback 为什么不会二次减 ref？
-- WakeLock 如何在多个 InFlight 间共享并重新归因？
-- `refCount == 0` 但列表非空时如何防御？
-- PendingIntent 和 listener 查 InFlight 分别用什么身份？
-- App Standby/AWI history 在到期、发出还是完成时记？
-- BroadcastDispatcher 为何需要 alarm in-flight UID？
-- 哪三类 r48 异常账本边界最值得警惕？
-
----
-
-## 75. 一页总结
+完整闭环可以压缩为：
 
 ```text
-等待态：
-  Alarm在Batch/pending容器
-  mAlarmsPerUid计数
+等待 Alarm 到期
+  → 尝试 PI send 或 listener oneway
+  ├─ 同步失败：finish counter 就地闭合，不建 InFlight
+  └─ 成功：第一个 acquire，共享 ref/list/stats 建账
 
-发出：
-  PI → operation.send(OnFinished, AlarmHandler)
-  Listener → doAlarm(IAlarmCompleteListener) + 默认5秒timeout
-  同步失败 → send/finish就地闭合，不建InFlight/WakeLock
+PI 完成
+  → broadcast 等广播链；其他类型通常等请求交接
+Listener 完成
+  → alarmComplete 或默认五秒 timeout
 
-成功InFlight：
-  第一个：设置WorkSource → acquire PARTIAL_WAKE_LOCK → active=true
-  每一个：add InFlight → ref++ → stats nesting++
-  同时记录AWI成功间隔、非豁免App Standby history、wakeup stats
-
-完成：
-  PI → onSendFinished
-  Listener → alarmComplete或timeout
-  remove InFlight → stats nesting-- → ref--
-  ref>0：归因给剩余队首
-  ref=0：release → active=false
-
-完成语义：
-  Broadcast PI：广播链完成
-  Activity/Service PI：启动请求交接
-  Listener：App报告完成或AlarmManager超时
-
-r48边界：
-  PI unmatched finish仍减ref
-  同listener重叠可能误删另一代timeout
-  同步失败可能漏BatteryStats noteAlarmFinish
-  broadcast recipient信号实传登记uid
-  同PI并发无generation精确配对
+每完成一个
+  → 移除一个 InFlight、stats nesting--、ref--
+  ├─ ref > 0：归因给剩余队首
+  └─ ref = 0：release，并报告 alarms inactive
 ```
 
----
+最终应记住六点：
 
-## 76. 下一章
+1. `mAlarmsPerUid` 是等待账，`mBroadcastRefCount`/InFlight 是执行账；
+2. 目标成功发起后才建立 InFlight 和 WakeLock，发送失败只闭合尝试计数；
+3. broadcast、activity/service 和 listener 的完成点不同，Alarm WakeLock 不覆盖所有业务生命周期；
+4. listener timeout 只结束 AlarmManager 跟踪，不停止 App 代码，也不在 r48 直接触发 ANR；
+5. 共享 WakeLock 按 ref 保护全部 InFlight，却只能用队首近似归因；
+6. unmatched PI callback、同 listener 重叠 timeout、同步失败的 noteAlarm 账是 r48 的关键健壮性边界。
 
-第 151 章继续研究：
-
-> AlarmManager 的 dumpsys、Proto、统计字段与故障诊断实战。
-
-重点把等待 Batch、四类 pending、InFlight、send/finish 差值、WakeLock、Top Alarms、wakeup history、time-change 和 allow-while-idle 证据组合成可操作的排查路径，并审计文本 dump 与 Proto 的字段差异。
+下一章把这些状态变成诊断证据：怎样联合等待 Batch、四类 pending、Java/kernel deadline、InFlight、send/finish 差值和 Proto 输出，定位一枚 Alarm 究竟卡在哪一层。

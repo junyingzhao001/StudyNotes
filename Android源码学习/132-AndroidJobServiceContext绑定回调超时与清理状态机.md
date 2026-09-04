@@ -1,154 +1,112 @@
-# 132 Android JobServiceContext：绑定、回调、超时与清理状态机
+# 132 JobServiceContext：旧 Job 的迟到回调，为什么不会结束复用后的新 Job？
 
-> 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
-> 学习方式：macOS 只读源码，不要求编译、不要求连接设备  
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`
+>
+> 学习方式：macOS 静态阅读，不要求编译或连接设备
+>
 > 前置章节：第 43、121、131 章
 
----
+## 先说问题、结论和读完收获
 
-## 1. 本章研究“拿到执行槽以后发生什么”
+假设 Slot #3 正在执行同步任务 `Job 42-v1`：
 
-第131章停在 `JobConcurrencyManager` 把一个 ready Job 分给空闲槽：
+1. `onStartJob()` 返回 true，应用把同步工作交给后台线程；
+2. 网络约束丢失，系统调用 `onStopJob()`，应用返回 true，请求以后重试；
+3. Slot #3 清理后，又执行 backoff 产生的 `Job 42-v2`；两代甚至有相同的 `jobId=42`；
+4. v1 的旧工作线程没及时停下，迟到地调用 `jobFinished(oldParams, false)`。
 
-```text
-Controllers.prepareForExecutionLocked(job)
-→ JobServiceContext.executeRunnableJob(job)
-```
+如果系统只比较 jobId，这个旧回调就可能把正在运行的 v2 错误完成。复用执行槽、异步线程和跨进程回调叠在一起，这正是 `JobServiceContext` 状态机要解决的问题。
 
-但这时应用的 `onStartJob()` 还没有执行。system_server 还要完成绑定、跨进程调用、应用主线程分发、开始回执、执行计时、停止回执和最终清理。
+先给结论：
 
-本章沿着一个 Job 的完整执行代际，回答：
+> Android 11 r48 为每次执行创建一个新的 `JobCallback` Binder，并把它放进本代 `JobParameters`。应用所有开始回执、停止回执、`jobFinished()` 和 WorkItem 操作都经这个 callback 返回。JSC 比较的是 callback 对象身份，而不是只比较 jobId；旧代 token 与当前 `mRunningCallback` 不同，因此迟到回调不能清理新代。BINDING、STARTING、EXECUTING、STOPPING 四个阶段又各自配有超时和取消规则，最后统一经 `closeAndCleanupJobLocked()` 释放 WakeLock、解绑、清槽并通知 JSS。
 
-> 一个槽怎样从 FINISHED 走到 BINDING、STARTING、EXECUTING、STOPPING，再安全回到 FINISHED；旧回调为什么不能误伤复用后的新 Job。
+读完本章，你应该能：
 
----
+- 解释拿到执行槽后，为什么应用仍未立即进入 `onStartJob()`；
+- 说清 `IJobService` 的 oneway 请求怎样通过 `IJobCallback` 取得布尔“回复”；
+- 分清 `onStartJob()` 和 `onStopJob()` 的 true 分别代表什么；
+- 画出五态与 18 秒、8 秒、10 分钟三组超时；
+- 推演不同阶段收到取消时，为什么有时不能立刻调用 `onStopJob()`；
+- 证明旧 `JobParameters` 的迟到回调为何不能误伤槽里的新代 Job；
+- 区分“本代槽已清理”和“Job 将来是否 reschedule”两个完成点。
 
-## 2. 先建立贯穿案例
+本章以普通 `schedule()` Job 为主，并在后面单独说明 `enqueue()` / `JobWorkItem` 如何复用同一代际令牌。并发容量与抢占选槽已在第 131 章讲完。
 
-假设应用 `com.demo.sync` 的 Job 42 已经 ready，JCM 把它分到 Slot #3：
+## 先分清四个对象和两个进程
 
-```text
-Job A：callingUid=10123，sourceUid=10123，jobId=42
-Slot #3：当前 FINISHED，可用
-应用行为：onStartJob() 返回 true，在工作线程同步数据
-```
+名字相近的对象分布在不同进程：
 
-执行5分钟后网络约束丢失，系统要求停止；应用的 `onStopJob()` 返回 true，希望按 backoff 重试。
-
-后文会持续追踪：
-
-1. Slot #3 何时算被占用；
-2. WakeLock 何时获得；
-3. 18秒、8秒、10分钟分别从哪里开始；
-4. `true` 在 start 与 stop 回调里为何意思相反；
-5. 清理后 Job A 是消失、周期续排，还是生成失败重试的新 JobStatus。
-
----
-
-## 3. 源码地图
-
-system_server 槽位状态机：
-
-```text
-frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobServiceContext.java
-```
-
-应用进程回调桥：
-
-```text
-frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobService.java
-frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobServiceEngine.java
-frameworks/base/apex/jobscheduler/framework/java/android/app/job/IJobService.aidl
-frameworks/base/apex/jobscheduler/framework/java/android/app/job/IJobCallback.aidl
-frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobParameters.java
-```
-
-完成后的重调度与 WorkItem 存储：
-
-```text
-frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java
-frameworks/base/apex/jobscheduler/service/java/com/android/server/job/controllers/JobStatus.java
-frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobWorkItem.java
-```
-
----
-
-## 4. JobServiceContext 不是应用的 JobService
-
-两者名字接近，但进程和职责完全不同：
-
-| 对象 | 所在进程 | 职责 |
+| 对象 | 所在位置 | 职责 |
 |---|---|---|
-| `JobServiceContext`，简称 JSC | `system_server` | 管理一个执行槽、绑定、超时、WakeLock、回调合法性与清理 |
-| `JobService` | 应用进程 | 让开发者实现 `onStartJob()`、`onStopJob()` |
-| `JobServiceEngine` | 应用进程 | 把 Binder 请求转交应用主线程，再把返回值回给系统 |
-| `JobStatus` | `system_server` | 保存已调度 Job 的系统内部状态与工作队列 |
+| `JobServiceContext`（JSC） | `system_server` | 一个可复用执行槽；负责绑定、状态、超时、WakeLock、回调校验和清理 |
+| `JobStatus` | `system_server` | 一项已调度 Job 的内部定义、约束、重试次数和 WorkItem 队列 |
+| `JobServiceEngine` | 应用进程 | 接收 `IJobService` Binder 请求，转投应用主线程并回传结果 |
+| App 的 `JobService` | 应用进程 | 开发者实现 `onStartJob()`、`onStopJob()` 的业务入口 |
 
-一个 JSC 同一时刻最多承载一个 Job，但会在系统运行期间反复服务不同应用、不同 Job。
+一条完整启动链是：
 
----
+```mermaid
+sequenceDiagram
+    participant J as JobSchedulerService / JCM
+    participant C as JobServiceContext Slot #3
+    participant A as ActivityManager / bind
+    participant E as App JobServiceEngine
+    participant M as App main thread
 
-## 5. r48 一共有16个长期复用的 JSC
+    J->>C: executeRunnableJob(Job 42-v1)
+    C->>A: bindServiceAsUser
+    A-->>C: onServiceConnected(IJobService)
+    C-)E: oneway startJob(params + callback-v1)
+    E->>M: MSG_EXECUTE_JOB
+    M->>M: onStartJob(params)
+    M->>C: callback-v1.acknowledgeStartMessage(...)
+```
 
-JSS 到 `PHASE_THIRD_PARTY_APPS_CAN_START` 时创建：
+到 `executeRunnableJob()` 返回 true 时，只走到“绑定请求已被接受”；到 `onServiceConnected()` 才取得 app Binder；到应用主线程处理消息，才真正进入业务回调。
+
+## 五态不是五个名词，而是四份等待协议
+
+r48 的 JSC 状态为：
 
 ```java
-for (int i = 0; i < MAX_JOB_CONTEXTS_COUNT; i++) {
-    mActiveServices.add(new JobServiceContext(...));
-}
+VERB_BINDING   = 0;
+VERB_STARTING  = 1;
+VERB_EXECUTING = 2;
+VERB_STOPPING  = 3;
+VERB_FINISHED  = 4;
 ```
-
-16是物理槽对象数，不是始终并行16个 Job。第131章所讲的屏幕、内存与 FG/BG 并发策略，决定这些槽中本轮可以新占用多少个。
-
-完成后不会销毁 JSC，而是清空本次运行字段并把同一个对象交给下一代 Job。
-
----
-
-## 6. 五态先看全图
 
 ```mermaid
 stateDiagram-v2
     [*] --> FINISHED
-    FINISHED --> BINDING: "executeRunnableJob"
-    BINDING --> STARTING: "onServiceConnected + startJob"
-    STARTING --> EXECUTING: "start ack：ongoing=true"
-    STARTING --> FINISHED: "start ack：ongoing=false"
-    EXECUTING --> FINISHED: "jobFinished"
-    EXECUTING --> STOPPING: "cancel / 10分钟超时"
-    STOPPING --> FINISHED: "stop ack / 8秒超时"
-    BINDING --> FINISHED: "18秒超时 / 连接后发现已取消"
-    STARTING --> FINISHED: "8秒超时"
+    FINISHED --> BINDING: executeRunnableJob
+    BINDING --> STARTING: Service connected，发送 startJob
+    STARTING --> EXECUTING: start ack，ongoing=true
+    STARTING --> FINISHED: start ack，ongoing=false
+    EXECUTING --> FINISHED: app 调用 jobFinished
+    EXECUTING --> STOPPING: 约束丢失/抢占/10分钟到期
+    STOPPING --> FINISHED: stop ack
+    BINDING --> FINISHED: bind 超时/取消后连接
+    STARTING --> FINISHED: start ack 超时
+    STOPPING --> FINISHED: stop ack 超时
 ```
 
-常量值：
+不要按日常中文猜状态：
 
-```text
-VERB_BINDING  = 0
-VERB_STARTING = 1
-VERB_EXECUTING= 2
-VERB_STOPPING = 3
-VERB_FINISHED = 4
-```
+| 状态 | JSC 正在等什么 | 应用业务是否一定在运行 |
+|---|---|---|
+| BINDING | 等 ServiceConnection | 否 |
+| STARTING | 已发 `startJob()`，等 `onStartJob()` 的反向 ack | 不一定；请求可能还在 Binder 或主线程队列 |
+| EXECUTING | App 回报还有异步工作，等 `jobFinished()` 或停止条件 | 只表示协议上 ongoing，不证明工作线程健康 |
+| STOPPING | 已发 `stopJob()`，等 `onStopJob()` 的反向 ack | App 必须尽快停止，但线程不会被框架瞬间杀掉 |
+| FINISHED | 当前代已经清槽或尚未分配 | 无当前运行 Job |
 
-`FINISHED` 在这里既表示“尚未接 Job”，也表示“上一代已经彻底清理”。
+状态的意义是“接下来哪种事件才合法，以及该等多久”，不是对业务线程的一张精确运行快照。
 
----
+## 三组超时分别从哪里开始
 
-## 7. 状态名不要按自然语言想当然
-
-`BINDING` 不是“应用正在工作”，它只是 system_server 已发起 Service 绑定、等待连接。
-
-`STARTING` 不是“刚开始做后台任务”，而是系统已经发送 `startJob(params)`，正在等应用主线程执行 `onStartJob()` 并回传布尔结果。
-
-`EXECUTING` 表示应用回报“还有异步工作”，系统进入10分钟 timeslice；它不保证工作线程真的健康运行。
-
-`STOPPING` 表示系统已发 `stopJob(params)`，正在等 `onStopJob()` 返回值。
-
----
-
-## 8. 三组超时不是一个总倒计时
-
-r48 常量：
+r48 固定值是：
 
 ```java
 OP_BIND_TIMEOUT_MILLIS = 18_000;
@@ -156,222 +114,129 @@ OP_TIMEOUT_MILLIS = 8_000;
 EXECUTING_TIMESLICE_MILLIS = 10 * 60 * 1000;
 ```
 
-映射如下：
+| 状态 | 超时 | 起点 | 超时动作 |
+|---|---:|---|---|
+| BINDING | 18 秒 | 发起 bind 前安排 | 直接 cleanup，不请求重试 |
+| STARTING | 8 秒 | 发 `startJob()` 前安排 | 直接 cleanup，不请求重试 |
+| EXECUTING | 10 分钟 | 收到 `onStartJob=true` 的 ack 后重新安排 | 设置 TIMEOUT 原因并发 `stopJob()`，进入 STOPPING |
+| STOPPING | 8 秒 | 发 `stopJob()` 前重新安排 | 直接 cleanup，并请求重试 |
 
-| 当前状态 | 本次 timeout | 等待什么 |
-|---|---:|---|
-| BINDING | 18秒 | Service 建立连接 |
-| STARTING | 8秒 | `onStartJob()` 返回并 ack |
-| EXECUTING | 10分钟 | 应用主动 `jobFinished()`，否则系统发 stop |
-| STOPPING | 8秒 | `onStopJob()` 返回并 ack |
-
-每次状态推进都会移除旧 timeout，再按新状态重新计时。因此不能把它们相加后写成一个固定“总寿命”。
-
----
-
-## 9. 这三个值在 r48 不是应用配置项
-
-它们是 `JobServiceContext` 中的固定常量，不从 `JOB_SCHEDULER_CONSTANTS` 解析。
-
-应用可以通过及时返回、主动 `jobFinished()` 来缩短占槽时间，却不能请求把 STARTING 超时改成30秒，或把执行 timeslice 改成1小时。
-
-不同 Android 版本可能改变规则，阅读其他版本文档时不能反向覆盖 r48。
-
----
-
-## 10. `executeRunnableJob()` 的入口条件
-
-JCM 只应把真实空槽交给它。JSC 自己仍防御性检查：
+每次 `scheduleOpTimeOutLocked()` 都先移除旧 timeout，再按当前 `mVerb` 安排新的：
 
 ```java
-if (!mAvailable) {
-    return false;
-}
+removeOpTimeOutLocked();
+long timeout = mVerb == VERB_EXECUTING
+        ? EXECUTING_TIMESLICE_MILLIS
+        : mVerb == VERB_BINDING
+                ? OP_BIND_TIMEOUT_MILLIS : OP_TIMEOUT_MILLIS;
 ```
 
-随后在同一个 JSS `mLock` 临界区中：
+因此不能把 `18 秒 + 8 秒 + 10 分钟 + 8 秒` 当成每个 Job 固定经历的总时长。正常绑定可能 100ms 完成，`onStartJob(false)` 也可能在几毫秒内直接结束。
 
-```text
-清 preferredUid
-创建本代 callback
-构造 JobParameters 快照
-记录 executionStart
-进入 BINDING
-安排18秒 timeout
-发起 bindServiceAsUser
-```
+这些值是 r48 `JobServiceContext` 的实现常量，不是 App 能通过 `JobInfo` 配置的时限；其他 Android 版本需要重新核对。
 
-返回 true 只表示绑定请求被系统接受，并不表示应用 `onStartJob()` 已经成功。
+Handler timeout 也不是实时中断器：到达时间只表示消息最早可被 Looper 处理，主线程繁忙时可能晚于名义时刻。10 分钟到期时系统先请求 stop，并不会直接杀死 App 的工作线程。
 
----
+## 从空槽到 BINDING：槽何时算被占用
 
-## 11. 槽在 bind 调用前就已有 `mRunningJob`
+### `executeRunnableJob()` 在 bind 前就建立本代身份
 
-关键顺序是：
+入口先检查 `mAvailable`，随后在 JSS 的 `mLock` 内创建本代状态：
 
 ```java
 mRunningJob = job;
 mRunningCallback = new JobCallback();
-// 构造 params
+mParams = new JobParameters(mRunningCallback, job.getJobId(), ...);
+mExecutionStartTimeElapsed = sElapsedRealtimeClock.millis();
 mVerb = VERB_BINDING;
-// 然后 bindServiceAsUser(...)
+scheduleOpTimeOutLocked();
 ```
 
-所以从 JSS 的 `getRunningJobLocked()` / `isCurrentlyActiveLocked()` 看，槽在 Binder 连接之前已经被占用。
+这里最重要的不是参数很多，而是顺序：
 
-`mAvailable=false` 却要等 `bindServiceAsUser()` 返回 true 后才设置。这两个字段的写入时点不一致，读源码时应以“运行对象是否已放入槽”和“内部 available 防线”两个角度分别理解，不能只盯一个 boolean。
+- `mRunningJob` 在 bind 前已经指向 Job 42-v1；
+- callback-v1 与 params-v1 同时属于这一代；
+- 18 秒绑定 timeout 也携带 callback-v1；
+- 从 JSS 的 `getRunningJobLocked()` 看，这个槽已经不再空闲。
 
----
+`mExecutionStartTimeElapsed` 也在 bind 前记录，所以 dumpsys 的 `Running for` 包含 BINDING、STARTING、EXECUTING 和 STOPPING，不等于纯业务线程运行时长。
 
-## 12. JobParameters 是一次执行代际的快照
+### `JobParameters` 是本代快照，不是 JobStatus 本体
 
-JSC 构造的 `JobParameters` 包含：
+本代参数包括：
 
 ```text
-本代 JobCallback Binder
-jobId
-PersistableBundle / transient Bundle
-ClipData 与 grant flags
-deadline 是否已经过期
-触发内容 URI / authority
-本次选中的 Network
+callback Binder、jobId、extras、transient extras、ClipData
+deadline 是否已过期、触发 URI/authority、本轮 Network
 ```
 
-它不是 JobStore 中可随时变化的 `JobStatus` 本体。尤其 `network`、内容触发集合与 deadline 标记，是进入本次执行时交给应用的快照。
+其中 Network、内容触发集合与 deadline 标志是在这次执行开始前冻结给 App 的快照。之后系统内部状态继续变化，不会把同一个 `JobParameters` 变成实时状态面板。
 
----
-
-## 13. deadline expired 的判断边界
+### bind 返回 true 只表示请求被接受
 
 JSC 使用：
 
 ```java
-job.hasDeadlineConstraint()
-        && job.getLatestRunTimeElapsed() < elapsedRealtimeNow
-```
-
-它在构造 `JobParameters` 时计算一次。之后即使时钟继续前进，应用拿到的 `isOverrideDeadlineExpired()` 也不会动态更新。
-
-而且 deadline 到期并不自动绕过 Doze、后台限制、quota/dynamic 等隐式门；这些门在 Job 进入 pending 前已经由 JSS/JobStatus 判断。
-
----
-
-## 14. `mExecutionStartTimeElapsed` 早于应用回调
-
-时间戳在构造 params 后、调用 bind 前写入：
-
-```text
-mExecutionStartTimeElapsed = elapsedRealtime
-```
-
-dumpsys 的 `Running for` 因而包括：
-
-- BINDING 等待；
-- STARTING 等应用主线程；
-- EXECUTING；
-- STOPPING。
-
-它不是纯业务代码运行时长。10分钟执行 timeslice 则从 start ack 进入 EXECUTING 后重新安排，两者计时起点不同。
-
----
-
-## 15. bind 使用哪些 flag
-
-r48 调用大意：
-
-```java
-bindServiceAsUser(intent, connection,
+bindServiceAsUser(intent, this,
         BIND_AUTO_CREATE
         | BIND_NOT_FOREGROUND
         | BIND_NOT_PERCEPTIBLE,
         UserHandle.of(job.getUserId()));
 ```
 
-`BIND_AUTO_CREATE` 允许为 Job 创建服务；另外两个 flag 明确不因这次绑定把宿主进程当成普通前台/可感知绑定来提升。
-
-这不等于应用没有运行优先级管理，AMS、OOM adj、WakeLock、JobScheduler 策略仍分别发挥作用。
-
----
-
-## 16. bind 返回 true 只代表请求被接受
-
-分清三个事件：
+必须区分：
 
 ```text
 bindServiceAsUser() 返回 true
-≠ onServiceConnected() 已到达
-≠ onStartJob() 已执行
+≠ onServiceConnected() 已回调
+≠ IJobService.startJob() 已发出
+≠ App 的 onStartJob() 已执行
 ```
 
-bind 返回 true 后 JSC 才做 `JobPackageTracker.noteActive()`、BatteryStats、statsd 和 UsageStats 记录，并把 `mAvailable` 置 false。
+bind 被接受后，JSC 才记 `noteActive`、statsd、BatteryStats、UsageStats，并把 `mAvailable=false`。但 `mRunningJob` 更早已经写入，因此“context 是否有 running Job”和“mAvailable 防御位”在极短窗口内并非同一时刻翻转。
 
-此时仍处 BINDING，18秒 timeout 仍在等待连接。
+### bind 立即失败不是事务性回滚
 
----
+若 bind 返回 false 或抛 `SecurityException`，JSC 会清掉 running/callback/params，回到 FINISHED，移除 timeout并返回 false。它没有走统一 cleanup，因为连接、WakeLock和 active 统计尚未完整建立。
 
-## 17. bind 立即失败不是标准 cleanup 路径
+第 131 章已经看到，JCM 之后仍会把该 Job 从 Pending 移除；JobStatus 定义仍在 JobStore，后续是否重新进入 Pending 依赖新的 JSS 检查。Controller 的 `prepareForExecutionLocked()` 又发生在 execute 之前，r48 没有在这个 false 分支统一调用对称 rollback。
 
-若 `bindServiceAsUser()` 返回 false，或因权限策略抛 `SecurityException`，JSC 会直接：
+所以不能把 false 理解成“所有状态原子地恢复到调用前”。这是 r48 实现边界，不是公开 API 对 App 承诺的可观察事务。
+
+## Service 连接后，为何先拿 WakeLock 再发 start
+
+`onServiceConnected()` 先核对当前仍有 running Job，且回调组件名等于它的 Service component。随后取得 `IJobService`，创建 PARTIAL_WAKE_LOCK：
+
+```java
+PowerManager.WakeLock wl = pm.newWakeLock(
+        PowerManager.PARTIAL_WAKE_LOCK, runningJob.getTag());
+wl.setWorkSource(deriveWorkSource(runningJob));
+wl.setReferenceCounted(false);
+wl.acquire();
+```
+
+WakeLock 的窗口是：
 
 ```text
-mRunningJob=null
-mRunningCallback=null
-mParams=null
-mExecutionStartTimeElapsed=0
-mVerb=FINISHED
-移除 timeout
-返回 false
+Service 已连接、即将发送 start
+→ STARTING
+→ EXECUTING / STOPPING
+→ closeAndCleanup 时释放
 ```
 
-它没有调用 `closeAndCleanupJobLocked()`，因为绑定未成功、统计 active 尚未开始，也没有可解绑的连接。
+它不覆盖 18 秒 BINDING 的全部等待。这样既保证 App 收到工作后 CPU 不因普通休眠中断协议，又避免仅仅等待进程/Service 建立连接就先持一只 Job WakeLock。
 
-第131章已经看到：JCM 仍把该 Job 从内部 pending 删除，但 JobStatus 仍在 JobStore，等待以后其他检查重新挑选。
+归因默认使用 `sourceUid`；若启用链式归因，则 WorkChain 先记 source UID，再记 `system_server` 的 JobScheduler。它回答“这段 CPU 保持应算给谁”，不改变 Binder 的 calling UID。
 
----
+源码还防御一个罕见现场：新 Service 已连接时 `mWakeLock` 居然仍非 null，就先释放旧锁再替换。这不是正常状态机的常规路径，而是避免竞态下遗失一只仍活着的锁。
 
-## 18. bind false 不是事务性回滚
+如果连接后宿主进程意外断开，`onServiceDisconnected()` 走统一 cleanup 并请求 reschedule。它表示执行通道崩了，不等于业务成功完成。
 
-JCM 在执行 JSC 前已经调用所有 Controller 的 `prepareForExecutionLocked(job)`。r48 没有统一的 `unprepareForExecutionLocked()` 与这个失败分支配对。
+## oneway 的“回复”在哪里：另一条 Binder 回调链
 
-因此只能得出：
+### start/stop 没有同步返回值
 
-```text
-没有进入正常 JSC completion
-没有从 JobStore 删除
-没有原样留在 mPendingJobs
-后续需靠新的 JSS 检查再次入队
-```
-
-不能笼统声称所有 Controller 的执行前副作用都已经回滚。这是 r48 的真实失败边界。
-
----
-
-## 19. 从 bind 到 start 的跨进程图
-
-```mermaid
-sequenceDiagram
-    participant C as "JSC / system_server"
-    participant A as "AMS 绑定服务"
-    participant B as "JobServiceEngine Binder / app"
-    participant M as "应用主线程"
-
-    C->>A: bindServiceAsUser
-    A-->>C: 返回true（请求被接受）
-    A->>C: onServiceConnected(IBinder)
-    C->>C: 获取PARTIAL_WAKE_LOCK
-    C->>B: IJobService.startJob(params)，oneway
-    B->>M: post MSG_EXECUTE_JOB
-    M->>M: onStartJob(params)
-    M->>C: acknowledgeStartMessage(token, result)
-```
-
-图中每条箭头都可能跨线程或跨进程，不能把整个流程当成一次普通 Java 同步调用。
-
----
-
-## 20. `IJobService` 是 oneway
-
-AIDL 声明：
+`IJobService.aidl` 明确是：
 
 ```aidl
 oneway interface IJobService {
@@ -380,1320 +245,483 @@ oneway interface IJobService {
 }
 ```
 
-所以 system_server 调 `service.startJob()` 返回，不代表应用已经跑完 `onStartJob()`，更拿不到它的 boolean 返回值。
+因此 system_server 调用 `service.startJob(mParams)` 后，不会在这次 Binder 调用的 reply Parcel 里同步取到 `onStartJob()` 的 boolean。oneway 的价值是：system_server 发出通知后不需要占着当前调用线程等待 App 主线程执行业务回调。
 
-返回值要沿另一条 `IJobCallback.acknowledgeStartMessage()` 通道回到 system_server，这正是 STARTING 状态和8秒 timeout 存在的原因。
+但“不等同步 reply”不等于“不需要结果”。Android 另给 App 一条反向通道 `IJobCallback`：
 
----
+```text
+system_server --oneway startJob(params + callback)--> App Binder线程
+App Binder线程 --Handler消息--> App主线程 onStartJob()
+App主线程 --acknowledgeStartMessage(boolean)--> system_server
+```
 
-## 21. 应用 Binder 线程不直接执行 JobService 回调
+这就是 oneway 取结果的通用模式：**请求和结果是两次独立 IPC，中间由 callback token 关联。**
 
-`JobServiceEngine.JobInterface.startJob()` 收到 Binder 请求后，只做：
+### App Binder 线程不直接执行业务回调
+
+`JobServiceEngine.JobInterface.startJob()` 只投递消息：
 
 ```java
-Message.obtain(mHandler, MSG_EXECUTE_JOB, params).sendToTarget();
+Message.obtain(service.mHandler,
+        MSG_EXECUTE_JOB, jobParams).sendToTarget();
 ```
 
-`mHandler` 使用 `service.getMainLooper()`。因此开发者的：
+Engine 构造时使用 `service.getMainLooper()`，因此真正的 `onStartJob()` 和 `onStopJob()` 都在应用主线程执行。回调结束后，主线程再调用 callback Binder 把 boolean 送回 JSC。
 
-```text
-onStartJob()
-onStopJob()
+这也是为什么 `onStartJob()` 必须快速决定：若要做耗时工作，应交给自己的线程/执行器并返回 true，不能在主线程里长时间阻塞到工作完成。STARTING 的 8 秒覆盖请求传递、主线程排队、回调执行和 ack 返回这一整段等待，而不是只测某一行 Java 代码。
+
+### 发送 start 本身抛异常时怎样收敛
+
+JSC 在调用 `service.startJob()` 前已经进入 STARTING 并安排 8 秒 timeout。若这次调用抛异常，r48 只记录日志，没有立即 cleanup；状态仍由 STARTING timeout 收敛。
+
+这是一种“先立超时，再调用外部进程”的防御方式：即使外部通知失败，槽也不会无限停在 STARTING。但代价是失败后可能继续占槽到 timeout 被处理。
+
+## start 和 stop 的 boolean 为什么意思相反
+
+### `onStartJob()` 返回值回答“本代是否还有异步工作”
+
+App 主线程执行：
+
+```java
+boolean ongoing = JobService.this.onStartJob(params);
+callback.acknowledgeStartMessage(jobId, ongoing);
 ```
 
-都在应用主线程执行，而不是 Binder 线程池。
+语义是：
 
----
-
-## 22. 为什么 onStartJob 必须迅速返回
-
-应用主线程既要处理 `onStartJob()`，也要处理稍后的 `onStopJob()`。如果开发者直接在 start 回调里做长时间网络或磁盘工作：
-
-1. 8秒内可能无法返回 start ack；
-2. 主线程还可能无法接收 stop 消息；
-3. system_server 超时清理并不等于那段阻塞代码被安全终止。
-
-正确模式是快速把工作交给线程池/协程等机制，再返回 true。
-
----
-
-## 23. start 返回 false 的精确含义
-
-应用主线程返回 false 后，Engine 回调：
-
-```text
-acknowledgeStartMessage(jobId, ongoing=false)
-```
-
-JSC 在 STARTING 中先把 `mVerb` 设成 EXECUTING，再立即走完成清理，`reschedule=false`。
-
-从外部语义看：
-
-> 工作已经在 `onStartJob()` 返回前同步完成，不再占槽，也不会再收到本次 `onStopJob()`。
-
-false 不是“启动失败，请自动重试”。
-
----
-
-## 24. start 返回 true 的精确含义
-
-true 被作为 `ongoing=true` 回传。JSC：
-
-```text
-STARTING → EXECUTING
-重新安排10分钟 timeout
-继续持有本代槽位与 WakeLock
-```
-
-true 不是“任务已成功”，而是：
-
-> `onStartJob()` 返回后仍有异步工作，应用承诺稍后调用 `jobFinished()`，或响应系统的 `onStopJob()`。
-
-如果异步工作完成却忘记 `jobFinished()`，系统最终会走10分钟超时停止协议。
-
----
-
-## 25. start 与 stop 的 boolean 语义相反
-
-| 回调 | 返回 false | 返回 true |
+| start 返回值 | 含义 | JSC 下一步 |
 |---|---|---|
-| `onStartJob()` | 已同步完成 | 仍在异步执行 |
-| `onStopJob()` | 不请求失败重试 | 请求按 backoff 失败重试 |
+| false | 工作已经在 `onStartJob()` 返回前完成 | 不调用 `onStopJob()`，直接 cleanup，且不请求重试 |
+| true | 工作还在别处继续 | 进入 EXECUTING，开始 10 分钟 timeslice，等待 `jobFinished()` 或停止 |
 
-两处 true 都不能翻译成“成功”。
-
-特别是 `onStopJob()` 无论返回什么，应用都必须停止本次工作；true 只决定是否希望调度器再创建一次失败重试。
-
----
-
-## 26. STARTING 的8秒从什么时候开始
-
-`onServiceConnected()` 先取消 BINDING timeout，获取 WakeLock，然后 `handleServiceBoundLocked()`：
+true 不是“执行成功”，更不是“永不超时”；它只是声明协议仍未完成。App 接下来必须保存本代 params，并在工作完成时调用：
 
 ```java
-mVerb = VERB_STARTING;
-scheduleOpTimeOutLocked();
-service.startJob(mParams);
+jobFinished(params, wantsReschedule);
 ```
 
-因此8秒覆盖从 system_server 发出 oneway `startJob()`，经过应用 Binder 投递、主线程排队、执行 `onStartJob()`，直到 ack 回到系统的整段时间。
+### `onStopJob()` 返回值回答“以后是否重试”
 
-它不只是计算 `onStartJob()` 方法体的 CPU 用时。
+系统要求停止后，App 主线程执行 `onStopJob(params)`。无论返回什么，本代工作都必须停止：
 
----
+| stop 返回值 | 当前工作 | 未来调度 |
+|---|---|---|
+| false | 必须停止 | 不因这次停止请求失败重试 |
+| true | 也必须停止 | 请求按 backoff 等规则创建后续重试 |
 
-## 27. start 调用抛异常的 system_server 边界
-
-JSC 对 `service.startJob(mParams)` 周围捕获 `Exception` 并记录日志，但该 catch 后没有立即 cleanup。
-
-正常远程 oneway 调用不会把应用业务异常同步抛回 system_server；应用业务异常发生在 Engine 的主线程 Handler 中，Engine 会包装成 `RuntimeException`，可能导致应用进程崩溃。
-
-若 system_server 侧发送本身出现异常，槽通常仍留在 STARTING，最终由8秒 timeout 或连接断开收束。
-
----
-
-## 28. 本代 callback 才是真正的运行令牌
-
-每次 `executeRunnableJob()` 都创建新的：
+因此这段应用代码是错的：
 
 ```java
-mRunningCallback = new JobCallback();
-```
-
-同一个 `jobId=42` 可以失败重试、周期再运行，甚至取消后被重新 schedule。仅凭 jobId 无法区分“第几次运行”。
-
-JSC 用对象身份：
-
-```java
-mRunningCallback == callbackFromApp
-```
-
-判断回调是否属于当前代。后文把它称为 callback token。
-
----
-
-## 29. jobId 为什么不够
-
-设 Job A 和失败重试后的 Job B 都是：
-
-```text
-callingUid=10123
-jobId=42
-```
-
-若旧工作线程在 B 已开始后才调用 `jobFinished(A.params, false)`，只比较 jobId 就会误把 B 清掉。
-
-r48 的 `doJobFinished()`、start/stop ack 方法虽然收到 jobId 参数，却没有用它判代；真正的判定是 Binder callback 对象身份。名字相同的 Job 可重跑，callback token 每代唯一。
-
----
-
-## 30. stale callback 的代际图
-
-```mermaid
-sequenceDiagram
-    participant A as "旧运行 A / tokenA"
-    participant C as "复用的 Slot #3"
-    participant B as "新运行 B / tokenB"
-
-    C->>A: startJob(paramsA, tokenA)
-    A-->>C: 正常结束并cleanup
-    C->>B: startJob(paramsB, tokenB)
-    A-->>C: 很晚才到的 jobFinished(tokenA)
-    C->>C: tokenA != mRunningCallback(tokenB)，忽略
-    B-->>C: jobFinished(tokenB)
-    C->>C: 合法，清理B
-```
-
-JSC 对象复用不意味着上一代回调仍有权操作它。
-
----
-
-## 31. 哪些 stale 回调静默忽略
-
-以下三类都走 `doCallback()`：
-
-```text
-acknowledgeStartMessage
-acknowledgeStopMessage
-jobFinished
-```
-
-`doCallback()` 先：
-
-```java
-if (!verifyCallerLocked(cb)) {
-    return;
+@Override public boolean onStopJob(JobParameters params) {
+    return true; // 错误理解：返回 true 就可以让旧线程继续
 }
 ```
 
-所以过期代际的 start ack、stop ack、jobFinished 只记录 debug 日志并忽略，不会结束当前 Job，也通常不会把异常抛回应用。
+正确做法是先取消或标记后台任务停止，再用 boolean 表达是否希望系统另行重排。回调 boolean 控制的是调度协议，不会替 App 强制中断 Java 线程。
 
----
+## 同一个取消请求，在四种状态下为何结果不同
 
-## 32. WorkItem stale 调用更严格
-
-`dequeueWork()` 与 `completeWork()` 走 `assertCallerLocked(cb)`。token 不等时抛 `SecurityException`，错误文本还可能带旧 callback 保存的停止原因和距停止时间。
-
-这是因为前面三种只是“晚到的生命周期通知”，安全忽略即可；WorkItem 操作却试图读写当前队列，必须明确拒绝。
-
-另外，合法 token 但 `completeWork(workId)` 找不到该 active work 时，服务端返回 false，`JobParameters.completeWork()` 再抛 `IllegalArgumentException`。两种错误来源不要混为一谈。
-
----
-
-## 33. timeout 消息也携带代际 token
-
-安排超时时：
+JSC 先把 stop reason 写入 `JobParameters`；PREEMPT 还会保存 `preferredUid`。随后按当前 `mVerb` 分支：
 
 ```java
-Message m = obtainMessage(MSG_TIMEOUT, mRunningCallback);
-sendMessageDelayed(m, timeoutMillis);
+switch (mVerb) {
+    case VERB_BINDING:
+    case VERB_STARTING:
+        mCancelled = true;
+        break;
+    case VERB_EXECUTING:
+        sendStopMessageLocked(reason);
+        break;
+    case VERB_STOPPING:
+        break;
+}
 ```
 
-Handler 收到后先比较：
+### BINDING：还没有 App Binder，不能发送 stop
+
+此时只设置 `mCancelled=true`。若 Service 随后连接，`handleServiceBoundLocked()` 发现已取消，不再发送 start，而是 cleanup 并请求 reschedule；若始终不连接，则由 18 秒 timeout 收敛。
+
+### STARTING：App 可能尚未收到 start，先等待开始回执
+
+系统已经发出 oneway start，但不知道 App 主线程处理到哪一步。JSC 先记取消，等 start ack：
+
+- ack 为 true：短暂切到 EXECUTING，发现 `mCancelled`，再发送 stop；
+- ack 为 false：App 表示本代已经完成，直接 cleanup，不需要再发 stop。
+
+这避免了 start/stop 在 App 主线程上的协议顺序混乱。
+
+### EXECUTING：已有 ongoing 工作，发送 stop
+
+JSC 进入 STOPPING、安排 8 秒 timeout，并通过 oneway `stopJob(params)` 通知 App。App 主线程调用 `onStopJob()` 后，再经 `acknowledgeStopMessage(reschedule)` 返回。
+
+### STOPPING：重复取消不重复发送
+
+槽已经在等 stop ack，再来一个取消只保持现状，避免同一代收到多次 `onStopJob()`。
+
+FINISHED 状态没有本代可取消，会被防御性忽略。
+
+### 显式 cancel 为什么不会被 `cleanup(true)` 复活
+
+有些早期取消分支会向 completion listener 传 `reschedule=true`。这不等于用户显式 `JobScheduler.cancel()` 后任务一定复活。
+
+JSS 的显式取消路径先把 JobStatus 从 JobStore 和 Controller 中移除，再要求 JSC 停止。稍后 cleanup 回调 `onJobCompletedLocked()` 时，JSS 已找不到旧 Job，会结束处理而不会把生成的重试重新登记。
+
+所以必须联合阅读 JSC 的“本槽希望重试”与 JSS 的“该 Job 定义是否仍存在”；一个局部 boolean 不能单独决定最终结果。
+
+## 超时不是一种结果：四个状态有四种处置
+
+| timeout 发生状态 | r48 处置 | 是否立刻 FINISHED |
+|---|---|---|
+| BINDING | `closeAndCleanup(false)` | 是 |
+| STARTING | `closeAndCleanup(false)` | 是 |
+| EXECUTING | 设 TIMEOUT stop reason，调用 `sendStopMessageLocked()` | 否，先进入 STOPPING |
+| STOPPING | `closeAndCleanup(true)` | 是 |
+
+最容易误读的是 10 分钟：
 
 ```text
-message.obj == mRunningCallback
+EXECUTING timeslice 到期
+→ 不是直接释放槽
+→ oneway stopJob
+→ 等 App 主线程 onStopJob + 反向 ack
+→ 最多再由 STOPPING 的8秒超时收敛
 ```
 
-旧 Job 的 timeout 即使因竞态已经出队，遇到新 Job 的 callback token 也只会记录“no longer active”，不会按新 Job 的状态执行 timeout。
+如果 App 忽略 `onStopJob()` 继续跑自己的线程，JSC 可以结束协议、释放 Job WakeLock并解绑，但这不等于那个任意业务线程被 Java 层强制终止。应用必须设计自己的 cancellation flag、Future.cancel、协程取消或其他协作式停止机制。
 
----
+shell 的强制 timeout 入口在 r48 也只对 `VERB_EXECUTING` 生效，不是任意阶段的“立即清槽”按钮。
 
-## 34. `removeMessages(MSG_TIMEOUT)` 与 token 是双保险
+## 真正防止旧回调误伤新代的是 callback 身份
 
-每次重新安排或清理都会：
+### 每次执行都有一个新 token
+
+Slot #3 执行 v1 时：
+
+```text
+mRunningJob      = Job 42-v1
+mRunningCallback = callback-v1
+mParams.callback = callback-v1
+```
+
+清理后，同一个槽执行 backoff 新建的 v2：
+
+```text
+mRunningJob      = Job 42-v2
+mRunningCallback = callback-v2
+mParams.callback = callback-v2
+```
+
+两代 jobId 都可以是 42，但 callback 对象不同。
+
+应用旧线程调用 `jobFinished(params-v1, false)` 时，params 仍携带 callback-v1。请求回到 system_server 的旧 `JobCallback` 对象，JSC 执行：
 
 ```java
-mCallbackHandler.removeMessages(MSG_TIMEOUT);
-```
-
-这会移除 Handler 中尚未处理的同类 timeout；token 比较处理“消息已经开始分发、无法再从队列移除”的竞态。
-
-因此安全性不依赖 Job id，也不依赖“旧消息一定成功删除”。
-
----
-
-## 35. onServiceConnected 先校验槽非空与组件，但它不是 bind 代际 token
-
-连接到达时 JSC 在锁内读取 `mRunningJob`，要求：
-
-```text
-runningJob != null
-且回调 component == runningJob.serviceComponent
-```
-
-不满足时走 cleanup；若槽早已 FINISHED，cleanup 的开头会直接 return。
-
-这道检查能拒绝“槽已经没有运行 Job”或“连接组件与当前 Job 不同”的回调，但不能像 `JobCallback` token 一样区分**同一组件**的两个绑定代际。正常 cleanup 会 `unbindService()`，`LoadedApk.ServiceDispatcher.doForget()` 使解绑后的迟到连接不再分发；JSC 还对残留旧 WakeLock 做了防御。不过，仅凭组件名比较不能宣称已经建立了完整的 bind-generation 身份验证。
-
----
-
-## 36. WakeLock 从 Service 连接后开始
-
-JSC 在 `onServiceConnected()` 中：
-
-```text
-创建 PARTIAL_WAKE_LOCK
-设置 WorkSource
-设为 non-reference-counted
-acquire
-然后发送 startJob
-```
-
-所以 WakeLock：
-
-- 不覆盖前面的 BINDING 等待；
-- 覆盖 STARTING；
-- 覆盖异步 EXECUTING；
-- 覆盖 STOPPING，直到 cleanup。
-
-它保证 CPU 层面的执行机会，不保证网络存在、进程不崩溃或业务代码一定向前推进。
-
----
-
-## 37. WakeLock 归因使用 source UID
-
-普通模式：
-
-```java
-new WorkSource(job.getSourceUid())
-```
-
-启用 chained battery attribution 时，WorkChain 依次加入 source UID 与 `system_server` 的 JobScheduler 节点。
-
-这与 JCM 抢占按 calling UID 不同。`scheduleAsPackage()` 场景中，调用者与真正受益/被归因的 source package 可能不是同一个身份。
-
----
-
-## 38. 为什么代码会防御“旧 WakeLock 还活着”
-
-JSC 为每个 Job 创建新的 WakeLock。源码特别处理罕见竞态：若新连接到来时 `mWakeLock` 仍非 null，先记录警告并释放旧锁，再保存新锁。
-
-这不是正常每次都会发生的双 WakeLock 流程，而是避免复用槽时遗失旧锁引用、造成泄漏的保险。
-
-最终正常释放仍在 `closeAndCleanupJobLocked()`。
-
----
-
-## 39. onServiceDisconnected 不是业务完成
-
-若承载 JobService 的进程崩溃或连接意外断开，JSC 直接：
-
-```java
-closeAndCleanupJobLocked(true,
-        "unexpectedly disconnected");
-```
-
-`true` 走失败重试意图，而不是把任务记为成功。
-
-但最终能否建立重试 Job 还取决于原 Job 是否仍在 JobStore；若它已经被显式 cancel/replace，JSS 完成回调找不到旧定义，就不会把它复活。
-
----
-
-## 40. r48 没有覆写两个新版 ServiceConnection 回调
-
-`ServiceConnection` 还有默认方法：
-
-```text
-onBindingDied()
-onNullBinding()
-```
-
-本版本 JSC 只实现 `onServiceConnected()` 与 `onServiceDisconnected()`，没有覆写前两者。
-
-因此不要凭较新版本实现推断 r48 在 `onNullBinding` 到达时会立即执行专门 cleanup。对“绑定请求接受但始终没有可用连接”的基本收束仍要看18秒 BINDING timeout 或其他连接回调。
-
----
-
-## 41. 取消入口先写 stop reason
-
-JSS 因约束、Doze、热限制、显式 cancel 或抢占调用：
-
-```java
-cancelExecutingJobLocked(reason, debugReason)
-```
-
-JSC 先把数值原因与调试文本写入 system_server 侧 `mParams`。若是 `REASON_PREEMPT`，还把当前 Job 的 calling UID 保存到 `mPreferredUid`。
-
-然后才根据当前 `mVerb` 决定立刻发 stop，还是只标记取消。
-
----
-
-## 42. 同一个 cancel 在四种状态下后果不同
-
-```mermaid
-flowchart TD
-    CANCEL["cancelExecutingJobLocked"] --> STATE{"当前状态"}
-    STATE -->|BINDING| MARK["mCancelled=true，等待连接"]
-    STATE -->|STARTING| ACK["mCancelled=true，等待start ack"]
-    STATE -->|EXECUTING| STOP["进入STOPPING，发stopJob"]
-    STATE -->|STOPPING| IGNORE["不重复发onStopJob"]
-    STATE -->|FINISHED| NONE["直接忽略"]
-    MARK --> LATER["连接到达或18秒timeout后cleanup"]
-    ACK --> LATER2["ack或8秒timeout后收束"]
-```
-
-“系统决定取消”不等于任何时刻都会立即调用应用 `onStopJob()`。
-
----
-
-## 43. BINDING 中取消只设置 `mCancelled`
-
-此时应用可能尚未创建，无法合理发送 stop。JSC：
-
-```text
-mCancelled=true
-保存第一条 stopped reason
-继续等待 ServiceConnection 或 BINDING timeout
-```
-
-若连接随后到达，JSC 会先获得 WakeLock，发现 `mCancelled`，然后不再发送 start，而是 `cleanup(true)`。
-
-若18秒先到，则 BINDING timeout 使用 `cleanup(false)`。这两个竞态出口的 reschedule 布尔并不相同，最终还要结合 JobStore 是否仍有旧 Job 判断。
-
----
-
-## 44. STARTING 中取消也不能立刻 stop
-
-system_server 已发送 start，但还不知道应用是否接收、以及 `onStartJob()` 会返回 true 还是 false，所以先：
-
-```text
-mCancelled=true
-等待 acknowledgeStartMessage
-```
-
-ack 到达后：
-
-- `ongoing=false`：应用声称同步完成，直接按正常完成 cleanup(false)；
-- `ongoing=true`：JSC 先进入 EXECUTING，再看见 `mCancelled`，随即发送 stop 并进入 STOPPING。
-
-这解释了为什么取消请求可能先于 `onStartJob()`，而 `onStopJob()` 仍在 start 返回 true 之后才到。
-
----
-
-## 45. EXECUTING 中取消才直接发 stop
-
-`sendStopMessageLocked()`：
-
-```text
-移除10分钟 timeout
-固定第一条 stopped debug reason
-mVerb=STOPPING
-安排8秒 timeout
-IJobService.stopJob(mParams)
-```
-
-更新过 stop reason 的 `JobParameters` 会再次通过 Binder 发给应用。应用侧 `JobServiceEngine` 把 stop 消息投到主线程，调用 `onStopJob(params)`。
-
----
-
-## 46. STOPPING 中重复取消不会重复通知应用
-
-`handleCancelLocked()` 对 STOPPING 什么也不做，因此不会重复发 `onStopJob()`。
-
-不过 `doCancelLocked()` 是先改 `mParams.stopReason` 再进入 switch；所以后来的 cancel 仍可能改 system_server 侧数值 stop reason，而 `mStoppedReason` 只保存第一条非 null 调试原因。
-
-调试时应分清：
-
-```text
-JobParameters 数值 stopReason
-JSC 首条 mStoppedReason 文本
-cleanup 的 reason 文本
-```
-
-它们有关联，但不是永远同一个字段。
-
----
-
-## 47. onStopJob 不负责决定“现在停不停”
-
-系统调用 stop 时，本次运行已经被要求结束。应用必须取消线程、网络请求与其他资源。
-
-返回值只表达：
-
-```text
-false → 不请求失败式重调度
-true  → 请求按 backoff 生成重试
-```
-
-即使返回 true，旧执行代际也会 cleanup，旧 callback 随即失效；不能在旧线程里继续工作并把 true 理解成“准许继续”。
-
----
-
-## 48. STOPPING 的8秒等待什么
-
-应用 `JobServiceEngine` 在主线程执行 `onStopJob()`，然后调用：
-
-```text
-acknowledgeStopMessage(jobId, reschedule)
-```
-
-JSC 在 STOPPING 中收到合法 token 后，将这个 boolean 传给 cleanup/JSS。
-
-若8秒内没有 ack，系统采用 `cleanup(true)`，也就是超时分支主动请求失败重试。这里的 true 是 framework 的兜底决定，不是应用返回值。
-
----
-
-## 49. 取消期间为什么不直接中断应用线程
-
-Binder stop 是协作协议，不是 Java `Thread.interrupt()`，也不会强杀某个 Executor task。
-
-若应用忽略 `onStopJob()`，system_server 在8秒后可释放槽、解绑并撤销 WakeLock，但应用中错误编写的线程仍可能继续一段时间，直到进程生命周期或它自己的逻辑结束。
-
-因此 `onStopJob()` 必须有明确的取消令牌，并让工作线程尽快观察它。
-
----
-
-## 50. 一个更安全的应用侧结构
-
-示意代码要同时防两件事：不要阻塞主线程；收到 stop 后，旧 worker 也不要再补一次 `jobFinished()`。下面省略异常处理，但保留了“同一个 Run 代际”的比较：
-
-```java
-public boolean onStartJob(JobParameters p) {
-    Run run = new Run();
-    runs.put(p.getJobId(), run);
-    run.future = executor.submit(() -> {
-        doInterruptibleWork(p, run);
-        if (!run.stopped && runs.remove(p.getJobId(), run)) {
-            jobFinished(p, false); // 正常完成，不请求失败重试
-        }
-    });
+private boolean verifyCallerLocked(JobCallback cb) {
+    if (mRunningCallback != cb) {
+        Slog.d(TAG, "Stale callback received, ignoring.");
+        return false;
+    }
     return true;
 }
+```
 
-public boolean onStopJob(JobParameters p) {
-    Run run = runs.remove(p.getJobId());
-    if (run != null) {
-        run.stopped = true;
-        run.future.cancel(true);
-    }
-    return true; // 本代仍须停止；这里只请求未来按backoff重试
+callback-v1 不等于当前 callback-v2，所以旧完成被忽略，v2 继续运行。
+
+这证明 jobId 为什么不够：jobId 标识逻辑调度项，可以在重试、周期或同一槽复用中再次出现；callback 标识的是“一次具体执行代际”。
+
+### 普通完成与 WorkItem 对 stale token 的处理不同
+
+开始 ack、停止 ack 和 `jobFinished()` 都走 `doCallback()`：token 不匹配时静默返回，以容忍异步迟到。
+
+`dequeueWork()` 与 `completeWork()` 会调用更严格的 `assertCallerLocked()`；stale token 会抛 `SecurityException`，因为旧代继续领取或完成当前代工作不只是重复通知，而是可能破坏工作队列所有权。
+
+这也说明 AIDL 中虽然还传了 `jobId`，r48 JSC 的核心代际判定并不依赖它；相关入口把真正的 `JobCallback` 对象作为首要凭证。
+
+### timeout 消息也带同一个代际 token
+
+安排 timeout 时：
+
+```java
+Message msg = mCallbackHandler.obtainMessage(
+        MSG_TIMEOUT, mRunningCallback);
+mCallbackHandler.sendMessageDelayed(msg, timeoutMillis);
+```
+
+处理时再次比较：
+
+```java
+if (message.obj == mRunningCallback) {
+    handleOpTimeoutLocked();
+} else {
+    // 旧代 timeout，忽略
 }
 ```
 
-`Run.stopped` 需要具备正确的跨线程可见性，例如用 `volatile`/原子变量。业务函数也必须真正响应取消；只调用 `cancel(true)` 但内部吞掉中断，同样无法按协议及时停止。生产代码还要按多个 jobId、异常和 start/stop 极近竞态完善容器同步。
+即使某条 v1 timeout 消息在槽复用后迟到，也不能给 v2 执行当前状态的超时动作。
 
----
+`removeMessages(MSG_TIMEOUT)` 负责正常切状态时清旧消息，token 比较再防御已经迟到或竞态中的旧代消息。一个是清理常规队列，一个是代际正确性保护。
 
-## 51. 10分钟到期先进入 stop，不是立即 FINISHED
+### ServiceConnection 校验没有使用同样的 per-bind token
 
-EXECUTING timeout 的源码动作：
+`onServiceConnected()` 检查的是：当前 running Job 非空、回调 component 等于当前 Job 的 component。它没有像 `JobCallback` 那样显式携带每次 bind 的独立代际 token。
 
-```text
-stopReason = REASON_TIMEOUT
-sendStopMessageLocked("timeout while executing")
-EXECUTING → STOPPING
-再等待8秒 stop ack
-```
+因此不能把 callback 的强代际校验自动推广到所有 ServiceConnection 竞态。r48 通过统一锁、解绑、组件检查和旧 WakeLock 防御来收敛这部分生命周期；这属于实现边界，而不是对任意迟到 bind 回调的形式化代际证明。
 
-所以“Job 最多运行10分钟”应理解为：10分钟是 r48 发起停止协议的 timeslice，不是到第600秒槽已经必然清空。
+## cleanup 完成了什么，又故意留下什么
 
-Handler 调度延迟、锁等待以及后续8秒 stop 窗口都会让总墙钟时间更长。
-
----
-
-## 52. 四态 timeout 后果总表
-
-| 超时发生态 | framework 动作 | `reschedule` 传给 JSS |
-|---|---|---:|
-| BINDING | 直接 cleanup | false |
-| STARTING | 直接 cleanup | false |
-| EXECUTING | 发 stop，进入 STOPPING | 暂未决定 |
-| STOPPING | 直接 cleanup | true |
-
-EXECUTING 超时后最终值：
-
-- 应用8秒内 stop ack：采用 `onStopJob()` 返回值；
-- 没有 ack：STOPPING timeout 强制 true；
-- stop Binder 抛 `RemoteException`：cleanup(true)。
-
----
-
-## 53. 超时是 Handler 最早执行时点，不是实时硬中断
-
-timeout 通过 system_server 主 Looper 的 Handler 延迟消息实现，不是硬件定时器，也不是 wakeup alarm。`sendMessageDelayed()` 的队列调度基于 uptime；JSC 为 dumpsys 保存的 `mTimeoutElapsed` 却是 `elapsedRealtime + timeout`。两者在设备深睡时并不等价。
-
-尤其 BINDING 阶段还没有取得本 JSC 的 WakeLock，深睡可以让 Handler 消息相对展示的 elapsed 目标明显推迟；STARTING 之后虽然本槽持有 WakeLock，主线程拥塞和锁等待仍可延后处理。
-
-因此 dumpsys 的 `timeout at` 是目标时点；超过它仍暂时看到槽未清理，并不自动证明 timeout 逻辑失效。
-
----
-
-## 54. shell timeout 只接受 EXECUTING
-
-`timeoutIfExecutingLocked()` 会匹配 user、source package、可选 jobId，并且要求：
+`closeAndCleanupJobLocked()` 是大多数正常完成、断连、取消和超时的汇合点。核心顺序是：
 
 ```text
-mVerb == VERB_EXECUTING
+固定首个停止原因
+→ 保存 completedJob 局部引用
+→ JobPackageTracker / statsd / BatteryStats 收尾
+→ 释放 WakeLock
+→ unbindService
+→ 清 runningJob / callback / params / service
+→ VERB_FINISHED，mAvailable=true，取消 timeout
+→ onJobCompletedLocked(completedJob, reschedule)
 ```
 
-它把原因设为 `REASON_TIMEOUT` 后进入正常 stop 协议。
+它先清槽再通知 JSS，因此 completion listener 后续触发新分配时，这个 context 已经可被复用。
 
-BINDING、STARTING、STOPPING 中即使 `getRunningJobLocked()!=null`，该 shell helper 也返回 false。方法名里的 Executing 在这里是严格状态，不是泛指“槽非空”。
+### “槽已清理”不等于“逻辑 Job 永远结束”
 
----
+JSS 收到 completion 后按类型处理：
 
-## 55. 完成与取消竞态由锁串行化
+| 情况 | 后续 |
+|---|---|
+| one-shot，`reschedule=false` | 移除旧 JobStatus，不生成失败重试 |
+| `reschedule=true` | 按 backoff 创建新的 JobStatus，失败次数 +1 |
+| periodic 正常完成 | 计算下一周期并登记新的周期实例 |
+| Job 已被显式 cancel/replace | 旧对象可能已不在 Store，completion 不得把它擅自复活 |
 
-考虑网络刚丢失时，工作线程也几乎同时调用 `jobFinished()`：
+reschedule 不是“原 JobStatus 原地继续”，也不是“当前调用栈马上再跑”。新 JobStatus 要重新进入 Controller、约束、Pending和并发分配流程。
 
-```mermaid
-sequenceDiagram
-    participant W as "应用工作线程"
-    participant A as "应用主线程 / JobServiceEngine"
-    participant S as "JSS / Controller"
-    participant C as "JSC + mLock"
+这正好形成 v1 → v2 的代际边界：逻辑 jobId 可以相同，执行对象、callback、参数快照和超时 token 都是新的。
 
-    par 业务完成
-        W->>A: JobService.jobFinished入队
-        A->>C: Binder callback.jobFinished(token)
-    and 约束丢失
-        S->>C: cancelExecutingJobLocked
-    end
-    C->>C: 两条路径在同一mLock下排序
-    Note over C: 先完成者清理；后到者看到FINISHED/旧token而无害
-```
+### cleanup 不会把所有字段机械清零
 
-`JobService.jobFinished()` 不会从任意工作线程直接跨 Binder；它先向应用主线程投递 `MSG_JOB_FINISHED`。真正争夺 JSS `mLock` 的，是随后进入 system_server 的 Binder 回调线程与 JSS/Controller 所在线程。它不保证哪一条先发生，但保证不会无锁并发地清理两次当前代。
+为了支持上一章的抢占交接，`mPreferredUid` 不在统一 cleanup 中清掉；由后续 JCM 分配决定何时使用或清除。`mStoppedReason/mStoppedTime` 也保留给 inactive slot 的诊断，下一次成功接受 bind 后再重置。
 
----
+所以检查 cleanup 不能只问“字段是否全部归零”，而要问“哪些状态属于当前代，哪些信息要跨到诊断或下一轮分配”。
 
-## 56. jobFinished 在 STOPPING 中也能结束本代
+## JobWorkItem 怎样复用本章的代际保护
 
-`doCallbackLocked()` 对 EXECUTING 与 STOPPING 都调用 `handleFinishedLocked()`。
+`JobScheduler.enqueue()` 允许同一个 Job 内有多个 `JobWorkItem`。它没有另造一套执行槽协议，而是经当前 `JobParameters.callback` 调用 JSC。
 
-因此若 stop 已发出，而应用工作线程先前排队的 `jobFinished(params, x)` 抢在 stop ack 前到达，它也可能成为第一个合法完成通知，并以自己的 `x` 决定 reschedule。
-
-随后到来的 stop ack 因 callback 已失效而被忽略。结论不是“stop ack 永远优先”，而是：
-
-> 当前 token 的第一个有效完成回调在锁内收束本代，后续回调成为 stale。
-
----
-
-## 57. `closeAndCleanupJobLocked()` 的完整顺序
-
-```mermaid
-flowchart TD
-    ENTER["closeAndCleanupJobLocked"] --> GUARD{"已经FINISHED？"}
-    GUARD -->|是| RETURN["直接返回"]
-    GUARD -->|否| STATS["固定reason，noteInactive，stats/BatteryStats"]
-    STATS --> WL["release WakeLock"]
-    WL --> UNBIND["unbindService"]
-    UNBIND --> CLEAR["清job/callback/params/service，FINISHED，可用"]
-    CLEAR --> TIMEOUT["移除timeout"]
-    TIMEOUT --> JSS["JSS.onJobCompletedLocked(job,reschedule)"]
-```
-
-先清空槽再通知 JSS 很重要：JSS 后续 greedy 检查看到的是真实空槽。
-
----
-
-## 58. cleanup 做了哪些统计收尾
-
-在字段清空前，JSC：
-
-- `JobPackageTracker.noteInactive()`；
-- 写 statsd 的 FINISHED 状态；
-- 调 `BatteryStats.noteJobFinish()`；
-- 保留首个停止调试原因供 inactive slot dump；
-- 释放本次 WakeLock。
-
-统计中的 stop reason 来自 `mParams` 数值字段；dumpsys inactive 文本来自 `mStoppedReason`。`JobParameters.stopReason` 的 Java `int` 默认值是0，而0又恰好等于 `REASON_CANCELED`。正常 `jobFinished()` 若从未经过 `setStopReason()`，统计中也可能出现这个默认数值；它不证明系统真的发过 cancel。与此同时，JSC 调试文本可以是“app called jobFinished”，两类字段必须结合起来看。
-
----
-
-## 59. cleanup 清什么，不清什么
-
-它清空：
+系统内部维护两张队列：
 
 ```text
-mRunningJob
-mRunningCallback
-mParams
-service
-mCancelled
-mWakeLock
+pendingWork   等 App 领取
+executingWork 已领取、尚未 complete
 ```
 
-并设置：
+`dequeueWorkLocked()` 把队首从 pending 原子移动到 executing，并增加 delivery count；`completeWorkLocked(workId)` 从 executing 删除对应项并撤销该 WorkItem 的 URI grant。
+
+两个完成边界容易混淆：
+
+- App 再次 dequeue，发现 pending 为空且 executing 也为空：JSC 自动把整个 Job 当作完成；
+- App complete 最后一个 executing item：只完成这一项，不在该方法里自动结束整个 Job；App 还要再 dequeue 到 null 或按 API 约定结束。
+
+若失败重试生成新 JobStatus，旧代 executing work 会先放回新代 pending 前部，再接上原 pending work；这让“已领取但未确认完成”的工作有机会重新投递。若彻底停止且没有 incoming Job，则撤销剩余 WorkItem 的授权并清队列。
+
+WorkItem 的 dequeue/complete 同样验证本代 callback，所以 v1 不能用旧 params 去领取或确认 v2 的工作。
+
+## 线程模型：跨进程不等于都在 Binder 线程完成
+
+完整线程接力可以概括为：
 
 ```text
-mVerb=FINISHED
-mAvailable=true
+system_server 调度入口（主 Handler、Binder 入口等）
+→ 持 JSS mLock 修改 JSC
+→ oneway IJobService 到 App Binder 线程
+→ JobServiceEngine Handler 到 App 主线程
+→ IJobCallback 回 system_server Binder 线程
+→ 持同一 mLock 校验 token 并推进状态
 ```
 
-它不会在这里销毁 JSC，也不会必然清掉 `mPreferredUid`。抢占时保存的 preferred UID 要留给下一轮 JCM；下一代真正 execute 时才清除，或 JCM 判断无需保留时清除。
+JSC timeout Handler 使用构造时传入的 system_server 主 Looper；`onServiceConnected()` 默认也在 system_server 的相应主线程分发。与此同时，App 发回的 `IJobCallback` 可以进入 system_server Binder 线程。
 
-正常 cleanup 也不把 `mExecutionStartTimeElapsed`、`mTimeoutElapsed` 归零；空槽文本 dump 不使用它们，下一代执行/安排 timeout 时会覆盖。bind 立即失败的特殊分支会把 `mExecutionStartTimeElapsed` 清零，但同样不能据此概括成“每次结束所有时间字段都归零”。
+正确的不变量是：共享的 running/callback/verb/timeout 状态在 JSS `mLock` 下串行检查与修改。不能把原因简化成“所有事件天然都在主线程”。
 
----
+`doCallback()` 还先 `Binder.clearCallingIdentity()`，再持锁处理，最后恢复身份。原因是后续 JSS/Controller 操作不应继续冒用 App 的 Binder 调用身份；这与 callback token 校验解决的是两个不同问题：前者管安全身份，后者管执行代际。
 
-## 60. cleanup 的 `reschedule` 不是“立即再跑”
+## 用 v1 → v2 场景做一次完整推演
 
-JSC 只把 boolean 交给：
+### v1 启动
 
 ```text
-JobSchedulerService.onJobCompletedLocked(completedJob, reschedule)
+FINISHED
+→ executeRunnableJob：callback-v1，BINDING，18秒
+→ Service connected：取得 WakeLock，STARTING，8秒
+→ App 主线程 onStartJob 返回 true
+→ ack-v1：EXECUTING，10分钟
 ```
 
-若 true，JSS 构造新的失败重试 JobStatus：
+App 应把同步工作放到 worker，并保存 params-v1 供本代结束时使用。
+
+### 网络约束丢失
 
 ```text
-failure count + 1
-按 linear/exponential backoff 算新的 earliest runtime
-保留约束并让 Controller 迁移必要状态
-重新进入 JobStore 与 tracking
+cancelExecutingJobLocked(CONSTRAINTS_NOT_SATISFIED)
+→ EXECUTING → STOPPING，8秒
+→ App 主线程 onStopJob(params-v1)
+→ App 先取消 worker，再返回 true 请求重试
+→ ackStop-v1 → cleanup
 ```
 
-它仍要等待 backoff、约束、隐式门、pending 队列和并发槽，绝非在 cleanup 调用栈中马上重启。
+JSS 创建带 backoff 的 Job 42-v2；它不会在 cleanup 的同一时刻绕过约束直接执行。
 
----
-
-## 61. 失败重试不是原 JobStatus 原地继续
-
-`getRescheduleJobForFailureLocked()` 创建 `new JobStatus(old, ...)`。JSS 先创建新对象，再把旧对象从 Store/Controllers 移除，然后 tracking 新对象。
-
-因此：
+### v2 后来复用 Slot #3
 
 ```text
-旧 callback token 失效
-旧执行代际结束
-新 JobStatus 有新的 earliest runtime 与 failure count
-下次执行还会创建新 callback token
+mRunningCallback = callback-v2
+mParams = params-v2
 ```
 
-“reschedule”描述逻辑任务继续存在，不描述 Java 对象和线程原地复用。
-
----
-
-## 62. 显式 cancel 后，cleanup(true) 也不一定复活
-
-JSS 的 cancel 流程会先从 JobStore 和 Controllers 移除 Job，再通知占用它的 JSC 停止。
-
-稍后 JSC 即使因 BINDING cancel、断连或 STOPPING timeout 把 `reschedule=true` 回给 JSS，`onJobCompletedLocked()` 也可能发现旧 Job 已不在 Store，于是只触发 greedy 检查，不创建失败重试。
-
-所以必须同时观察：
+若旧 worker 未正确响应取消，迟到调用 `jobFinished(params-v1, false)`：
 
 ```text
-JSC 给出的 reschedule 意图
-旧 Job 在完成时是否仍受 JSS tracking
+params-v1.callback = callback-v1
+callback-v1 != 当前 callback-v2
+→ verifyCallerLocked=false
+→ 忽略旧完成
+→ v2 不受影响
 ```
 
----
+系统端防住了误完成，但应用端仍有责任停止 v1：旧线程继续访问文件、网络或数据库，依然可能与 v2 产生业务竞态。callback token 保护的是 JobScheduler 状态，不会自动修复 App 自己的数据并发。
 
-## 63. 周期 Job 的完成分支不同
+## macOS 静态验证：按四条证据链阅读
 
-若 `reschedule=false`：
+在 AOSP 根目录执行。
 
-- 普通非周期 Job：正常移除；
-- 周期 Job：JSS 根据 period/flex 创建下一周期的新 JobStatus。
-
-若 `reschedule=true`，即使原来是周期 Job，也先走失败 backoff 重试路径，并保存原周期窗口所需信息；成功完成后才回归正常周期计算。
-
-周期续排不是应用在 `onStopJob()` 返回 false 就永久取消了 schedule。
-
----
-
-## 64. 完成后为什么发送 GREEDY 检查
-
-JSS 完成新旧 JobStatus 的替换/移除、unprepare、active 状态汇报后，发送：
-
-```text
-MSG_CHECK_JOB_GREEDY
-```
-
-Handler 下一轮会重建 ready/pending，并调用 JCM 分配刚释放的槽。
-
-抢占场景下，这也让 preserved `preferredUid` 生效：同 calling UID 的高优先级替代 Job 有机会优先进入该空槽。
-
----
-
-## 65. 进入 JobWorkItem：一个 Job 内还可有工作队列
-
-应用可用 `JobScheduler.enqueue(job, work)` 把多个 `JobWorkItem` 合并到同一个 Job 定义中。
-
-`JobStatus` 内部区分：
-
-```text
-pendingWork
-  尚未交给应用
-
-executingWork
-  已被应用dequeue、尚未complete
-```
-
-它们仍共享同一个 JSC、同一个 JobParameters callback token 和同一个执行 timeslice，不会每个 WorkItem 占一个槽。
-
-这里先固定一个重要持久化边界：r48 的 Binder `enqueue()` 明确拒绝 `job.isPersisted()`，直接抛 `IllegalArgumentException("Can't enqueue work for persisted jobs")`。`pendingWork`/`executingWork` 是 system_server 内存状态，JobStore 的 persisted XML 不保存它们；它们可在应用进程死亡后由仍存活的 system_server 重投，却不能跨 system_server 或设备重启恢复。`JobWorkItem` 能写入 Parcel 只说明它能跨 Binder，不等于能写入 jobs.xml。
-
----
-
-## 66. enqueue 时如何编号与授权
-
-`enqueueWorkLocked()`：
-
-```text
-分配递增 workId
-若 Intent 带 URI grant flag，则为 source 身份创建权限授权
-加入 pendingWork 尾部
-更新估算网络字节
-```
-
-workId 是这个 JobStatus 工作队列中的内部编号，和 jobId 不同。
-
-应用完成时必须把系统曾经 dequeue 给它的同一 `JobWorkItem` 传给 `completeWork()`。
-
----
-
-## 67. dequeue 是 pending → executing 的原子迁移
-
-合法 callback token 在 JSS `mLock` 下调用：
-
-```java
-JobWorkItem work = pendingWork.remove(0);
-executingWork.add(work);
-work.bumpDeliveryCount();
-```
-
-所以 delivery count 表示这项工作被交给应用的次数。若前一代执行中断、未 complete 的 work 被转回下次 pending，它再次 dequeue 时计数继续增加。
-
-它可帮助应用识别重复交付，却不是框架替应用提供 exactly-once 事务保证。
-
-还有一个 r48 实现细节：`updateEstimatedNetworkBytesLocked()` 只在基础 Job 的估算值已知时累加当前 `pendingWork` 的已知估算，不把已经 dequeue 到 `executingWork` 的项继续算在总量里；dequeue 会触发重算，所以总估算可能下降。它服务于启动前的网络可行性判断，不是“所有未完成工作实际流量”的实时账单。第133章会完整核对未知值与源码注释的偏差。
-
----
-
-## 68. dequeue 空队列可能自动完成整个 Job
-
-JSC 得到 `work=null` 后还检查：
-
-```java
-!mRunningJob.hasExecutingWorkLocked()
-```
-
-如果 pending 为空且也没有任何已交付未完成项，就：
-
-```text
-doCallbackLocked(false, "last work dequeued")
-→ cleanup(false)
-```
-
-因此 enqueue 模式的正确尾声是：处理并 complete 已取 work 后，再调用一次 `dequeueWork()` 得到 null，让系统在锁内确认队列真的空并自动结束。
-
----
-
-## 69. complete 最后一项不会自动结束 Job
-
-`completeWorkLocked(workId)` 只做：
-
-```text
-从 executingWork 删除对应项
-撤销该 WorkItem 的 URI grants
-返回 true
-```
-
-它不检查 pending 是否为空，也不调用 cleanup。
-
-这是有意设计：complete 与另一个线程同时 enqueue 可能竞态；让下一次 dequeue 在系统锁内统一检查“pending 与 executing 同时为空”更安全。
-
----
-
-## 70. 为什么 enqueue 模式不应随便调用 jobFinished
-
-`JobParameters` 文档明确警告：处理 WorkItem 队列时不要用 `jobFinished()` 代替 dequeue-empty 协议，否则可能丢失同时刚入队的工作。
-
-安全循环是：
-
-```text
-dequeue → 处理 → complete
-dequeue → 处理 → complete
-...
-dequeue 返回null → system_server自动完成
-```
-
-若并行处理，可连续 dequeue 多项并任意顺序 complete，但最终仍要再 dequeue 一次触发空队列判定。
-
----
-
-## 71. STOPPING 中 WorkItem API 的边界不完全对称
-
-当前 callback token 仍有效时，`doDequeueWork()` 在 STOPPING 返回 null，不再派发新工作。源码也写了 FINISHED 分支，但正常 cleanup 进入 FINISHED 时已经把 `mRunningCallback` 清空；应用拿旧 token 调用会先在 `assertCallerLocked()` 被判 stale 并抛 `SecurityException`，通常到不了 FINISHED 判断。FINISHED 更像内部防御分支，不能据此承诺外部旧调用会拿到 null。
-
-`doCompleteWork()` 没有同样的状态判断；只要 callback token 仍是当前代，就仍可尝试完成 executing work。
-
-一旦 cleanup 清掉 `mRunningCallback`，旧 token 再 complete 会因 stale 抛 `SecurityException`。因此应用收到 stop 后应尽快停止，不要把这条短窗口理解成可以继续消费队列。
-
----
-
-## 72. 失败重试时 WorkItem 怎样保留
-
-JSS 创建失败重试的新 JobStatus 后，旧 `stopTrackingJobLocked(incomingJob)` 会把：
-
-```text
-旧 executingWork 放到新 pendingWork 前部
-再追加旧 pendingWork
-迁移 nextPendingWorkId
-```
-
-未 complete 的 executing item 下一代会再次 delivery，count 再增加。已经 complete 的项已从 executing 列表删除且授权撤销，不会再次迁移。
-
-若没有 incoming Job、调度被彻底删除，则 pending/executing work 的授权都被撤销并清空。
-
----
-
-## 73. WorkItem URI grant 生命周期
-
-包含合适 grant flag 的 Intent 入队时，system_server 为 source package/user 创建 URI 权限。
-
-正常 `completeWork()` 撤销单项 grant；Job 被彻底移除时批量撤销 remaining pending/executing grants；失败重试迁移则继续保存未完成 work 与 grant。
-
-所以 complete 不只是改一个列表，它也是告诉系统“这项工作对应的临时资源访问可以结束”。
-
----
-
-## 74. WorkItem 贯穿案例
-
-假设 Job 42 有 W1、W2：
-
-```mermaid
-flowchart LR
-    P["pending: W1,W2"] --> D1["dequeue W1，delivery=1"]
-    D1 --> E1["executing: W1；pending: W2"]
-    E1 --> C1["complete W1，撤销W1 grant"]
-    C1 --> D2["dequeue W2，delivery=1"]
-    D2 --> STOP["处理途中系统STOP"]
-    STOP --> DECIDE{"最终reschedule=true且旧Job仍在Store？"}
-    DECIDE -->|"是"| RETRY["失败重试：W2回到新pending"]
-    DECIDE -->|"否"| DROP["撤销W2 grant并丢弃剩余队列"]
-    RETRY --> D3["再次dequeue W2，delivery=2"]
-    D3 --> C2["complete W2"]
-    C2 --> EMPTY["再dequeue得到null，自动cleanup"]
-```
-
-这是一种 at-least-once 风格边界：W2 的业务副作用需要应用自己设计幂等性。
-
----
-
-## 75. Binder identity 为什么要清除
-
-`doDequeueWork()` 与 `doCompleteWork()` 是从应用进入 system_server 的 Binder 调用。JSC 使用：
-
-```java
-long ident = Binder.clearCallingIdentity();
-try {
-    synchronized (mLock) { ... }
-} finally {
-    Binder.restoreCallingIdentity(ident);
-}
-```
-
-这样内部权限、URI、JobStatus 操作不会意外继续携带外部应用的 Binder calling identity；离开方法前无论成功还是抛异常都恢复。
-
-生命周期 ack/jobFinished 路径也采用同样的 clear/restore 模式。
-
----
-
-## 76. system_server 内并非所有入口都在同一线程
-
-JSC 的事件来源包括：
-
-```text
-JCM/JSS 调 execute 或 cancel
-ServiceConnection 回调（system_server 主线程）
-JobServiceHandler timeout（构造时传入 JSS 主 Looper）
-IJobCallback（Binder 线程）
-```
-
-应用侧 start/stop 则经 Engine Handler 到应用主线程。
-
-正确并发不变量是 JSC/JSS 共享状态由同一个 `mLock` 串行化；不要简写成“所有 JSC 代码天然只跑主线程”。
-
----
-
-## 77. `mRunningJob` 的注释给出读写规则
-
-源码注明：
-
-```text
-非 Handler 线程的 dereference 必须持 mLock
-写入只允许 Handler 线程或 executeRunnableJob()
-```
-
-实际关键公开/包内入口也普遍在锁内。`@GuardedBy("mLock")` 是阅读线索，但注解本身不会在运行时自动加锁。
-
-判断一个竞态是否成立，应跟到调用点确认锁，而不是只看方法名带 Locked 就凭感觉断言。
-
----
-
-## 78. onServiceConnected 也显式持同一把锁
-
-ServiceConnection 通常在 system_server 主 Looper 回调，但 JSC 仍 `synchronized(mLock)`。
-
-这是为了与来自 Binder 线程的完成、来自 Controller/JSS 的取消、以及 timeout 消息统一排序。
-
-“当前恰好同 Looper”是实现细节；“共享状态在 mLock 下修改”才是状态机可靠的核心约束。
-
----
-
-## 79. stale timeout 为什么还能打印旧停止原因
-
-cleanup 会把 JSC 的 `mRunningCallback` 清空，但旧 `JobCallback` 对象自己的：
-
-```text
-mStoppedReason
-mStoppedTime
-```
-
-仍保存最后一次 `applyStoppedReasonLocked()` 写入的信息。
-
-因此迟到 timeout 或非法 WorkItem 调用能在日志里解释“这代 Job 何时、因何已经停止”，而不需要重新引用已被复用的 JSC 当前字段。
-
----
-
-## 80. stop reason 只固定首条调试文本
-
-`applyStoppedReasonLocked(reason)` 仅当：
-
-```text
-reason != null && mStoppedReason == null
-```
-
-才写 JSC 与 callback 的调试字段。
-
-这样在多个取消、回调、cleanup 原因连续到来时，dumpsys 尽量保留最早触发停止的解释，而不是被后续“完成清理”文本覆盖。
-
-它不是不可变的 `JobParameters.stopReason`；后者由不同取消入口设置数值原因。
-
----
-
-## 81. dumpsys 怎样观察状态机
-
-有设备时：
+### 1. 验证五态和三组 timeout
 
 ```bash
-adb shell dumpsys jobscheduler
-```
-
-`Active jobs` 中每个 Slot 可看到：
-
-```text
-当前 JobStatus
-Running for
-timeout at
-Evaluated priority
-madeActive 与 pending 时长
-```
-
-空槽若保存过停止文本，则显示 inactive since 与 stopped because。
-
-但 r48 文本 dump 没直接打印 `VERB_STARTING` 这样的 mVerb 名称；可结合 timeout 剩余、日志和 trace 判断所在阶段。
-
----
-
-## 82. `Running for`、`madeActive`、业务执行三种时间
-
-```text
-executionStartTime
-  JSC bind前记录，覆盖完整槽生命周期
-
-madeActive
-  bind请求返回true后由JobPackageTracker记录，使用uptime
-
-业务EXECUTING时间
-  start ack(true)后开始10分钟timer
-```
-
-它们不但起点不同，时钟也不同：前者 elapsed realtime，tracker 使用 uptime。另一个更隐蔽的双时钟边界是 timeout Handler 按 uptime 延迟，而 `timeout at` 以 elapsed realtime 保存和展示；深睡时二者会产生偏移。
-
-不要直接相减混算，也不要把 dumpsys 的 Running for 当成应用工作线程已经执行的时间。
-
----
-
-## 83. 常见误解一：executeRunnableJob=true 就已调用 onStartJob
-
-错误。它最多说明 bind 请求被接受；后面还有 ServiceConnection、WakeLock、oneway start、应用主线程消息与 start ack。
-
----
-
-## 84. 常见误解二：onStartJob=true 表示成功
-
-错误。它表示还有异步工作，槽与 WakeLock继续保留；真正完成需要 `jobFinished()` 或 WorkItem 空队列协议。
-
----
-
-## 85. 常见误解三：10分钟一到线程立刻消失
-
-错误。10分钟到期只使 JSC 发 `onStopJob()` 并进入 STOPPING，还给应用8秒 ack 窗口；framework 也不会直接中断应用工作线程。
-
----
-
-## 86. 常见误解四：任何取消都会立即 onStopJob
-
-错误。BINDING/STARTING 只标 `mCancelled`，等待连接或 start ack/timeout；只有 EXECUTING 直接发 stop。
-
----
-
-## 87. 常见误解五：jobId 能防止旧回调
-
-错误。同一 jobId 会有多个运行代际。真正防线是每次 execute 新建的 `JobCallback` 对象身份。
-
----
-
-## 88. 常见误解六：onStopJob=true 允许旧任务继续
-
-错误。本代必须停止并 cleanup；true 只请求 JSS 创建受 backoff 与全部门控约束的新 JobStatus。
-
----
-
-## 89. 常见误解七：complete 最后一项会自动结束
-
-错误。必须再 `dequeueWork()` 一次，由 system_server 同时确认 pending 和 executing 都为空后自动完成。
-
----
-
-## 90. 常见误解八：WakeLock 从 bind 请求开始
-
-错误。r48 在 `onServiceConnected()` 后才 acquire；BINDING 等待阶段不持本 JSC 的执行 WakeLock。
-
----
-
-## 91. 常见误解九：disconnect 就算业务成功
-
-错误。JSC 以 `cleanup(true)` 处理意外断连，表达失败重试意图；最终是否重试还要看旧 Job 是否仍在 Store。
-
----
-
-## 92. 常见误解十：reschedule=true 会立刻运行同一对象
-
-错误。JSS 创建新 JobStatus，计算 backoff，重新 tracking；之后仍参与 ready、pending 与并发竞争。
-
----
-
-## 93. 面试题：为什么需要 STARTING 状态
-
-参考回答：
-
-`IJobService.startJob()` 是 oneway，system_server 无法从同步返回值知道应用主线程是否处理以及 `onStartJob()` 返回什么。STARTING 表示“启动请求已发，等待反向 ack”，并用8秒防止应用主线程卡死或 Binder 消息失联。
-
-如果只说“STARTING 是任务刚开始”，没有解释双向 Binder 协议，就没有抓到源码本质。
-
----
-
-## 94. 面试题：怎样避免旧 jobFinished 清掉新 Job
-
-参考回答：
-
-每个执行代际创建新的 `JobCallback` Binder stub，并把它放入本代 `JobParameters`。回调回到 system_server 后比较 callback 对象是否等于当前 `mRunningCallback`。jobId 可重复，不能单独作为运行代际标识。
-
-timeout 消息也携带同一个 callback token，从而避免旧 timeout 误杀新代。
-
----
-
-## 95. 面试题：onStartJob 与 onStopJob 的 true 各是什么
-
-```text
-onStartJob=true
-  本次仍有异步工作，稍后需主动完成
-
-onStopJob=true
-  本次必须停止，但请求按失败backoff再调度
-```
-
-前者延长当前代，后者结束当前代并请求未来新代；语义方向相反。
-
----
-
-## 96. macOS 只读练习一：画出五态与 timeout
-
-```bash
-sed -n '65,100p' \
-  frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobServiceContext.java
-
-sed -n '719,876p' \
+rg -n -C 8 'VERB_BINDING|OP_BIND_TIMEOUT_MILLIS|scheduleOpTimeOutLocked' \
   frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobServiceContext.java
 ```
 
-在纸上为每个状态标出：
+预期观察：BINDING 单独使用 18 秒，EXECUTING 使用 10 分钟，其他等待 ack 的状态使用 8 秒；切状态会重排 timeout。
 
-1. 谁触发进入；
-2. timeout 多长；
-3. timeout 后是直接 cleanup 还是先 stop；
-4. 传给 JSS 的 reschedule 是 true、false 还是由应用决定。
-
----
-
-## 97. macOS 只读练习二：追 start 双向 Binder
+### 2. 验证 oneway 请求与反向 callback
 
 ```bash
-rg -n "oneway|startJob|acknowledgeStartMessage|MSG_EXECUTE_JOB|onStartJob" \
+rg -n -C 8 'oneway interface IJobService|acknowledgeStartMessage|acknowledgeStopMessage' \
   frameworks/base/apex/jobscheduler/framework/java/android/app/job/IJobService.aidl \
   frameworks/base/apex/jobscheduler/framework/java/android/app/job/IJobCallback.aidl \
-  frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobServiceEngine.java \
+  frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobServiceEngine.java
+```
+
+预期观察：start/stop 本身没有返回值；App Handler执行回调后，经 IJobCallback 把 boolean 反向送回。
+
+### 3. 验证代际 token
+
+```bash
+rg -n -C 10 'mRunningCallback = new JobCallback|verifyCallerLocked|message.obj == mRunningCallback' \
   frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobServiceContext.java
 ```
 
-分别标注：system_server 主线程、应用 Binder 线程、应用主线程、system_server Binder 线程。
+预期观察：每次 execute 新建 callback；普通回调和 timeout 都用对象身份与当前代比较。
 
----
-
-## 98. macOS 只读练习三：证明 token 而非 jobId 判代
+### 4. 验证 cleanup 与重试是两层
 
 ```bash
-rg -n "new JobCallback|verifyCallerLocked|assertCallerLocked|mRunningCallback|message.obj" \
-  frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobServiceContext.java
-```
-
-回答：
-
-- 生命周期 stale 回调为什么静默 return？
-- WorkItem stale 回调为什么抛 SecurityException？
-- 旧 timeout 为什么不能影响新 Job？
-
----
-
-## 99. macOS 只读练习四：追 cleanup 到 backoff
-
-```bash
-rg -n "closeAndCleanupJobLocked|onJobCompletedLocked|getRescheduleJobForFailureLocked|MSG_CHECK_JOB_GREEDY" \
+rg -n -C 12 'closeAndCleanupJobLocked|onJobCompletedLocked|getRescheduleJobForFailureLocked' \
   frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobServiceContext.java \
   frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java
 ```
 
-写出 `reschedule=true` 后旧 JobStatus 被替换、最早运行时间改变、Controller 状态迁移、greedy 检查重新分配的顺序。
+预期观察：JSC 先释放本槽资源再通知 JSS；JSS 根据 reschedule、periodic 和 Store 当前状态决定是否创建新 JobStatus。
 
----
+这些命令能验证 r48 源码事实，不能代替真机测量 App 主线程拥堵时的实际延迟。
 
-## 100. macOS 只读练习五：模拟 WorkItem 队列
+## 检查题与答案
 
-```bash
-sed -n '596,689p' \
-  frameworks/base/apex/jobscheduler/service/java/com/android/server/job/controllers/JobStatus.java
+### 1. `executeRunnableJob()` 返回 true，能否记录“App 已开始执行”？
 
-sed -n '250,324p' \
-  frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobParameters.java
+不能。此时只成功发起绑定并让 JSC 承担该 Job，仍处 BINDING。至少要看到 ServiceConnection、startJob 发送和 App 主线程回调；不同观测点的“开始”定义也要写清。
+
+### 2. `IJobService` 是 oneway，`onStartJob()` 的 boolean 怎么回来？
+
+不是通过原 Binder reply。JobParameters 携带 `IJobCallback`，App 主线程执行完 `onStartJob()` 后另发 `acknowledgeStartMessage(jobId, boolean)` 到 system_server。
+
+### 3. `onStartJob()` 返回 true 是否表示任务成功？
+
+不是。它表示还有异步工作，JSC 进入 EXECUTING。最终还要 `jobFinished()`、停止 ack 或 timeout 收敛。
+
+### 4. `onStopJob()` 返回 true 后，旧线程可以继续吗？
+
+不可以。无论 true/false，本代都必须停止。true 只请求系统以后按重试规则安排新代。
+
+### 5. 10 分钟到期是否立即释放 context？
+
+不是。EXECUTING timeout 先发 stop 并进入 STOPPING；正常等 App ack，最坏再由 STOPPING 的 8 秒 timeout 清理。Handler 调度还不是硬实时秒表。
+
+### 6. v1 与 v2 的 jobId 都是 42，旧 `jobFinished()` 为什么不能结束 v2？
+
+因为 params-v1 携带 callback-v1，JSC 当前保存 callback-v2；`verifyCallerLocked()` 比较 callback 对象身份，二者不同就忽略旧完成。
+
+### 7. 为什么 WorkItem 的 stale callback 要抛异常，而普通迟到完成只是忽略？
+
+普通完成可能是可容忍的重复/迟到通知；旧代 dequeue 或 complete 会改变当前工作队列所有权，风险更高，因此使用 `assertCallerLocked()` 严格拒绝。
+
+### 8. `closeAndCleanup(true)` 是否足以证明 Job 必然重试？
+
+不足。它只是 JSC 向 JSS 传递请求；JSS 还要看旧 Job 是否仍在 Store、是否被显式 cancel/replace，以及是否为周期 Job，然后才决定创建哪个后续 JobStatus。
+
+## 一次可操作练习：画出 callback-v1 的所有去路
+
+请画一张表：
+
+```text
+事件 | 到达时 mVerb | callback 是否当前代 | JSC 动作 | 是否生成新 JobStatus
 ```
 
-用两项 W1/W2 手算：
+依次推演：
 
-1. dequeue 后两个列表怎样变化；
-2. complete 后 grant 怎样变化；
-3. 为什么还要再 dequeue；
-4. stop+reschedule 时未完成 W2 怎样迁移、delivery count 怎样变化。
+1. v1 的 start ack 返回 true；
+2. EXECUTING 第 5 分钟网络丢失；
+3. stop ack 返回 true；
+4. v2 复用同一槽并进入 EXECUTING；
+5. v1 的旧 `jobFinished(false)` 迟到；
+6. v1 的旧 timeout 消息迟到；
+7. v2 正常 `jobFinished(false)`。
 
----
+参考答案：
 
-## 101. macOS 只读练习六：审计 ServiceConnection 版本边界
+| 事件 | 核心判断 | 结果 |
+|---|---|---|
+| start ack-v1=true | token 当前，状态 STARTING | 进入 EXECUTING，安排 10 分钟 |
+| 网络丢失 | 当前 EXECUTING | 进入 STOPPING，发 stop-v1，安排 8 秒 |
+| stop ack-v1=true | token 当前，状态 STOPPING | cleanup v1；JSS 可按 backoff 创建 v2 |
+| v2 启动 | 新 callback-v2 | 槽的新代建立 |
+| old jobFinished-v1 | callback-v1 != callback-v2 | 静默忽略，不完成 v2 |
+| old timeout-v1 | message token != callback-v2 | 记录/忽略，不对 v2 执行 timeout |
+| jobFinished-v2=false | callback-v2 当前，状态 EXECUTING | cleanup v2，不请求失败重试 |
 
-```bash
-rg -n "onServiceConnected|onServiceDisconnected|onBindingDied|onNullBinding" \
-  frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobServiceContext.java \
-  frameworks/base/core/java/android/content/ServiceConnection.java
-```
+再补一句应用侧结论：即使 system_server 正确忽略旧回调，App 仍必须让 v1 worker 真正停止，并用自己的 generation/cancellation 机制避免旧线程继续写业务数据。
 
-确认 r48 JSC 覆写了哪两个、没有覆写哪两个。以后阅读新版本时，若这里出现实现差异，要按新分支重画失败状态机。
+## 最后带走这六句话
 
----
+1. `JobServiceContext` 是 system_server 的可复用执行槽，不是应用的 `JobService`。
+2. BINDING、STARTING、EXECUTING、STOPPING 分别等待连接、start ack、业务完成和 stop ack；18 秒、8 秒、10 分钟不能合成一个总倒计时。
+3. `IJobService` 用 oneway 发 start/stop，boolean 结果通过 `IJobCallback` 的第二次 IPC 返回。
+4. start 的 true 表示“还有工作”；stop 的 true 表示“以后希望重试”，但当前都必须停止。
+5. 每代新建的 `JobCallback` 是执行令牌；jobId 相同也不会让旧回调通过身份校验。
+6. cleanup 结束的是当前槽代际；是否 backoff、周期续排或彻底消失，由 JSS 和 JobStore 的更高层状态决定。
 
-## 102. 阅读检查题
+## 源码索引
 
-1. JSC 与应用 JobService 分别在哪个进程？
-2. 五个 VERB 各代表哪段协议？
-3. BINDING、STARTING、EXECUTING、STOPPING 各用多长 timeout？
-4. 为什么这些 timeout 不是一个总倒计时？
-5. `mRunningJob`、`mAvailable=false`、noteActive 的写入时点有何不同？
-6. JobParameters 为什么叫执行快照？
-7. bind 返回 true 能证明哪些事，不能证明哪些事？
-8. WakeLock 何时 acquire，何时 release，归因给谁？
-9. `IJobService` 为什么用 oneway？
-10. 应用的 start/stop 回调运行在哪个线程？
-11. start true/false 各是什么？
-12. stop true/false 各是什么？
-13. BINDING 和 STARTING 中收到 cancel 后为何不立刻发 stop？
-14. EXECUTING 超时为什么还要进入 STOPPING？
-15. 同 jobId 多代运行如何防 stale callback？
-16. timeout 消息怎样防止误杀新代？
-17. jobFinished 与 cancel 同时到达如何串行化？
-18. cleanup 为什么先清空槽再通知 JSS？
-19. reschedule=true 为什么不等于立即运行？
-20. 显式 cancel 后为何 cleanup(true) 也可能不重试？
-21. pendingWork 与 executingWork 有何区别？
-22. complete 最后一项后为什么仍要 dequeue？
-23. STOPPING 中 dequeue 与 complete 的行为有何差异？
-24. delivery count 为什么要求业务具备幂等性？
+| 目的 | Android 11 r48 文件 |
+|---|---|
+| 五态、timeout、WakeLock、token 与 cleanup | `frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobServiceContext.java` |
+| oneway start/stop | `frameworks/base/apex/jobscheduler/framework/java/android/app/job/IJobService.aidl` |
+| 反向 ack、finish 与 WorkItem 接口 | `frameworks/base/apex/jobscheduler/framework/java/android/app/job/IJobCallback.aidl` |
+| App Binder 到主线程及 boolean 回传 | `frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobServiceEngine.java` |
+| App 回调语义 | `frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobService.java` |
+| 当前代参数与 callback | `frameworks/base/apex/jobscheduler/framework/java/android/app/job/JobParameters.java` |
+| 完成后的 backoff、周期与 Store 处理 | `frameworks/base/apex/jobscheduler/service/java/com/android/server/job/JobSchedulerService.java` |
+| WorkItem pending/executing、转移和授权 | `frameworks/base/apex/jobscheduler/service/java/com/android/server/job/controllers/JobStatus.java` |
 
----
-
-## 103. 一页复习图
-
-```mermaid
-flowchart TB
-    SLOT["JCM分配空槽"] --> PARAM["创建callback token与params快照"]
-    PARAM --> BIND["BINDING：18秒"]
-    BIND --> CONNECT["ServiceConnected：WakeLock"]
-    CONNECT --> START["STARTING：oneway start + 8秒ack"]
-    START -->|false| CLEAN0["cleanup(false)"]
-    START -->|true| RUN["EXECUTING：10分钟"]
-    RUN -->|jobFinished| CLEANX["cleanup(app选择)"]
-    RUN -->|取消/超时| STOP["STOPPING：oneway stop + 8秒ack"]
-    STOP -->|ack| CLEANX
-    STOP -->|超时/RemoteException| CLEAN1["cleanup(true)"]
-    CLEAN0 --> JSS["JSS移除/周期续排/失败重试"]
-    CLEANX --> JSS
-    CLEAN1 --> JSS
-    JSS --> NEXT["greedy检查，再次竞争槽"]
-```
-
----
-
-## 104. 本章结论
-
-JobServiceContext 可以压缩为十五点：
-
-1. r48 用16个长期复用的 JSC 承载真实执行，每槽同一时刻一个 Job；
-2. 五态是 Binder 协议态，不是五种业务进度；
-3. BINDING=18秒、STARTING=8秒、EXECUTING=10分钟、STOPPING=8秒，每次换态重新计时；
-4. bind 返回 true 只表示绑定请求被接受，槽中的 `mRunningJob` 更早已写入；
-5. Service 连接后才取得 source UID 归因的 PARTIAL WakeLock；
-6. `IJobService` 是 oneway，应用 Engine 再把 start/stop 投到主线程；
-7. start true 表示异步继续，stop true 表示结束本代并请求 backoff 重试；
-8. BINDING/STARTING 中 cancel 只先标记，EXECUTING 中才直接发 stop；
-9. 10分钟到期只是进入 STOPPING，不是瞬间终止应用线程或释放槽；
-10. 每次 execute 新建 callback token，jobId 不能单独区分运行代际；
-11. stale 生命周期回调被忽略，stale WorkItem 操作被明确拒绝，timeout 也验证 token；
-12. cleanup 记录统计、释放 WakeLock、解绑、清槽，再通知 JSS；
-13. reschedule=true 会创建受 backoff 和所有约束控制的新 JobStatus，不会原地立即运行；
-14. WorkItem 在 pending/executing 两队列间移动，未完成项失败重试时可重新交付；
-15. complete 最后一项不自动结束，必须再 dequeue，让系统在锁内确认真正空队列。
-
-最值得带走的一句话：
-
-> JSC 管理的不是一个 Java 方法调用，而是一代可超时、可取消、可被迟到消息干扰的跨进程协议；状态、锁与 callback token 共同保证槽能安全复用。
-
----
-
-## 105. 生成后复读：容易误解处的修订
-
-初稿完成后，对照 JSC、JobServiceEngine、两份 AIDL、JobParameters、JobStatus 与 JSS 完成链反向复读，重点修订：
-
-1. 把五态写成协议阶段，避免把 BINDING/STARTING 当成业务已经执行；
-2. 将 BINDING 18秒与 STARTING/STOPPING 8秒分开，不写成“三段都是8秒”；
-3. 明确10分钟到期先发 stop，再有8秒停止回执窗口；
-4. 区分 `mRunningJob` 提前占槽、bind 返回 true、ServiceConnection 与应用回调四个时点；
-5. 限定 WakeLock 从连接到 cleanup，不覆盖前面的 BINDING 等待；
-6. 沿 oneway AIDL 与 Engine 主线程 Handler 展开双向 start/ack；
-7. 用表格纠正 start true 与 stop true 的相反语义；
-8. 按四种状态分别描述 cancel，补出 BINDING/STARTING 只标记的竞态；
-9. 使用 callback 对象身份解释代际，不把 jobId 误当运行 token；
-10. 区分 stale 生命周期回调的静默忽略与 stale WorkItem 的 SecurityException；
-11. 补出 timeout 消息携带 callback token 的二次防线；
-12. 展开 `jobFinished()` 先入应用主线程、再由 system_server Binder 回调与 cancel 争锁的路径，以及谁先拿锁谁收束；
-13. 限定 disconnect 的 true 只是失败重试意图，显式 cancel 已移除 Store 时不会复活；
-14. 把 cleanup 与 JSS backoff/周期/greedy 链拆开，不把 reschedule 写成立即运行；
-15. 补出 r48 未覆写 onBindingDied/onNullBinding，并限定组件校验不是同组件 bind 代际 token；
-16. 将 WorkItem 的 pending→executing→complete→再 dequeue 空队列写成闭环；
-17. 补充当前 token 在 STOPPING 时 dequeue 拒绝新工作、complete 仍可能处理当前项，并说明 cleanup 后旧 token 在 FINISHED 判断前已被拒绝；
-18. 增加 WorkItem 不能与 persisted Job 共用、内存队列不能跨 system_server 重启的持久化边界；
-19. 补出 Handler timeout 使用 uptime、dumpsys目标使用 elapsed，以及 BINDING 深睡可能推迟处理的双时钟边界；
-20. 将只读练习全部限制为 `rg`/`sed`，不要求 macOS 编译 AOSP。
-
-下一章专门进入 `JobWorkItem`：从公开 `enqueue()` 与跨 Binder 副本追到 pending/executing 双队列、隐藏 workId、delivery count、URI grant、同 JobInfo 追加与 replacement、失败重投和“不跨 system_server 重启”的持久化边界；本章只预览的工作队列会在那里完整展开。失败 backoff 与周期窗口计算放到第134章继续。
+下一章会把本章最后预览的 `JobWorkItem` 放大：同一个 Job 里多份工作怎样入队、领取、确认、失败重投，并且让 URI 临时授权跟着正确的一项工作生灭。

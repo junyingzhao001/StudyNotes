@@ -1,885 +1,819 @@
-# 98 Android Binder 性能与故障：线程池饥饿、同步/oneway 队列、锁与调用链诊断
+# 98 Android Binder 性能与故障：线程池饥饿、oneway 积压、锁与调用链诊断
 
-> 源码版本：Android 11（`android-11.0.0_r48`）  
-> 本章目标：将 Binder 驱动对象模型、Parcel/AIDL、system_server 线程模型组合成一套故障分析方法；能从“调用慢、卡住、死亡、大事务、回调积压”追到真正等待链，而不是只归因于 Binder。
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`
+> 阅读方式：不需要编译 AOSP；跟着一个 system_server 卡顿场景，学会从现象追到真正的等待者。
 
----
+这篇文章解决一个很实际的问题：
 
-## 1. “Binder 调用慢”至少包含五段
+> 应用栈停在 `BinderProxy.transactNative()`，system_server 又出现 Binder 线程池告警，
+> 到底是驱动慢、服务慢、oneway 堵了，还是一把锁制造了跨进程死锁？
 
-一次同步调用：
+读完后，你应该能做到四件事：
 
-```text
-客户端调用前工作
-  → Proxy 写 Parcel
-  → 驱动投递/排队
-  → 服务端 Binder 线程执行 Stub 和业务
-  → reply 序列化、驱动返回、客户端读 reply
-```
+- 把一次 Binder “很慢”拆成排队、服务端执行、同步调用方等待三本账；
+- 解释 system_server 的 `31` 是怎样配置的，以及线程为什么不是一次性建齐；
+- 判断 oneway 是“调用方不等业务回复”，而不是“服务端无限并发”；
+- 用线程栈、Perfetto、BinderCallsStats 和 binderfs 快照拼出等待链。
 
-若服务端再 post 到 Handler 并等待：
+一句话结论：
 
-```text
-client
-  → server Binder thread
-      → post server Handler
-      → Binder thread 等 Handler
-          → Handler 排队/执行业务
-      ← signal
-  ← reply
-```
+> Binder 通常只是把阻塞传播给调用方；真正的根因常在服务端锁、下游同步调用或无背压的
+> oneway 生产者。先找到“谁在等谁”，再谈扩线程池。
 
-用户看到的总时长包含所有段。`BinderProxy.transactNative` 只是客户端当前停留点，不等于根因在内核。
+文中的 `ISettingsPolicy`、`IVendorPolicy` 是为诊断教学组合出的接口名，不是声称 AOSP 中存在同名故障。
 
----
+## 1. 问题：点一下设置，为什么像整个系统都卡住了
 
-## 2. 本章源码地图
+先看贯穿全篇的诊断场景。
 
-```text
-frameworks/native/libs/binder/IPCThreadState.cpp
-frameworks/native/libs/binder/ProcessState.cpp
-frameworks/native/libs/binder/BpBinder.cpp
-frameworks/base/core/jni/android_util_Binder.cpp
-frameworks/base/core/java/android/os/Binder.java
-frameworks/base/core/java/android/os/BinderProxy.java
-frameworks/base/core/java/com/android/internal/os/BinderCallsStats.java
-frameworks/base/services/core/java/com/android/server/BinderCallsStatsService.java
-frameworks/base/services/core/java/com/android/server/Watchdog.java
-frameworks/base/core/java/android/os/TransactionTooLargeException.java
-frameworks/base/core/java/android/os/DeadObjectException.java
-```
+用户在设置应用里点击“读取策略”。调用链如下：
 
-当前 checkout 未必含匹配设备的 kernel Binder driver，内核细节应结合设备内核版本；本章以 AOSP Android 11 用户空间和 Binder UAPI 语义为准。
+~~~text
+Settings 主线程
+  → 同步调用 ISettingsPolicy.getEffectivePolicy()
+      → system_server Binder 线程进入 PolicyService
+          → 持有 mLock
+          → 同步调用 vendor 进程 IVendorPolicy.readPolicy()
+~~~
 
----
+vendor 服务把读取工作交给自己的工作线程，并等待结果。
 
-## 3. 同步事务的等待模型
+这个 vendor 工作线程又同步回调 system_server：
 
-AIDL 普通方法默认同步：
+~~~text
+vendor worker
+  → IPolicyCallback.onBeforeRead()
+      → system_server 另一条 Binder 线程
+          → 等待同一个 mLock
+~~~
 
-```text
-Client thread --BC_TRANSACTION--> driver
-Client thread 进入等待
-Driver --BR_TRANSACTION--> Server Binder thread
-Server 执行并 --BC_REPLY--> driver
-Driver --BR_REPLY--> Client thread
-Client 解 reply 后返回
-```
+于是等待关系闭环：
 
-同步调用的优点：
+~~~text
+system_server Binder #12
+  持有 mLock
+  └─ 等 vendor readPolicy() 返回
+       vendor Binder 线程
+       └─ 等 vendor worker 完成
+            vendor worker
+            └─ 等 system_server callback 返回
+                 system_server Binder #19
+                 └─ 等 mLock
+~~~
 
-- 返回值与异常清楚；
-- 顺序直观；
-- 调用完成就是服务端此次方法已返回。
+与此同时，其他调用进入 `PolicyService` 后也等待 `mLock`。当足够多的 Binder 线程都困在这条等待链上，新事务只能排队。
 
-风险：
+另一个客户端还在高频发送：
 
-- 客户端线程被占用；
-- 可形成跨进程等待环；
-- 主线程调用慢服务直接卡 UI；
-- 服务端线程池/Handler/锁问题向客户端传播。
+~~~aidl
+oneway void notifyPolicyInputChanged(int generation);
+~~~
 
----
+这里的 `generation` 是递增的状态版本号：数字越大，代表更新的状态。
 
-## 4. oneway 的真实语义
+调用方看起来“发送很快”，但状态迟迟没有生效。
 
-oneway AIDL 设置 `FLAG_ONEWAY`：客户端把事务提交给驱动后不等待业务 reply。
+这里其实混着三个不同问题：
 
-```text
-Client --oneway--> driver queue → Server Binder thread → method
-Client <立即返回提交结果>
-```
+1. 设置应用为什么一直等？
+2. system_server 的 Binder 线程为什么没有归还线程池？
+3. oneway 为什么返回了，服务端却还没处理？
 
-它不意味着：
+若把三个问题都叫作“Binder 慢”，修复方向很容易跑偏。
 
-- 服务端立即执行；
-- 创建专用后台线程；
-- 无限并发；
-- 业务异常返回给客户端；
-- 不占 Binder buffer/线程/CPU；
-- 不会排队。
+## 2. 先拆三本时间账：排队、执行、同步等待
 
-oneway 解决“客户端是否同步等待”，没有消除服务端工作。
+### 2.1 同步调用方看到的是端到端时间
 
----
+普通 AIDL 方法默认是同步事务。
 
-## 5. oneway 为什么会积压
+~~~mermaid
+sequenceDiagram
+    participant C as 应用调用线程
+    participant D as Binder 驱动
+    participant S as system_server Binder 线程
+    participant V as vendor 服务
+    C->>D: 提交同步事务
+    Note over C: 等待最终 reply
+    D->>S: 投递事务
+    S->>V: 下游同步调用
+    Note over S: 等待下游 reply
+    V-->>S: reply
+    S-->>D: reply
+    D-->>C: 唤醒并返回
+~~~
 
-同一目标 Binder node 的异步事务需要维持序列化/顺序语义。若每个回调耗时 100ms，生产速度又高于消费速度：
+调用方从调用到返回的总时间，大致包含：
 
-```text
-oneway queue: [1][2][3][4][5]...[1000]
-server:          每 100ms 消费一个
-```
+~~~text
+T客户端 =
+  参数序列化
+  + 目标进程排队
+  + 服务端 onTransact 与业务执行
+  + 服务端内部等待
+  + reply 序列化与返回调度
+~~~
 
-客户端调用看似快速成功，但：
+所以客户端栈停在：
 
-- 状态更新越来越迟；
-- Binder buffer 压力增大；
-- 旧事件可能在新状态后很久才到；
-- 其他事务可能被资源竞争影响；
-- 新内核可能报告 one-way spam，但 Android 11 设备能力依内核版本而异。
+~~~text
+android.os.BinderProxy.transactNative
+~~~
 
-回调接口要考虑合并、去重、限流、只传最新状态，而非把每个高频采样都当可靠消息队列。
+只证明“这条线程还在等同步事务结束”。它不能证明 CPU 时间花在 Binder 驱动里。
 
----
+这像打客服电话：你听到的是等待音乐，但真正耽搁可能是坐席在等另一个部门盖章。
 
-## 6. oneway 的顺序不要过度外推
+### 2.2 驱动排队时间回答“多久才有人接单”
 
-可依赖的是 Binder 为特定异步事务流提供的顺序约束；不要推导成：
+排队从事务可被目标进程接收开始，到目标线程真正接到事务为止。
+排队变长可能是：
 
-- 不同 Binder 对象之间全局有序；
-- oneway 与同步事务跨对象严格按客户端源码顺序完成；
-- post 到两个不同 Handler 后仍保持 Binder 接收顺序；
-- 多客户端发送顺序可合成唯一全局顺序。
+- 目标 Binder 线程都在执行或阻塞；
+- 目标线程虽可运行，却长时间没有得到 CPU；
+- 同一 Binder node 的前序异步事务尚未完成；
+- 目标进程被冻结、卡死或正承受严重内存压力。
 
-若业务要求版本一致性，消息应携带 sequence/generation，并在消费端丢弃过期事件。
+排队时间不能只靠一份 Java 栈精确得出。更适合用 Binder ftrace/Perfetto 的 transaction 与 received 事件连接两端。
+### 2.3 服务端执行时间不等于“有效 CPU 计算”
 
----
+服务端从进入 Java Binder Stub 到返回，期间可能：
 
-## 7. Binder 线程池如何增长
-
-native Binder 线程加入池时向驱动发送：
-
-```text
-BC_ENTER_LOOPER / BC_REGISTER_LOOPER
-```
-
-驱动发现线程不足时可返回：
-
-```text
-BR_SPAWN_LOOPER
-```
-
-ProcessState 再按配置生成 Binder 线程，直到上限。system_server Android 11 将最大线程配置提高为 31；普通 native 进程常见默认 15。
-
-上限不是并发能力保证：线程可能全在等待同一把锁，增加数量只会增加等待者。
-
----
-
-## 8. 线程池饥饿的三类根因
-
-### 业务阻塞
-
-Binder 方法直接做磁盘、HAL、网络或长计算。
-
-### 锁竞争
-
-所有线程进入服务后等待同一个全局锁。
-
-### 嵌套同步 IPC
-
-Binder 线程向外同步调用，对端又慢、池耗尽或反向调用。
-
-典型 dump：
-
-```text
-Binder:system_1  waiting on mLock
-Binder:system_2  waiting on mLock
-...
-Binder:system_31 BinderProxy.transactNative → vendor process
-```
-
-真正要找的是持锁者/最末端远端，不是把上限从 31 改成更大。
-
----
-
-## 9. Watchdog 的 BinderThreadMonitor
-
-system_server Watchdog Monitor 调用：
-
-```java
-Binder.blockUntilThreadAvailable();
-```
-
-其 native 目标是等待 Binder 线程可用。若线程池长期被占满，这个 Monitor 不能返回，foreground HandlerChecker 会超时。
-
-它证明“system_server 已无法及时接收入站 IPC”，但不会自动指出哪个事务占满线程。仍需分析所有 Binder 线程栈和依赖图。
-
----
-
-## 10. 同步 Binder 环形死锁
-
-```text
-Process A thread 1 --sync--> Process B thread 1
-Process B thread 1 --sync--> Process A
-```
-
-Binder 支持嵌套事务，并可能让原等待线程处理回入事务，从而缓解某些简单重入。但不能依赖它解决所有环：
-
-- 回调等待 A 中另一 Handler；
-- A 持锁发起 B 调用；
-- B 回调 A 需要同一锁；
-- 多进程、多线程、多锁形成复杂环；
-- 线程池其他线程也已耗尽。
-
-最安全原则仍是：不持关键锁做外部同步 IPC。
-
----
-
-## 11. 锁内 IPC 的标准等待图
-
-```text
-A Binder thread
-  lock(A.mLock)
-  → sync call B
-
-B Binder thread
-  → callback A
-
-A callback Binder thread
-  → wait A.mLock
-
-原 A thread 等 B reply；B 等 callback；callback 等 A.mLock
-```
-
-修复通常不是加 timeout，而是：
-
-- 锁内复制状态/回调列表；
-- 锁外 IPC；
-- 回来后用 generation 验证状态未过期；
-- 必要时拆分事务为异步协议。
-
----
-
-## 12. Handler 二次排队
-
-许多服务为保护状态机：Binder 入站后 post 到 Handler。异步 API 可立即返回；同步 API 有时用 latch 等结果。
-
-耗时拆分：
-
-```text
-Ttotal = Binder driver queue
-       + Stub/permission
-       + Handler delivery latency
-       + Handler dispatch duration
-       + reply serialization
-```
-
-如果 BinderCallsStats 显示方法 wall time 长，CPU time 很短，可能大部分时间在等 Handler/锁/远端，而不是 Binder 方法 CPU 执行。
-
----
-
-## 13. 客户端主线程同步 Binder
-
-客户端主线程调用：
-
-```text
-UI main → BinderProxy.transact → wait service
-```
-
-可能造成卡顿甚至应用 ANR。Framework Manager 经常隐藏 Binder 细节，API 看似普通 Java getter，也可能跨进程。
-
-排查 API 前应确认：
-
-- Manager 是否缓存本地值；
-- 方法是否 AIDL；
-- 是否允许主线程调用；
-- 服务是否可能 I/O/等待；
-- callback/async API 是否更合适。
-
-不能因方法名是 `getX()` 就假设 O(1) 本地读取。
-
----
-
-## 14. `warnOnBlocking` 与 `allowBlocking`
-
-Framework 可启用 Binder Proxy 阻塞调用警告，帮助发现不应同步调用的 Binder。某些已知服务引用通过：
-
-```java
-Binder.allowBlocking(binder)
-```
-
-允许阻塞调用。
-
-这只是诊断策略标记，不会把同步调用改成异步，也不会保证服务快速。看到 `allowBlocking` 应理解为“调用者明确接受这里可能阻塞”，不是性能豁免证书。
-
----
-
-## 15. BinderCallsStats 观测什么
-
-`BinderCallsStatsService` 发布：
-
-```text
-binder_calls_stats
-```
-
-并可通过 `Binder.setObserver()` 安装 `BinderCallsStats`，在 Java Binder 入站事务周围采样/记账。
-
-典型维度包括：
-
-- calling/work-source UID；
-- Binder class 与 transaction code/method；
-- call count、recorded count；
-- CPU time；
-- latency/wall time；
-- request/reply size（配置相关）；
-- exception count；
-- screen interactive 状态等。
-
-具体输出与设置、采样率、detailed tracking 有关，不要把未采样条目当作从未调用。
-
----
-
-## 16. WorkSource UID 为什么需要授权
-
-调用者可携带 work-source attribution，但不能相信任意 UID 声称“耗时算给别人”。`AuthorizedWorkSourceProvider`：
-
-- 默认归因真实 calling UID；
-- 只有白名单 appId（system_server 自身、持特定系统权限包）可设置可信 work source；
-- userId 与 appId 要区分。
-
-因此 Binder 统计既是性能数据，也涉及资源归因安全。
-
----
-
-## 17. BinderCallsStats 的成本
-
-详细追踪可能记录 CPU、latency、Parcel size 和调用 UID，带来：
-
-- 每事务时间读取；
-- map 查找与锁；
-- 内存条目；
-- dump/导出开销。
-
-Android 11 支持 sampling interval、最大条目、detailed tracking 开关。诊断时提高精度，测量本身也可能扰动系统；应记录配置并在完成后恢复。
-
----
-
-## 18. 统计数据不能直接给出等待 owner
-
-BinderCallsStats 能告诉你：
-
-```text
-某 UID 调某 transaction 很多/很慢
-```
-
-但仅靠聚合无法区分：
-
-- 等服务内部锁；
+- 真正在 CPU 上运行；
+- 等 Java 锁或 native 锁；
 - 等 Handler；
-- 等下游 Binder/HAL；
-- 服务自己 CPU 热点；
-- GC/调度延迟。
+- 等磁盘或设备 I/O；
+- 再发同步 Binder，并等待下游 reply。
 
-下一步必须用 Perfetto Binder flow、线程栈、锁 owner 和服务源码还原单次调用链。
+Android 11 的 `BinderCallsStats` 同时取得线程 CPU 时间和 elapsed real time：
 
----
+~~~java
+final long duration =
+        getThreadTimeMicro() - s.cpuTimeStarted;
+final long latencyDuration =
+        getElapsedRealtimeMicro() - s.timeStarted;
+callStat.cpuTimeMicros += duration;
+callStat.latencyMicros += latencyDuration;
+~~~
 
-## 19. transaction code 如何映射方法名
+路径：`frameworks/base/core/java/com/android/internal/os/BinderCallsStats.java`
 
-AIDL Stub 常定义：
+如果 elapsed time 高而线程 CPU time 低，说明“等待”是重要候选；但统计本身不会告诉你在等哪把锁、哪个 Handler 或哪个远端进程。
+### 2.4 三本账如何配合
 
-```java
-static final int TRANSACTION_doWork = FIRST_CALL_TRANSACTION + N;
-```
-
-并可实现 `getDefaultTransactionName(code)`。诊断输出只有 code 时：
-
-1. 找接口 Stub。
-2. 搜 `TRANSACTION_` 常量。
-3. 看 onTransact case。
-4. 对照参数反序列化和目标方法。
-
-native AIDL/HIDL 需到对应生成后端代码/接口定义映射，不能把不同 descriptor 下相同 code 当同一方法。
-
----
-
-## 20. TransactionTooLargeException 的边界
-
-Android 11 r48 的 Java Binder JNI 对 `FAILED_TRANSACTION` 使用启发式映射：当该调用允许抛
-`RemoteException` 且本次 data Parcel 大于 `200 * 1024` 字节时，抛
-`TransactionTooLargeException`；较小 Parcel 则通常按“远端可能已死”映射为
-`DeadObjectException`（不允许抛受检异常的入口会变成 RuntimeException）。源码注释同时明确：
-事务过大是 `FAILED_TRANSACTION` 最常见的原因，但驱动还可能因 malformed transaction、已关闭
-FD 等原因给出同类失败，所以这个异常仍是启发式诊断，不是驱动返回的精确失败分类。
-
-所以该异常表示“本次 data Parcel 已越过 r48 JNI 的 200 KiB 启发式门槛”，也是大事务/
-transaction buffer 压力的强线索，但仍不是“刚好越过固定 Binder 上限”的证明；排查还应考虑：
-
-- request 大；
-- reply 大；
-- 进程共享 Binder buffer 中并发未完成事务多；
-- 大量 oneway 排队占用 buffer；
-- FD/Binder 对象数组与偏移开销；
-- 驱动其他失败状态被粗粒度映射。
-
-不要杜撰一个适用于所有设备/版本/并发状态的“刚好固定最大单 Parcel 字节数”。
-
----
-
-## 21. request 大还是 reply 大
-
-异常可能在调用发出或读取回复阶段暴露。应查看接口：
-
-- 入参是否 Bundle、Intent extras、大 List、Bitmap/byte[]；
-- out/return 是否返回大集合；
-- 服务是否把数据库全量结果一次返回；
-- 是否在 Activity lifecycle state 保存大对象。
-
-解决：分页、流式接口、共享内存/FD、ContentProvider、文件、只传标识符后按需读取。
-
-“捕获异常重试同样大数据”通常只会再次失败并增加压力。
-
----
-
-## 22. Binder buffer 是进程共享压力
-
-应用文档常用约 1MB 解释 Binder transaction buffer，但重要语义是：buffer 空间由进程中在途事务共享，而不是每个调用独享一个永远固定的完整额度。
-
-因此：
-
-```text
-单次 700KB 可能失败
-多个并发 200KB 也可能失败
-同样 payload 在不同瞬间结果可能不同
-```
-
-设计 IPC 时应远低于极限，不能以实验“这台设备偶尔能过”作为协议保证。
-
----
-
-## 23. DeadObjectException
-
-表示目标 Binder 所在进程/对象已死亡或连接不可用。它回答的是存活性，不解释死亡原因。
-
-客户端恢复链：
-
-```text
-DeadObject/death recipient
-  → 使本地代理/session/callback 状态失效
-  → 避免在 Binder 回调线程做重恢复
-  → 重新查询/绑定服务
-  → 重新注册 callback
-  → 使用 generation 防旧回调污染
-```
-
-不要对每个 DeadObject 立即无限 tight-loop 重试；服务可能在 crash loop，重连需要退避和系统生命周期信号。
-
----
-
-## 24. `linkToDeath` 的竞态
-
-可能发生：
-
-- 调用前服务已死；
-- `linkToDeath` 时已死；
-- 注册成功后立即死亡；
-- 死亡回调和新服务注册交错；
-- 旧 death recipient 晚到，误清理新连接。
-
-使用连接 generation：
-
-```text
-connect generation=7
-death callback captures 7
-later reconnect generation=8
-old death(7) arrives → 不清理 generation 8
-```
-
-死亡通知是边沿信号，不是完整状态同步；重连后仍需重新拉取快照。
-
----
-
-## 25. RemoteException 的错误分层
-
-客户端看到 RemoteException 可能来自：
-
-- Binder transport/目标死亡；
-- 服务端写入远程异常协议；
-- AIDL wrapper 转换；
-- transaction failure。
-
-Framework Java Manager 常调用：
-
-```java
-throw e.rethrowFromSystemServer();
-```
-
-转换为 RuntimeException。排查不能只看客户端最终异常类，要找原始 cause、服务端日志和 transaction。
-
-业务错误应尽量用明确返回/typed exception，而不是让所有失败都表现为 RemoteException。
-
----
-
-## 26. 服务端异常与 oneway
-
-同步调用可把受支持异常写入 reply，客户端读出。oneway 没有 reply，服务端异常不能按同步方式返回客户端。
-
-因此 oneway 权限检查失败可能只在服务端日志可见，客户端“调用返回”并不证明业务成功。
-
-需要确认完成时应设计：
-
-- 单独 callback 带 requestId；
-- 状态查询；
-- 结果事件；
-- 有界超时/取消；
-- 幂等重试。
-
----
-
-## 27. 高调用频率与单次慢是不同问题
-
-```text
-接口 A：每次 20ms，每秒 1 次
-接口 B：每次 0.2ms，每秒 5000 次
-```
-
-B 每秒总 CPU 可能更高。诊断同时看：
-
-- call count；
-- recorded/sample count；
-- total CPU/latency；
-- max latency；
-- per-call average；
-- payload size；
-- 调用方 UID 分布。
-
-优化热点不只按“平均最慢”排序。
-
----
-
-## 28. 批处理的收益与风险
-
-把 100 次小 IPC 合并为 1 次可减少：
-
-- syscall/transaction 固定开销；
-- Parcel header；
-- 上下文切换；
-- 服务端锁进入次数。
-
-但批过大又会：
-
-- 增加 TTLE 风险；
-- 单次 Binder 线程占用更久；
-- 提高尾延迟；
-- 失败时重试成本更大。
-
-需要有界 batch、分页和背压，而不是“越大越好”。
-
----
-
-## 29. dump 调用也会占 Binder 资源
-
-`dumpsys` 通常通过 Binder 请求服务 dump。若 dump：
-
-- 持服务主锁遍历大状态；
-- 在锁内调用远端；
-- 写大量文本而 pipe 消费慢；
-- 执行同步 I/O；
-
-会占用 Binder 线程并影响业务。
-
-优秀 dump 应复制快照后锁外输出、支持参数缩小范围、避免触发副作用，并处理 fd 写阻塞。
-
----
-
-## 30. Binder 优先级继承不是万能药
-
-Binder 驱动/运行时可参与调度优先级传播，system_server 又禁用后台降级，但它不能解决：
-
-- 锁 owner 是低优先级非 Binder 线程；
-- 等 I/O；
-- Binder 环死锁；
-- oneway 队列积压；
-- 服务端算法慢；
-- CPU 热降频。
-
-优先级只影响 Runnable 线程调度，不创造缺失的 reply 或释放锁。
-
----
-
-## 31. Perfetto 的 Binder 调用链
-
-合适配置下可看到客户端 transaction、目标线程、reply/flow。步骤：
-
-1. 定位客户端长 `binder transaction`。
-2. 沿 flow 到服务端 Binder thread。
-3. 看服务端何时 runnable/running。
-4. 若服务端又发 Binder，继续沿 flow。
-5. 若 post Handler，找对应 trace/message。
-6. 若 blocked，结合 stack 找 lock owner。
-7. 沿依赖直到最后一个真正执行/等待外部资源的节点。
-
-这比只截客户端 ANR 栈更接近根因。
-
----
-
-## 32. 没有 Perfetto 时如何画等待图
-
-收集同一时刻：
-
-- 客户端 traces；
-- system_server traces；
-- 目标 native/HAL 进程 traces；
-- BinderCallsStats/dumpsys；
-- logcat transaction/slow-call；
-- kernel binder state（设备允许时）。
-
-手动画：
-
-```text
-App main
- └─ waits IPackageManager.foo
-      SystemServer Binder #8
-       └─ waits mPackages lock
-            owner: PackageManager main
-             └─ waits installd Binder
-                  installd worker
-                   └─ blocked disk I/O
-```
-
-最后一段 disk I/O 才是根因候选。
-
----
-
-## 33. BinderCallsStats 常用思路
-
-有权限的调试设备可观察：
-
-```bash
-adb shell dumpsys binder_calls_stats
-adb shell dumpsys binder_calls_stats --help
-```
-
-具体参数以该 Android 11 checkout/设备 `--help` 为准，因为不同版本开关会变化。
-
-建议流程：
-
-1. reset。
-2. 控制时间窗口复现。
-3. 导出调用统计。
-4. 找总 CPU、总 latency、次数、异常/大 Parcel 线索。
-5. 映射 transaction code。
-6. 对候选接口采 Perfetto/stack。
-7. 恢复 detailed/sampling 配置。
-
----
-
-## 34. 常见故障症状对照
-
-| 症状 | 首要怀疑 | 关键证据 |
+| 要回答的问题 | 首选证据 | 不能单独证明什么 |
 |---|---|---|
-| 单个同步调用偶发很慢 | 锁、下游 IPC、I/O、调度 | 单次 Perfetto + stacks |
-| 大量服务一起无响应 | system_server Binder 池/全局锁 | 所有 Binder 线程栈 |
-| oneway 客户端快但状态迟到 | 异步队列/Handler 积压 | transaction/queue 时间线 |
-| `TransactionTooLargeException` | request/reply/共享 buffer 压力 | payload、并发在途事务 |
-| `DeadObjectException` | 目标进程死亡/重启 | death log、tombstone、service re-register |
-| CPU 高但单次不慢 | 高频小 IPC | call count + total CPU |
-| Watchdog Binder monitor | 无可用 system_server Binder thread | Binder thread dump/等待图 |
+| 调用方总共等了多久 | 客户端 trace、方法埋点、Perfetto | 根因就在客户端或驱动 |
+| 事务多久才到服务线程 | Binder flow / ftrace | 服务方法内部做了什么 |
+| Stub 进入后耗时在哪 | 服务端栈、服务 trace、CPU/elapsed 对比 | 排队前发生了什么 |
 
----
+诊断时先明确自己在量哪一本账。把三者混成一个“Binder latency”，后面的优化很难验证。
 
-## 35. 修复线程池饥饿的优先顺序
+## 3. 机制：system_server 的 Binder 线程池怎样长到配置上限
 
-1. 找到占用线程的共同栈/等待点。
-2. 找真正 lock owner 或下游服务。
-3. 缩短 Binder 入站同步工作。
-4. 锁外做外部 IPC。
-5. 对可异步工作 post，但保留协议语义。
-6. 拆分大锁/使用不可变快照。
-7. 限制高频调用和 oneway 生产速率。
-8. 最后才评估线程上限。
+### 3.1 31 是配置值，不是预先创建的线程数
 
-单纯扩池常把“31 个线程卡住”变成“63 个线程卡住”，还扩大内存和竞争。
+Android 11 r48 的 `SystemServer` 明确把最大线程配置为 31：
 
----
+~~~java
+// maximum number of binder threads used for system_server
+// will be higher than the system default
+private static final int sMaxBinderThreads = 31;
+// Increase the number of binder threads in system_server
+BinderInternal.setMaxThreads(sMaxBinderThreads);
+~~~
 
-## 36. 接口设计阶段的性能检查表
+路径：`frameworks/base/services/java/com/android/server/SystemServer.java`
 
-- 方法必须同步返回吗？
-- 是否能 callback/requestId？
-- 高频状态能共享内存/监听变化而非轮询吗？
-- List 是否分页、有最大数量吗？
-- Parcel 是否可能含 Bitmap/大 byte[]/嵌套 Bundle？
-- oneway 是否有背压/合并？
-- 服务端是否持锁外调？
-- 回调死亡如何清理？
-- 调用方 UID/WorkSource 如何归因？
-- 是否能取消过期请求？
-- dump 是否复制快照并限量？
+JNI 最终调用：
 
-IPC 性能首先是协议设计问题，其次才是微优化序列化代码。
+~~~cpp
+static void android_os_BinderInternal_setMaxThreads(
+        JNIEnv*, jobject, jint maxThreads) {
+    ProcessState::self()
+            ->setThreadPoolMaxThreadCount(maxThreads);
+}
+~~~
 
----
+`ProcessState` 再通过 `BINDER_SET_MAX_THREADS` 告诉驱动。
 
-## 37. 常见误区纠正
+普通 libbinder 进程打开驱动时的默认配置是 15：
 
-### 误区 1：栈停在 transactNative，Binder 驱动就是根因
+~~~cpp
+#define DEFAULT_MAX_BINDER_THREADS 15
 
-错误。客户端只是等待，根因常在服务端或更下游。
+size_t maxThreads = DEFAULT_MAX_BINDER_THREADS;
+result = ioctl(fd, BINDER_SET_MAX_THREADS, &maxThreads);
+~~~
 
-### 误区 2：oneway 不会阻塞任何线程
+system_server 随后把自己的配置改为 31。这不是说所有进程都是 31，也不是说启动时已经存在 31 条工作线程。
 
-错误。客户端不等 reply，服务端仍执行并可能积压。
+更准确的理解是：
 
-### 误区 3：线程池耗尽就把上限调大
+> 31 是 system_server 交给 Binder 驱动、同时保存在 libbinder 中的池上限配置；
+> 线程按需求增长，上限也不等于同时完成 31 份独立业务的保证。
 
-错误。先找线程为何不归还。
+驱动请求创建的注册线程、主动加入池的线程，以及同步等待期间承接嵌套事务的线程，会让“进程里实际可见多少条相关线程”比一句“池大小等于 31”更复杂。
+### 3.2 第一条池线程由用户空间主动启动
 
-### 误区 4：TTLE 证明单个 Parcel 恰好超过固定 1MB
+`ProcessState::startThreadPool()` 只在第一次调用时创建主池线程：
 
-错误。`FAILED_TRANSACTION` 映射较粗，buffer 还是进程共享压力。
+~~~cpp
+void ProcessState::startThreadPool() {
+    AutoMutex _l(mLock);
+    if (!mThreadPoolStarted) {
+        mThreadPoolStarted = true;
+        spawnPooledThread(true);
+    }
+}
+~~~
 
-### 误区 5：DeadObjectException 是网络超时
+这条线程进入 `joinThreadPool(true)`，向驱动发送 `BC_ENTER_LOOPER`。
 
-错误。它表示 Binder 目标死亡/不可用，不解释原因。
+system_server 走过 `ZygoteInit.nativeZygoteInit()` 后，`frameworks/base/cmds/app_process/app_main.cpp` 会调用 `startThreadPool()`。
+### 3.3 后续线程是驱动按需提出、用户空间创建
 
-### 误区 6：BinderCallsStats 能直接显示锁 owner
+当驱动判断需要补充线程且未超过配置边界时，会返回 `BR_SPAWN_LOOPER`。libbinder 的处理很直接：
 
-错误。它是聚合入口数据，需结合 trace/stack。
+~~~cpp
+case BR_SPAWN_LOOPER:
+    mProcess->spawnPooledThread(false);
+    break;
+~~~
 
-### 误区 7：平均延迟最低的接口无需优化
+新线程用 `joinThreadPool(false)` 加入，并发送 `BC_REGISTER_LOOPER`。
 
-错误。高频接口总 CPU 可能最大。
+可以把它想成收费站：
 
-### 误区 8：allowBlocking 会让调用更快
+- `startThreadPool()` 先开一个窗口；
+- 排队出现且符合驱动条件时，驱动亮出“再开窗口”的牌子；
+- 用户空间收到牌子后创建线程；
+- 达到配置边界后，不会因为队伍继续变长就无限开窗口。
 
-错误。只改变阻塞诊断许可。
+`BR_SPAWN_LOOPER` 的边界也要说清：
 
-### 误区 9：catch RemoteException 就完成恢复
+- 它是驱动给用户空间的请求，不是“一笔事务固定创建一条线程”；
+- `spawnPooledThread()` 只有在池已经启动时才真正创建；
+- 创建线程仍受调度和资源影响，不等于事务立刻开始；
+- 线程已创建也可能全部卡在同一把锁上。
+### 3.4 “线程池满”可能几乎不消耗 CPU
 
-错误。还需清状态、重查服务、重注册 callback 和防旧事件。
+`IPCThreadState` 对正在处理命令的线程计数。当计数长时间顶到本地 `mMaxThreads`，离开饥饿状态时会记录：
 
-### 误区 10：dump 与业务无关
+~~~cpp
+if (starvationTimeMs > 100) {
+    ALOGE("binder thread pool (%zu threads) starved for %"
+          PRId64 " ms", mProcess->mMaxThreads,
+          starvationTimeMs);
+}
+~~~
 
-错误。dump 也可能占 Binder 线程与服务锁。
+这里的 100 ms 是 r48 代码里的日志阈值，不是“超过 100 ms 就一定死锁”。
 
----
+当执行中计数达到 31，而相关线程都睡在锁、条件变量或下游 Binder 上时，线程池已经没有及时处理新入站工作的余量，但 CPU 使用率完全可能不高。
 
-## 38. 第二遍复读：最易混的五种“慢”
+## 4. oneway：不等业务 reply，为什么仍会排队
 
-### 38.1 客户端等待慢
+### 4.1 oneway 省掉的是哪一段等待
 
-只说明端到端同步方法未返回，不证明服务端一直执行 CPU。
+AIDL 的 oneway 最终带上 `TF_ONE_WAY` / `FLAG_ONEWAY`。
 
-### 38.2 驱动排队慢
+libbinder 的关键分支是：
 
-可能是目标线程池无空闲、目标调度迟、oneway 前序积压，而非驱动算法本身慢。
+~~~cpp
+if ((flags & TF_ONE_WAY) == 0) {
+    err = waitForResponse(reply);
+} else {
+    err = waitForResponse(nullptr, nullptr);
+}
+~~~
 
-### 38.3 服务端执行慢
+看到 oneway 分支仍调用 `waitForResponse`，不要误以为它在等服务端结果。`waitForResponse(nullptr, nullptr)` 收到 `BR_TRANSACTION_COMPLETE` 后即可结束：
 
-应继续拆 CPU、锁、I/O、Handler wait、下游 IPC。
+~~~cpp
+case BR_TRANSACTION_COMPLETE:
+    if (!reply && !acquireResult) goto finish;
+    break;
+~~~
 
-### 38.4 高频累计慢
+这个 complete 表示发送侧事务命令已被驱动处理，不是“服务端方法执行完成”。远端方法可能在调用方返回前已经开始，也可能稍后才获得线程；调用方不能拿自己的返回时刻推断服务端进度。
 
-单次很快但调用量巨大，主要消耗来自固定 IPC/Parcel/锁开销。
+因此最准确的说法是：
 
-### 38.5 恢复慢
+> oneway 不同步等待服务端业务 reply；它仍要序列化、进入驱动并完成发送侧提交，
+> 所以也不是一条保证瞬时返回、永不阻塞的普通函数。
 
-服务死亡后重连、重新注册和状态重放不完整，会表现为功能长期不可用，和单次 transaction latency 是不同问题。
+服务端执行完 oneway 后不会发送 reply。服务端抛出的业务异常也无法沿同一次调用返回客户端。
 
----
+如果调用方需要确认完成，应把协议设计成：
 
-## 39. Mac 只读源码练习
+~~~text
+submit(requestId)  --oneway-->
+                  <-- callback(requestId, result)
+~~~
 
-### 练习 1：追同步与 oneway 生成差异
+或者提交后用 `requestId` 查询状态。“oneway 调用返回”不能充当完成回执。
 
-```bash
-rg -n "FLAG_ONEWAY|transact\(" \
-  out/soong/.intermediates 2>/dev/null | head
-rg -n "oneway" frameworks/base -g '*.aidl' | head -30
-```
+### 4.2 同一 Binder node 的异步队列为何会积压
 
-若没有生成目录，就用第 92 章方法阅读 AIDL generator/已有 Java Stub。
+这里的 node 可以先理解成“某个服务端 Binder 对象在驱动里的身份”。
 
-### 练习 2：追线程池协议
+Binder 对同一目标 node 的异步事务维持串行处理边界：一笔异步事务尚未完成时，后续异步事务进入该 node 的 async 队列。
 
-```bash
-rg -n "BR_SPAWN_LOOPER|BC_ENTER_LOOPER|BC_REGISTER_LOOPER|joinThreadPool" \
-  frameworks/native/libs/binder/IPCThreadState.cpp \
+r48 用户空间仓库没有设备内核的 `drivers/android/binder.c`，但 libbinder 测试明确构造了两笔 oneway，并检查预期顺序：
+
+~~~cpp
+ret = pollServer->transact(
+        BINDER_LIB_TEST_DELAYED_CALL_BACK,
+        data, nullptr, TF_ONE_WAY);
+// second transaction will end up on the async_todo list
+ret = pollServer->transact(
+        BINDER_LIB_TEST_DELAYED_CALL_BACK,
+        data2, nullptr, TF_ONE_WAY);
+~~~
+
+路径：`frameworks/native/libs/binder/tests/binderLibTest.cpp` 的 `OnewayQueueing`。
+
+这个串行边界不是“整个进程所有 oneway 全部串行”：
+
+- 不同 Binder node 可以有不同的异步处理进度；
+- 同步事务不因此变成同一条全局 FIFO；
+- 多个发送者之间不要自行推导业务级全局顺序；
+- Stub 收到后若再投递到别的 Executor/Handler，后续业务顺序由那个队列决定。
+
+回到诊断场景：
+
+1. 第一笔 `notifyPolicyInputChanged()` 在服务端等待 `mLock`；
+2. 同一 node 的后续 oneway 继续排队；
+3. 客户端每次都不等业务完成，所以生产速度没有被服务端自然限制；
+4. 用户最终看到的是“调用都返回了，状态却越来越旧”。
+
+这就像把快件不断放进驿站：寄件人不用等收件人拆包，但驿站只有一条对应货架的处理通道。入库成功不等于已经送到家。
+
+### 4.3 oneway 需要业务层背压
+
+状态通知通常不该把每个瞬间都当成必须送达的历史事件。可选策略包括：
+
+- 发送前合并，只发送最新 generation；
+- 服务端用单槽“最新状态”覆盖旧状态；
+- 给队列设上限，并定义溢出行为；
+- 消费端丢弃 generation 小于当前值的旧消息；
+- 必须逐条可靠处理时，使用有确认、有窗口的协议。
+
+Binder 的 oneway 标志只改变调用/回复语义，不会替业务决定丢弃、重试、合并或限速。
+
+## 5. 根因：持锁跨 Binder 怎样形成等待环
+
+### 5.1 危险点不是“用了锁”，而是锁的释放受远端控制
+
+下面这类代码最值得警惕：
+
+~~~java
+synchronized (mLock) {
+    updateLocalStateLocked();
+    return mVendor.readPolicy(); // 远端同步 Binder
+}
+~~~
+
+一旦进入 `readPolicy()`，`mLock` 的持有时长就由远端决定。
+
+远端可能：
+
+- 等自己的工作线程；
+- 等设备 I/O；
+- 再调用第三个进程；
+- 回调当前进程；
+- 已经发生线程池饥饿。
+
+于是一个本地临界区被扩展成跨进程临界区。其他本来很快的方法也会堵在 `mLock` 后面。
+
+### 5.2 本案例为何不会被简单 Binder 重入自动解开
+
+libbinder 的同步等待循环并非只能接收 `BR_REPLY`。遇到其他命令时，它会执行：
+
+~~~cpp
+default:
+    err = executeCommand(cmd);
+    if (err != NO_ERROR) goto finish;
+    break;
+~~~
+
+这意味着等待同步 reply 的 Binder 线程具备处理嵌套入站事务的能力。某些直接的 A→B→A 调用可能因此回到原等待线程。
+
+但这不是死锁免疫：
+
+- 回调可能由 B 的另一工作线程发起，不在原嵌套调用栈上；
+- 回调可能先 post 到 A 的 Handler，再同步等待 Handler；
+- 环中可能还有第三个进程或第二把锁；
+- native 非递归锁与 Java 可重入 monitor 的行为不同；
+- 即使同线程重入成功，也可能破坏“外部调用期间状态不变”的假设。
+
+本案例中，vendor Binder 线程等待 vendor worker，而 callback 是 vendor worker 新发起的同步事务。system_server 中承接 callback 的另一 Binder 线程只能等待 `mLock`，所以环仍然成立。
+
+### 5.3 先快照，锁外调用，再校验 generation
+
+一种常见改法是：
+
+~~~java
+final Snapshot snapshot;
+final long generation;
+synchronized (mLock) {
+    snapshot = makeSnapshotLocked();
+    generation = mGeneration;
+}
+Result result = mVendor.readPolicy(snapshot); // 锁外 IPC
+synchronized (mLock) {
+    if (generation == mGeneration) {
+        applyResultLocked(result);
+    }
+}
+~~~
+
+这里解决了两件事：
+
+- 远端再慢，也不再占着 `mLock`；
+- 远端返回时用 generation 防止旧结果覆盖新状态。
+
+它也有局限：
+
+- 快照必须足够表达本次请求；
+- 状态变化后，是丢弃、重试还是合并，需要业务定义；
+- 锁外调用期间对象生命周期必须安全；
+- 不能为了“移到锁外”而悄悄破坏原来的原子语义。
+
+所以修改前要先写清不变量，再决定快照内容和冲突策略。
+
+## 6. 方案：为什么盲目增加线程通常只是延后爆发
+
+假设 31 个执行槽位都在等待同一个 `mLock`。把配置提高后，新增线程也会走到同一行等待。
+
+结果通常只是：
+
+~~~text
+原来：较少等待者 + 较早出现池耗尽
+后来：更多等待者 + 更多线程/栈内存/调度与锁竞争
+最终：共同阻塞点仍未释放
+~~~
+
+扩线程还可能把压力继续传给 vendor 服务，让下游更快达到自己的队列或线程上限。
+
+优先修复顺序应当是：
+
+1. 找出大多数 Binder 线程共同等待的位置；
+2. 找到锁 owner 或最末端未返回的下游调用；
+3. 移除锁内同步 IPC；
+4. 缩短 Binder Stub 内的同步工作；
+5. 为 oneway 增加合并、限速或确认；
+6. 再评估独立短事务是否真的缺少并行度。
+不同根因对应不同方案：
+
+| 证据 | 更可能的机制 | 优先方案 |
+|---|---|---|
+| 多数线程等待同一锁 | 临界区过大或锁内外调 | 找 owner，拆临界区，锁外 IPC |
+| 多数线程停在同一远端 transact | 下游慢或环形等待 | 继续跨进程追踪，改异步协议 |
+| Binder elapsed 高、CPU 低 | 锁/I/O/Handler/下游等待 | 找具体等待对象 |
+| CPU 与 elapsed 都高 | 服务端计算或高频调用 | 优化算法、缓存、批处理 |
+| oneway 状态越来越旧 | 生产快于单 node 消费 | 合并最新状态、限流、确认 |
+| 线程互不依赖且都是短任务 | 突发并发确实过高 | 测量后再评估池配置 |
+
+线程上限不是永远不能改。只有证据显示请求彼此独立、没有共同锁与下游瓶颈，并且增加并发不会破坏内存和尾延迟时，它才可能是合理调参。
+
+## 7. 验证：四类证据怎样拼成一条等待链
+
+### 7.1 线程栈先回答“此刻停在哪里”
+
+需要同时看：
+
+- 调用应用的阻塞线程；
+- system_server 的全部 Binder 线程；
+- 涉及的 vendor/native 服务线程；
+- 可能承接回调或 Handler 消息的线程。
+
+如果只截到应用主线程：
+
+~~~text
+main → BinderProxy.transactNative
+~~~
+
+只能标出等待链起点。
+
+本案例的关键证据应是同一时刻出现：
+
+~~~text
+App main                 → 等 ISettingsPolicy reply
+system_server Binder #12 → 持 mLock，等 IVendorPolicy reply
+vendor Binder            → 等 worker
+vendor worker            → 等 callback reply
+system_server Binder #19 → 等 mLock
+~~~
+
+Java traces 常能给出“waiting to lock”及 owner 线索；native futex 还要结合符号、锁日志和相邻线程状态。
+
+不要因为很多线程栈相同，就立即把那一行叫根因。共同等待点的 owner 才是下一站。
+
+### 7.2 Perfetto 负责把跨进程片段连起来
+
+r48 的 atrace 类别 `binder_driver` 启用：
+
+~~~text
+binder_transaction
+binder_transaction_received
+binder_transaction_alloc_buf
+binder_set_priority（可选）
+~~~
+
+对应注册位于：`frameworks/native/cmds/atrace/atrace.cpp`。
+
+在 Perfetto 中沿 flow 检查：
+
+1. 客户端何时提交 transaction；
+2. system_server 哪条线程何时 received；
+3. 该线程何时再发往 vendor；
+4. vendor callback 是否从另一线程返回 system_server；
+5. 各线程是 Running、Runnable，还是 blocked/sleeping；
+6. reply 最后停在哪一段。
+
+Perfetto 给出时序关系，线程栈给出代码位置。两者结合，才能区分“没调度到”和“拿不到锁”。
+
+### 7.3 BinderCallsStats 用来找入口热点，不负责找锁 owner
+
+Android 11 的服务名是 `binder_calls_stats`。在有相应权限的调试设备上，可以先查看帮助，再限定复现窗口：
+
+~~~bash
+adb shell dumpsys binder_calls_stats -h
+adb shell dumpsys binder_calls_stats --reset
+# 在这里复现一次问题，再读取这一窗口的统计
+adb shell dumpsys binder_calls_stats
+~~~
+
+需要 Parcel 大小、异常等详细维度时，可临时启用 detailed tracking；完成后应恢复：
+
+~~~bash
+adb shell dumpsys binder_calls_stats --enable-detailed-tracking
+adb shell dumpsys binder_calls_stats --disable-detailed-tracking
+~~~
+
+读取统计时记住四个边界：
+
+- 它围绕 Java `Binder.execTransactInternal()` 记账，不含事务到达 Stub 前的驱动排队；
+- CPU time 只统计当前线程实际消耗，elapsed time 会包含内部等待；
+- 默认存在采样与条目上限，未出现不代表从未调用；
+- r48 在设备状态尚未就绪或正在充电时会跳过 `callStarted` 记录。
+
+因此它适合回答“哪个 Java Binder 入口调用多、累计 CPU/elapsed 可疑”，不适合单独回答“锁由谁持有”。
+
+### 7.4 binderfs 快照告诉你驱动此刻看到什么
+
+Android 11 r48 的 `init.rc` 挂载 `/dev/binderfs`，`dumpstate` 会优先读取：
+
+~~~text
+/dev/binderfs/binder_logs/state
+/dev/binderfs/binder_logs/stats
+/dev/binderfs/binder_logs/transactions
+/dev/binderfs/binder_logs/proc/<pid>
+~~~
+
+不可访问时，r48 的 dumpstate 还会回退到 `/sys/kernel/debug/binder`。
+
+这些文件受 build 类型、SELinux、内核和权限影响。普通 user 设备不一定允许直接读取，优先从已授权的 bugreport 获取。
+
+驱动快照能帮助确认线程、node、transaction 与 async 队列状态，但格式随设备内核变化，且它仍不能替代业务源码中的锁关系。
+
+### 7.5 Watchdog 是报警器，不是根因分析器
+
+`Watchdog.BinderThreadMonitor` 调用：
+
+~~~java
+public void monitor() {
+    Binder.blockUntilThreadAvailable();
+}
+~~~
+
+native 侧等待 `mExecutingThreadsCount < mMaxThreads`。
+
+它长时间不返回，说明 system_server 缺少可及时接收入站工作的 Binder 执行容量。它不会自动指出是哪把锁、哪个 transaction 或哪个 vendor 服务造成的。
+
+还要注意：`dumpsys` 自己也常通过 Binder 请求服务。池已经完全堵住时，诊断命令可能卡住或改变现场；Watchdog 自动 traces、预先启用的 Perfetto 环形缓冲和 bugreport 中已有快照因此很重要。
+
+## 8. 用“问题 → 机制 → 验证”闭环本案例
+
+### 问题
+
+可观察到的事实是：
+
+- 设置应用同步调用未返回；
+- system_server Binder 可用性出现告警；
+- oneway 发送者没有同步报错，但状态更新迟到。
+
+这些是症状，不是结论。
+
+### 机制假设
+
+根据调用链提出可证伪假设：
+
+~~~text
+锁内下游同步 IPC
+  → vendor worker 发起非原事务栈上的同步回调
+  → callback 等 system_server 的 mLock
+  → 原线程持锁等 vendor
+  → 其他 Binder 线程继续堆在 mLock
+  → 池可用容量耗尽
+  → 同 node oneway 继续积压
+~~~
+
+### 验证
+
+只有下面的证据能够互相对应，假设才站得住：
+
+- 栈能连出持锁者、远端等待者和 callback 等锁者；
+- Perfetto 能连出 app→system_server→vendor→system_server callback；
+- Binder 快照与线程栈中的 pid/tid、transaction 方向一致；
+- BinderCallsStats 若有样本，入口 elapsed 明显包含等待，而非只看 CPU；
+- 移除锁内 IPC 后，同一等待环不再出现，相关线程能够归还。
+
+验证修复时不要写“性能明显提升”就结束。至少比较同样复现场景中的：
+
+- 同步调用端到端分布；
+- Binder received 前的排队；
+- 服务端 Stub elapsed 与 CPU；
+- 池饥饿日志是否再现；
+- oneway 最大滞后 generation 或业务队列深度；
+- 功能语义是否因快照冲突策略发生变化。
+
+这里不填写虚构数值。真实项目应记录设备、build、负载、样本数和统计窗口，再报告结果。
+
+## 9. Mac 上只读源码：不编译也能验证哪些结论
+
+以下命令都以源码根目录 `/Users/ninebot/androidSource` 为当前目录。
+
+### 9.1 先确认两个核心仓库的版本
+
+~~~bash
+git -C frameworks/base describe --tags --always
+git -C frameworks/native describe --tags --always
+~~~
+
+本章对应输出应是 `android-11.0.0_r48`。若 tag 不同，应重新核对常量、统计开关和驱动接口。
+
+### 9.2 追 31 从 Java 到 ioctl
+
+~~~bash
+rg -n "sMaxBinderThreads|setMaxThreads" \
+  frameworks/base/services/java/com/android/server/SystemServer.java \
+  frameworks/base/core/jni/android_util_Binder.cpp
+rg -n "DEFAULT_MAX_BINDER_THREADS|BINDER_SET_MAX_THREADS" \
   frameworks/native/libs/binder/ProcessState.cpp
-```
+~~~
 
-说明驱动请求与用户空间建线程如何衔接。
+### 9.3 追线程池从首线程到动态扩展
 
-### 练习 3：检查 FAILED_TRANSACTION 映射
+~~~bash
+rg -n "startThreadPool|spawnPooledThread|BC_ENTER_LOOPER|BC_REGISTER_LOOPER" \
+  frameworks/native/libs/binder/ProcessState.cpp \
+  frameworks/native/libs/binder/IPCThreadState.cpp
+rg -n "BR_SPAWN_LOOPER" \
+  frameworks/native/libs/binder/IPCThreadState.cpp
+~~~
 
-```bash
-sed -n '830,890p' frameworks/base/core/jni/android_util_Binder.cpp
-```
+应能画出：
 
-回答为什么不能把每次 TransactionTooLargeException 都当精确尺寸证明。
+~~~text
+startThreadPool
+  → 首线程 BC_ENTER_LOOPER
+  → 驱动 BR_SPAWN_LOOPER
+  → 新线程 BC_REGISTER_LOOPER
+~~~
 
-### 练习 4：阅读 BinderCallsStats 安装
+### 9.4 验证同步与 oneway 等待边界
 
-```bash
-rg -n "setObserver|setProxyTransactListener|setSamplingInterval|setDetailedTracking" \
-  frameworks/base/services/core/java/com/android/server/BinderCallsStatsService.java \
+~~~bash
+sed -n '650,720p' \
+  frameworks/native/libs/binder/IPCThreadState.cpp
+sed -n '832,875p' \
+  frameworks/native/libs/binder/IPCThreadState.cpp
+~~~
+
+再看 r48 的顺序测试：
+
+~~~bash
+sed -n '928,955p' \
+  frameworks/native/libs/binder/tests/binderLibTest.cpp
+~~~
+
+### 9.5 验证统计、Watchdog 与 binderfs 的边界
+
+~~~bash
+rg -n "callStarted|cpuTimeStarted|timeStarted|isCharging" \
   frameworks/base/core/java/com/android/internal/os/BinderCallsStats.java
-```
+rg -n "BinderThreadMonitor|blockUntilThreadAvailable" \
+  frameworks/base/services/core/java/com/android/server/Watchdog.java \
+  frameworks/native/libs/binder/IPCThreadState.cpp
+sed -n '175,190p' system/core/rootdir/init.rc
+sed -n '1538,1548p' \
+  frameworks/native/cmds/dumpstate/dumpstate.cpp
+~~~
 
-区分统计启用、采样、WorkSource 与详细追踪。
+完成后，用一张纸画出本案例的五个线程和四条等待边。能标出每条边是“等锁、等 worker、等同步 reply”中的哪一种，比记住 `BR_SPAWN_LOOPER` 的名字更重要。
 
-### 练习 5：画一次真实等待链
+## 10. 边界、常见翻车点、自测答案与行动清单
 
-任选 Framework Manager API：
+### 10.1 这套方法的边界
 
-```text
-Manager → AIDL Proxy → target Stub → permission → lock/Handler
-        → downstream Binder → reply → client
-```
+- 当前 AOSP 工作区没有设备内核的 `drivers/android/binder.c`；
+  node 异步队列的具体实现要和目标设备内核源码、trace 格式一起核对。
+- 厂商可能修改线程配置、服务实现、内核与 SELinux 权限。
+- Perfetto 丢事件或缺少类别时，时间线可能不完整。
+- Java BinderCallsStats 看不到 native Binder 服务的完整内部耗时。
+- 采样统计适合找候选，不等于单次故障的因果证据。
+- 线程栈是一个瞬间；竞争短暂时需要多次样本或连续 trace。
+- 本案例是教学用复合场景，不能拿它替代目标设备的真实等待链。
 
-为每段标线程、是否持锁、是否同步、可能错误。
+### 10.2 六个最常见的翻车点
 
----
+**翻车 1：看到 `transactNative` 就改 Binder 驱动。**
 
-## 40. 自测题
+先沿 transaction 找服务端。`transactNative` 多数时候只是同步调用方的等待位置。
 
-1. 同步 Binder 总时长包含哪些阶段？
-2. oneway 客户端返回是否代表服务端已执行？
-3. BR_SPAWN_LOOPER 起什么作用？
-4. Binder 池耗尽为何 CPU 可能很低？
-5. Watchdog 如何检测 system_server Binder 可用性？
-6. 为什么不应持服务锁做远端回调？
-7. Handler 二次排队怎样进入同步调用时长？
-8. BinderCallsStats 的 CPU 与 latency 有何区别？
-9. TTLE 为什么不是精确的单 Parcel 尺寸证明？
-10. DeadObject 后为什么要 generation？
-11. 高频快调用为何仍可能是热点？
-12. 为什么扩 Binder 池不是首选修复？
+**翻车 2：把 31 当作启动时固定存在的 31 条线程。**
 
----
+线程池按需求扩展；配置上限、实际线程数、正在执行数不是同一个量。
 
-## 41. 参考答案
+**翻车 3：认为 oneway 完全不会阻塞调用线程。**
 
-1. 客户端准备/序列化、驱动排队、服务端线程/业务、reply 序列化和返回。
-2. 不代表，只说明异步事务已提交，服务端可能仍排队。
-3. 驱动通知用户空间 Binder 线程不足，可按上限生成新 looper 线程。
-4. 线程可能全在等锁、IPC、I/O 或条件而不占 CPU。
-5. BinderThreadMonitor 调用 `Binder.blockUntilThreadAvailable()`。
-6. 远端可能慢或反向调用，形成长持锁和死锁环。
-7. Binder 线程 post 后等待，Handler delivery/dispatch 都包含在端到端时间。
-8. CPU 是实际处理消耗；latency/wall 包含等待与调度。
-9. JNI 从较粗的 FAILED_TRANSACTION 映射，且进程 buffer 由在途事务共享。
-10. 防旧连接 death/callback 晚到后清理或污染新连接。
-11. 固定 IPC 开销乘以巨大调用次数会产生高总 CPU/调度成本。
-12. 它不消除共同阻塞点，可能扩大竞争和资源占用。
+它不等业务 reply，但仍有序列化、驱动提交、buffer 与调度成本。
 
----
+**翻车 4：认为 oneway 返回等于服务端成功。**
 
-## 42. 本章总结
+服务端还可能排队，异常也不会沿同一事务返回。需要结果就设计 callback 或查询协议。
 
-```text
-“Binder 慢”
-  → 先定同步/oneway、request/reply 和目标 descriptor/code
-  → 找客户端等待线程
-  → 沿驱动 flow 到服务端 Binder thread
-  → 拆 permission、lock、Handler、I/O、下游 IPC
-  → 找等待链末端 owner
-  → 用 BinderCallsStats 看频率/累计热点
-  → 用 Parcel/并发证据判断大事务
-  → 用 death + generation 设计恢复
-```
+**翻车 5：线程池满就立刻加线程。**
 
-Binder 是运输与调度机制。真正的性能和可靠性往往取决于接口粒度、线程模型、锁边界、背压和恢复协议。
+如果所有线程等同一锁，新增线程只是新增等待者。
 
----
+**翻车 6：只看平均耗时。**
 
-## 43. 下一章预告
+池耗尽常由尾部等待、突发并发和跨进程环触发。还要看调用量、最大/分位延迟、队列滞后和线程状态。
 
-第 99 章将学习：
+### 10.3 自测题与答案
 
-**Android 启动可观测性：bootstat、EventLog、statsd、sys.boot_completed、logcat 与 Perfetto**
+1. **调用方停在 `BinderProxy.transactNative`，能否断定驱动慢？**
 
-重点是给各种“开机完成”指标建立准确起止点，并将属性、事件、统计 Atom、trace 与用户可交互时刻对应起来。
+   不能。它只说明同步 reply 尚未回来，根因可能在目标线程排队、服务端锁、Handler、I/O 或更下游 Binder。
+
+2. **system_server 的 31 表示什么？**
+
+   它是 r48 在 `SystemServer` 中设置的 Binder 池上限配置，通过 JNI 和 `BINDER_SET_MAX_THREADS` 交给 libbinder/驱动；不是启动时预建 31 条线程，也不是 31 份业务必然并行。
+
+3. **`BR_SPAWN_LOOPER` 做什么？**
+
+   驱动在需要补充池线程且符合边界时通知用户空间；libbinder 收到后调用 `spawnPooledThread(false)`。
+
+4. **oneway 为什么还会调用 `waitForResponse(nullptr, nullptr)`？**
+
+   发送侧仍需等待 `BR_TRANSACTION_COMPLETE` 完成提交；它不读取服务端业务 reply。
+
+5. **同一个 node 的 oneway 为什么会越积越多？**
+
+   异步事务在该 node 上有串行处理边界。若生产速度持续大于完成速度，后续事务只能排队。
+
+6. **为什么直接 A→B→A 有时没有死锁，仍不能依赖 Binder 自动解环？**
+
+   同步等待循环可以处理嵌套命令，但回调可能来自另一线程、经 Handler、经过第三进程或等待另一把锁；重入还可能破坏状态不变量。
+
+7. **CPU 很低，为何 Binder 池仍可能耗尽？**
+
+   线程可以全部睡眠在锁、futex、I/O 或远端 reply 上，“占着执行槽位”不等于“正在运行 CPU”。
+
+8. **BinderCallsStats 能否直接给出锁 owner？**
+
+   不能。它帮助定位 Java Binder 入口的调用量、CPU 与 elapsed 候选，owner 仍要靠栈、trace 和源码等待关系确认。
+
+### 10.4 读完即可执行的诊断清单
+
+遇到下一次 Binder 卡顿，按顺序做：
+
+- [ ] 写下具体客户端线程、接口 descriptor 和 transaction/method；
+- [ ] 标明它是同步还是 oneway；
+- [ ] 分开记录客户端等待、驱动排队、服务端执行；
+- [ ] 收集同一时间窗内 app、system_server 和下游服务栈；
+- [ ] 给每个等待点找 owner，而不是停在第一处 `transactNative`；
+- [ ] 检查服务端是否持锁做同步外部 Binder；
+- [ ] 检查回调是否来自另一工作线程或经 Handler；
+- [ ] 检查 oneway 的 node 边界、生产速率和业务背压；
+- [ ] 用 Perfetto flow 验证跨进程方向与先后；
+- [ ] 用 BinderCallsStats 找入口热点，但注明采样与充电状态；
+- [ ] 用 bugreport/binderfs 快照补充驱动现场；
+- [ ] 修复后用同一场景、同一统计口径验证，不编造提升数字；
+- [ ] 最后才决定线程池配置是否需要调整。
+
+真正值得带走的不是“Binder 有 31 条线程”这句话，而是这条判断链：
+
+~~~text
+谁在等待
+  → 等的是队列、锁、Handler、I/O 还是同步 reply
+  → 谁拥有解除等待的条件
+  → 哪个协议或临界区让等待传播
+  → 修复后用相同证据验证等待链已断开
+~~~
+
+只要能画出这张等待图，“Binder 慢”就不再是一个模糊结论，而会变成可以定位、修改和验证的工程问题。
