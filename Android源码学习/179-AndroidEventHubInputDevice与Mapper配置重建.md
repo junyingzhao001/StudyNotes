@@ -6,75 +6,60 @@
 
 ---
 
-## 1. 本章目标：从 `/dev/input/event*` 到 Mapper，不要跳过设备建模
+## 1. 本章只追一个问题：一条 evdev 记录凭什么变成某台 Android 设备的事件
 
-第 178 章的入口已经是 `InputDispatcher::notifyKey/notifyMotion()`。再往下追，会遇到 Linux evdev 的 `struct input_event`：
+第 178 章从 `InputDispatcher::notifyKey/notifyMotion()` 开始。再向下追，会遇到 Linux：
 
-```text
-time + type + code + value
+```c
+struct input_event {
+    struct timeval time;
+    __u16 type;
+    __u16 code;
+    __s32 value;
+};
 ```
 
-但一个 `EV_ABS / ABS_MT_POSITION_X / 1234` 并不是 Android MotionEvent。系统还需要知道：
+例如：
 
-- 这是哪台物理/逻辑设备；
-- 设备有哪些 kernel capability bit；
-- 应加载哪个 `.idc/.kl/.kcm`；
-- 它是 keyboard、mouse、touch、joystick 还是复合设备；
-- 哪些 InputMapper 应解释同一批 raw events；
-- 设备热插拔、显示变化、布局变化时怎样重新配置。
+```text
+EV_ABS / ABS_MT_POSITION_X / 1234
+```
 
-本章把这层“设备发现与 Mapper 建模”完整搭起来。
+它还不是 MotionEvent。Android 必须先回答：
 
----
+- 这条记录来自哪个 fd、哪个 EventHub device；
+- 该节点有哪些 key/abs/rel/switch/ff capability；
+- 应加载哪份 `.idc/.kl/.kcm`；
+- 它应建 Keyboard、Cursor、Touch 还是多个 Mapper；
+- 若多个 evdev 节点属于一台逻辑设备，怎样合并；
+- 热插拔、disable、配置刷新和 SYN_DROPPED 怎样划断旧状态；
+- 哪个 generation 改变，何时通知 Java 与 Dispatcher。
 
-## 2. 先记住十条结论
+本章主线是：
 
-1. EventHub 使用 inotify 发现 `/dev/input` 节点变化，用 epoll 等待设备 fd、inotify fd 和 wake pipe。
-2. EventHub 输出既有 kernel raw event，也有 `DEVICE_ADDED/REMOVED/FINISHED_DEVICE_SCAN` 合成事件。
-3. EventHub id、Framework `InputDevice.getId()` 和稳定 descriptor 是三种不同身份。
-4. 同 descriptor 的多个 evdev 节点可合并成一个逻辑 `InputDevice`。
-5. 一个子设备可同时拥有多个 Mapper；同一 raw event 按顺序交给该子设备的每个 Mapper。
-6. Mapper 类型由 EventHub 基于 capability bit 与配置分类，而不是只看设备名称。
-7. `.idc`、`.kl`、`.kcm` 有不同职责和搜索/回退过程。
-8. 普通 configuration change 复用现有 fd、InputDevice 与 Mapper，只按 changes bit 重配。
-9. `CHANGE_MUST_REOPEN` 会按 removed 先于重新扫描/open/add 的顺序重建，不是原地 reload 文件；这些事件可能落在同一个后续 `getEvents()` 批次，也可能因输出缓冲区容量而跨批次。
-10. InputReader 在锁内生产 NotifyArgs，却在锁外 flush 给 Dispatcher，避免反向调用死锁。
+```text
+/dev/input 节点
+→ EventHub fd/identifier/classes
+→ RawEvent(eventHubId)
+→ 逻辑 InputDevice(framework id)
+→ 子设备 Context + Mappers
+→ QueuedInputListener
+→ Dispatcher
+```
 
----
-
-## 3. 本章要回答的二十个问题
-
-1. 为什么 EventHub 需要 `CAP_BLOCK_SUSPEND`？
-2. `EPOLLWAKEUP` 保证到哪个完成点？
-3. inotify 与 epoll 分别解决什么问题？
-4. wake pipe 为什么不是条件变量？
-5. EventHub 怎样取得设备 name/vendor/product/location/uniqueId？
-6. descriptor 为什么是 SHA-1，而不是直接用 eventN？
-7. 没有 uniqueId 的同型号设备怎样避免冲突？
-8. capability bit 怎样推断 keyboard/cursor/touch/joystick？
-9. 为什么识别为 0 classes 的设备不注册？
-10. `.idc/.kl/.kcm` 的搜索顺序是什么？
-11. virtual keyboard 为什么没有真实 fd？
-12. DEVICE_ADDED 与 FINISHED_DEVICE_SCAN 各有什么作用？
-13. 为什么 EventHubId 可合并成一个逻辑 deviceId？
-14. 每个 class 对应哪些 Mapper？
-15. `configure(0)` 和增量 configure 有什么不同？
-16. disable 时为何先 reset 再关 fd？
-17. SYN_DROPPED 后为什么等下一个 SYN_REPORT？
-18. generation 改变后通知谁？
-19. changes bit 怎样合并和唤醒 Reader？
-20. MUST_REOPEN 为什么先 break，再有序移除和重扫？
+Linux 节点、EventHub Device、逻辑 InputDevice 与 Mapper 是四层对象，不能只用“输入设备”一个词带过。
 
 ---
 
-## 4. 源码地图
+## 2. 源码地图与三种身份
+
+核心文件：
 
 ```text
 frameworks/native/services/inputflinger/reader/
 ├── EventHub.cpp
 ├── InputReader.cpp
 ├── InputDevice.cpp
-├── InputReaderFactory.cpp
 ├── include/EventHub.h
 ├── include/InputReader.h
 ├── include/InputDevice.h
@@ -94,277 +79,230 @@ frameworks/native/libs/input/
 └── Keyboard.cpp
 ```
 
----
+三种身份分别解决不同问题：
 
-## 5. 三层对象总图
+| 身份 | 产生位置 | 作用 | 稳定性 |
+|---|---|---|---|
+| path，如 `event7` | kernel/devtmpfs 枚举 | 打开当前节点 | 重启、重插可变 |
+| EventHub id | `openDeviceLocked()` | RawEvent 指向当前 fd | 普通节点每次 open 递增 |
+| Framework deviceId | InputReader 建逻辑 InputDevice | App/Mapper/Dispatcher 共用 | 逻辑对象存活期稳定 |
+| descriptor | EventHub 根据硬件身份求 SHA-1 | 尝试跨节点/重连识别性质 | 取决于 uniqueId 与连接顺序 |
 
-```mermaid
-flowchart LR
-    K["Linux evdev node<br/>/dev/input/eventN"] --> EH["EventHub::Device<br/>fd + capabilities + config"]
-    EH -->|"RawEvent + EventHubId"| IR["InputReader"]
-    IR --> LD["逻辑InputDevice<br/>Framework deviceId + generation"]
-    LD --> C1["子设备Context A<br/>EventHubId A"]
-    LD --> C2["子设备Context B<br/>EventHubId B"]
-    C1 --> M1["Keyboard / Cursor / Touch... Mapper"]
-    C2 --> M2["另一组Mapper"]
-    M1 --> N["NotifyKey / NotifyMotion / ..."]
-    M2 --> N
+表中实际有四行，因为 descriptor 不是数字 id，而是另一条“关联身份轴”。
+
+保留值：
+
+```text
+VIRTUAL_KEYBOARD_ID = -1
+BUILT_IN_KEYBOARD_ID = 0
+END_RESERVED_ID      = 1
 ```
 
-Linux 节点、EventHub Device、逻辑 InputDevice、Mapper 不是同一对象的不同名字。
+普通 Framework id 从 2 开始递增；不要把日志里的 EventHub id 与 Java `InputDevice.getId()` 机械等同。
 
 ---
 
-## 6. EventHub 构造时建立三类等待源
+## 3. EventHub 的等待集合：epoll、inotify、wake pipe 与 capability
 
-EventHub 创建：
+构造 EventHub 时创建：
 
 1. `epoll_create1(EPOLL_CLOEXEC)`；
-2. `inotify_init()` 并监视 `/dev/input` 的 CREATE/DELETE；
-3. 非阻塞 wake pipe。
+2. `inotify_init()`，监视 `/dev/input` 的 CREATE/DELETE；
+3. 普通 `pipe()`，再分别用 `fcntl(F_SETFL, O_NONBLOCK)` 设成非阻塞。
 
-inotify fd 与 wake read fd 都注册进同一个 epoll。每个成功打开的设备 fd 之后也注册进去。
-
-所以一个 `epoll_wait()` 同时可因：
-
-- 新 raw input；
-- 设备节点增删；
-- Reader 配置刷新主动 wake；
-
-而返回。
-
----
-
-## 7. 为什么使用 EPOLLWAKEUP
-
-设备 fd 注册事件为：
+inotify read fd、wake read fd、真实 input fd 和已配对的 V4L fd 都进入同一个 epoll，事件标志为：
 
 ```cpp
 EPOLLIN | EPOLLWAKEUP
 ```
 
-源码注释解释：驱动在有未读事件时阻止 suspend；最后一笔被 read 后，epoll 的 wakeup 责任延续到下一次对同 fd 的 `epoll_wait()`。
+因此 poll 可因四类原因返回：
 
-EventHub 因而能在本轮把 RawEvent 交给 InputReader/Mapper/QueuedListener，再进入下一轮 poll 才释放这段唤醒保护。
-
-这不是一个永久 WakeLock，也不保证 App 最终处理完。它覆盖的是底层事件从内核取出并交给上层输入管线的关键窗口。
-
----
-
-## 8. CAP_BLOCK_SUSPEND 是启动硬条件
-
-构造器调用 `ensureProcessCanBlockSuspend()`，确认进程 effective capabilities 包含 `CAP_BLOCK_SUSPEND`，否则 fatal。
-
-因为没有该 capability，`EPOLLWAKEUP` 无法可靠承担阻止 suspend 的语义，输入可能在读取/处理窗口中被挂起。
-
-这也是 EventHub 不是普通 App 可随便复制的一段代码：它依赖 system_server/native input 的特权运行环境。
-
----
-
-## 9. 首次扫描与热插拔
-
-初始 `mNeedToScanDevices=true`，第一次 `getEvents()` 调用 `scanDevicesLocked()`：
-
-- 遍历 `/dev/input`；
-- 尝试打开每个目录项；
-- 可选扫描 `/dev/v4l-touch*`；
-- 确保虚拟键盘存在。
-
-后续 inotify CREATE 调 `openDeviceLocked(path)`，DELETE 调 `closeDeviceByPathLocked(path)`。
-
-inotify 只告诉“名字变化”；设备真实能力仍要 open fd 后通过 ioctl 读取。
-
----
-
-## 10. 为什么先处理设备 fd 再处理 inotify
-
-`getEvents()` 收到一批 epoll items 时，只先把 inotify 标为 pending。等这一批其他 fd 都处理完，才 `readNotifyLocked()` 修改设备列表。
-
-源码目的很明确：若同一轮既有设备残余事件又有 DELETE，先把 fd 中最后的事件读完，再关闭设备。
-
-否则热拔插边界可能无故丢掉已经进入 kernel buffer 的尾部 UP/SYN_REPORT。
-
----
-
-## 11. wake pipe 怎样刷新配置
-
-其他线程调用 `InputReader::requestRefreshConfiguration(changes)`：
-
-```cpp
-mConfigurationChangesToRefresh |= changes;
-if (之前没有待刷新bit) {
-    mEventHub->wake();
-}
+```text
+evdev raw event
+inotify 节点变化
+Reader 主动 wake
+可选 touch video frame
 ```
 
-EventHub `wake()` 向非阻塞 pipe 写一个字节，epoll 立即返回。Reader 下一轮在取 raw events 前读取并清 changes，执行配置刷新。
+`ensureProcessCanBlockSuspend()` 强制检查 effective `CAP_BLOCK_SUSPEND`，缺失即 fatal。没有该 capability，EPOLLWAKEUP 不能承担这里需要的唤醒保护。
 
-多次请求用 OR 合并；只有从 0 变成非 0 时需要写 wake byte，避免无意义唤醒风暴。
+其完成边界是：设备驱动读完最后事件后，epoll 继续持有 wakeup source，直到下一次对该 epoll 实例调用 `epoll_wait()`。正常情况下，EventHub 先把 RawEvent 返回给 InputReader，Reader 完成 Mapper 处理、设备列表通知和 listener flush，下一轮才重新 wait。
+
+它不保护到：
+
+- App 回 FINISHED；
+- View callback；
+- Surface present。
+
+r48 的 epoll fd 有 CLOEXEC，但 `inotify_init()` 和 `pipe()` 没使用 CLOEXEC 版本；这是 fd 创建细节，不应从“epoll 自身 CLOEXEC”推导所有伴随 fd 都有同样标志。
 
 ---
 
-## 12. openDevice 先读取身份
+## 4. 扫描与 open：名字只是起点，capability 才决定是否留下
 
-打开参数：
+首次 `mNeedToScanDevices=true`。`scanDevicesLocked()`：
+
+- 遍历 `/dev/input`；
+- 可选遍历 `/dev/v4l-touch*`；
+- 确保 virtual keyboard 存在。
+
+`scanDirLocked()` 只跳过 `.` 和 `..`，并不先筛 `event*`；目录中其他名字也会被尝试 open，失败或 class=0 后自然淘汰。
+
+真实节点用：
 
 ```cpp
 O_RDWR | O_CLOEXEC | O_NONBLOCK
 ```
 
-随后 ioctl 读取：
+打开，随后读取：
 
-- `EVIOCGNAME`：名称；
-- `EVIOCGVERSION`：驱动版本；
-- `EVIOCGID`：bus/vendor/product/version；
-- `EVIOCGPHYS`：物理 location；
-- `EVIOCGUNIQ`：unique id。
+| ioctl | 字段 |
+|---|---|
+| `EVIOCGNAME` | name |
+| `EVIOCGVERSION` | driver version |
+| `EVIOCGID` | bus/vendor/product/version |
+| `EVIOCGPHYS` | location |
+| `EVIOCGUNIQ` | uniqueId |
+| `EVIOCGBIT/EVIOCGPROP` | capability/property bitmask |
 
-若名称在 excluded device list 中，立即 close 并忽略。excluded list 来自 Reader policy 配置，并不是 SELinux 拒绝后的状态。
+excluded name 在取得 name 后就检查；它是 Reader policy 给的排除表，不是 SELinux 拒绝状态。
 
----
+分类与 keymap 完成后，若 `classes==0`，Device 被删除且 fd 随析构关闭，不注册 epoll，也不发送 DEVICE_ADDED。
 
-## 13. descriptor 为什么不使用 `/dev/input/eventN`
-
-eventN 是内核本次枚举顺序，重启或插拔后可变化，不适合作为稳定设备身份。
-
-EventHub 根据 vendor/product、uniqueId；若 vendor/product 都为 0，还加入 name 或 location，生成 raw descriptor，再取 SHA-1 作为 opaque descriptor。
-
-相同硬件跨重连尽量得到相同 descriptor，供：
-
-- 键盘布局关联；
-- 多 evdev 节点合并；
-- Framework 设备变化识别。
-
-SHA-1 在这里用于稳定压缩标识，不是密码认证。
-
----
-
-## 14. nonce 解决“当前同时连接”的冲突
-
-没有 uniqueId 时，若当前已有相同 descriptor 的设备，代码递增 nonce 并重新生成 descriptor，直到不冲突。
-
-这能区分同时插入的两只同型号、无序列号设备，但 nonce 取决于当次连接集合和顺序，不能保证它们跨重启各自保持同一个 identity。
-
-所以 Android 所谓 stable descriptor 是尽力而为，硬件提供可靠 uniqueId 才能真正稳定地区分个体。
-
----
-
-## 15. `.idc` 的搜索和加载
-
-配置文件类型 0 是 `.idc`。查找名依次尝试：
-
-1. `Vendor_vvvv_Product_pppp_Version_xxxx`；
-2. `Vendor_vvvv_Product_pppp`；
-3. 规范化 device name。
-
-根目录依次：
+留下的设备按顺序：
 
 ```text
-/odm/usr/idc/
-/vendor/usr/idc/
-$ANDROID_ROOT/usr/idc/    通常/system/usr/idc/
-$ANDROID_DATA/system/devices/idc/
+匹配可选 video
+→ 注册 input/video fd 到 epoll
+→ configureFd
+→ 加入 mDevices 与 mOpeningDevices
 ```
 
-找到后 `PropertyMap::load()`。解析失败记录错误并使用默认配置；路径不为空不等于配置一定成功加载。
+`configureFd()` 尝试关闭 kernel key repeat，并用 `EVIOCSCLOCKID` 请求 CLOCK_MONOTONIC；失败只记日志，设备仍可继续。
 
 ---
 
-## 16. `.kl` 与 `.kcm` 的职责
+## 5. descriptor、nonce 与 composite：只有某些“相同”会被合并
 
-- `.kl` Key Layout：Linux scan code/HID usage → Android keyCode、flags，也可描述 joystick axis；
-- `.kcm` Key Character Map：keyCode + meta state → 字符/行为、键盘类型。
+descriptor 的 raw 输入不是 path，也不包含 bus/version。它从：
 
-KeyMap 使用类似设备 identifier 查找，并继续探测 Generic/Virtual 等 fallback。键盘 class 判断之后还会用 keymap 检查 Q、DPAD 四向+中心、gamepad keycode，以派生 ALPHAKEY/DPAD/GAMEPAD class。
+```text
+:vendor:product:
++ 若 uniqueId 非空：uniqueId
++ 否则仅在冲突时：nonce
++ 若 vendor==0 且 product==0：name；name 空才用 location
+```
 
-所以“内核上报 KEY_Q 就自然等于 Android AKEYCODE_Q”不准确，中间有 `.kl` 映射。
+拼接后取 SHA-1。SHA-1 在这里用于短而 opaque 的标识，不是安全认证。
+
+关键分支：
+
+```cpp
+if (identifier.uniqueId.empty()) {
+    while (已有相同 descriptor) {
+        nonce++;
+        重新生成 descriptor;
+    }
+}
+```
+
+所以 nonce 只对“没有 uniqueId”的当前连接节点强制唯一：
+
+- 两个同型号、无序列号节点会得到不同 descriptor；
+- 哪个实体拿 nonce=0/1 取决于当次 open 顺序，跨重启可互换；
+- 有非空 uniqueId 时不做冲突消解，相同 uniqueId 的多个节点保留相同 descriptor。
+
+InputReader 恰好按 descriptor 查找已有逻辑 InputDevice。因此 composite 合并通常发生在一块物理设备的多个 interface/node 暴露相同非空 uniqueId 时；无 uniqueId 的相似节点反而会被 nonce 拆开。
+
+同样的机制也有误合并风险：两台设备若错误上报相同非空 uniqueId，就会进入同一逻辑 InputDevice。不能把“descriptor 相同”当成经过加密验证的物理同一性。
 
 ---
 
-## 17. capability bit 怎样分类
+## 6. 配置文件、class 与 Mapper 是三次不同决策
 
-EventHub 用 `EVIOCGBIT`/`EVIOCGPROP` 读取：
+配置文件先按名字查：
 
-- key bitmask；
-- abs/rel axis bitmask；
-- switch、LED、force feedback；
-- input properties。
+```text
+Vendor_vvvv_Product_pppp_Version_xxxx
+→ Vendor_vvvv_Product_pppp
+→ canonical device name
+```
 
-典型推断：
+只有 vendor 和 product 都非 0 才走前两级。每个名字再按根目录：
 
-| 条件 | class |
+```text
+/odm/usr/{idc,keylayout,keychars}/
+→ /vendor/usr/...
+→ $ANDROID_ROOT/usr/...
+→ $ANDROID_DATA/system/devices/...
+```
+
+`.idc` 由 `PropertyMap::load()` 解析。路径找到但解析失败时保留路径日志，configuration 内容则按默认处理。
+
+键盘映射分两层：
+
+- `.kl`：Linux scan code/HID usage → Android keyCode/flags，也可映射 joystick axis；
+- `.kcm`：keyCode + meta state → 字符、fallback/behavior 与 keyboard type。
+
+KeyMap 可先使用 `.idc` 指定的名字，再按 identifier、Generic、Virtual 补缺；`.kl` 与 `.kcm` 是分别探测的，因此最终两份文件不一定来自同一个 basename。
+
+EventHub class 主要来自 capability 组合：
+
+| 代表条件 | class |
 |---|---|
-| 键区/gamepad button | KEYBOARD |
+| keyboard/gamepad button 范围有 bit | KEYBOARD |
 | BTN_MOUSE + REL_X + REL_Y | CURSOR |
-| ABS_MT_POSITION_X/Y | TOUCH + TOUCH_MT |
-| BTN_TOUCH + ABS_X/Y | TOUCH（single touch） |
-| 压力/触摸但无X/Y | EXTERNAL_STYLUS |
-| gamepad button + 合适ABS axis | JOYSTICK |
+| ABS_MT_POSITION_X/Y，且有 BTN_TOUCH 或非 gamepad | TOUCH + TOUCH_MT |
+| BTN_TOUCH + ABS_X/Y | TOUCH |
+| pressure/touch 但无 X/Y | EXTERNAL_STYLUS，并移除 KEYBOARD |
+| gamepad button + 可解释 ABS axis | JOYSTICK |
 | 任一 SW bit | SWITCH |
 | FF_RUMBLE | VIBRATOR |
+| `device.type=rotaryEncoder` | ROTARY_ENCODER |
 
-一个 device 可同时具备多个 class。
+keymap 又派生 ALPHAKEY、DPAD、GAMEPAD；`.idc` 还能影响 internal/external、mic 等属性。
 
----
-
-## 18. 识别中的纠偏规则
-
-PS3 等手柄可能上报与 ABS_MT 范围冲突的轴，所以 multi-touch 判断还要求 BTN_TOUCH 或“不是 gamepad buttons”。
-
-external stylus 被识别后会移除 KEYBOARD class，因为相关 button 要留给 stylus 与 touchscreen 融合，而不是再当普通键盘键。
-
-这种规则说明 class 是 Framework 对 capability 组合的解释，不是 kernel 自带的单一设备类型字段。
+InputDevice 最后按 class 建 Mapper。KEYBOARD/ALPHAKEY/DPAD/GAMEPAD 合并为一个 KeyboardInputMapper；TOUCH_MT 优先 MultiTouch，否则 SingleTouch。一个子设备可以同时拥有 Keyboard、Cursor、Vibrator 等多个 Mapper。
 
 ---
 
-## 19. 0 class 的节点不会进入 epoll
+## 7. getEvents：内核时间被保留，但跨 fd 没有全局时间排序
 
-若所有分类后 `device->classes == 0`：
+`epoll_wait()` 一次最多返回 16 个 ready item。EventHub 按 epoll 给出的 item 顺序逐 fd read，并把每个 `input_event` 转成：
 
-```cpp
-delete device;
-return -1;
+```text
+RawEvent {
+    when     = input_event.time
+    deviceId = EventHub id（built-in 特例为 0）
+    type/code/value
+}
 ```
 
-系统不会监视它，也不会向 InputReader 报 DEVICE_ADDED。
-
-一个出现在 `/dev/input` 的节点不保证被 Android Input Framework 采用。它可能是传感器式 evdev、能力不被识别或被 excluded list 忽略。
-
----
-
-## 20. 注册 fd 前后的初始化
-
-识别完成后：
-
-1. 可与同名 v4l-touch video device 配对；
-2. 注册 input/video fd 到 epoll；
-3. `configureFd()`；
-4. 加入 mDevices 和 opening list。
-
-`configureFd()` 对 keyboard 关闭 kernel key repeat，因为 Android Dispatcher 自己生成重复；还尝试 `EVIOCSCLOCKID(CLOCK_MONOTONIC)`，让事件时间与 Android 其他 monotonic 时间一致。
-
-ioctl 失败会记录但设备通常仍继续工作；日志 `usingClockIoctl=false` 是诊断时间基准的重要线索。
-
----
-
-## 21. RawEvent 的时间来自哪里
-
-读取 `struct input_event` 后：
+`when` 不是 read 时的 `now()`。它保留 evdev client buffer 入队时刻，正常为 monotonic：
 
 ```cpp
-when = seconds_to_nanoseconds(tv_sec)
-     + microseconds_to_nanoseconds(tv_usec);
+seconds_to_nanoseconds(tv_sec)
++ microseconds_to_nanoseconds(tv_usec)
 ```
 
-它使用驱动写入 evdev client buffer 的事件时间，而不是 EventHub read 时重新调用 now。因此下游可估算从内核入队开始的输入延迟。
+但 EventHub 不把不同 fd 的记录按 `when` 归并排序。若 epoll 先返回 B，再返回 A，B 缓冲中的较新事件可能先于 A 的较旧事件进入 RawEvent 数组。
 
-成功设置 EVIOCSCLOCKID 后是 CLOCK_MONOTONIC；旧驱动不支持时需谨慎检查实际时钟契约。
+稳定的顺序只包括：
+
+- 同一 fd 单次 read 中的 kernel buffer 顺序；
+- EventHub 实际遍历并写入数组的顺序；
+- InputReader 按数组顺序处理。
+
+不能由 timestamp 推出跨设备全局 dispatch 顺序。
+
+一批 epoll items 同时含设备数据与 inotify 时，EventHub 先把 inotify 标 pending，处理完其他 ready fd 后才 `readNotifyLocked()`。它尽量在 DELETE 前读走旧 fd 的残余事件，但遇到 ENODEV、HUP 或驱动行为时不保证一定得到尾部 UP。
 
 ---
 
-## 22. EventHub 的三类合成事件
+## 8. 合成事件、opening/closing list 与缓冲区边界
 
-EventHub 定义高位 type：
+EventHub 自定义三种高位 type：
 
 ```text
 DEVICE_ADDED          0x10000000
@@ -372,171 +310,183 @@ DEVICE_REMOVED        0x20000000
 FINISHED_DEVICE_SCAN  0x30000000
 ```
 
-它们与 EV_KEY/EV_ABS/EV_SYN 不属于同一 kernel event type 范围。
+它们不是 Linux EV_*。时间取本轮 monotonic `now`，InputReader 只读取所需字段。
 
-opening/closing list 让 add/remove 通知在 getEvents 中有序输出；FINISHED_DEVICE_SCAN 表示最近一批扫描的 add/remove 已报告完，并且启动时至少发送一次。
+新 Device 已先进入 `mDevices`，再压到单链表 `mOpeningDevices`；关闭对象则离开 mDevices，进入 `mClosingDevices`，直到 DEVICE_REMOVED 被取走后才 delete。
+
+链表都从 head 输出，因此一次扫描/open 多个节点时通知顺序不承诺等于 `readdir` 或 inotify 原始顺序。
+
+`FINISHED_DEVICE_SCAN` 表示最近一轮 opening/closing 报告已走到扫描边界。InputReader 收到后：
+
+```text
+updateGlobalMetaStateLocked()
+→ queue NotifyConfigurationChangedArgs
+```
+
+它不是 Java 屏幕 Configuration，也不表示所有 App 已观察到新设备。
+
+r48 还有一个极端容量假设：InputReader 的 RawEvent buffer 是 256。closing/opening 循环在 `--capacity==0` 时只 break 当前 while，却没有在继续 scan 或写 FINISHED 前统一退出。设备数逼近缓冲上限时，控制流并不提供可靠的“自然跨下一批”保护；标准设备数量远低于此值，但审计时不能把 bufferSize 当成已严格防护的协议上限。
 
 ---
 
-## 23. reopen 为什么先 break 返回
+## 9. InputReader 一轮：两段持锁，中间 poll，最后先通知设备列表再 flush
 
-`mNeedToReopenDevices` 被看到时：
+`InputReader::loopOnce()` 的骨架：
+
+```text
+Reader lock:
+    保存 old global generation
+    取走并清 configuration changes
+    refresh config / 计算 timeout
+
+lock outside:
+    EventHub.getEvents(timeout)
+
+Reader lock:
+    process RawEvent
+    处理 mapper timeout
+    若 global generation 改变，快照完整 InputDeviceInfo 列表
+
+lock outside:
+    policy.notifyInputDevicesChanged(list)
+    QueuedInputListener.flush()
+```
+
+Mapper 在 Reader 锁内把 NotifyArgs 复制进 QueuedInputListener。最后锁外 flush，是因为 Dispatcher/WindowManager 可能反向查询 InputReader；持锁回调会形成真实死锁环。
+
+不过不要扩大成“Reader 从不持锁调用 policy”。`refreshConfigurationLocked()` 会在 Reader 锁内调用 `mPolicy->getReaderConfiguration()`；锁外的是设备列表变更通知和 queued input flush。
+
+顺序也值得记住：
+
+> 同一 loop 中，policy 先收到新的完整 InputDeviceInfo 列表，随后 Dispatcher 才收到 Mapper 已排队的 DeviceReset/ConfigurationChanged/Key/Motion。
+
+这是两个完成点，不是一个原子广播。
+
+---
+
+## 10. 配置请求与软件 timeout：wake 只负责叫醒，不保证准点
+
+其他线程请求配置刷新：
 
 ```cpp
-closeAllDevicesLocked();
-mNeedToScanDevices = true;
-break;
+bool needWake = !mConfigurationChangesToRefresh;
+mConfigurationChangesToRefresh |= changes;
+if (needWake) {
+    mEventHub->wake();
+}
 ```
 
-发现 `mNeedToReopenDevices` 的这次 `getEvents()` 会先 `closeAllDevices()`，设置待扫描标志，然后直接 `break`；因此这一调用通常先以 0 个事件返回。后续调用先从 closing list 输出 `DEVICE_REMOVED`，之后才扫描和重新 open，并输出 `DEVICE_ADDED`、`FINISHED_DEVICE_SCAN`。
+多次请求用 OR 合并；只有 pending 从 0 变非 0 时向非阻塞 pipe 写一字节。
 
-这里要特别避免把它记成“严格两个调用”：如果调用方提供的 RawEvent 缓冲区仍有容量，removed 与随后扫描产生的 added/scan-finished 可以出现在同一次后续 `getEvents()` 返回中；容量不足时也可能跨更多次调用。真正稳定的约束是逻辑顺序——旧设备先 removed，之后新定义才 added，使 InputReader 能先拆旧 Mapper 状态，再按重新读取的 capability/config 建新状态。
+若 pipe 已满，`write()` 返回 EAGAIN 会被忽略，因为旧 wake byte 已足以让 epoll 返回。其他写错误只记日志；changes bit 仍在，但若没有别的事件，Reader 可能不能立即醒来。
+
+Mapper 也可设置 `mNextTimeout`，Reader 将它换算为 `epoll_wait` timeout。EventHub 明确写着：
+
+> timeout is advisory only
+
+系统已 suspend 时，不会仅为这个软件 timeout 唤醒。EPOLLWAKEUP 保护上一次 ready event 的处理窗口，却在下一次 epoll_wait 时释放；它不是精确 Alarm。
+
+所以手势/按键 Mapper 的 timeout 到点只能解释成“线程下次被调度且 poll 返回后处理”，不是硬实时 deadline。
 
 ---
 
-## 24. virtual keyboard 没有真实 fd
+## 11. 逻辑 InputDevice：添加、合并、移除与 DeviceReset
 
-首次扫描若缺少保留的 virtual keyboard，EventHub 创建：
+收到 DEVICE_ADDED 后，InputReader：
 
 ```text
-fd = -1
-classes = KEYBOARD | ALPHAKEY | DPAD | VIRTUAL
+取 EventHub identifier
+→ 在当前 mDevices 中找相同非空 descriptor
+→ 命中：复用已有 shared InputDevice
+→ 未命中：分配 Framework deviceId、新建 InputDevice
+→ addEventHubDevice(eventHubId)
+→ configure(changes=0)
+→ reset
+→ 把 eventHubId 映射到该 shared InputDevice
 ```
 
-它加载 keymap 并作为 DEVICE_ADDED 报告，但不注册 evdev fd。第 177 章的 injected Key 使用 `VIRTUAL_KEYBOARD_ID`，正是复用这套逻辑设备语义，而不是假装来自某个 eventN。
-
----
-
-## 25. EventHubId 与 Framework deviceId
-
-EventHub 每打开节点分配 eventHubId。InputReader 收到 DEVICE_ADDED 后，依据 descriptor 查已有逻辑设备：
-
-- 找到同 descriptor → 把新 eventHubId 加为同一 InputDevice 的子设备；
-- 找不到 → 新建 Framework InputDevice，并分配逻辑 id/generation。
-
-保留 id 范围内可能沿用 eventHubId；普通设备则用 `nextInputDeviceIdLocked()`。
-
-因此日志排查时不要把 eventHubId 与 Java `InputDevice.getId()` 机械等同。
-
----
-
-## 26. composite device 的含义
-
-一块物理 USB/Bluetooth 设备可能暴露多个 evdev node：例如一个键盘节点、一个鼠标节点。若它们的 descriptor 相同，InputReader 用一个逻辑 InputDevice 聚合。
-
-内部结构：
+内部可能是：
 
 ```text
-InputDevice
-  ├─ eventHubId A → InputDeviceContext + mappers A
-  └─ eventHubId B → InputDeviceContext + mappers B
+logical InputDevice id=7
+├── eventHubId=14 → Context + KeyboardMapper
+└── eventHubId=15 → Context + CursorMapper
 ```
 
-移除一个子节点后，只要还有其他 EventHub device，逻辑 InputDevice 仍存在并重新 configure；最后一个子节点移除后才完全消失。
+RawEvent 仍按 eventHubId 找入口，只有该子设备的 mappers 收到它；公开设备列表则通过 `mDeviceToEventHubIdsMap` 对 shared InputDevice 去重。
 
----
+移除一个子节点时：
 
-## 27. class 到 Mapper 的映射
+1. 删除 eventHubId→shared device 映射；
+2. 从逻辑对象移除该子设备；
+3. 若仍有子设备，重新 `configure(changes=0)`；
+4. 无论是否还有子设备，都 `reset(when)`。
 
-`InputDevice::addEventHubDevice()` 为每个子设备选择：
-
-| class | Mapper |
-|---|---|
-| SWITCH | SwitchInputMapper |
-| ROTARY_ENCODER | RotaryEncoderInputMapper |
-| VIBRATOR | VibratorInputMapper |
-| KEYBOARD/ALPHAKEY/DPAD/GAMEPAD | 一个合并 sources 的 KeyboardInputMapper |
-| CURSOR | CursorInputMapper |
-| TOUCH_MT | MultiTouchInputMapper |
-| TOUCH（非MT） | SingleTouchInputMapper |
-| JOYSTICK | JoystickInputMapper |
-| EXTERNAL_STYLUS | ExternalStylusInputMapper |
-
-同一子设备可同时建 Keyboard + Cursor 等多个 Mapper。
-
----
-
-## 28. 同一 RawEvent 为何按 Mapper 顺序逐个处理
-
-`InputDevice::process()` 对每一笔 rawEvent，再遍历该 eventHubId 对应的全部 Mapper：
+`reset()` 的顺序是：
 
 ```text
-raw event 1 → mapper A → mapper B
-raw event 2 → mapper A → mapper B
+所有剩余 Mapper.reset
+→ 重算 global meta
+→ queue NotifyDeviceResetArgs(logical deviceId)
 ```
 
-不能把整批先给 mapper A、再整批给 mapper B。joystick movement 与 gamepad button 可能由不同 Mapper 处理，但必须保持 kernel 原始先后顺序。
-
-某 Mapper 对不关心的 type/code 自己忽略。
+Dispatcher 收 DeviceReset 后按逻辑 deviceId 合成取消。因此拔掉复合设备的一个 interface 也会重置整台逻辑设备，而不只是被移除节点对应的 Mapper。
 
 ---
 
-## 29. 首次添加的 configure + reset
+## 12. 首次 configure 与 enable/disable：注释意图并未完全实现
 
-InputReader 收到 DEVICE_ADDED：
+`configure(changes=0)` 会重新汇总：
+
+- 所有子设备 classes/configuration/controller number；
+- isExternal、hasMic；
+- keyboard overlay、alias、enabled；
+- display port/viewport；
+- 每个 Mapper 的完整参数、sources/ranges。
+
+普通增量 configure 则复用现有 fd、Context 和 Mapper，只让关心 changes bit 的路径更新。
+
+`setEnabled()` 的正常顺序：
+
+```text
+enable:  EventHub open/configure/register → Mapper reset
+disable: Mapper reset → EventHub unregister/close
+```
+
+reset 在关闭前执行，是因为 MultiTouch 等 Mapper 可能需要查询仍有效的 fd。
+
+但 r48 首次配置有一处源码/注释矛盾：
 
 ```cpp
-device = createDeviceLocked(...);
-device->configure(when, &mConfig, 0);
-device->reset(when);
+if (!changes || (changes & CHANGE_ENABLED_STATE)) {
+    setEnabled(enabled, when);
+}
+...
+mapper.configure(...)
+...
+if (!changes) {
+    setEnabled(enabled, when);
+}
 ```
 
-`changes=0` 表示首次完整配置：
+注释声称新设备应先完成 Mapper configure 再按 policy disable；可 `!changes` 使前一个分支已经生效。若 Framework id 预先位于 `disabledDevices`，fd 会在 Mapper.configure 前关闭，末尾调用只是 no-op。
 
-- 汇总子设备 classes/config；
-- 读取 keyboard overlay、alias、enabled、display association；
-- 调每个 Mapper 的完整 configure；
-- 生成 sources/ranges；
-- 最后 reset，从 kernel 当前状态建立干净起点并发 DeviceReset 通知。
+显示端口缺 viewport 的路径稍有不同：首次 display 分支先记录 association，末尾 `setEnabled(true)` 又会因“有 port 无 viewport”在函数入口改成 false，所以它确实是在 Mapper configure 后禁用。
 
----
+还有失败边界：
 
-## 30. 为什么首次配置最后才允许 disable
+- composite enable 对每个子设备调用 `enableDevice()`，返回值被 lambda 忽略；
+- 某个 open 失败仍会继续 reset 并 bump generation；
+- EventHub open 成功但 epoll register 失败时没有关闭/回滚，device 可显示 enabled 却收不到事件；
+- `isEnabled()` 只抽查第一个子设备，并假设 composite 全部同态。
 
-首次 configure 中，Mapper 需要通过仍打开的 fd 查询 absolute axis 范围和当前设备属性。
-
-所以即便 policy 配置里设备 disabled，也先让 Mapper 完成首次配置，再调用 `setEnabled(false)` 关闭 fd。
-
-若一开始就关，MultiTouch 等 Mapper 无法 ioctl 得到正确范围/状态。
+因此 enabled 是软件期望/局部状态，不是“全部 fd 已可靠进入 epoll”的完成证明。
 
 ---
 
-## 31. enable 与 disable 的 reset 顺序
+## 13. 增量重配与 MUST_REOPEN：对象保留和全量重建的分界
 
-`InputDevice::setEnabled()`：
-
-```text
-enable:  先重新open/register fd → reset
-disable: 先reset → unregister/close fd
-```
-
-某些 Mapper reset 会查询驱动当前状态，所以 reset 必须在 fd 可用时执行。
-
-reset 还会向 Dispatcher 发 `NotifyDeviceResetArgs`，使已按下的 key/touch 状态得到取消收尾。
-
----
-
-## 32. 增量配置不是重建 Mapper
-
-Reader 收到 pointer speed、display、show touches、keyboard layout 等 changes 时：
-
-```cpp
-device->configure(now, &mConfig, changes);
-```
-
-同一个 InputDevice、InputDeviceContext 和 Mapper 对象保留。每个 Mapper 只在关心的 bit 出现时重算对应参数。
-
-例如：
-
-- Cursor 关心 pointer speed、display、pointer capture；
-- Touch 关心 affine、display、show touches、gesture enablement、stylus presence；
-- Keyboard 关心 display/keyboard layout。
-
----
-
-## 33. 哪些状态来自 ReaderConfiguration
-
-changes bit 包括：
+常见 changes：
 
 ```text
 POINTER_SPEED
@@ -552,350 +502,260 @@ ENABLED_STATE
 MUST_REOPEN
 ```
 
-配置源由 native policy `getReaderConfiguration()` 从 system_server 当前状态拼出，例如 display viewports/port associations、disabled device set、pointer display 等。
-
-这些是 Framework 运行配置，不等于 `.idc` 设备静态 PropertyMap。
-
----
-
-## 34. MUST_REOPEN 什么时候需要
-
-普通 configure 不重新执行 EventHub `openDeviceLocked()`，也不会重新：
-
-- 加载 `.idc/.kl/.kcm` 基础文件；
-- 读取 capability bitmask；
-- 重新判定 classes；
-- 重建 Mapper 类型集合。
-
-若变化影响这些“设备定义”，必须请求 `CHANGE_MUST_REOPEN`，让 EventHub close + rescan + reload。
-
-键盘 layout overlay 则有专门增量路径，不要求重新打开底层设备。
-
----
-
-## 35. generation 是“设备描述改变”版本号
-
-逻辑 InputDevice 有 id 和 generation。以下变化会 bump generation：
-
-- 子设备增删；
-- enabled 状态变化；
-- alias 变化；
-- keyboard layout overlay 变化；
-- Mapper/config 导致 device info 改变。
-
-Reader 每轮记住 oldGeneration；处理完发现全局 generation 变化，就构造完整 InputDeviceInfo 列表，在 Reader 锁外通知 policy/IMS。
-
-id 回答“哪台逻辑设备”，generation 回答“这台设备的公开描述是哪一版”。
-
----
-
-## 36. FINISHED_DEVICE_SCAN 为什么触发 configuration changed
-
-InputReader 看到该合成事件后调用 `handleConfigurationChangedLocked()`：
-
-1. 重算全局 meta state；
-2. 排队 `NotifyConfigurationChangedArgs` 给下游。
-
-它不等同于 Java `Configuration` 屏幕旋转对象，而是通知输入下游“设备扫描批次完成、输入配置可能变化”。
-
-DEVICE_ADDED/REMOVED 本身修改 generation，随后 policy 还会收到新的 InputDeviceInfo 列表。
-
----
-
-## 37. Reader 的两阶段锁边界
-
-```mermaid
-sequenceDiagram
-    participant IR as InputReader thread
-    participant EH as EventHub
-    participant M as InputDevice/Mapper
-    participant Q as QueuedInputListener
-    participant D as InputDispatcher
-    participant P as ReaderPolicy/IMS
-
-    IR->>IR: 锁内取changes/算timeout
-    IR->>EH: 锁外getEvents/epoll_wait
-    EH-->>IR: RawEvent[]
-    IR->>M: Reader锁内process/configure
-    M->>Q: 复制NotifyArgs入队
-    IR->>P: generation变化时锁外通知设备列表
-    IR->>Q: 锁外flush
-    Q->>D: notifyKey/Motion/Reset/Config
-```
-
-Mapper 不直接在持 Reader 锁时同步进入 Dispatcher；QueuedInputListener 先复制参数，最后锁外 flush。
-
----
-
-## 38. 为什么 flush 必须锁外
-
-源码注释给出可能的反向链：
+非 MUST_REOPEN：
 
 ```text
-InputReader → InputDispatcher → WindowManager
-                            ↘ 某路径又查询 InputReader
+同一 EventHub fd
++ 同一 InputDevice/Context/Mapper
++ mapper.configure(changes)
 ```
 
-若 Reader 持 `mLock` 调 Dispatcher/Policy，而对方又反向查询 scanCode/device state，就可能死锁。
+它不会重新读取 capability，也不会重新决定 Mapper 类型。Keyboard layout overlay 有自己的增量路径，不要求重开 evdev。
 
-QueuedInputListener 的代价是多一次 NotifyArgs copy，换来清楚的锁边界和同轮事件顺序。
+MUST_REOPEN：
+
+```text
+requestReopenDevices + wake
+→ 下一次 getEvents 看到 flag
+→ closeAllDevicesLocked
+→ mNeedToScanDevices=true
+→ break，本次通常返回 0
+→ 后续 getEvents 先报 DEVICE_REMOVED
+→ scan/open
+→ 报 DEVICE_ADDED
+→ FINISHED_DEVICE_SCAN
+```
+
+不要记成严格“第二次只 removed、第三次才 added”。后续一次 `getEvents()` 只要缓冲仍有空间，就会在 closing list 后立即 scan 并继续输出 opening/finished；设备多时才可能跨批，极端 256 容量还有上一节的实现缺口。
+
+普通动态 EventHub id 在 reopen 后继续递增，旧逻辑对象又已先 removed，因此新的 Framework deviceId 也会重新分配；只有 -1/0 保留设备走固定 id。descriptor 帮助识别设备性质，并不会让 InputReader 复活已删除对象或复用普通数字 id。
 
 ---
 
-## 39. SYN_DROPPED 怎样恢复
+## 14. 两种 generation 与 SYN_DROPPED 的 composite 共享状态
 
-evdev buffer overrun 时 kernel 可发送：
+r48 有两层 generation：
+
+| 字段 | 含义 | 更新方式 |
+|---|---|---|
+| `InputReader::mGeneration` | 整份设备列表/任一设备信息变化的全局脉冲 | `bumpGenerationLocked()` |
+| `InputDevice::mGeneration` | 某个逻辑设备公开描述的版本 | `device.bumpGeneration()` 取得新的全局值 |
+
+每轮只比较 old/new 全局 generation；只要不同，就快照并通知完整设备列表。多次 bump 会合并成一次 callback。
+
+两者不能混写：
+
+- 添加子设备时 `addEventHubDevice()` 会 bump 单设备 generation，add 流程还会再 bump 全局；
+- enabled、alias、keyboard overlay 等可 bump 单设备；
+- 移除子设备时 `InputReader::removeDeviceLocked()` 只无条件 bump 全局，`InputDevice::removeEventHubDevice()` 本身不 bump 单设备；
+- 若 composite 仍存活，其 sources/ranges 可因重新 configure 改变，但公开的 per-device generation 不一定随这次移除更新。
+
+这是 r48 的版本边界，不能把 generation 统一解释成一个严格递增的“设备描述事务号”。
+
+另一份容易忽略的共享状态是 `InputDevice::mDropUntilNextSync`。它属于整个逻辑 InputDevice，不属于 eventHubId。
+
+收到：
 
 ```text
 EV_SYN / SYN_DROPPED
 ```
 
-InputDevice 立即：
+后会 reset 整个逻辑设备并置 true。随后来自任一子节点的 raw event 都被丢弃；遇到任一子节点的下一笔 SYN_REPORT 时只清 flag，该 SYN_REPORT 本身也不交 Mapper。
 
-- `mDropUntilNextSync=true`；
-- `reset(when)`，让 Mapper/Dispatcher取消已知状态。
+于是 composite 设备中：
 
-之后丢弃所有 raw event，直到下一笔 `EV_SYN/SYN_REPORT` 才恢复正常处理。
+- A 节点 overrun 会短暂丢掉 B 节点事件；
+- B 的 SYN_REPORT 也可能先替 A 清掉恢复门。
 
-原因是 overrun 后中间状态已不可信；从下一个完整 report 边界重新开始，比尝试解释残缺轴/按键更新安全。
-
----
-
-## 40. 设备移除如何收尾
-
-EventHub close：
-
-- 从 epoll 移除 fd；
-- close fd；
-- 释放 controller number；
-- 放入 closing list。
-
-InputReader 收 DEVICE_REMOVED 后从 eventHubId map 移除子设备，bump generation；若逻辑复合设备仍有其他子节点则完整 configure(0)，最后 device reset。
-
-reset 发 DeviceReset 到 Dispatcher，第 176 章看到 Dispatcher 会为这个 device 合成取消，避免拔键盘后 key 永远按下、拔触屏后 gesture 不结束。
+它是按逻辑设备恢复的保守近似，不是每个 evdev buffer 各自精确同步。
 
 ---
 
-## 41. disabled device 与 physically removed 不同
+## 15. virtual keyboard、V4L 旁路、诊断与九组练习
 
-disabled：EventHub Device 对象与 path/identifier/config 保留，只注销 epoll 并 close fd；重新 enable 时按原 path open、configureFd、注册 epoll。
+virtual keyboard 在扫描末尾确保存在：
 
-removed：节点已不存在，EventHub Device 离开 mDevices，并向 InputReader 发 DEVICE_REMOVED。
-
-因此 disabled device 可继续出现在 Framework 设备列表中但 `isEnabled=false`；physical removal 则从列表中移除或让复合设备少一个子节点。
-
----
-
-## 42. V4L touch video 是旁路伴随数据
-
-r48 可扫描 `/dev/v4l-touch*`，按 device name 与 input device 配对。video fd 也进入 epoll，读取 frame 后排队，Touch mapper 构造 NotifyMotion 时可附带 `TouchVideoFrame`。
-
-它不是用视频帧替代 evdev 坐标：evdev 仍提供手势时序和 axes，video 是与触摸关联的可选附加帧。
-
-`ro.input.video_enabled=false` 可禁用扫描，因为 V4L 设备不支持多客户端，EventHub 打开会阻止其他工具直接读取。
-
----
-
-## 43. 完整热插拔时间线
-
-```mermaid
-sequenceDiagram
-    participant K as kernel/udev
-    participant EH as EventHub
-    participant IR as InputReader
-    participant DEV as InputDevice/Mappers
-    participant IMS as IMS/Java listeners
-
-    K->>EH: /dev/input/eventN IN_CREATE
-    EH->>EH: open + ioctl identity/capabilities
-    EH->>EH: load idc/keymap + classify + epoll add
-    EH-->>IR: DEVICE_ADDED(eventHubId)
-    IR->>DEV: 按descriptor合并/新建，选择Mappers
-    IR->>DEV: configure(changes=0) + reset
-    EH-->>IR: FINISHED_DEVICE_SCAN
-    IR-->>IMS: generation变化后的完整InputDeviceInfo列表
-    K->>EH: EV_KEY/EV_ABS/EV_SYN
-    EH-->>IR: RawEvent
-    IR->>DEV: mapper.process
+```text
+fd = -1
+id = VIRTUAL_KEYBOARD_ID(-1)
+classes = KEYBOARD | ALPHAKEY | DPAD | VIRTUAL
 ```
 
----
+它加载 keymap、发送 DEVICE_ADDED，但不进入 epoll。第 177/178 章的 inject 会把 Key/Motion deviceId 都改成 -1；这只是保留输入身份语义，不代表存在一个能产出 Motion raw event 的虚拟 evdev fd。
 
-## 44. 普通重配与 reopen 对照
+V4L touch video 则是旁路：
 
-| 维度 | 增量 configure | MUST_REOPEN |
-|---|---|---|
-| EventHub fd | 保留，enable变化例外 | 全部close再open |
-| `.idc/.kl/.kcm` 基础加载 | 不重新探测 | 重新探测 |
-| capability bit | 保留 | 重新ioctl |
-| Mapper对象 | 保留 | 随旧device拆除、新device重建 |
-| Framework deviceId | 通常保留 | 可能变化；descriptor用于重新关联语义 |
-| 事件通知 | generation按需变化 | removed→rescan/added→scan finished；可能同批或跨批 |
-| 状态收尾 | Mapper configure/reset按bit | 完整remove/reset/add/reset |
+- 默认扫描 `/dev/v4l-touch*`，可用 `ro.input.video_enabled=false` 关闭；
+- 以 device name 与 input node 配对；
+- 已配对 video fd 才进入 epoll，未配对对象留在 holding queue；
+- frame 被读取并排队，Touch Mapper 可消费为 `TouchVideoFrame`；
+- evdev axes/SYN 仍是主触摸时序。
 
----
+按 name 配对也是启发式：多台同名设备可能关联到先命中的 input Device。V4L 又不支持多客户端，EventHub 打开后会阻止调试工具同时直接读取。
 
-## 45. 常见误解逐条纠正
+诊断顺序：
 
-### 误解一：每个 eventN 就是一个 Java InputDevice
+```text
+EventHub 是否 open 成功
+→ identifier / descriptor / classes 是否合理
+→ configuration / kl / kcm 实际路径
+→ eventHubId 是否合入预期 logical deviceId
+→ Mapper 集合、enabled、associated viewport
+→ RawEvent / SYN_DROPPED
+→ QueuedListener / Dispatcher
+```
 
-错误。同 descriptor 节点可合并成复合逻辑设备。
-
-### 误解二：设备类型来自名字或 `.idc` 的单一字段
-
-错误。主要由 kernel capability 组合推断，配置可覆盖部分属性/类型。
-
-### 误解三：配置变化都重新打开设备
-
-错误。大多数 changes 只重配现有 Mapper；只有 MUST_REOPEN 走 close/rescan。
-
-### 误解四：event timestamp 是 EventHub read 的时间
-
-错误。它保留 kernel input_event timestamp，正常配置为 monotonic。
-
-### 误解五：reset 只是清 InputReader 内存
-
-错误。Mapper reset 还能发 NotifyDeviceReset，驱动 Dispatcher 合成取消。
-
-### 误解六：InputReader 持锁直接调用 Dispatcher
-
-错误。它通过 QueuedInputListener 复制并在锁外 flush。
-
----
-
-## 46. macOS 只读练习
-
-### 练习一：列出 fd 来源
+### 练习一：核对四类 epoll fd 与 capability
 
 ```bash
 cd /Users/ninebot/androidSource
-sed -n '283,355p' \
+sed -n '250,335p' \
   frameworks/native/services/inputflinger/reader/EventHub.cpp
+sed -n '1128,1215p' \
+  frameworks/native/services/inputflinger/reader/EventHub.cpp
+```
+
+找出 CAP_BLOCK_SUSPEND、inotify、wake pipe、input/video 注册点。
+
+### 练习二：重建 getEvents 顺序
+
+```bash
 sed -n '847,1060p' \
   frameworks/native/services/inputflinger/reader/EventHub.cpp
 ```
 
-写出 device、inotify、wake pipe、可选video四类 fd 怎样进入 epoll。
+标出 reopen、closing、scan、opening、finished、epoll item 与 inotify 的先后。
 
-### 练习二：手工判定 Mapper
-
-假设节点能力：
-
-```text
-BTN_MOUSE, REL_X, REL_Y
-KEY_A ... KEY_Z
-FF_RUMBLE
-```
-
-推导 classes 与 Mappers。答案通常是 CURSOR + KEYBOARD + VIBRATOR，对应 Cursor、Keyboard、Vibrator 三个 Mapper；是否 ALPHAKEY 还取决于 keymap 能否映射 Q。
-
-### 练习三：找配置文件优先级
+### 练习三：手工分类一个节点
 
 ```bash
-sed -n '45,145p' frameworks/native/libs/input/InputDevice.cpp
-sed -n '85,170p' frameworks/native/libs/input/Keyboard.cpp
+sed -n '1218,1510p' \
+  frameworks/native/services/inputflinger/reader/EventHub.cpp
 ```
 
-分别写出名字优先级和分区根优先级。
+假设有 BTN_MOUSE、REL_X/Y、字母键和 FF_RUMBLE，推导 Cursor、Keyboard、Vibrator Mappers；ALPHAKEY 还要看 keymap 是否映出 Q。
 
-### 练习四：推演 reopen
+### 练习四：证明 nonce 不总消除 descriptor 重复
 
 ```bash
-rg -n "CHANGE_MUST_REOPEN|mNeedToReopenDevices|mNeedToScanDevices" \
-  frameworks/native/services/inputflinger/reader
+sed -n '680,740p' \
+  frameworks/native/services/inputflinger/reader/EventHub.cpp
+sed -n '269,288p' \
+  frameworks/native/services/inputflinger/reader/InputReader.cpp
 ```
 
-说明为什么第一次 getEvents 主要返回 REMOVED，第二次才扫描并返回 ADDED。
+比较 uniqueId 为空和非空时的冲突处理，再说明 composite 的形成条件。
+
+### 练习五：追配置文件与混合 fallback
+
+```bash
+sed -n '35,130p' \
+  frameworks/native/libs/input/InputDevice.cpp
+sed -n '35,155p' \
+  frameworks/native/libs/input/Keyboard.cpp
+```
+
+分别写出 filename、partition roots、identifier/Generic/Virtual 的优先级。
+
+### 练习六：验证 Reader 的两个锁外动作
+
+```bash
+sed -n '80,180p' \
+  frameworks/native/services/inputflinger/reader/InputReader.cpp
+sed -n '329,375p' \
+  frameworks/native/services/inputflinger/reader/InputReader.cpp
+```
+
+确认 getReaderConfiguration 在锁内，而 device-list notify 和 listener flush 在锁外。
+
+### 练习七：复现首次 disabled 顺序矛盾
+
+```bash
+sed -n '40,90p' \
+  frameworks/native/services/inputflinger/reader/InputDevice.cpp
+sed -n '245,330p' \
+  frameworks/native/services/inputflinger/reader/InputDevice.cpp
+```
+
+令 `changes=0` 且 deviceId 已在 disabledDevices，按行推演 fd 何时关闭。
+
+### 练习八：区分两种 generation
+
+```bash
+sed -n '185,290p' \
+  frameworks/native/services/inputflinger/reader/InputReader.cpp
+sed -n '125,215p' \
+  frameworks/native/services/inputflinger/reader/InputDevice.cpp
+sed -n '450,465p' \
+  frameworks/native/services/inputflinger/reader/InputDevice.cpp
+```
+
+比较 add subdevice 与 remove subdevice 对全局/单设备 generation 的影响。
+
+### 练习九：证明 SYN_DROPPED 状态不是 per-subdevice
+
+```bash
+sed -n '327,370p' \
+  frameworks/native/services/inputflinger/reader/InputDevice.cpp
+sed -n '110,145p' \
+  frameworks/native/services/inputflinger/reader/include/InputDevice.h
+```
+
+找出 `mDropUntilNextSync` 的对象归属，并推演两节点 composite 的交错事件。
 
 ---
 
-## 47. dumpsys 与源码证据
+## 16. 本章结论、自检与下一章
 
-`dumpsys input` 的 Event Hub / Input Reader 部分可观察：
-
-- EventHub device id/path/name/classes；
-- configuration、key layout、key character map；
-- logical device id/generation/sources；
-- associated display port；
-- motion ranges；
-- 各 Mapper 内部状态。
-
-诊断顺序建议：
+最终模型：
 
 ```text
-EventHub看得到节点吗？
-  → classes正确吗？
-  → InputReader逻辑设备/子节点是否合并正确？
-  → Mapper是否存在、sources/ranges正确？
-  → Notify是否到Dispatcher？
+发现
+= inotify 告知名字变化
++ open/ioctl/config 建 identifier 与 classes
++ epoll 读取真实 fd
+
+建模
+= EventHubId 标记当前节点
++ descriptor 决定是否合入逻辑 InputDevice
++ class 决定每个子设备的 Mapper 集合
+
+演进
+= changes bit 增量 configure
++ MUST_REOPEN 的 remove→scan→add
++ global/device 两层 generation
++ reset/SYN_DROPPED 划断旧状态
+
+交付
+= Reader 锁内产生 NotifyArgs
++ 锁外先通知设备列表
++ 再 flush 到 Dispatcher
 ```
 
-在 macOS 源码机上没有 Android `/dev/input` 和 dumpsys 现场也没关系，本章练习只需读实现；真实设备验证留到未来 Linux/adb 环境。
+最重要的边界是：
 
----
+- EPOLLWAKEUP 只覆盖到底层管线进入下一次 wait，不到 App FINISHED；
+- RawEvent 保留 kernel timestamp，但多 fd 不按时间全局排序；
+- nonce 只唯一化无 uniqueId 节点，复合合并通常依赖重复非空 uniqueId；
+- `.kl` 与 `.kcm` 可从不同 fallback basename 补齐；
+- class=0 的节点在 EventHub 就被淘汰；
+- 首次显式 disabled 会在 Mapper.configure 前关 fd，和后段注释意图冲突；
+- enabled 不证明 composite 每个 fd 都 open 且 epoll 注册成功；
+- reopen 后普通数字 id 重新分配，descriptor 不复活旧对象；
+- global generation 与 per-device generation 是两份账，子设备移除只保证前者 bump；
+- SYN_DROPPED 的 drop flag 由整个逻辑 composite 共享。
 
-## 48. 复读审计：八个 r48 边界
+自检时应能回答：
 
-### 边界一：EventHub timeout 是 advisory
+1. inotify、wake pipe、EPOLLWAKEUP 分别解决什么问题？
+2. 为什么一个 `eventN` 不等于一个 Java InputDevice？
+3. 没有 uniqueId 的两个相同节点为什么通常不会合并？
+4. 同一子设备为何可同时有 Keyboard、Cursor、Vibrator Mapper？
+5. 不同 fd 的事件为什么不能按 when 推导全局先后？
+6. policy 的设备列表通知为什么早于 queued input flush？
+7. 首次 disabled 的实际顺序与源码注释哪里矛盾？
+8. MUST_REOPEN 后普通 deviceId 为什么不会保留？
+9. composite 子节点移除时哪层 generation 一定变化？
+10. A 的 SYN_DROPPED 为什么会影响 B 的 raw event？
 
-设备睡眠时不会只为软件 timeout 唤醒；它不是精确 alarm。
-
-### 边界二：扫描尝试打开目录中的每个非点项
-
-`scanDirLocked()` 不先按名字限定 event*，而是逐项 `openDeviceLocked()`；失败/0 class 自然被过滤，日志可能包含非目标节点的open失败。
-
-### 边界三：配置文件“找到”不等于解析成功
-
-PropertyMap load失败后路径仍可能打印在device日志，但 configuration对象不可按成功内容理解。
-
-### 边界四：descriptor nonce 只保证当前集合唯一
-
-无uniqueId的同型号设备，重插顺序变化可让个体descriptor互换。
-
-### 边界五：复合设备按descriptor合并是启发式
-
-错误或碰撞的descriptor可能误合并；不同descriptor则不会因为名字相同自动在InputReader合并。
-
-### 边界六：disable保留EventHub Device但fd=-1
-
-`hasValidFd()` 要同时满足非virtual与enabled；查询当前kernel state在disabled时通常不可用。
-
-### 边界七：MUST_REOPEN 的 logical id 不承诺稳定
-
-EventHub重新分配id，InputReader旧逻辑对象已removed；descriptor帮助上层识别设备性质，但不要把一次reopen前后的数字deviceId当永久身份。
-
-### 边界八：InputDevice::reset 的顺序是 Mapper reset → global meta → notifyReset
-
-r48先逐个调用Mapper `reset()`，再调用一次 `mContext->updateGlobalMetaState()`，最后 `notifyReset(when)`。这样全局meta已经反映清空后的Mapper状态，而下游再收到device reset并按已派发状态合成取消事件；不要误读为更新两次，也不要把notifyReset说成普通按键UP。
-
----
-
-## 49. 检查题
-
-1. inotify、epoll、wake pipe 各解决什么问题？
-2. EPOLLWAKEUP 保护到 App FINISHED 吗？
-3. descriptor 与 eventN 的稳定性差别是什么？
-4. 同 descriptor 的两个节点如何组成一个 InputDevice？
-5. TOUCH_MT 与 TOUCH 各建什么 Mapper？
-6. `.idc/.kl/.kcm` 分别描述什么？
-7. changes=0 为什么比增量 configure 做得更多？
-8. disable 时为何 reset 必须发生在 close fd 之前？
-9. SYN_DROPPED 后为何不继续解释中间 raw event？
-10. MUST_REOPEN 为什么不是一个原地 reload 方法？
-
----
-
-## 50. 最终模型与下一章
-
-### 一句话模型
-
-```text
-EventHub以inotify发现evdev节点、以ioctl和配置文件建立身份/能力/class、以epoll读取带内核时间戳的RawEvent；
-InputReader再按descriptor把一个或多个EventHub子设备组合成逻辑InputDevice，按class创建多个Mapper并严格交错处理raw顺序；
-普通Framework配置用changes bit增量重配现有Mapper，影响设备定义的变化则close→removed→rescan→added完整重建，
-所有NotifyArgs最后经QueuedInputListener在Reader锁外送往Dispatcher。
-```
-
-### 下一章
-
-第 180 章深入 KeyboardInputMapper、`.kl/.kcm`、meta state、key repeat 与 fallback，逐笔推演 Linux scan code 怎样成为 Android KeyEvent。
+下一章深入 **KeyboardInputMapper、`.kl/.kcm`、meta state、key repeat 与 fallback**，逐笔推演 Linux scan code 怎样成为 Android KeyEvent。

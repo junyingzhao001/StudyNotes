@@ -1,1088 +1,639 @@
 # 176 Android InputDispatcher ANR、焦点等待与事件取消恢复
 
 > 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
-> 学习方式：macOS 只读源码，不要求编译、不要求连接设备  
+> 学习方式：macOS 静态只读源码，不要求编译或连接设备  
 > 前置章节：第 18、20、113、173、174、175 章
 
 ---
 
-## 1. 本章目标：不要把所有“输入 ANR”想成同一种超时
+## 1. “输入 ANR”至少有两条不同路径
 
-第 174 章看到事件 publish 到 App 后进入 `waitQueue`，第 175 章又看到 App 最终发送 `FINISHED`。如果 App 太久不确认，InputDispatcher 会发现超时。
-
-但 Android 11 还有另一种输入 ANR：
+看到日志里的 `Input dispatching timed out`，最容易形成的模型是：事件已经进 App，主线程五秒没处理。但 Android 11 还有一种发生在 publish 之前的输入 ANR：
 
 ```text
-系统已经知道“哪个应用应当获得焦点”
-                ↓
-这个应用却迟迟没有可接收焦点事件的窗口
-                ↓
-事件根本还没有 publish 到某个 App InputChannel
+WMS 已指定 focused application
+→ InputDispatcher 要为 Key/非 pointer Motion 找 focused window
+→ 该应用一直没有可接收输入的 focused window
+→ 当前事件停在 mPendingEvent
+→ 按 application timeout 报告 ANR
 ```
 
-所以本章先建立两个模型：
+另一条才是第 174—175 章的完成链超时：
 
-| 类型 | 事件卡在哪里 | 计时对象 | 典型理由 |
+```text
+已找到 connection
+→ socket publish 成功
+→ DispatchEntry 进入 waitQueue
+→ App 没有及时返回 FINISHED
+→ 按 connection/window deadline 报告 ANR
+```
+
+两者的分界是 publish：
+
+| 类型 | 事件位置 | 归因对象 | App 是否可能已经收到这笔事件 |
 |---|---|---|---|
-| 无焦点窗口 ANR | `mPendingEvent`，尚未找到窗口目标 | `mNoFocusedWindowTimeoutTime` + awaited application | `... does not have a focused window` |
-| connection ANR | 已 publish，留在某连接 `waitQueue` | 每个 `DispatchEntry.timeoutTime` + `AnrTracker` | `... is not responding. Waited ... for ...` |
+| no-focused-window | 全局 `mPendingEvent` | `InputApplicationHandle` | 否 |
+| connection ANR | 某 connection 的 `waitQueue` | InputChannel token | 是 |
 
-这两个超时最后都会经过 WMS/AMS，但起点、现场、可恢复方式和取消动作并不相同。
-
----
-
-## 2. 先记住最重要的结论
-
-1. InputDispatcher 的默认派发超时是 5 秒，但窗口或应用可携带自己的 timeout。
-2. “无焦点窗口”不是从 Activity 启动那一刻计时，而是第一次有焦点路由事件需要投递时才启动计时。
-3. connection timeout 从事件成功 publish 时计算，不是从硬件产生事件时计算。
-4. `AnrTracker` 是 deadline 索引，不保存事件本体；事件本体仍在 connection 的 `waitQueue`。
-5. native 发现超时后不会直接杀进程，而是回调策略层，让 WMS/AMS决定终止还是继续等待。
-6. 策略要求继续等待时，native 会重设 deadline；要求中止时，connection 路径会合成取消事件。
-7. “取消事件”不等于“立刻断开 InputChannel”，窗口/进程退出后才会走通道移除和连接清理。
-8. 被标记 `responsive=false` 的窗口不会接收一条**新触摸手势**，但焦点事件仍可能继续积压。
+本章目标是学会从队列、deadline、token 和取消状态判断是哪一条路径，并说明 WMS/AMS 延长或终止等待后，native 真正做了什么。它不把 ANR 报告等同于杀进程，也不把合成 CANCEL 等同于客户端已经执行清理。
 
 ---
 
-## 3. 本章要回答的十八个问题
+## 2. 源码地图与三只容易混淆的时钟
 
-1. 5 秒常量究竟在哪里使用？
-2. 为什么有 focused application 却没有 focused window？
-3. 没有 application、也没有 window 时为何不等 5 秒？
-4. 无焦点窗口的 pending event 是否已经进入 App？
-5. 焦点应用变化怎样撤销旧计时？
-6. 新窗口出现怎样恢复当前事件？
-7. 触摸另一个 App 为什么能剪枝旧输入队列？
-8. `outboundQueue`、socket 和 `waitQueue` 分别代表什么？
-9. `timeoutTime` 在什么时刻写入？
-10. 为什么 `AnrTracker` 使用 deadline + token 的 multiset？
-11. 为什么报告理由选择 waitQueue 最老事件？
-12. WMS 怎样从 InputChannel token 找到窗口和进程？
-13. AMS 返回什么值表示“继续等待”？
-14. 调试中的进程为何可能被延长？
-15. ANR 后合成的 Key UP、Motion CANCEL 从哪里来？
-16. 为什么合成 CANCEL 仍可能送不进已经卡住的 App？
-17. App 晚到的 FINISHED 怎样使 connection 恢复 responsive？
-18. `dumpsys input` 中应该怎样判断卡在哪一层？
-
----
-
-## 4. 源码地图
-
-建议按下面顺序阅读：
+native 调度、超时索引与取消状态：
 
 ```text
 frameworks/native/services/inputflinger/dispatcher/
 ├── InputDispatcher.cpp
 ├── InputDispatcher.h
-├── AnrTracker.cpp
-├── AnrTracker.h
-├── InputState.cpp
-├── InputState.h
+├── AnrTracker.cpp / AnrTracker.h
+├── InputState.cpp / InputState.h
 └── CancelationOptions.h
-
-frameworks/base/services/core/java/com/android/server/
-├── input/InputManagerService.java
-├── wm/InputManagerCallback.java
-├── wm/ActivityRecord.java
-└── am/ActivityManagerService.java
 ```
 
-四个核心阅读入口：
+Java policy 与进程归因：
 
-- 目标尚未确定：`findFocusedWindowTargetsLocked()`；
-- 周期检查：`processAnrsLocked()`；
-- 回调策略：`doNotifyAnrLockedInterruptible()`；
-- 已投递事件完成：`doDispatchCycleFinishedLockedInterruptible()`。
-
----
-
-## 5. 两条 ANR 路径总图
-
-```mermaid
-flowchart TD
-    E["焦点路由事件成为 mPendingEvent"] --> F{"有 focused window?"}
-    F -- "没有 window，也没有 app" --> D["立即 FAILED / 丢弃"]
-    F -- "有 app，无 window" --> T["启动或继续 no-focused-window timer"]
-    T --> W{"窗口在 deadline 前出现?"}
-    W -- 是 --> R["清 timer，找到 target"]
-    W -- 否 --> A1["application ANR 回调"]
-    F -- 有 --> R
-    R --> P["publish 到 InputChannel"]
-    P --> Q["DispatchEntry 进入 waitQueue"]
-    Q --> ACK{"deadline 前收到 FINISHED?"}
-    ACK -- 是 --> OK["移出 waitQueue"]
-    ACK -- 否 --> A2["connection ANR 回调"]
-    A1 --> POLICY["WMS / AMS 决定 abort 或继续等"]
-    A2 --> POLICY
+```text
+frameworks/base/services/core/
+├── jni/com_android_server_input_InputManagerService.cpp
+└── java/com/android/server/
+    ├── input/InputManagerService.java
+    ├── wm/InputManagerCallback.java
+    ├── wm/ActivityRecord.java
+    └── am/ActivityManagerService.java
 ```
 
-这张图最关键的分界是 `publish`：上半条 ANR 尚无具体 connection；下半条已经能指向一个 InputChannel token。
+r48 有三只经常同时出现在输入卡顿讨论中的时钟：
 
----
+| 时长 | 用途 | 到点行为 |
+|---|---|---|
+| 默认 5s | application/window 没提供其他 dispatch timeout 时兜底 | 进入 ANR policy 链 |
+| 2s | FINISHED 后计算出的慢处理告警 | 只写 slow log |
+| 500ms | Key 等待更早未完成派发，以给潜在焦点变化机会 | 超时后仍把 Key 发给当前焦点 |
 
-## 6. 时间基准：这里使用单调时钟
-
-`InputDispatcher::now()` 最终使用适合计算持续时间的单调时间，不依赖用户修改墙上时钟。以下时间均属于同一类持续时间模型：
-
-- `deliveryTime`；
-- `timeoutTime`；
-- `mNoFocusedWindowTimeoutTime`；
-- `eventDuration`；
-- Looper 下一次唤醒时间。
-
-因此把系统日期从 2026 年改到 2027 年，不应让输入 ANR 立刻触发。日志中的 ANR snapshot 另用 `time(nullptr)` 生成可读日期，那只是展示时间，不参与 deadline 比较。
-
----
-
-## 7. 默认 5 秒不是所有输入等待的唯一时间
-
-Android 11 r48 定义：
+窗口与 application handle 可携带自己的 timeout，所以 ANR 不保证恰好五秒。三者都基于：
 
 ```cpp
-constexpr std::chrono::nanoseconds
-        DEFAULT_INPUT_DISPATCHING_TIMEOUT = 5s;
-constexpr nsecs_t
-        SLOW_EVENT_PROCESSING_WARNING_TIMEOUT = 2000 * 1000000LL;
-constexpr std::chrono::nanoseconds
-        KEY_WAITING_FOR_EVENTS_TIMEOUT = 500ms;
+systemTime(SYSTEM_TIME_MONOTONIC)
 ```
 
-三者不要混淆：
-
-| 时间 | 用途 | 到点结果 |
-|---|---|---|
-| 默认 5 秒 | 窗口/应用未提供其他派发 timeout 时的兜底 | 可能进入 ANR 策略 |
-| 2 秒 | 单笔事件完成后的 slow processing 日志 | 只记录慢，不等于 ANR |
-| 500ms | Key 等待更早 Motion 完成以避免错投焦点 | 超时后仍把 Key 发给当前焦点窗口 |
-
-窗口 timeout 可覆盖默认值，所以“输入 ANR 永远恰好 5 秒”并不准确。
+修改墙上日期不会直接推进 deadline。`mLastAnrState` 中用 `time(nullptr)` 生成的可读日期只用于展示，不参与超时比较。
 
 ---
 
-## 8. focused application 与 focused window 不是一个对象
+## 3. 目标选择前先分清 focused application 与 window
 
-回顾第 173 章：
+两份焦点状态按 display 保存：
 
-- focused application 表示 WMS 认为哪个 Activity/application 正在成为交互主体；
-- focused window 表示当前真正能接收焦点路由输入的窗口；
-- 两者都按 display 保存；
-- focused display 又决定 displayId 未明确的事件去哪个显示屏。
+- focused application：WMS 认为正在成为交互主体的 Activity/application；
+- focused window：当前窗口快照中真正可接收 focus-routed 输入的窗口；
+- focused display：事件没指定 display 时使用的默认显示屏。
 
-应用启动或窗口切换期间，可以短暂出现：
+启动或窗口切换期间可以合法地短暂出现：
 
 ```text
 focusedApplication = 新 Activity
 focusedWindow      = null
 ```
 
-这不一定是错误。应用可能正在创建窗口、relayout 或等待窗口快照同步。InputDispatcher 因而给它一个等待窗口，而不是立即丢掉第一笔 Key。
+Key 与非 pointer Motion 主要通过 `findFocusedWindowTargetsLocked()` 选目标。普通触摸 DOWN 走 `findTouchedWindowTargetsLocked()`，按坐标、touch region 与已有 `TouchState` 选窗；“无 focused window”不会自动冻结所有触摸。
 
----
+### 3.1 没有 window 也没有 application 时立即失败
 
-## 9. 没有窗口也没有应用：立即失败
+若目标 display 两者皆空，源码返回 `INPUT_EVENT_INJECTION_FAILED`。此时连“该等谁”都无法归因，不建立 no-focus timer；硬件事件会结束为 drop，同步注入则得到相应失败结果。
 
-`findFocusedWindowTargetsLocked()` 先取目标 display 的两份状态：
+### 3.2 有 application、无 window 时才开始等待
 
-```cpp
-sp<InputWindowHandle> focusedWindowHandle =
-        getValueByKey(mFocusedWindowHandlesByDisplay, displayId);
-sp<InputApplicationHandle> focusedApplicationHandle =
-        getValueByKey(mFocusedApplicationHandlesByDisplay, displayId);
-
-if (focusedWindowHandle == nullptr &&
-        focusedApplicationHandle == nullptr) {
-    return INPUT_EVENT_INJECTION_FAILED;
-}
-```
-
-此时系统连“应该等谁”都不知道，所以不能建立 application ANR 归因，也不会凭空等待默认 5 秒。
-
-这和“已有 focused application、只差窗口”是两种状态。
-
----
-
-## 10. 无焦点窗口计时何时开始
-
-核心代码是：
-
-```cpp
-if (focusedWindowHandle == nullptr &&
-        focusedApplicationHandle != nullptr) {
-    if (!mNoFocusedWindowTimeoutTime.has_value()) {
-        const nsecs_t timeout =
-                focusedApplicationHandle->getDispatchingTimeout(
-                        DEFAULT_INPUT_DISPATCHING_TIMEOUT.count());
-        mNoFocusedWindowTimeoutTime = currentTime + timeout;
-        mAwaitedFocusedApplication = focusedApplicationHandle;
-        *nextWakeupTime = *mNoFocusedWindowTimeoutTime;
-        return INPUT_EVENT_INJECTION_PENDING;
-    }
-    // 仍在等待或已经超时……
-}
-```
-
-注意计时不是由 `setFocusedApplication()` 主动启动。只有某个需要按焦点选目标的事件来到这里，Dispatcher 才“发现”缺窗口并开始计时。
-
-所以更准确的说法是：
-
-> 有 focused application 且出现了待派发的焦点事件，但始终没有 focused window。
-
----
-
-## 11. 哪些事件进入这条焦点路由
-
-`findFocusedWindowTargetsLocked()` 主要服务于按焦点选择目标的事件，例如 Key 和非 pointer Motion。普通触摸 DOWN 通常走 `findTouchedWindowTargetsLocked()`，按坐标命中窗口，而不是要求目标必须是 focused window。
-
-因此“没有焦点窗口一定导致所有触摸都停住”是错误概括。触摸可能命中另一个可触摸窗口，甚至帮助用户离开正在启动但无窗口的应用。
-
----
-
-## 12. 等待期间事件留在哪里
-
-函数返回 `INPUT_EVENT_INJECTION_PENDING` 后，当前事件仍是 `mPendingEvent`，下一轮 dispatch loop 会再次尝试。
-
-它尚未：
-
-- 生成针对某个窗口的 `DispatchEntry`；
-- 写入某个 InputChannel socket；
-- 进入任何 connection 的 `waitQueue`；
-- 到达 App 的 `NativeInputEventReceiver`。
-
-这解释了为什么无焦点窗口 ANR 的回调携带 `InputApplicationHandle`，而没有 InputChannel token。
-
----
-
-## 13. 窗口及时出现后的恢复
-
-当下一轮目标选择发现有效 focused window 时：
-
-```cpp
-// we have a valid, non-null focused window
-resetNoFocusedWindowTimeoutLocked();
-```
-
-该函数同时清掉：
-
-```cpp
-mNoFocusedWindowTimeoutTime = std::nullopt;
-mAwaitedFocusedApplication.clear();
-```
-
-随后继续做注入权限、paused、Key 排序等待等检查，最终把当前 pending event 指向新窗口。
-
-不是另造一笔事件，也不是等待的事件已经丢失后重放；通常就是同一个 pending event 再次选目标成功。
-
----
-
-## 14. 焦点应用换人也会撤销旧计时
-
-`setFocusedApplication()` 中有一条代际检查：
-
-```cpp
-if (oldFocusedApplicationHandle == mAwaitedFocusedApplication &&
-        inputApplicationHandle != oldFocusedApplicationHandle) {
-    resetNoFocusedWindowTimeoutLocked();
-}
-```
-
-含义是：正在等待 A 创建窗口时，WMS 已把 focused application 改成 B，就不能继续拿 A 的 deadline 和名字归因。
-
-下一轮若 B 也没有窗口，会在新的焦点事件选择中重新建立计时。
-
----
-
-## 15. 超时时，先生成 native 现场
-
-`processAnrsLocked()` 每轮 dispatch 后检查：
-
-```cpp
-if (mNoFocusedWindowTimeoutTime.has_value() &&
-        mAwaitedFocusedApplication != nullptr) {
-    if (currentTime >= *mNoFocusedWindowTimeoutTime) {
-        onAnrLocked(mAwaitedFocusedApplication);
-        mAwaitedFocusedApplication.clear();
-        return LONG_LONG_MIN;
-    }
-}
-```
-
-`onAnrLocked(application)` 生成理由：
+只有某笔需要焦点路由的事件真正来到目标选择，且发现 application 存在、window 为空时，才执行：
 
 ```text
-<application name> does not have a focused window
+mNoFocusedWindowTimeoutTime = currentTime + application timeout
+mAwaitedFocusedApplication  = focused application
+当前事件返回 INPUT_EVENT_INJECTION_PENDING
 ```
 
-并调用 `updateLastAnrStateLocked()`，把当时 Dispatcher 状态保存到 `mLastAnrState`，供后续 dump 查看。
-
-这里先清 `mAwaitedFocusedApplication`，避免 dispatch loop 在策略回调完成前反复报告同一超时。
+所以计时起点不是 Activity 启动、resume 或 `setFocusedApplication()` 的时刻，而是 Dispatcher 第一次因一笔事件发现“有应用、无窗口”的时刻。
 
 ---
 
-## 16. 为什么新触摸可剪掉旧队列
+## 4. no-focus 事件停在全局 pending，timer 也是单份
 
-等待某 App 的焦点窗口时，如果用户按下另一个 App 的窗口，`shouldPruneInboundQueueLocked()` 可以返回 true：
+目标选择返回 PENDING 后，同一笔事件仍由 `mPendingEvent` 持有，下一轮 dispatch loop 重试。此时它尚未：
 
-```cpp
-if (isPointerDownEvent && mAwaitedFocusedApplication != nullptr) {
-    sp<InputWindowHandle> touched =
-            findTouchedWindowAtLocked(displayId, x, y, nullptr);
-    if (touched != nullptr &&
-        touched->getApplicationToken() !=
-                mAwaitedFocusedApplication->getApplicationToken()) {
-        return true;
-    }
-}
-```
+- 为某个窗口创建 `DispatchEntry`；
+- 进入某个 connection 的 `outboundQueue`；
+- 写入 InputChannel socket；
+- 进入 `waitQueue` 或 `AnrTracker`；
+- 到达 App 的 `InputEventReceiver`。
 
-新 DOWN 被记为 `mNextUnblockedEvent`。在它之前被旧等待阻塞的 Key/Motion 会以 `DropReason::BLOCKED` 丢弃，直到走到这笔新事件，标记被清除。
+这解释了 no-focus ANR 为什么只有 `InputApplicationHandle`，没有 connection token。
 
-目的不是优化吞吐量，而是避免一个没有窗口的 App 把用户切换到其他 App 的输入也堵在后面。
+### 4.1 window 出现后复用原事件继续选目标
 
----
+`setInputWindows()` 会唤醒 Dispatcher。下一次同一 pending event 看见有效 focused window 时，`resetNoFocusedWindowTimeoutLocked()` 同时清除 deadline 与 awaited application，然后继续检查注入权限、paused 和 Key 排序门。
 
-## 17. gesture monitor 也能成为剪枝理由
+“窗口出现”本身没有在 `setInputWindowsLocked()` 中直接清 timer；清理发生在事件重试并确认有 focused window 时。通常仍是原 pending event 继续，不是丢掉后重造。
 
-即便坐标下没有另一个应用窗口，只要存在一个仍 responsive 的 gesture monitor，代码也允许剪枝：
+### 4.2 application 换代只在匹配 awaited 时清 timer
+
+`setFocusedApplication(displayId, new)` 会比较：
 
 ```text
-旧 focused application 没窗口
-        +
-新 pointer DOWN 到来
-        +
-至少一个 gesture monitor 仍能接收
-        ↓
-允许清掉新 DOWN 之前的阻塞事件
+该 display 的 old focused application == mAwaitedFocusedApplication
+且 new != old
 ```
 
-这保证系统级手势监控者仍有机会观察新手势。它不是说 monitor 自动成为普通目标，而是说它提供了“不应被旧队列永久拖住”的理由。
+满足才 reset。这个条件避免其他 display 的 application 更新误清当前等待，但也说明 r48 的 no-focus 状态并不是 per-display map：
+
+```text
+mNoFocusedWindowTimeoutTime   // 全局单份
+mAwaitedFocusedApplication    // 全局单份
+```
+
+同一时刻只有全局 pending 头事件正在选目标，这种设计与串行 dispatch loop 配套；分析多显示现场时仍不能凭每 display 焦点表臆造多只 timer。
 
 ---
 
-## 18. 第二条路径从成功 publish 开始
+## 5. no-focus 到期、abort 与继续等待怎样收尾
 
-对于已经选定 connection 的事件，`startDispatchCycleLocked()` 先设置：
+每轮 `dispatchOnce()` 在 command 处理之后调用 `processAnrsLocked()`。no-focus 条件满足时：
 
-```cpp
-dispatchEntry->deliveryTime = currentTime;
-const nsecs_t timeout = getDispatchingTimeoutLocked(
-        connection->inputChannel->getConnectionToken());
-dispatchEntry->timeoutTime = currentTime + timeout;
+```text
+currentTime >= deadline
+→ onAnrLocked(awaited application)
+→ 保存 mLastAnrState
+→ command queue 加入 notifyANR
+→ 清 mAwaitedFocusedApplication
+→ 立即再跑一轮
 ```
 
-只有 `publishKeyEvent()` / `publishMotionEvent()` / `publishFocusEvent()` 成功后，它才从 outbound 移入 wait：
+注意这里只清 awaited application，没有清 `mNoFocusedWindowTimeoutTime`。随后 policy 有两种返回：
+
+### 5.1 extension > 0
+
+因为 no-focus 没有 connection，`extendAnrTimeoutsLocked()` 用：
+
+```text
+now() + extension → 新 no-focus deadline
+原 application    → 重新写回 awaited
+```
+
+于是相同 pending event 继续等窗口，到下一次 deadline 可再次报告。
+
+### 5.2 extension == 0
+
+abort 分支按 null token 找不到 connection，直接返回，不合成 CANCEL。下一轮目标选择看到旧 deadline 已过，会返回 injection failed 并释放 pending event；在 timer 未被其他 reset 路径清除前，后续 focus-routed 事件也会立即失败。
+
+`processAnrsLocked()` 用 `>=` 报告，到目标选择里判断“已经报告”用 `>`。正常循环先让 pending 重试，再在尾部检查 ANR；边界值附近不要把这两个比较写成同一行源码。
+
+### 5.3 paused focused window 是第三种等待状态
+
+一旦 focused window 非空，源码先 reset no-focus timer；若该 window 的 `paused=true`，焦点路由函数只返回 PENDING，没有为这条分支另建 no-focus 或 connection deadline。它依赖后续窗口状态更新唤醒并解除；普通 touch 命中 paused window 则把它排除，最终可能直接失败。
+
+所以“所有 publish 前等待都会五秒 ANR”不成立。`paused` 是需要单独看窗口快照和注入调用方等待上限的门。
+
+---
+
+## 6. 新触摸可以剪枝，但不直接清 no-focus timer
+
+当 no-focus 等待存在，新 pointer DOWN 入 inbound queue 时，`shouldPruneInboundQueueLocked()` 检查：
+
+```text
+坐标命中的 window 属于不同 application token
+或者
+该 display 至少有一个仍 responsive 的 gesture monitor
+```
+
+命中任一条件，就把这笔 DOWN 记为 `mNextUnblockedEvent`。在它之前成为 pending 的 Key/Motion 会被标为 `DropReason::BLOCKED`；FOCUS、configuration 与 device-reset 不走这条 drop 分支。走到 sentinel DOWN 本身时标记清除，它再正常选触摸目标。
+
+这让用户有机会离开一个迟迟没有窗口的 App，也让系统手势监控者不被旧 pending 永久堵住。
+
+但剪枝函数没有直接调用 `resetNoFocusedWindowTimeoutLocked()`。它通常依赖新 DOWN 引起 WMS 焦点/application 更新来清旧等待；在该更新真正到达前，旧 no-focus deadline 仍是 native 状态。不要把“旧 Key 已 drop”直接等价为“application ANR timer 已清”。
+
+### 6.1 每笔 BLOCKED drop 还会触发全连接取消
+
+`dropInboundEventLocked()` 对被丢的 Key/非 pointer Motion 合成 `CANCEL_NON_POINTER_EVENTS`，对 pointer Motion 合成 `CANCEL_POINTER_EVENTS`，而且调用的是 `synthesizeCancelationEventsForAllConnectionsLocked()`。
+
+它不是只清理原本可能成为目标的一个窗口。一个全局 inbound 流被截断时，Dispatcher 选择跨所有 connection 修复对应类别的输入状态；这比“删掉 inbound 节点”影响更广。
+
+---
+
+## 7. 500ms Key 门实际查看全局 AnrTracker
+
+焦点窗口有效后，Key 仍可能暂缓。设计动机是：更早触摸可能打开新窗口，用户紧接着按下的键应该有机会送给新焦点，而不是旧窗口。
+
+源码注释常以 Motion 举例，但 r48 的实际条件只是：
 
 ```cpp
-connection->waitQueue.push_back(dispatchEntry);
-if (connection->responsive) {
-    mAnrTracker.insert(dispatchEntry->timeoutTime,
-                       connectionToken);
+if (mAnrTracker.empty()) {
+    return false;
 }
 ```
 
-因此 connection ANR 计量的是“成功交给内核 socket 后，等待 App FINISHED 多久”。硬件采样到 publish 之前的排队时间不包含在这一笔 `timeoutTime` 中。
+因此它看到的是全局所有 responsive connection 已索引的未完成派发，不限定：
+
+- 事件一定是 Motion；
+- connection 一定是当前 focused window；
+- display 一定与当前 Key 相同。
+
+首次发现 tracker 非空时设置全局 `mKeyIsWaitingForEventsTimeout = now + 500ms`。更早事件全部完成、500ms 到期，或新 pointer DOWN 到来把该 timer 改为 `now()`，都会让 pending Key 继续发给那一刻的 focused window。
+
+另一个边界是：connection 被判 unresponsive 后，`eraseToken()` 会从 tracker 删除它的所有索引，但 waitQueue 仍可非空。此时 Key 门可能因 tracker 空而放行；它并不是扫描所有 waitQueue 的“绝对先前事件屏障”。
+
+500ms 到点只结束排序等待，不报告 ANR，也不改变已在 waitQueue 中事件自己的 deadline。
 
 ---
 
-## 19. 三个队列和 socket 的准确关系
+## 8. connection deadline 只在 publish 成功后入索引
 
-```mermaid
-flowchart LR
-    I["Inbound / Pending<br/>还在全局选目标"] --> O["outboundQueue<br/>已生成某connection的DispatchEntry"]
-    O -->|"socket send 成功"| S["内核 SOCK_SEQPACKET 缓冲<br/>App可能尚未read"]
-    S --> W["waitQueue<br/>Dispatcher等待FINISHED"]
-    W -->|"FINISHED(seq)"| X["移除并释放"]
-    O -->|"WOULD_BLOCK"| O
+目标确定后，`DispatchEntry` 先进入该 connection 的 outbound。`startDispatchCycleLocked(currentTime, connection)` 为队头写：
+
+```text
+deliveryTime = 本次函数参数 currentTime
+timeoutTime  = currentTime + 当前 window/default timeout
 ```
 
-`waitQueue` 与 socket 缓冲不是先后互斥状态。send 成功后，App 可能还没有 read，但 Dispatcher 已经把同一 DispatchEntry 放进 waitQueue。
+然后尝试 `publishKeyEvent`、`publishMotionEvent` 或 `publishFocusEvent`。只有 socket send 成功才：
 
-所以 dump 中 waitQueue 很长可能是：
+```text
+从 outbound 删除
+→ 加到 waitQueue 尾部
+→ connection responsive 时把 (timeoutTime, token) 插入 AnrTracker
+```
 
-- App 主线程没读；
-- App 已读但 InputStage/IME/View 没 finish；
-- App 已调用 finish，但反向 FINISHED packet 尚未被 Dispatcher 处理。
+WOULD_BLOCK 会把条目留在 outbound；下一次 start cycle 会用新的 currentTime 覆盖 delivery/timeout。它尚未进入本次 connection ANR 计时。
 
-只看 waitQueue 无法区分这三段，需要结合 App 主线程堆栈、trace 和 socket/Looper 现场。
+`startDispatchCycleLocked()` 的 while 循环不会在每次 publish 前重新调用 `now()`。同一轮连续成功写出的多个 entry 会共享函数传入的 deliveryTime 基线，并在 timeout 相同时共享 deadline。这是近似批次时刻，不是每个 packet 独立取时。
+
+### 8.1 waitQueue 与 socket 缓冲可同时表示同一笔事件
+
+publish 成功只证明内核接受完整 packet。App 还没 read 时，packet 可在 socket 接收缓冲，而逻辑 `DispatchEntry` 已在 Dispatcher waitQueue：
+
+```text
+waitQueue 有 entry
+≠ App Java callback 已开始
+≠ View 已处理
+≠ FINISHED 已在反向 socket
+```
+
+connection timeout 覆盖 socket 等 App 读取、App Looper、IME/ViewRoot/View、以及 FINISHED 返回 Dispatcher 的整个后半段；硬件采样到成功 publish 之前的排队不计入该 entry 的 delivery duration。
 
 ---
 
-## 20. AnrTracker 只是“最早闹钟索引”
+## 9. AnrTracker 是 deadline 索引，不是事件队列
 
-`AnrTracker` 内部是：
+其核心结构是：
 
 ```cpp
 std::multiset<std::pair<nsecs_t, sp<IBinder>>> mAnrTimeouts;
 ```
 
-每一项只有：
+只存 deadline 和 connection token。事件描述、deliveryTime、resolved action 与 target flags 仍在 `waitQueue` 的 `DispatchEntry`。使用 multiset 是因为同一 connection 的多个事件可以拥有相同 deadline；删除一个 `(time, token)` 只移除一份重复项。
 
-- timeout deadline；
-- connection token。
-
-`multiset` 允许同一 connection 多笔事件、甚至相同 deadline。最前面的 pair 就是全系统下一次该检查的 connection deadline。
-
-事件描述、delivery time、target flags 等仍在 `connection->waitQueue` 的 `DispatchEntry` 中。
-
----
-
-## 21. processAnrsLocked 怎样安排 Looper 唤醒
-
-每轮 `dispatchOnce()` 在处理 pending command 后调用：
-
-```cpp
-const nsecs_t nextAnrCheck = processAnrsLocked();
-nextWakeupTime = std::min(nextWakeupTime, nextAnrCheck);
-```
-
-然后把绝对时间换算成 `pollOnce()` 的毫秒超时。
-
-它先检查 no-focused-window deadline，再取 `mAnrTracker.firstTimeout()`。所以同一轮中前者已经到期时，会先发 application ANR，并立即再跑一轮；connection deadline 随后仍会被检查，并非永久遗漏。
-
----
-
-## 22. connection 到期后为何删掉该 token 的所有 tracker 项
-
-核心代码：
-
-```cpp
-connection->responsive = false;
-mAnrTracker.eraseToken(connection->inputChannel->getConnectionToken());
-onAnrLocked(connection);
-```
-
-一旦确认 connection 不响应，继续让它的第二、第三笔 deadline 每到一次就报同一个 ANR 没有价值。因此索引中删掉这个 token 的全部项。
-
-注意：
-
-- `waitQueue` 本体没有因此全部清空；
-- 连接也没有因此改成 BROKEN；
-- 它只是暂时不再参与下一次 ANR 闹钟索引。
-
----
-
-## 23. 为什么理由使用 waitQueue 最老事件
-
-`onAnrLocked(connection)` 从 waitQueue 取最先发送的 entry：
-
-```cpp
-DispatchEntry* oldestEntry = *connection->waitQueue.begin();
-const nsecs_t currentWait = now() - oldestEntry->deliveryTime;
-```
-
-源码注释承认：触发最早 deadline 的不一定是 oldest entry。例如窗口 timeout 在两笔事件之间变化，新事件可能拥有更早 deadline。
-
-但应用通常顺序处理输入，最老未完成事件更能解释“队头为什么堵住”，所以 reason 仍展示 oldest entry。
-
-诊断时要区分：
+每轮 `processAnrsLocked()` 先考虑 no-focus deadline，再与 `mAnrTracker.firstTimeout()` 取最早唤醒点。若 connection deadline 已到：
 
 ```text
-触发 tracker.firstTimeout 的 entry
-        不保证等于
-reason 中描述的 oldest waitQueue entry
+connection.responsive = false
+→ eraseToken(token)，删掉该 connection 的全部 deadline 索引
+→ onAnrLocked(connection)
+→ 返回 LONG_LONG_MIN，要求立即再跑
 ```
 
----
+删除全部索引是为了避免同一不响应连接的第二、第三笔 entry 连续重复报告；waitQueue 本体没有清空，connection 状态也没有因此变为 BROKEN。
 
-## 24. waitQueue 已恢复时可取消一次过时 ANR
+### 9.1 ANR reason 解释 oldest，不保证解释触发项
 
-ANR 检查与策略 command 之间会释放锁并穿插完成回执。`onAnrLocked(connection)` 因而先检查：
-
-```cpp
-if (connection->waitQueue.empty()) {
-    ALOGI("Not raising ANR because ... has recovered");
-    return;
-}
-```
-
-这是典型的“到期事实”和“执行处置”之间重新验证。不能因为 tracker 曾发现 timeout，就断言最终一定弹 ANR。
-
----
-
-## 25. native 不在锁内直接进入 WMS
-
-`onAnrLocked()` 只往 command queue 放 `doNotifyAnrLockedInterruptible`。真正回调时：
-
-```cpp
-mLock.unlock();
-const nsecs_t timeoutExtension =
-        mPolicy->notifyAnr(application, token, reason);
-mLock.lock();
-```
-
-这是重要锁边界。WMS/AMS 可能取复杂锁、收集现场甚至触发异步 ANR 工作，不能持着 Dispatcher 全局锁调用。
-
-“Interruptible” 在这里不是 Java 线程中断，而是表示回调期间主动释放 native 锁，回来后必须重新面对状态已变化的可能性。
-
----
-
-## 26. Java 回调链
-
-```mermaid
-sequenceDiagram
-    participant ID as InputDispatcher(native)
-    participant IMS as InputManagerService
-    participant IMC as InputManagerCallback(WMS)
-    participant AR as ActivityRecord
-    participant AMS as ActivityManagerService
-
-    ID->>IMS: notifyANR(applicationHandle, token, reason)
-    IMS->>IMC: notifyANR(...)
-    IMC->>IMC: 找WindowState/embedded window/ActivityRecord
-    IMC->>IMC: saveANRStateLocked + ATMS save state
-    alt 能归因到Activity
-        IMC->>AR: keyDispatchingTimedOut(reason, windowPid)
-        AR->>AMS: inputDispatchingTimedOut(...)
-    else 只有windowPid
-        IMC->>AMS: inputDispatchingTimedOut(pid, aboveSystem, reason)
-    end
-    AMS-->>IMC: abort 或继续等待
-    IMC-->>ID: 0 或 timeoutExtension(ns)
-```
-
-JNI/native policy 桥接细节不改变这里的语义：返回正数是再等多久，返回 0 是停止本次派发等待。
-
----
-
-## 27. WMS 怎样找到责任窗口
-
-`InputManagerCallback.notifyANRInner()` 首先用 InputChannel token 查询：
-
-```java
-windowState = mService.mInputToWindowMap.get(token);
-```
-
-找到后可取得：
-
-- `WindowState.mActivityRecord`；
-- 窗口所属 session PID；
-- 窗口是否位于 system alert layer 之上。
-
-若不是普通 WindowState，还会查询 `EmbeddedWindowController`，用 embedded window 的 owner PID 和 host window 推断层级。
-
-若 token 为空而有 `InputApplicationHandle`，则从 application token 找 `ActivityRecord`。这正对应无焦点窗口 ANR。
-
----
-
-## 28. 为什么先保存 WMS/ATMS 现场再通知 AMS
-
-WMS 在全局锁内完成窗口归因和：
-
-```java
-mService.saveANRStateLocked(activity, windowState, reason);
-```
-
-释放 WMS 锁后再调用：
-
-```java
-mService.mAtmInternal.saveANRState(reason);
-```
-
-以及 AMS timeout 入口。
-
-这既保留窗口层现场，又避免持 WMS 锁跨入 AMS。源码中仍有 TODO，说明 r48 这段 WMS 锁范围偏大；`preDumpIfLockTooSlow()` 也用来应对取得锁过慢时的预先 dump。
-
----
-
-## 29. AMS 的 abort / wait 语义
-
-对于 Activity 路径：
-
-```java
-final boolean abort = activity.keyDispatchingTimedOut(reason, windowPid);
-if (!abort) {
-    return activity.mInputDispatchingTimeoutNanos;
-}
-return 0;
-```
-
-对于只有 PID 的窗口：
-
-```java
-long timeout = mAmInternal.inputDispatchingTimedOut(...);
-if (timeout >= 0) {
-    return timeout * 1000000L;
-}
-return 0;
-```
-
-这里 Java 内部一个接口用 boolean，另一个用毫秒或负值；`InputManagerCallback` 最终统一成 native 所需的纳秒 extension 或 0。
-
----
-
-## 30. 调试进程为何可能继续等待
-
-AMS 的 `inputDispatchingTimedOut()` 检查 `proc.isDebugging()`：
-
-```java
-if (proc.isDebugging()) {
-    return false;
-}
-```
-
-这里 `false` 表示不要 abort，于是上层返回一个新的 timeout。调试器暂停主线程时，系统避免立刻按普通 ANR 终止应用。
-
-而有 active instrumentation 的进程会结束 instrumentation 并返回 abort。不要把“调试/测试环境都无限延长”概括在一起。
-
----
-
-## 31. 策略要求延长：无焦点窗口路径
-
-native 收到正 extension 后调用 `extendAnrTimeoutsLocked()`。若找不到 connection、但 application 不为空：
-
-```cpp
-if (mNoFocusedWindowTimeoutTime.has_value() && application != nullptr) {
-    mNoFocusedWindowTimeoutTime = now() + timeoutExtension;
-    mAwaitedFocusedApplication = application;
-}
-```
-
-所以无焦点窗口计时重新从 policy 回调返回后的 `now()` 起算，awaited application 也恢复。
-
-如果窗口恰好已出现，后续目标选择会清掉这份计时。
-
----
-
-## 32. 策略要求延长：connection 路径
-
-若 token 仍能找到 connection：
-
-```cpp
-connection->responsive = true;
-const nsecs_t newTimeout = now() + timeoutExtension;
-for (DispatchEntry* entry : connection->waitQueue) {
-    if (newTimeout >= entry->timeoutTime) {
-        entry->timeoutTime = newTimeout;
-        mAnrTracker.insert(newTimeout, connectionToken);
-    }
-}
-```
-
-先前 `eraseToken()` 已清掉旧 tracker 项，所以这里重新插入仍需等待的 entry。
-
-条件是 `newTimeout >= entry->timeoutTime`。若某 entry 原 deadline 反而更晚，就保留其原值；但因为旧索引已被删除，这段代码没有为该“原 deadline 更晚”的 entry 重新 insert。通常 policy extension 足够长，不会碰到这个角落；阅读 r48 时仍应看到这个条件边界，而不要宣称所有 wait entry 必然被重新追踪。
-
----
-
-## 33. 策略要求 abort：connection 合成取消事件
-
-当 extension 不大于 0：
-
-```cpp
-sp<Connection> connection = getConnectionLocked(token);
-if (connection == nullptr) {
-    return;
-}
-cancelEventsForAnrLocked(connection);
-```
-
-无焦点窗口路径没有 token，也没有 connection，所以这里不会凭空合成 CANCEL。
-
-connection 路径则构造：
-
-```cpp
-CancelationOptions options(
-        CancelationOptions::CANCEL_ALL_EVENTS,
-        "application not responding");
-```
-
-然后让该 connection 的 `InputState` 按自己已知的未释放输入状态生成对应终止事件。
-
----
-
-## 34. InputState 为什么能“补”出取消事件
-
-每个 connection 都用 `InputState` 记录已经发布给客户端的状态：
-
-- 哪些 Key DOWN 尚未看到 UP；
-- 哪组 pointer gesture 尚未结束；
-- hover 是否已 enter；
-- fallback key 对应关系。
-
-这不是重放完整历史，而是保存足以让客户端状态归零的 memento。
-
-例如：
+`onAnrLocked(connection)` 使用 `waitQueue.begin()` 的最老发送项计算等待时间并拼 reason。若窗口 timeout 在多笔发送之间变化，最先到期的 tracker entry 可能不是最老 wait entry。
 
 ```text
-App 已收到 KEY_DOWN(A)，未收到 KEY_UP
-        → 合成 KEY_UP(A) + FLAG_CANCELED
-
-App 已收到 ACTION_DOWN/MOVE，手势未结束
-        → 合成 ACTION_CANCEL
-
-App 正在 hover
-        → 合成 ACTION_HOVER_EXIT
+触发 ANR 的最小 deadline
+不保证等于
+reason 文本里展示的 oldest event
 ```
 
----
+源码认为 App 多半线性处理，所以最老未完成项更有诊断价值。精确复盘仍要同时看每笔 wait 与当时 timeout。
 
-## 35. 四种 CancelationOptions
+### 9.2 waitQueue.empty 检查是防御，不是常规 ACK 竞态
 
-| Mode | Key | pointer Motion | 非 pointer Motion | 典型用途 |
-|---|---:|---:|---:|---|
-| `CANCEL_ALL_EVENTS` | 取消 | 取消 | 取消 | ANR、device reset、整体 reset |
-| `CANCEL_POINTER_EVENTS` | 不取消 | 取消 | 不取消 | 窗口移除、触摸焦点转移 |
-| `CANCEL_NON_POINTER_EVENTS` | 取消 | 不取消 | 取消 | 焦点离开、某类事件被 drop |
-| `CANCEL_FALLBACK_EVENTS` | 仅 fallback Key | 不取消 | 不取消 | fallback 清理 |
+`onAnrLocked(connection)` 开头确实在队列为空时放弃报告。但正常路径中，`processAnrsLocked()` 设置 responsive、erase tracker 并调用 `onAnrLocked()` 都持同一把 Dispatcher 锁、在同一 Dispatcher 线程连续执行；FINISHED 不能插进这几行之间把队列清空。
 
-“non-pointer”不等于“只有按键”，它还包含来源不属于 pointer class 的 Motion。
+真正释放 native 锁发生在稍后的 policy command。回调回来后，其他线程可能已 unregister connection，所以 extend/abort 路径会重新按 token 查 connection。不能用开头的 empty 防御证明“到期后、snapshot 前 ACK 可并发取消本次报告”。
 
 ---
 
-## 36. 合成 CANCEL 不是本地直接清状态
+## 10. native 保存现场后，把处置决定交给 WMS/AMS
 
-`synthesizeCancelationEventsForConnectionLocked()` 会把合成事件再做成该 connection 的 DispatchEntry：
+两种 `onAnrLocked()` 都先调用 `updateLastAnrStateLocked()`，把 reason、可读墙上时间和当时的完整 dispatcher dump 存入 `mLastAnrState`，再向 command queue 投递 `doNotifyAnrLockedInterruptible`。
 
-```cpp
-enqueueDispatchEntryLocked(connection, cancelationEventEntry,
-                           target,
-                           InputTarget::FLAG_DISPATCH_AS_IS);
-startDispatchCycleLocked(currentTime, connection);
-```
-
-因此它尝试通过同一个 InputChannel 告诉客户端“先前状态作废”。它不是只在服务端把 memento 擦掉。
-
-这也带来现实边界：如果 App 主线程彻底卡住或 socket 持续满，合成的 CANCEL 可能继续排在 outbound，不能保证客户端立即执行它。
-
----
-
-## 37. ANR 后为什么不立即断开 channel
-
-源码注释明确说：
+command 执行时主动：
 
 ```text
-这里不会主动 break connection。
-如果策略决定关闭 App，之后 unregisterInputChannel
-会负责真正清理 connection。
+unlock InputDispatcher.mLock
+→ mPolicy->notifyAnr(application, token, reason)
+→ lock InputDispatcher.mLock
 ```
 
-于是 ANR 之后可能看到：
+这是同步 policy 调用，但不持 Dispatcher 全局锁。调用期间 Dispatcher 线程本身被占用，不会同时处理 Looper 上的 FINISHED；其他线程仍可能改变窗口或注销连接。
 
-- connection 状态仍是 `STATUS_NORMAL`；
-- `responsive=false`；
-- 原 waitQueue 仍存在；
-- 合成的 cancel 进入 outbound/wait；
-- 之后才因窗口删除、进程死亡或 channel error 进入清理。
-
-这就是“响应性”和“通道存活状态”必须分开的原因。
-
----
-
-## 38. 不响应窗口不会接收新的触摸手势
-
-一条新 pointer gesture 开始选窗时：
-
-```cpp
-if (connection == nullptr) {
-    newTouchedWindowHandle = nullptr;
-} else if (!connection->responsive) {
-    newTouchedWindowHandle = nullptr;
-}
-```
-
-gesture monitor 也经过 `selectResponsiveMonitorsLocked()` 过滤。
-
-若不响应窗口和 monitor 都被排除，当前 DOWN 会因没有 touchable target 而失败。
-
-关键限定是“新手势”。已经建立 `TouchState` 的旧 gesture 有自己的持续路由和取消收尾，不应把这里解释成 `responsive=false` 后所有既有 pointer entry 都瞬间从所有队列消失。
-
----
-
-## 39. 焦点事件仍可能继续积压
-
-`cancelEventsForAnrLocked()` 的注释说得很直白：
+Java 归因顺序是：
 
 ```text
-We are already not sending new pointers to the connection when it blocked,
-but focused events will continue to pile up.
+token → WMS mInputToWindowMap → WindowState / ActivityRecord / owner PID
+token 非普通窗口 → EmbeddedWindowController → owner PID / host 层级
+仍无 Activity 且有 application handle → application token → ActivityRecord
 ```
 
-所以 responsive 标志主要参与新触摸目标和 monitor 过滤，并不是对所有派发入口统一短路。
+WMS 在 global lock 内记录窗口现场，释放后再保存 ATMS 状态并调用 AMS。`preDumpIfLockTooSlow()` 只在 debuggable build 工作，用额外线程探测 WMS/AMS 锁并在过慢时预抓现场；它不改变 native deadline。
 
-这也是 abort 后合成 CANCEL、等待窗口/进程处置仍然必要的原因。
+JNI policy callback 若抛 Java 异常，会清异常并把 extension 置 0，也就是 native 按 abort 处理，而不是无限重试回调。
 
 ---
 
-## 40. 晚到 FINISHED 怎样恢复 responsive
+## 11. AMS 返回的是“是否继续等”，不是杀进程完成点
 
-App 后来发送 `FINISHED(seq)`，Dispatcher 在 waitQueue 找到 entry 后：
-
-```cpp
-connection->waitQueue.erase(dispatchEntryIt);
-mAnrTracker.erase(dispatchEntry->timeoutTime, connectionToken);
-if (!connection->responsive) {
-    connection->responsive = isConnectionResponsive(*connection);
-}
-```
-
-`isConnectionResponsive()` 会扫描剩余 waitQueue；只要仍有 entry 的 timeout 已过，就保持 false。所有剩余 entry 都未过期，才恢复 true。
-
-因此“一笔迟到 ACK 就立刻恢复”并不总成立，要看队列里是否还有过期 entry。
-
----
-
-## 41. 2 秒 slow log 与 5 秒 ANR 再对照
-
-处理 FINISHED 时会计算：
-
-```cpp
-eventDuration = finishTime - dispatchEntry->deliveryTime;
-if (eventDuration > 2s) {
-    ALOGI("... spent ... processing ...");
-}
-```
-
-典型时间线：
+Activity 路径：
 
 ```text
-t0 publish
-t0+2.2s FINISHED
-    → 写 slow log
-    → 不触发 5s ANR
-
-t0 publish
-t0+5s 还未 FINISHED
-    → connection timeout
-    → 回调 WMS/AMS
+ActivityRecord.keyDispatchingTimedOut(...)
+→ boolean abort
+→ abort=false：返回 activity.mInputDispatchingTimeoutNanos
+→ abort=true ：返回 0
 ```
 
-如果窗口自定义 timeout 小于 2 秒，理论上 ANR 可早于 slow log，因为 slow log 只在最终 finish 后判断。
+只有 PID 的窗口路径：
 
----
-
-## 42. drop 为什么也需要合成取消
-
-输入因为 policy、dispatch disabled、app switch、blocked 或 stale 被丢弃时，若前序 DOWN 已经送到客户端，直接丢掉 UP/MOVE 会让 View 永远以为按键或手势仍在进行。
-
-所以 `dropInboundEventLocked()` 按类型选择：
-
-- Key → `CANCEL_NON_POINTER_EVENTS`；
-- pointer Motion → `CANCEL_POINTER_EVENTS`；
-- 非 pointer Motion → `CANCEL_NON_POINTER_EVENTS`。
-
-这和 ANR 的 `CANCEL_ALL_EVENTS` 目标不同：drop 是修复某类流的一致性，ANR 是把该 connection 已跟踪的全部输入状态归零。
-
----
-
-## 43. 全局 reset 又是什么
-
-`resetAndDropEverythingLocked(reason)` 用于更彻底的状态切换：
-
-1. 为所有 connection 合成 `CANCEL_ALL_EVENTS`；
-2. 重置 key repeat；
-3. 释放 pending event；
-4. 清空 inbound queue；
-5. 清无焦点窗口 timer；
-6. 清 `AnrTracker`；
-7. 清每 display 的 touch state、hover 和 replaced keys。
-
-它比“某一个 connection ANR”影响范围大得多。不要看到 CANCEL_ALL 就认为两者等价。
-
----
-
-## 44. 焦点变化也会合成取消，但类型不同
-
-窗口失去焦点时，Dispatcher 给旧 focused input channel 合成：
-
-```cpp
-CANCEL_NON_POINTER_EVENTS, "focus left window"
+```text
+AMS.inputDispatchingTimedOut(...)
+→ 非负毫秒：InputManagerCallback 转成纳秒返回
+→ 负值：InputManagerCallback 返回 0
 ```
 
-focused display 改变时，也只取消旧 focused window 上 display 未指定的 non-pointer events。
+最终仍以 native 的 `timeoutExtension > 0` 为继续等待条件；所以正数才延长，Java 返回 0 即使经过“非负”分支也会落到 abort。
 
-触摸焦点由 `TouchState` 维护，不会仅因键盘焦点切换就无条件 CANCEL pointer gesture。这正体现 Android 把 pointer 路由和 focus 路由分开。
+AMS 对正在调试的进程返回“不 abort”，因此 policy 给 Dispatcher 一段新 timeout；active instrumentation 则会被结束并返回 abort。调试与 instrumentation 不是同一豁免。
 
----
+普通 ANR 工作由 `mAnrHelper.appNotResponding(...)` 发起，后续 traces、对话框或进程处置还有自己的异步阶段。故：
 
-## 45. 一条 connection ANR 的完整时间线
-
-```mermaid
-sequenceDiagram
-    participant D as InputDispatcher
-    participant S as Unix socket
-    participant A as App主线程
-    participant W as WMS/AMS
-
-    D->>S: publish(seq=41)
-    D->>D: deliveryTime=t0, timeoutTime=t0+timeout
-    D->>D: entry放入waitQueue和AnrTracker
-    S-->>A: App可读事件
-    Note over A: 主线程/IME/View链长时间未finish
-    D->>D: processAnrsLocked发现deadline
-    D->>D: responsive=false, eraseToken全部索引
-    D->>W: notifyANR(token, reason)
-    alt WMS/AMS决定继续等
-        W-->>D: timeoutExtension > 0
-        D->>D: responsive=true并重建deadline索引
-    else WMS/AMS决定abort
-        W-->>D: 0
-        D->>S: 尝试发送合成Key UP/Motion CANCEL
-        Note over D,S: channel此刻不一定断开
-    end
+```text
+InputDispatcher 发现 deadline
+≠ AMS 已采完 traces
+≠ ANR 对话框已显示
+≠ 进程已退出
 ```
 
----
-
-## 46. dumpsys input 怎样读
-
-`dumpDispatchStateLocked()` 会输出：
-
-- `DispatchEnabled` / `DispatchFrozen`；
-- `FocusedApplications` 与 `FocusedWindows`；
-- `PendingEvent` 及 age；
-- `InboundQueue`；
-- 每个 connection 的 status、responsive；
-- `OutboundQueue`；
-- `WaitQueue` 中每笔 event 的 age 与 wait；
-- 最近一次 ANR 时保存的 Input Dispatcher snapshot。
-
-可用下面的判断顺序：
-
-| 现场 | 优先解释 |
-|---|---|
-| 有 focused app、无 focused window、PendingEvent 很老 | 无焦点窗口路径 |
-| connection responsive=false、WaitQueue 很老 | 已 publish 未 finish |
-| OutboundQueue 增长且 WaitQueue 非空 | socket/backpressure，App 没及时消费 |
-| WaitQueue 增长但 App 已在 View 逻辑 | App InputStage/View/主线程慢 |
-| status=BROKEN/ZOMBIE | 通道死亡/注销，已不是单纯 responsive 问题 |
-
-静态 dump 不是原子跨进程快照，必须结合 WMS/AMS ANR 日志和 App traces。
+WMS `notifyANR` 还记录整次回调耗时，因为它运行在 InputDispatcher thread 上；policy 自身变慢会继续阻塞该线程处理其他输入。
 
 ---
 
-## 47. 常见误解逐条纠正
+## 12. extension 会重建 deadline，但 r48 不是无条件全量重建
 
-### 误解一：输入 ANR 就是 App 收到触摸后 5 秒没处理
+connection ANR 发生时，旧 tracker 索引已由 `eraseToken()` 全删。policy 返回正 extension 后：
 
-不完整。无 focused window 路径中事件尚未送到任何 App connection。
+```text
+connection.responsive = true
+newTimeout = now() + extension
+遍历 waitQueue
+若 newTimeout >= entry.timeoutTime：
+    entry.timeoutTime = newTimeout
+    AnrTracker.insert(newTimeout, token)
+```
 
-### 误解二：Activity 一进入启动状态就开始 5 秒计时
+通常所有旧 deadline 都早于新的 extension，于是一起重新受监控。但条件是 `>=`：若某个较新的 wait entry 原 deadline 比 `newTimeout` 更晚，代码保留其 deadline，却没有把它重新插入刚被清空的 tracker。
 
-错误。r48 只在有焦点路由事件需要派发、且发现 focused app 无 focused window 时启动。
+这是 r48 的索引边界：
 
-### 误解三：ANR 到点 InputDispatcher 直接杀进程
+```text
+waitQueue 仍有 entry
++ connection 被设回 responsive
+不必然推出
+每个 surviving entry 都重新存在于 AnrTracker
+```
 
-错误。native 保存现场并回调 WMS/AMS，处置决定在 policy/AMS 层。
+后续新派发可再插入该 token 的新索引，但不能据此反推所有旧 entry 已恢复逐笔 deadline 追踪。分析定制 timeout 或较短 extension 时尤其要看源码条件。
 
-### 误解四：responsive=false 等于 InputChannel broken
-
-错误。responsive 是等待健康度；NORMAL/BROKEN/ZOMBIE 是连接生命周期状态。
-
-### 误解五：abort 后 waitQueue 立即清空
-
-错误。r48 先尝试给同一 connection 合成取消事件，真正连接清理通常来自后续 unregister/channel broken。
-
-### 误解六：一收到迟到 FINISHED 就恢复
-
-不一定。剩余 waitQueue 中若还有超期 entry，connection 仍不 responsive。
+no-focus extension 没有此循环，只把单份 timer 改为 `now()+extension` 并恢复 awaited application。
 
 ---
 
-## 48. macOS 只读练习
+## 13. abort 合成的是状态终止事件，不会清旧队列或断通道
 
-不编译也可以完成以下练习。
+connection policy 返回 0 后，native 重新按 token 查 connection。若已注销就结束；若仍是 `STATUS_NORMAL`，调用：
 
-### 练习一：定位两个 timeout 起点
+```text
+CancelationOptions(CANCEL_ALL_EVENTS, "application not responding")
+→ connection.inputState.synthesizeCancelationEvents(...)
+→ 为合成事件创建新的 DispatchEntry
+→ 追加到同一 connection outbound
+→ startDispatchCycleLocked()
+```
+
+它不会：
+
+- erase 原有 waitQueue；
+- 删除原 outbound 中尚未发送的普通事件；
+- 把 connection 标成 BROKEN/ZOMBIE；
+- 直接杀 App；
+- 保证卡住的客户端马上读到 CANCEL。
+
+connection 可继续保持 `STATUS_NORMAL + responsive=false`，直到窗口/进程处置触发 unregister，或 channel 错误进入 broken 清理。
+
+### 13.1 InputState 在入 outbound 时已经更新
+
+容易误写成“InputState 只记录已 publish 给客户端的状态”，但 r48 在 `enqueueDispatchEntryLocked()` 中先调用 `trackKey/trackMotion()`，然后才把新 entry push 到 outbound。
+
+因此 memento 表示 Dispatcher 计划交给该 connection 的有序流，可能包含尚未成功 publish 的 entry。ANR 取消可据此为它生成终止事件；只要 channel 保持 FIFO 且最终可写，原事件会排在 CANCEL 前到达。
+
+合成的 Key UP、Motion CANCEL/HOVER_EXIT 在再次 enqueue 时又进入 `trackKey/trackMotion()`，立刻把相应 memento 清掉——仍早于客户端真正收到终止 packet。若之后通道断开或长期反压，服务端状态已归零不代表客户端执行了清理。
+
+### 13.2 CANCEL_ALL 不等于“删除所有 DispatchEntry”
+
+InputState 保存：
+
+- 尚未配对 UP 的 Key DOWN；
+- 活跃 pointer/non-pointer Motion 状态；
+- hover 状态；
+- fallback key 映射。
+
+取消结果主要是 canceled Key UP、Motion CANCEL 或 HOVER_EXIT。FOCUS entry 不在这套 memento 中；旧 outbound/wait entry 仍保留。名字里的 ALL 指符合状态类别的全部 tracked key/motion，而不是清空 connection 的所有事件对象。
+
+---
+
+## 14. unresponsive 后的新输入与迟到 FINISHED 都有边界
+
+新 pointer gesture 选窗时，unresponsive window 被排除；新 gesture monitor 也经 `selectResponsiveMonitorsLocked()` 过滤。若两者都没有，DOWN 失败，连 WATCH_OUTSIDE 目标也不会因这个无效主目标收到事件。
+
+限定词是“新 gesture”。已经建立的 `TouchState` 后续 MOVE/UP 走持续路由，不在每一笔上重新执行同一 responsive 过滤。焦点路由也没有统一的 responsive 拒绝门；源码注释明确说 focused events 还会积压。
+
+`startDispatchCycleLocked()` 对 `responsive=false` 仍可尝试 publish，只是不向 AnrTracker 插入新 deadline。因此取消事件、焦点事件或既有手势后续可能继续进入 outbound/wait，但在连接恢复前不形成新的逐笔 ANR 闹钟。
+
+### 14.1 迟到 FINISHED 只按剩余 wait deadline 重算 responsive
+
+收到某 seq 的 FINISHED 后，Dispatcher 删除对应 wait entry，并在 connection 当前不 responsive 时扫描剩余队列：
+
+```text
+存在 entry.timeoutTime < now → 仍 false
+否则                        → true
+```
+
+这里使用 `<`，而 `processAnrsLocked()` 的触发比较是 `>=`；精确等于 deadline 时两处边界并不一致。
+
+更重要的是，late-FINISHED 路径把 `responsive` 改回 true 后，没有把剩余、尚未过期的旧 wait entry 重新插入先前已 `eraseToken()` 的 AnrTracker。以后新 publish 会产生新索引，但旧 surviving entry 本身可能没有恢复闹钟。
+
+所以“迟到一笔 ACK 后恢复 true”只说明这一刻剩余 entry 尚未严格过期，不证明旧 waitQueue 的 ANR 索引已完整重建。若还有已过期项，则保持 false；若 connection 已被 unregister，FINISHED 也无法恢复它。
+
+### 14.2 dispatch freeze 不宜理解成暂停所有既有 ANR 时钟
+
+`dispatchOnceInnerLocked()` 在 `mDispatchFrozen` 时提前返回，注释说不投递新事件；但 r48 外层 `dispatchOnce()` 之后仍无条件调用 `processAnrsLocked()`。因此仅凭 frozen 不能推断已登记的 no-focus/connection deadline 会暂停累加。解冻路径会 reset no-focus timer，却不会把已有 connection deliveryTime 整体平移。
+
+这是按 r48 控制流可得的静态结论；真实产品是否长期使用 frozen、上层是否同时清理状态，需要设备现场另证。
+
+---
+
+## 15. 用队列定位现场，并完成九组静态练习
+
+先按证据分流：
+
+| 现场 | 更可能的阶段 | 下一步 |
+|---|---|---|
+| 有 focused app、无 focused window、PendingEvent 很老 | no-focus | 查 WMS 窗口创建/同步与 application timeout |
+| focused window `paused=true`、pending 不前进 | publish 前 paused gate | 查谁设置/解除 paused；不要套 connection ANR |
+| outbound 增长、wait 非空 | 正向 socket 反压 | 查 App 消费、channel 与旧 wait |
+| wait 很老、responsive=true | deadline 尚未到或索引/时间异常 | 查每笔 wait、window timeout、tracker 逻辑 |
+| wait 很老、responsive=false | 已报告 connection ANR | 查 policy 返回、cancel entry、App/进程处置 |
+| status=BROKEN/ZOMBIE | 连接错误或注销 | 查 unregister/broken drain，不再只谈响应慢 |
+| saved ANR reason 与最短 deadline 对不上 | reason 使用 oldest entry | 对照全部 wait entry 的 timeout 代际 |
+
+当前 dump 会给出 focused applications/windows、PendingEvent、InboundQueue、每个 connection 的 status/responsive/outbound/wait，以及最近一次保存的 ANR snapshot。它是 Dispatcher 单锁下的本地快照，不与 WMS、AMS traces 或 App 主线程现场原子对齐。
+
+以下命令只读 `android-11.0.0_r48` 工作树。
+
+### 练习 1：区分两个 ANR 起点
 
 ```bash
-cd /Users/ninebot/androidSource
-rg -n "mNoFocusedWindowTimeoutTime|deliveryTime =|timeoutTime =" \
-  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+sed -n '1447,1507p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+sed -n '2456,2595p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
 ```
 
-回答：为什么前者在目标选择阶段，后两者在 publish cycle？
+分别标出 no-focus timer、deliveryTime、publish 成功与 tracker insert；解释为什么前者没有 token。
 
-### 练习二：证明 tracker 不是事件队列
+### 练习 2：证明剪枝不直接 reset timer
 
 ```bash
-sed -n '1,110p' \
-  frameworks/native/services/inputflinger/dispatcher/AnrTracker.h
-sed -n '20,80p' \
-  frameworks/native/services/inputflinger/dispatcher/AnrTracker.cpp
+sed -n '688,735p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+sed -n '640,680p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
 ```
 
-列出 tracker 保存的两个字段，再找事件描述实际位于哪里。
+找出 `mNextUnblockedEvent` 的设置与消费，并确认这两段没有清 no-focus 成员。
 
-### 练习三：追 Java 策略返回值
+### 练习 3：核对 500ms Key 门的真实范围
 
 ```bash
-sed -n '175,280p' \
-  frameworks/base/services/core/java/com/android/server/wm/InputManagerCallback.java
-rg -n "inputDispatchingTimedOut" \
-  frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+sed -n '1412,1450p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+sed -n '2705,2745p' frameworks/native/services/inputflinger/tests/InputDispatcher_test.cpp
 ```
 
-说明 boolean abort、毫秒 timeout 和 native 纳秒 extension 如何转换。
+回答实现为什么是全局 tracker gate，以及新 pointer DOWN 如何只把 timer 推到当前时刻。
 
-### 练习四：手算状态
+### 练习 4：拆开 tracker 与 waitQueue
 
-假设同一 connection：
-
-```text
-E1 delivery=0s timeout=5s
-E2 delivery=1s timeout=6s
-当前时间=5.2s
+```bash
+sed -n '20,95p' frameworks/native/services/inputflinger/dispatcher/AnrTracker.h
+sed -n '20,85p' frameworks/native/services/inputflinger/dispatcher/AnrTracker.cpp
+sed -n '489,525p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
 ```
 
-回答：
+说明 `eraseToken()` 删除什么、不删除什么，以及相同 deadline 为什么能有重复项。
 
-1. tracker 首项是谁？
-2. connection 何时变 false？
-3. reason 通常描述谁？
-4. 此时收到 E1 FINISHED，但 E2 未过期，responsive 能否恢复？
+### 练习 5：追 ANR snapshot 与 Java policy
 
-答案：E1；5 秒检查时；E1；能，因为剩余 E2 的 deadline 6 秒尚未到。
+```bash
+sed -n '4545,4698p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+sed -n '175,275p' frameworks/base/services/core/java/com/android/server/wm/InputManagerCallback.java
+sed -n '19819,19890p' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+```
+
+写出锁释放、token/application 归因、debugger、instrumentation 与 extension 单位转换。
+
+### 练习 6：验证 extension 的索引边界
+
+```bash
+sed -n '4650,4698p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
+
+假设某 surviving entry 原 deadline 晚于 `now()+extension`，判断它是否仍在 wait、是否被重新 insert。
+
+### 练习 7：证明 InputState 早于 publish
+
+```bash
+sed -n '2298,2405p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+sed -n '2799,2870p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+sed -n '230,310p' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+```
+
+画出 track → outbound → publish 与 synthesize → track cancel → outbound 的先后。
+
+### 练习 8：检查迟到 FINISHED 的恢复缺口
+
+```bash
+sed -n '4741,4808p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
+
+找出 `< now` 比较和 `responsive=true`，再确认此路径是否为剩余旧 entry 重建 tracker。
+
+### 练习 9：对照单元测试与 dump
+
+```bash
+sed -n '2360,2640p' frameworks/native/services/inputflinger/tests/InputDispatcher_test.cpp
+sed -n '4035,4290p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
+
+用 basic ANR、no-focus extension、相同 deadline 与新手势过滤测试，对照 dump 中能观察和不能观察的状态。
 
 ---
 
-## 49. 复读审计：最容易不理解的五个边界
+## 16. 本章结论与自检
 
-### 边界一：无焦点 timer 是 r48 的单份 Dispatcher 状态
-
-focused app/window 映射按 display 保存，但 `mNoFocusedWindowTimeoutTime` 与 `mAwaitedFocusedApplication` 在该版本是单份成员，不是 per-display map。多显示场景不能想当然地为每块屏独立维护多只 no-focus timer。
-
-### 边界二：超时比较存在 `>=` 与 `>` 差异
-
-`processAnrsLocked()` 用 `currentTime >= deadline` 报告；目标选择中“已经报告后丢事件”用 `currentTime > deadline`。正常 loop 会先运行 ANR 检查，但读单个函数时不要忽略边界值差异。
-
-### 边界三：policy 回调期间状态可变化
-
-native 主动释放 `mLock`。回来时 connection 可能已经消失，代码因此重新 `getConnectionLocked(token)`；找不到就直接返回。
-
-### 边界四：合成取消只是尽力发送
-
-它能修复协议状态，却不能强迫卡死主线程运行。App 被杀或窗口移除时，通道清理可能先于客户端真正消费 CANCEL。
-
-### 边界五：slow、ANR、AMS trace 不是同一个时间点
-
-2 秒 slow 在 FINISHED 到达后记录；native ANR snapshot 在 InputDispatcher 判断超时时记录；AMS 的 Java/native traces 又在后续 ANR 工作中采集。分析时不能假设三份现场完全同时。
-
----
-
-## 50. 本章检查题与最终模型
-
-### 检查题
-
-1. 两类输入 ANR 的 publish 分界是什么？
-2. 为什么 no-focus timeout 不能只看 Activity 启动时长？
-3. `AnrTracker.eraseToken()` 为什么不等于清空 waitQueue？
-4. `responsive=false` 会阻止哪一种新输入选择？
-5. WMS 如何在 application 路径和 connection 路径之间归因？
-6. extension 为正和为 0 各让 native 做什么？
-7. 为什么 CANCEL_ALL 仍不保证 App 立刻收到 CANCEL？
-8. 晚到 ACK 后用什么条件恢复 responsive？
-
-### 一句话模型
+最终模型是三层账加一个 policy 决策：
 
 ```text
-焦点路由事件先可能因“有应用、无窗口”停在pending并按应用计时；
-找到窗口并成功publish后，才转为按connection的waitQueue逐笔计时；
-到期时InputDispatcher保存现场、把决定交给WMS/AMS，
-策略可以延长deadline，也可以让native基于InputState合成取消，
-而连接是否存活、客户端是否真正消费CANCEL、进程是否被处置仍是后续步骤。
+publish 前
+= mPendingEvent + focused application/window + 单份 no-focus timer
+
+publish 后
+= per-connection outbound/wait + delivery/timeout + 全局 AnrTracker 索引
+
+状态修复
+= enqueue 时更新的 InputState memento + 合成 Key UP/Motion CANCEL/HOVER_EXIT
+
+处置
+= native snapshot + 解锁回调 WMS/AMS + extension 或 abort
 ```
 
-### 下一章
+必须记住这些边界：
 
-第 177 章继续阅读 InputDispatcher 的输入注入、权限校验、同步等待与结果语义，把 shell/test 注入事件怎样安全进入同一派发链讲清楚。
+- no-focus timer 从第一笔焦点路由事件发现缺窗口时开始，不从 Activity 启动开始；
+- 有效 focused window 出现后要等 pending 重试才清 timer；paused window 又是无独立 ANR deadline 的 publish 前门；
+- 触摸剪枝只标 sentinel 并 drop 之前的 Key/Motion，不直接清 no-focus timer；
+- 500ms Key 门看全局 responsive tracker，不只看 Motion、当前窗口或当前 display；
+- connection deadline 从成功 publish 起算，同一 send 批次可共享 currentTime；
+- tracker 只索引 deadline+token，reason 却描述 waitQueue oldest，两者可不是同一 entry；
+- WMS/AMS 返回 0 只让 native尝试合成状态终止事件，不等于杀进程、清队列或关闭 channel；
+- InputState 在 entry 入 outbound 时更新，CANCEL 的服务端记账也早于客户端收到；
+- extension 与 late-FINISHED 两条恢复路径在 r48 都存在 surviving wait entry 未重新入 tracker 的边界；
+- unresponsive 主要排除新 pointer gesture，既有手势与 focused events 仍可能继续排队/发送。
 
+自检时应能回答：
+
+1. 两类输入 ANR 的 publish 分界与归因对象分别是什么？
+2. 为什么 no-focus 事件不可能已经进入目标 App？
+3. focused window 为 paused 时为何不能套用 no-focus 五秒模型？
+4. 新 DOWN 剪枝了 pending Key，为什么 timer 仍可能暂时存在？
+5. 500ms Key 门为何可能被其他 display 的非 Motion 派发影响？
+6. `eraseToken()` 为什么既必要，又不等于 waitQueue 清空？
+7. policy extension 如何重建 deadline，哪个条件可能漏掉旧 entry？
+8. CANCEL_ALL 为什么既可能依据未 publish 的状态，又不会删除旧 DispatchEntry？
+9. connection 恢复 responsive 为什么不保证旧 tracker 索引完整？
+10. native ANR、AMS traces、进程退出和客户端执行 CANCEL 为什么是四个完成点？
+
+下一章进入 **InputDispatcher 输入注入、权限校验与同步等待**，解释 shell/test 事件怎样进入同一派发链，以及 WAIT_FOR_RESULT、WAIT_FOR_FINISHED 到底各等什么。

@@ -1,76 +1,78 @@
 # 173 Android InputWindowHandle、InputDispatcher 窗口快照与触摸路由
 
 > 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
-> 学习方式：macOS 只读源码，不要求编译、不要求连接设备  
+> 学习方式：macOS 静态只读源码，不要求编译或连接设备  
 > 前置章节：第 19、20、163—172 章
 
 ---
 
-## 1. 本章目标：画面在哪和触摸发给谁是两套状态
+## 1. 先把“点错了”分成选窗错误与坐标错误
 
-一个按钮肉眼显示在 `(500, 800)`，用户点击那里却触发旁边控件，常见直觉是“View 的坐标算错了”。但问题也可能发生在 View 之前：InputDispatcher 选择窗口及把屏幕坐标转换为窗口坐标时，使用的是一份独立的输入窗口快照。
-
-Android 11 r48 的核心链路是：
+按钮显示在屏幕 `(500, 800)`，点击那里却触发旁边控件，不一定是 View 布局错误。事件进入 ViewRootImpl 之前，InputDispatcher 已经用一份独立的输入窗口快照完成两件事：
 
 ```text
-WMS根据WindowState生成Java InputWindowHandle
-→ 把输入元数据写入对应SurfaceControl.Transaction
-→ SurfaceFlinger把元数据提交到Layer drawing state
-→ SF结合Layer最终transform/crop重新计算InputWindowInfo
-→ 经IInputFlinger Binder发送到native InputManager/InputDispatcher
-→ InputDispatcher按display、Z序、可见性、flags和touchable region选窗
-→ 按frame与scale生成窗口局部坐标
-→ 通过InputChannel投递给ViewRootImpl
+命中测试：这个屏幕点应交给哪个 InputChannel？
+坐标变换：屏幕坐标怎样成为目标窗口的局部坐标？
 ```
 
-所以本章最重要的结论是：
+因此第一步应问：
 
-> 显示 Layer 树和输入窗口树都从窗口/Surface 状态出发，却在不同模块、不同时间点生成；画面正确不能自动证明输入快照已经同步，输入焦点也不决定一次新触摸的命中窗口。
+| 现场 | 优先检查 |
+|---|---|
+| 事件进入了错误进程/窗口 | display、Z 序、visible、flags、touchable region、consumer、旧手势 |
+| 事件进入正确窗口，但位置固定偏移 | frameLeft/Top、offset |
+| 事件进入正确窗口，但误差随距离成比例 | windowX/YScale、Layer transform |
+| App 收到正确局部点，控件仍选错 | ViewRootImpl 后的 View 树分发 |
+
+画面 Layer 树与输入窗口树都来自窗口和 Surface 状态，但生成模块、快照时刻、可见性语义不同。“画面正确”不能证明新输入窗口快照已经安装。
 
 ---
 
-## 2. 先做版本纠偏：r48由SF生成最终输入窗口列表
+## 2. r48 让最终输入窗口列表经过 SurfaceFlinger
 
-旧版本架构里，WMS 更接近直接向 InputDispatcher 发布窗口列表。Android 11 r48 已把 Layer 的最终几何纳入中间过程：
+Android 11 r48 的主链不是 WMS 直接把一张 Java Window 列表交给 InputDispatcher：
 
 ```text
 WMS InputMonitor
-→ Transaction.setInputWindowInfo(surface, handle)
-→ SurfaceFlinger Layer::setInputInfo()
-→ Layer::fillInputInfo()
+→ 填 Java InputWindowHandle
+→ SurfaceControl.Transaction.setInputWindowInfo()
+→ JNI 值复制为 native InputWindowInfo
+→ LayerState.eInputInfoChanged
+→ SF current state
+→ SF transaction commit 到 drawing state
+→ Layer::fillInputInfo() 叠加最终 Layer 几何
+→ reverse-Z 生成 vector<InputWindowInfo>
 → IInputFlinger::setInputWindows()
+→ InputDispatcher 按 display 安装快照
+→ 新 DOWN 选窗并建立 TouchState
+→ InputChannel 投递给 App
 ```
 
-这样 TaskOrganizer、动画 leash、父 Layer crop、Layer scale、clone、portal 等最终 Surface 层级变化可以反映到触摸区域。
+这样 reparent、动画 leash、父 Layer transform、Surface crop、organized Task 和 clone 等最终 Surface 层级事实可以影响输入几何与 Z 序。
 
-另外，本地源码还保留 `/system/bin/inputflinger` host 工程和 rc 文件，但当前 SystemServer 主路径在 `InputManagerService.nativeInit()` 中创建 native `InputManager`，并把这个对象以 `inputflinger` 名字发布到 ServiceManager。SF 获取该 Binder 服务后，调用回 system_server 进程内的 native InputManager/InputDispatcher。
+### 2.1 五个完成点不要混成一个
 
-不能只看 `host/inputflinger.rc` 就断言当前主链固定经过独立 inputflinger 进程。
+```text
+有 InputWindowHandle
+≠ 已注册 InputChannel
+≠ InputInfo 已进入 SF current state
+≠ drawing state 已生成并安装到 Dispatcher
+≠ App 已收到或处理事件
+```
 
----
+`updateInputWindowsImmediately()` 也只是立即重建 WMS 的 input transaction，并 merge 给调用者的 transaction；若后者尚未 apply，Dispatcher 仍看不到它。
 
-## 3. 本章要回答的十四个问题
+### 2.2 inputflinger 服务名不代表独立进程
 
-1. WindowState 什么时候拥有 InputChannel 和 InputWindowHandle？
-2. WMS 在哪些条件下把窗口纳入输入 transaction？
-3. 为什么不能接收输入的 overlay 仍可能拥有 InputInfo？
-4. Java handle 如何变成 native InputWindowInfo？
-5. InputInfo 怎样随 Layer transaction 到达 SF？
-6. SF 为什么要根据 drawing-state transform 再算一次 frame 和 region？
-7. `visible` 为什么不完全等同于 Layer 真实可见？
-8. InputDispatcher 如何保留窗口 Z 顺序并更新同一窗口代际？
-9. Key、Touch 和 focus 分别怎样选目标？
-10. touch modal 与 touchable region 是什么关系？
-11. 一次手势开始后，MOVE 是否每次重新按坐标选窗？
-12. display、portal、crop 与 scale 如何改变触摸路由？
-13. `syncInputWindows()` 等到了什么，又没等什么？
-14. 如何用 WMS trace、SF trace 与 input dump 诊断触摸错位？
+r48 的正常 SystemServer 路径在 `InputManagerService.nativeInit()` 创建 native `InputManager`，并以 `inputflinger` 名字注册 Binder 服务。SurfaceFlinger 跨 Binder 调回的是 system_server 进程内的 native InputManager/InputDispatcher。
+
+源码还保留独立 host binary 和 rc 文件，但不能只凭服务名或 host 工程断言当前主链固定经过独立 inputflinger 进程。
 
 ---
 
-## 4. 源码地图
+## 3. 源码地图
 
-### 4.1 WMS与Java描述对象
+WMS 生产端：
 
 ```text
 frameworks/base/services/core/java/com/android/server/wm/
@@ -86,7 +88,7 @@ frameworks/base/core/java/android/view/
 └── SurfaceControl.java
 ```
 
-### 4.2 JNI与Transaction
+JNI、transaction 与协议：
 
 ```text
 frameworks/base/core/jni/
@@ -96,9 +98,15 @@ frameworks/base/core/jni/
 frameworks/native/libs/gui/
 ├── SurfaceComposerClient.cpp
 └── LayerState.cpp
+
+frameworks/native/libs/input/
+├── InputWindow.cpp
+└── IInputFlinger.cpp
+
+frameworks/native/include/input/InputWindow.h
 ```
 
-### 4.3 SurfaceFlinger与输入服务
+SF 与输入服务：
 
 ```text
 frameworks/native/services/surfaceflinger/
@@ -109,392 +117,156 @@ frameworks/native/services/surfaceflinger/
 frameworks/native/services/inputflinger/
 ├── InputManager.cpp
 └── dispatcher/InputDispatcher.cpp
-```
 
-### 4.4 数据协议
-
-```text
-frameworks/native/libs/input/InputWindow.cpp
-frameworks/native/libs/input/IInputFlinger.cpp
-frameworks/native/include/input/InputWindow.h
+frameworks/base/services/core/jni/
+└── com_android_server_input_InputManagerService.cpp
 ```
 
 ---
 
-## 5. 全链路与进程边界
+## 4. Handle、Channel 与 WMS 更新调度是三本账
 
-```mermaid
-sequenceDiagram
-    participant WMS as "system_server / WMS InputMonitor"
-    participant JNI as "SurfaceControl JNI"
-    participant SF as "surfaceflinger / SF主线程"
-    participant IF as "IInputFlinger Binder"
-    participant ID as "system_server native InputDispatcher"
-    participant APP as "App / ViewRootImpl"
-
-    WMS->>WMS: "遍历WindowState并填InputWindowHandle"
-    WMS->>JNI: "Transaction.setInputWindowInfo(surface, handle)"
-    JNI->>JNI: "Java字段复制为InputWindowInfo"
-    JNI->>SF: "Surface transaction / eInputInfoChanged"
-    SF->>SF: "提交到drawing state并按Layer几何fillInputInfo"
-    SF->>IF: "setInputWindows(vector<InputWindowInfo>)"
-    IF->>ID: "按display替换InputWindowHandle快照"
-    ID->>ID: "DOWN选窗、锁定TouchState、转换坐标"
-    ID->>APP: "InputChannel publishMotionEvent"
-```
-
-这里存在两次“填充”：
-
-1. WMS 填业务属性、原始窗口 frame、flags、token 和 touchable region；
-2. SF 结合最终 drawing Layer transform、buffer/crop/screen bounds 再计算屏幕空间结果。
-
-触摸错位时只读 WMS 的 frame，会漏掉第二次计算。
-
----
-
-## 6. WindowState创建handle不等于已经能收事件
-
-WindowState 构造时创建：
+WindowState 构造时可以先有：
 
 ```java
 mInputWindowHandle = new InputWindowHandle(
-        activityInputApplicationHandle,
-        getDisplayId());
+        activityInputApplicationHandle, getDisplayId());
 ```
 
-但真正接收事件还需要 InputChannel。`openInputChannel()` 创建一对 channel：
+它只是一份可变描述。真正投递还要由 `openInputChannel()` 建立一对 channel：服务端向 native Dispatcher 注册，客户端交给 App/ViewRootImpl；共享 connection token 再写进 handle。
+
+### 4.1 WMS 通过 AnimationHandler 合并更新
+
+`setUpdateInputWindowsNeededLw()` 只置 dirty。`updateInputWindowsLw()` 在需要时 post `UpdateInputWindows` 到 `mService.mAnimationHandler`；pending 为 true 时后续变化不会重复 post。
+
+Runnable 最终在 WMS global lock 内：
 
 ```text
-server channel → 注册到native InputDispatcher
-client channel → 交给应用进程/ViewRootImpl
+清 pending/needed
+→ 准备 drag 与四类 InputConsumer
+→ 按 top-to-bottom 遍历 DisplayContent 的 WindowState
+→ 把各 InputInfo 写进 mInputTransaction
+→ merge 到 DisplayContent pending transaction
+→ scheduleAnimation()
 ```
 
-两端共享的 connection token 写入：
+多个窗口变化可合并，代价是 WMS 字段变化与 Dispatcher 快照更新之间存在传播窗口。
+
+`updateInputWindowsImmediately(t)` 会 remove 已排队 callback 并同步执行 Runnable，但最后只是 `t.merge(mInputTransaction)`；方法名的 immediately 不等于 transaction 已 apply。
+
+### 4.2 WMS 遍历顺序不是最终输入 Z 序
+
+WMS 用：
 
 ```java
-mInputWindowHandle.token = mInputChannel.getToken();
+mDisplayContent.forAllWindows(this, true /* traverseTopToBottom */);
 ```
 
-因此要区分：
+逐 Surface 写 InputInfo。SF 随后从 drawing Layer 树执行 `traverseInReverseZOrder()` 形成最终 vector，InputDispatcher 再把 vector 前项当作前景候选。
+
+最终顺序受 Layer parent/reparent 与 Z 影响，不能只按 Window 创建时间或 WMS 某次数组下标推导。
+
+---
+
+## 5. 常规窗口、无通道 Layer 与 InputConsumer 都可能进快照
+
+WMS 对常规 WindowState 填入：
 
 ```text
-有InputWindowHandle = 有一份可描述窗口的对象
-有已注册InputChannel = InputDispatcher有投递通道
-进入最新window snapshot = 当前选窗算法能看见它
+token / application handle / name / owner pid+uid
+LayoutParams flags+type / inputFeatures / timeout
+visible / canReceiveKeys / hasFocus / paused / hasWallpaper
+displayId / frame / surfaceInset / global scale
+touchableRegion / crop Surface / portal
 ```
 
-三者不是同一个完成点。
+其中 `scaleFactor = 1 / child.mGlobalScale`；organized Task 则调用 `replaceTouchableRegionWithCrop(null)`，要求 SF 用当前窗口 Layer 自身 crop 边界替换传统 region。
 
----
+这些仍是 WMS 语义的输入元数据。JNI 和 SF 会在后面生成两个新快照。
 
-## 7. InputWindowHandle记录哪些信息
+### 5.1 被跳过的窗口也可能留下遮挡条目
 
-Java `InputWindowHandle` 是可变字段集合，主要包括：
-
-- token、name、ownerPid/Uid；
-- LayoutParams flags/type 和 inputFeatures；
-- dispatching timeout；
-- frame 与 surfaceInset；
-- global `scaleFactor`；
-- touchableRegion；
-- visible、canReceiveKeys、hasFocus、paused；
-- displayId、portalToDisplayId；
-- touchable-region crop Surface；
-- replaceTouchableRegionWithCrop；
-- InputApplicationHandle。
-
-它不是 Binder handle 的同义词，也不是 WindowState 的轻量引用。进入 transaction 时，JNI 会把当前字段复制成 native `InputWindowInfo` 快照。
-
----
-
-## 8. InputMonitor为什么异步合并更新
-
-`setUpdateInputWindowsNeededLw()` 只设置 dirty 标记；`updateInputWindowsLw()` 再通过 WMS AnimationHandler post 一个 `UpdateInputWindows` Runnable。
-
-多个窗口/布局变化可以合并成一次更新：
-
-```text
-变化A → needed/pending
-变化B → 已pending，不重复post
-AnimationThread执行Runnable
-→ 在WMS全局锁内遍历整个Display窗口
-```
-
-这降低开销，但意味着 WMS 某字段改变到 InputDispatcher 收到新快照之间存在异步窗口。短暂点击错位可能发生在这个传播间隙。
-
----
-
-## 9. WMS按top-to-bottom遍历窗口
-
-InputMonitor 执行：
-
-```java
-mDisplayContent.forAllWindows(this,
-        true /* traverseTopToBottom */);
-```
-
-它不是立即构造一个独立 Java 列表，而是对每个 WindowState 把 InputInfo 写入相应 SurfaceControl 的 transaction。
-
-最后 SF 会按自己的 drawing Layer 树再次 `traverseInReverseZOrder()`，生成前到后的 native window vector。InputDispatcher 的选窗算法默认把 vector 第一项当最上层候选。
-
-所以 Z 顺序最终以 SF drawing Layer 层级为准，而不是简单按 WMS 创建时间排序。
-
----
-
-## 10. 哪些Window会被跳过
-
-常规 Window 满足以下任一情况时不会作为可投递窗口正常填写：
-
-```text
-没有InputChannel
-OR 没有InputWindowHandle
-OR WindowState已removed
-OR cantReceiveTouchInput且没有Recents input consumer替代
-```
-
-若它仍有 Surface，WMS 可能给该 Surface 写一份 invalid/overlay InputInfo，而不是完全忽略。这份信息不提供正常输入 channel，却能告诉 InputDispatcher 该 Layer 是否应参与遮挡安全判断。
-
----
-
-## 11. 非输入overlay为什么也要进入窗口快照
-
-一个视觉 overlay 即使不可触摸，也可能遮挡下面应用。InputDispatcher 需要知道触摸点是否被另一个 UID 的不可信窗口覆盖，从而给事件设置 obscured 标志或执行防点击劫持策略。
-
-WMS 因此为不可输入但有 Surface 的层填写：
+没有 InputChannel/handle、已 removed，或不可收 touch 且没有 Recents 替代 consumer 的窗口，不会作为正常目标填充。但只要还有 Surface，WMS 会写一份 invalid overlay 信息：
 
 ```text
 NO_INPUT_CHANNEL
 NOT_TOUCH_MODAL | NOT_TOUCHABLE | NOT_FOCUSABLE
-空touchableRegion
-保留name、type与visible
+空 touchableRegion
+填入 name、type、visible
 ```
 
-可信系统 overlay 则使用特定 type，使 `isTrustedOverlay()` 返回 true，不被当成恶意遮挡。
+这是 WMS 写入 transaction 时的值。SF 用 `token != null` 定义 `hasInputInfo()`；invalid handle 的 token 为空，所以 `fillInputInfo()` 又会进入无真实 InputInfo 分支，覆盖 name、owner、inputFeatures、flags 与 displayId，type 和空 region 等未被该分支改写的内容才继续保留，visible 最后按 Layer `isVisible()` 重算。
 
-“不接收事件”和“不影响输入安全判断”不是一回事。
+它最终不能普通命中，却可参与 InputDispatcher 的 obscured/点击劫持判断。“不是投递目标”不等于“对输入安全模型不可见”。
 
----
+### 5.2 无 WMS InputInfo 的 BufferLayer 也可进入
 
-## 12. WMS如何填常规窗口字段
+`Layer::needsInputInfo()` 默认要求已有 token；`BufferLayer` 却覆盖为 `!mPotentialCursor`。普通非 cursor buffered Layer以及上面的 null-token invalid overlay，都可能由 `fillInputInfo()` 补 name、owner、NO_INPUT_CHANNEL、NOT_TOUCH_MODAL 等默认值，作为遮挡条目发送。
 
-`populateInputWindowHandle()` 的输入来自 WindowState：
+其 region 为空、无 channel，因此不会普通地成为触摸目标。可信系统 overlay 是否计入恶意遮挡，还取决于 type 等安全规则。
 
-```text
-name                    ← WindowState.toString()
-inputApplicationHandle  ← ActivityRecord
-flags/touchableRegion   ← getSurfaceTouchableRegion()
-type                    ← LayoutParams.type
-timeout                 ← app/window dispatch timeout
-visible                 ← isVisibleLw()
-canReceiveKeys          ← canReceiveKeys()
-hasFocus                ← isFocused()
-paused                  ← ActivityRecord.paused
-owner pid/uid           ← Session
-inputFeatures           ← LayoutParams.inputFeatures
-displayId               ← Window所在Display
-frame                   ← getFrameLw()
-surfaceInset            ← attrs.surfaceInsets.left
-```
+### 5.3 InputConsumer 是有通道的伪窗口
 
-这些是 WMS 语义的输入元数据，还不是 InputDispatcher 最终使用的屏幕空间 frame。
+navigation、PIP、wallpaper、Recents animation consumer 拥有自己的 Surface、InputChannel 与 handle，并被安插到特定 Layer 位置。视觉上最上方是 App，不代表输入 Z 序最先可命中者也是 App。
+
+例如 PIP consumer 会 reparent 到 root Task、放到高 Z，并用 Task Surface crop 替换可触摸区；Recents consumer 也可在动画期先接管目标 App 上方的输入。
 
 ---
 
-## 13. WMS的global scale为什么取倒数
+## 6. Java handle 在 JNI 边界值复制，再随 Layer transaction 提交
 
-若 `child.mGlobalScale != 1`，WMS 写：
-
-```java
-inputWindowHandle.scaleFactor =
-        1.0f / child.mGlobalScale;
-```
-
-因为画面被全局缩放后，送进窗口客户端的触摸坐标需要做反向换算，回到应用期望的逻辑坐标。不过，不能据此误以为 Dispatcher 会拿这个字段把 X/Y 再乘一次。
-
-例子：应用逻辑宽 1000，画面以 `mGlobalScale=0.8` 显示成 800。屏幕移动 80 像素，应对应应用逻辑移动 100；输入侧 scaleFactor 是 `1/0.8=1.25`。
-
-沿着 r48 的实际实现看，`mGlobalScale` 同时进入了 Surface 的视觉 transform；SF 从这个 transform 求倒数并累计进 `windowXScale/windowYScale`，所以 X/Y 的反向补偿已经在 window scale 中。`globalScaleFactor` 这个独立字段在 Dispatcher 侧主要额外缩放 `TOUCH_MAJOR/MINOR`、`TOOL_MAJOR/MINOR`，不会再把 X/Y 重复乘一遍。若 Layer 还有其他缩放，它们也会一起反映到最终 window scale。
-
----
-
-## 14. organized Task为什么用Surface crop替换触摸区域
-
-TaskOrganizer 可以通过 SurfaceControl 层级设置 crop，而 WMS 传统 Window frame 不一定完整反映这些组织器几何。
-
-当窗口属于 organized Task 时，WMS 调用：
-
-```java
-inputWindowHandle.replaceTouchableRegionWithCrop(
-        null /* use this surface crop */);
-```
-
-也就是让 SF 以当前窗口 Surface 的最终裁剪边界替换 touchable region。
-
-否则可能出现：画面已经被 organizer 裁小，但输入仍按旧全屏区域命中，形成“空白处也能点到”的幽灵触摸区。
-
----
-
-## 15. Input Consumer是独立的伪窗口
-
-WMS 可创建导航、PIP、壁纸和 Recents 动画等 InputConsumer。它们有自己的 InputChannel、InputWindowHandle 和 Surface 层级位置。
-
-用途例如：
-
-- Recents 动画期间把目标 App 上的触摸先交给动画控制方；
-- PIP consumer 把可触摸区裁到 Task bounds；
-- wallpaper consumer 位于首个可见壁纸之上；
-- navigation consumer 覆盖特定系统手势区域。
-
-因此“顶层看得见的是 App 窗口”不等于“输入 Z 序顶层也是 App 窗口”。InputConsumer 可能抢先命中。
-
----
-
-## 16. Java handle在setInputWindowInfo时被复制
-
-JNI `nativeSetInputWindowInfo()` 先取得 native `NativeInputWindowHandle`，调用 `updateInfo()` 从 Java 对象逐字段读取，再执行：
+`nativeSetInputWindowInfo()` 取得 `NativeInputWindowHandle` 后调用 `updateInfo()`，逐字段读取 Java 对象，再执行：
 
 ```cpp
 transaction->setInputWindowInfo(ctrl, *handle->getInfo());
 ```
 
-这里是快照边界：之后 Java handle 再被修改，不会自动改变已经写入 transaction 的 native `InputWindowInfo`；必须重新执行一次更新 transaction。
+因此 Java handle 随后修改不会自动改变已经写入 transaction 的 native 值；必须重新走一次 setInputWindowInfo。
 
-JNI 内的 `NativeInputWindowHandle` 用 Java weak reference 保存来源对象，但写入 LayerState 的是值复制，不是让 SF 跨进程回调 Java 对象。
+Java crop Surface 由 WeakReference 保存。JNI promote 失败、native object 为 0 或未设置时，会清空 `touchableRegionCropHandle`，不会保留上次成功的 handle。
 
----
+### 6.1 LayerState 用 what bit 携带增量
 
-## 17. WeakReference crop Surface失效时会怎样
-
-Java `touchableRegionSurfaceControl` 是 `WeakReference<SurfaceControl>`。JNI 尝试 promote：
-
-```text
-WeakReference.get()
-→ SurfaceControl.mNativeObject
-→ native SurfaceControl handle
-```
-
-若 Java 对象已被回收、native object 为 0 或没设置，`touchableRegionCropHandle` 被清空。
-
-之后语义取决于 `replaceTouchableRegionWithCrop`：
-
-- false + crop handle空：不做额外 crop；
-- true + crop handle空：SF 使用当前窗口 Layer 自身的 screen bounds 替换 region。
-
-所以“crop对象失效”不总是等于“触摸区完全不裁”。
-
----
-
-## 18. InputInfo如何进入Surface transaction
-
-Native `Transaction::setInputWindowInfo()` 取得该 Surface 的 `layer_state_t`，写入：
+native Transaction 写入：
 
 ```cpp
 s->inputInfo = info;
 s->what |= layer_state_t::eInputInfoChanged;
 ```
 
-InputInfo 与 position、crop、matrix、alpha、reparent 等 Layer 字段进入同一笔 Surface transaction，可在 SF 事务提交边界一起生效。
+InputInfo 可以和 position、matrix、crop、reparent 等放在同一笔 Layer transaction 中。这给视觉与输入元数据提供共同提交边界，但不等于它们已同时 present 或被 App 消费。
 
-这提供了重要的一致性目标：视觉几何和输入元数据尽量随同一 Layer transaction 传播，而不是 WMS 先后调用两个完全独立服务。
+### 6.2 普通 App 不能伪造这份系统输入元数据
 
----
+SF 应用 `eInputInfoChanged` 时检查 transaction 是否 privileged。非特权调用只记录无 ACCESS_SURFACE_FLINGER 权限的错误，不调用 `Layer::setInputInfo()`。
 
-## 19. WMS的input transaction如何真正apply
-
-正常异步更新结束时：
-
-```java
-mDisplayContent.getPendingTransaction()
-        .merge(mInputTransaction);
-mDisplayContent.scheduleAnimation();
-```
-
-也就是说 InputInfo 先合并进 DisplayContent 的 pending Surface transaction，随后随布局/动画 Surface 提交。
-
-特殊同步或调用者已有 transaction 时，`updateInputWindowsImmediately(t)` 会立即运行更新，并把 `mInputTransaction` merge 进传入 transaction；它仍是“合并等待后续 apply”，不是方法名中的 immediately 就等于 InputDispatcher 已更新。
+通过检查后，`setInputInfo()` 先写 `mCurrentState.inputInfo`、解析 crop Layer 弱引用并标记 modified/inputInfoChanged；transaction commit 后才进入 drawing state。最终窗口 vector 来自 drawing state，而不是刚写 current state 的瞬间。
 
 ---
 
-## 20. SF收到eInputInfoChanged后先写current state
+## 7. SF 的 fillInputInfo 用最终 Layer 几何覆盖 WMS frame
 
-SF 应用 layer state 时还先检查调用者是否具有受信任的 SF 权限。只有 transaction 被判定为 `privileged`，`eInputInfoChanged` 才调用：
+`Layer::fillInputInfo()` 先复制 `mDrawingState.inputInfo`，写入 Layer sequence 作为 id，再处理 transform、bounds、region、visibility 和 crop。
+
+### 7.1 scale 只取 transform 的对角项
+
+r48 读取 `getTransform().sx()/sy()`：
 
 ```cpp
-layer->setInputInfo(s.inputInfo);
-```
-
-`Layer::setInputInfo()` 写 `mCurrentState.inputInfo`，解析 touchable-region crop handle 为 Layer 弱引用，并标记：
-
-```text
-currentState.modified = true
-currentState.inputInfoChanged = true
-eTransactionNeeded
-```
-
-之后 transaction commit 把 current 变化推进到 drawing state。InputDispatcher 最终收到的是 SF 从 drawing state 生成的结果，不是刚写入 current state 的瞬间值。
-
-非特权调用者即使手工构造 `eInputInfoChanged`，SF 也只记录 `Attempt to update InputWindowInfo without permission ACCESS_SURFACE_FLINGER`，不会应用这份输入元数据。普通 App 不能借自己的 Surface transaction 任意伪造系统输入窗口身份。
-
----
-
-## 21. SF为什么还要fillInputInfo
-
-WMS 知道窗口策略 frame，但 SF 才知道最终 Layer drawing hierarchy：
-
-- parent/reparent 与动画 leash；
-- Layer position、matrix 和 scale；
-- buffer size、crop 与 screen bounds；
-- organizer/mirror/clone 的 Surface 边界；
-- 最终 Layer Z 顺序。
-
-所以 `Layer::fillInputInfo()` 复制 drawing-state inputInfo 后，按 SF 几何重新生成：
-
-```text
-id
-displayId fallback
-windowX/YScale
-frameLeft/Top/Right/Bottom
-touchableRegion屏幕位置
-visible
-crop后的touchableRegion
-```
-
-这一步是理解“画面正确、输入错误”的核心源码入口。
-
----
-
-## 22. SF怎样从transform推导输入scale
-
-SF 取 `getTransform()` 的 `sx/sy`。这里的 `sx()`、`sy()` 在 r48 中就是 3×3 矩阵的两个对角项，不是变换后基向量长度。若它们不为 1：
-
-```cpp
-info.windowXScale *= 1.0f / xScale;
-info.windowYScale *= 1.0f / yScale;
+info.windowXScale *= xScale != 0 ? 1 / xScale : 0;
+info.windowYScale *= yScale != 0 ? 1 / yScale : 0;
 info.touchableRegion.scaleSelf(xScale, yScale);
 ```
 
-Layer 在屏幕上缩小到 0.5 时：
+`sx/sy` 是 3×3 矩阵对角项，不是变换后基向量长度。普通轴对齐缩放 0.5 时，屏幕 region 缩至一半，window scale 变为约 2；零 scale 则把对应 window scale 置 0 以避开除零。
 
-- 屏幕 touchable region 也缩小到 0.5；
-- 发给应用的局部坐标用 `windowScale=2` 反向放大。
+对 90° 旋转，对角项可为 0。Layer bounds 使用完整 `t.transform()`，region 却只做 sx/sy 缩放再平移。因此这条 r48 表达链不是“对任意旋转/倾斜都做完整逆矩阵”。
 
-若 xScale 或 yScale 为 0，相应 window scale 被乘以 0，避免除零，但此时输入映射已经退化；不应期待得到正常可逆坐标。
+### 7.2 frame 来自 buffer/cropped bounds
 
----
+源 bounds 通常取 drawing buffer size；portal 用原 touchable region bounds；非法时回退 cropped buffer size。完整 Layer transform 后再按缩放后的 surfaceInset 收缩，inset 会钳到最大半宽/半高，整数加减也防 overflow。
 
-## 23. frame最终由Layer bounds决定
-
-SF 先取源边界：
-
-```text
-普通Layer → drawing buffer size
-portal → 原touchableRegion bounds
-buffer size非法 → drawing cropped buffer size
-```
-
-再用 Layer transform 变到屏幕空间，并按 surface inset 收缩。inset 会被钳到最大半宽/半高，同时用 overflow-safe 加减避免整数溢出。
-
-最后覆盖 WMS 传来的 frame：
+最终覆盖：
 
 ```cpp
 info.frameLeft = layerBounds.left;
@@ -503,567 +275,456 @@ info.frameRight = layerBounds.right;
 info.frameBottom = layerBounds.bottom;
 ```
 
-所以 input dump 的最终 frame 和 WMS trace frame 不同，不一定是谁“打印错了”；它们可能正处在两层坐标计算结果。
+所以 WMS trace frame 与 `dumpsys input` 最终 frame 不同，不必然是谁打印错；两者位于不同计算阶段。
 
----
+### 7.3 touchable region 转成屏幕空间
 
-## 24. touchableRegion从局部坐标移到屏幕坐标
-
-WMS 生成的 touchable region 以窗口/Surface 局部坐标为基础。SF 先按 Layer scale 缩放，再执行：
+region 先按 sx/sy scale，再平移 frameLeft/Top：
 
 ```cpp
 info.touchableRegion =
-        info.touchableRegion.translate(
-                info.frameLeft, info.frameTop);
+        info.touchableRegion.translate(info.frameLeft, info.frameTop);
 ```
 
-得到 InputDispatcher 用于点击测试的屏幕空间 Region。
-
-这里没有把任意旋转/倾斜矩阵逐点应用到 Region：Layer bounds 会经过完整 `t.transform()`，但 touchable Region 只按对角项 `sx/sy` 缩放，再按最终 frame 平移。因此不要把这段实现理解成“完整逆矩阵坐标映射”。对 90° 旋转，对角项甚至可能为 0；复杂非轴对齐 Layer input transform 在 Android 11 r48 的这条输入表达链上有明确版本边界。
+InputDispatcher 的命中测试使用这个屏幕空间 Region。不要再把它当 WMS WindowState 的局部坐标。
 
 ---
 
-## 25. crop是相交还是完全替换
+## 8. crop、clone、portal 与 visible 各有独立语义
 
-```mermaid
-flowchart TD
-    A["已有touchableRegion"] --> B{"replaceTouchableRegionWithCrop?"}
-    B -- "是" --> C{"crop Layer存在?"}
-    C -- "是" --> D["region = cropLayer.screenBounds"]
-    C -- "否" --> E["region = 当前Layer.screenBounds"]
-    B -- "否" --> F{"crop Layer存在?"}
-    F -- "是" --> G["region = region ∩ cropLayer.screenBounds"]
-    F -- "否" --> H["保留region"]
-```
-
-区别非常重要：
-
-- intersect 保留原 region 的形状，只砍掉超出 crop 的部分；
-- replace 完全忽略原 region，把整个 crop bounds 作为新可触摸区。
-
-误用 replace 会把本来局部可点的窗口扩大到整个 Task/Layer crop。
-
----
-
-## 26. clone还会再裁一次触摸区域
-
-若 Layer 是 clone，SF 会找到 cloned root，并将 touchable region 与 cloned root 的 screen bounds 相交。
-
-这是为了防止镜像/克隆层的触摸区跑出被克隆子树的可见边界。
-
-但 clone、portal 和普通 window 的输入用途不同；看到画面镜像并不能自动推断克隆 Layer 是一个可接收原应用 InputChannel 的第二交互副本，仍要检查 token、displayId、portal 与 inputFeatures。
-
----
-
-## 27. SF中的visible为何故意忽略“还没有buffer”
-
-对于真正带 WMS InputInfo 的 Layer，SF 使用：
-
-```cpp
-info.visible = canReceiveInput();
-```
-
-而不是 `isVisible()`。源码注释说明这是兼容行为：窗口即使尚未提交第一块 buffer，只要策略上可接收输入，也允许提前成为输入窗口。
-
-对于没有真实 InputInfo、只用于遮挡检测的普通 buffered Layer，才使用实际 `isVisible()`，因为不可见 Layer 不应遮挡别人。
-
-因此：
+crop 逻辑为：
 
 ```text
-InputDispatcher dump中visible=true
-≠ SF已经有可见buffer
+replace=true，crop Layer 存在 → region = cropLayer.screenBounds
+replace=true，crop Layer 不存在 → region = 当前 Layer.screenBounds
+replace=false，crop Layer 存在 → region = region ∩ cropLayer.screenBounds
+replace=false，crop Layer 不存在 → 保留 region
 ```
 
-这也是启动期间“按键/触摸先等待或先到窗口，而画面稍后出现”的可能基础。
+因此 Java WeakReference 失效不一定等于“不裁”：replace=true 时会回退当前 Layer bounds。replace 与 intersect 也不能互换，前者会丢掉原 region 的局部形状。
+
+clone 还会把 region 与 cloned root 的 screen bounds 再求交，防止输入越出克隆子树；这不自动赋予 clone 一个新的可投递 InputChannel。
+
+### 8.1 portal 递归换 display，但沿用坐标
+
+命中有效 `portalToDisplayId` 时，Dispatcher 在目标 display 用同一 `(x,y)` 递归选窗，并记录 portal window 以补充 gesture monitors。该函数没有应用任意跨 display 缩放矩阵；生产端必须让 portal frame/region 符合约定坐标。
+
+### 8.2 input visible 不等于 Layer 已有 buffer
+
+有真实 InputInfo 的 Layer 使用 `canReceiveInput()`，r48 实际只排除 policy hidden；为了兼容，它可在首块 buffer 提交前成为输入窗口。无真实 InputInfo、仅供遮挡检测的 Layer 才使用 `isVisible()`。
+
+所以：
+
+```text
+Dispatcher visible=true
+≠ Layer 已有可见 buffer
+≠ HWC 已 present
+```
+
+而一个画面上可见但 NOT_TOUCHABLE 的窗口也不会成为正常 foreground touch target。
 
 ---
 
-## 28. 哪些Layer需要InputInfo
+## 9. SF 发送整份 vector，Dispatcher 却按出现过的 display 更新
 
-基类 `Layer::needsInputInfo()` 默认等于 `hasInputInfo()`。但 `BufferLayer` 覆盖为：
-
-```cpp
-return !mPotentialCursor;
-```
-
-即大量非 cursor buffered Layer 即使没有 WMS 提供的 InputInfo，也会生成一份无 channel、not-touch-modal 的默认信息，用于遮挡检测。
-
-这解释了 InputDispatcher 窗口列表中为什么可能出现不能接收事件的 Layer；窗口快照兼具“路由候选”和“安全遮挡模型”两种职责。
-
----
-
-## 29. SF何时把窗口列表发送给InputFlinger
-
-`updateInputFlinger()` 的主要门是：
+SF 的更新门是：
 
 ```text
 mVisibleRegionsDirty OR mInputInfoChanged
 ```
 
-满足时，SF 对 `mDrawingState` 做 reverse-Z traversal，调用每个 Layer 的 `fillInputInfo()`，再发整份 vector。
+满足时，它清 input-info dirty，遍历整棵 drawing tree，为 `needsInputInfo()` 的 Layer 生成前到后的 vector，再调用 `IInputFlinger::setInputWindows()`。所以即使 WMS InputInfo 未变，Layer 增删、可见区域或几何变化也可促使新快照生成。
 
-即使 WMS InputInfo 没变，Layer 可见区域/几何层级改变也可能触发重新生成输入窗口；这正是让输入跟随 Surface 动画和 crop 的关键。
+InputManager 把 vector 中每条 info 包装成 `BinderWindowHandle`，按 displayId 分组。相同 display 的 push 顺序仍与 SF vector 一致，然后同步调用 Dispatcher。
 
-若两种 dirty 都没有，但 transaction 请求了 `syncInputWindows`，SF 直接回完成通知，因为没有新窗口列表需要发送。
+### 9.1 本次 vector 没出现的 display 不会被顺手清空
 
----
-
-## 30. IInputFlinger真正跨越哪个进程
-
-Android 11 r48 的正常 SystemServer 初始化路径：
-
-```cpp
-mInputManager = new InputManager(this, this);
-defaultServiceManager()->addService(
-        String16("inputflinger"), mInputManager, false);
-```
-
-SurfaceFlinger 在 bootFinished 后从 ServiceManager 获取 `inputflinger`，保存 `IInputFlinger` proxy。
-
-所以窗口列表的关键进程边界是：
+InputManager 只为实际出现的 displayId 建 map entry；Dispatcher 也只循环更新传入 map 中的 display。于是：
 
 ```text
-surfaceflinger进程
-→ Binder IInputFlinger
-→ system_server进程中的NativeInputManager/InputManager
-→ 同进程native InputDispatcher对象
+某 display 在本次 vector 中至少有一项 → 替换该 display 的列表
+传入该 display 的显式空 vector → 清该 display 的列表
+本次 map 根本没有该 display → 保留旧列表
 ```
 
-源码中的独立 host binary 是另一种/遗留宿主形态，不能替代对当前启动主链的核对。
+显示移除另走 `InputMonitor.onDisplayRemoved()` → `InputManagerService.onDisplayRemoved()`，由 native 路径清理。不要把一次全局 `setInputWindows(vector)` 想成对所有可能 display 的自动空集覆盖。
 
----
+### 9.2 id 与 token 共同识别窗口代际
 
-## 31. InputManager按display分组时的细节
-
-`InputManager::setInputWindows(vector)` 把每个 `InputWindowInfo` 包装成 `BinderWindowHandle`，再按 `displayId` 放进 map，交给 InputDispatcher。
-
-每次循环先 `emplace(displayId, empty vector)`，若 key 已存在 emplace 不会清掉旧的本次循环内容，然后 push，因此同一 display 的 Z 序保持输入 vector 顺序。
-
-但只出现在旧快照、这次 vector 完全没有任何条目的 display，不会出现在这个 map 中；InputDispatcher 的 `setInputWindows()` 只更新传入 map 里的 display。显示移除由另外的 `onDisplayRemoved/nativeDisplayRemoved` 显式传空列表清理。
-
----
-
-## 32. InputDispatcher如何保留同一窗口对象代际
-
-每次新快照包含新建的 BinderWindowHandle 对象。InputDispatcher 为了让正在进行的 TouchState 等仍能按指针识别同一窗口，会按：
+每次 Binder 更新都会创建新的 handle 包装。Dispatcher 为保持正在进行的 TouchState 等仍能用同一对象指针，先按 Layer sequence id 找旧 handle，再要求 token 相等：
 
 ```text
-InputWindowInfo.id（SF Layer sequence）
-AND token
+same id && same token
+→ 把新 info 更新进旧 handle，保留对象身份
+
+id 或 token 不同
+→ 采用新 handle
 ```
 
-匹配旧 handle。匹配成功就把新 info 更新进旧对象，再把旧对象放入新 Z 序 vector。
+只用 name 或 id 判断连接代际都不够；token 变化通常意味着 InputChannel 身份也变了。
 
-只匹配 id 不够，因为 Layer id 与 channel token 共同定义当前可投递身份；token 变了通常代表输入连接代际改变。
+### 9.3 无 channel 不必然丢弃
 
----
-
-## 33. 无InputChannel的条目何时会被保留
-
-若找不到注册 channel，且不是 portal，InputDispatcher 计算：
+若找不到注册 channel 且不是 portal，Dispatcher 计算：
 
 ```cpp
 canReceiveInput = !NOT_TOUCHABLE || !NOT_FOCUSABLE;
 ```
 
-只有“看起来仍能接收某类输入”且没有 `NO_INPUT_CHANNEL` 标志时，才把它视为异常并跳过。
+这是 OR。看起来还能触摸或聚焦、又没声明 NO_INPUT_CHANNEL 的条目会被判为异常并跳过；同时不可触摸和不可聚焦，或显式 NO_INPUT_CHANNEL 的遮挡条目可以保留。
 
-如果窗口同时不可触摸、不可聚焦，或明确声明 NO_INPUT_CHANNEL，它可以留在快照中参与遮挡等判断，却不会成为正常投递连接。
-
-注意这里是 OR 逻辑：只要还可触摸或还可聚焦，就被视为可能接收输入，需要 channel 或明确 NO_INPUT_CHANNEL。
+安装新列表还会重算最上层 `hasFocus && visible` 窗口、发送 focus lost/gained，清 hover，给从快照消失的触摸目标合成 pointer CANCEL，并释放不再使用的 channel 引用。它不只是替换一个数组。
 
 ---
 
-## 34. 更新窗口列表会处理focus与旧手势
-
-InputDispatcher 接收新列表后会：
-
-1. 选择最上方 `hasFocus && visible` 的窗口；
-2. 与旧 focused token 比较；
-3. 对旧窗口取消非 pointer 事件并发送 focus lost；
-4. 对新窗口发送 focus gained；
-5. 清理消失的 hover window；
-6. 若正在触摸的窗口已不在快照，合成 pointer cancel；
-7. 释放消失窗口的 channel 引用；
-8. 唤醒 dispatch looper。
-
-窗口快照更新不是只换一个 vector，它还驱动输入状态机收敛。
-
----
-
-## 35. focused application、focused window、focused display
-
-这是三张不同的状态：
+## 10. focused application、focused window 与 focused display 分属三条更新链
 
 ```text
-focused application
-  = WMS认为哪个Activity/App应最终拥有焦点，可在窗口尚未出现时先设置
+focused application per display
+= WMS 认为哪个 Activity/App 最终应有焦点
 
 focused window per display
-  = InputDispatcher从该display窗口快照中选出的hasFocus+visible窗口
+= Dispatcher 从该 display 快照选出的首个 hasFocus && visible handle
 
 focused display
-  = displayId缺省的按键/非定向事件应路由到哪个display
+= displayId 未指定的焦点型事件默认去哪个 display
 ```
 
-RootWindowContainer 单独调用 `setFocusedDisplay()`；InputMonitor 单独调用 `setFocusedApplication()`；focused window 则随 `setInputWindows()` 的 handle flags 推导。
+WMS 的 InputMonitor 直接调用 InputManager 设置 focused application；窗口焦点随 SF 窗口 vector 推导；RootWindowContainer 又单独设置 focused display。三者不是同一个 boolean 的不同打印位置。
 
-把三者合成一个“当前焦点”会看不懂无 focused window ANR。
+切 focused window 时，Dispatcher 对旧窗口取消未完成的 non-pointer 事件并发 focus lost，再向新窗口发 focus gained。切 focused display 只取消旧 focused display 上那些 displayId 未指定的未释放事件，显式指定 display 的事件不因此全部取消。
 
----
+### 10.1 Key 主要走焦点链
 
-## 36. 按键怎样选择窗口
-
-Key 或非 touch 焦点事件先确定目标 display：事件自带有效 displayId 就用它，否则用 `mFocusedDisplayId`。
-
-然后：
+Key 或其他非 touch 焦点事件先取事件自己的有效 displayId，否则使用 focused display。之后：
 
 ```text
-既无focused window也无focused app → 丢弃
-有focused app但尚无focused window → 等待窗口，超时可触发ANR
-focused window paused → 继续pending
-正常focused window → 作为foreground target
+有 focused window → 检查注入权限与 paused，再投递
+无 focused window，但有 focused application
+→ 等待该 App 建窗口，按 application timeout 进入 no-focused-window ANR 路径
+两者都无 → 没有可用焦点目标，事件失败/丢弃
 ```
 
-按键还会等待先前事件完成一小段时间，因为先前点击可能弹出新窗口并改变焦点。这样紧跟点击输入的键更有机会发给新弹窗，而不是旧窗口。
+Key 还会短暂等待先前事件完成，因为前一个点击可能打开新窗口并改变焦点。这个串行门是为了避免紧跟点击的按键发给旧弹窗下方窗口。
+
+### 10.2 Touch DOWN 不用 input focus 决定目标
+
+一个没有键盘焦点的浮窗，只要在触摸 display 的前景扫描中命中，仍可接收新触摸。反过来，focused window 若 NOT_TOUCHABLE 或在可穿透 region 外，也可能不是 foreground touch target。
+
+触屏 DOWN 命中非 focused window 时还可触发 policy 的 pointer-down-outside-focus 通知；这不等于把事件改投给 focused window。
 
 ---
 
-## 37. 触摸DOWN不按输入焦点选窗
+## 11. 新 DOWN 按前到后、visible、flags 与 region 选窗
 
-新的 touch gesture 根据事件 displayId 和坐标，从该 display 的窗口 vector 前到后扫描。
+核心扫描是：
 
 ```mermaid
 flowchart TD
-    A["ACTION_DOWN at display,x,y"] --> B["按输入Z序从前到后遍历"]
-    B --> C{"同display且visible?"}
+    A["DOWN: displayId, x, y"] --> B["取该 display 的前到后 WindowHandles"]
+    B --> C{"visible?"}
     C -- "否" --> B
     C -- "是" --> D{"NOT_TOUCHABLE?"}
-    D -- "是" --> F["可选记录WATCH_OUTSIDE，再看下层"]
-    D -- "否" --> E{"touch modal或点在touchableRegion?"}
-    E -- "否" --> F
-    E -- "是" --> G{"portal到其他display?"}
-    G -- "是" --> H["递归到目标display选窗"]
-    G -- "否" --> I["选为foreground touched window"]
+    D -- "是" --> G["可记 WATCH_OUTSIDE，再看下层"]
+    D -- "否" --> E{"touch modal 或 region 命中?"}
+    E -- "否" --> G
+    E -- "是" --> F{"portal 到另一 display?"}
+    F -- "是" --> H["在目标 display 递归选窗"]
+    F -- "否" --> I["成为 foreground target"]
 ```
 
-因此一个没有键盘焦点的浮窗也可以接收触摸；反之，focused window 如果点击点落在可穿透区域，也可能不是 touch target。
+窗口必须属于当前 display 且 visible。NOT_TOUCHABLE 直接排除普通命中；否则满足 touch modal 或点在 touchable region 任一条件就停止扫描。
 
----
+### 11.1 modal 窗口能在 region 外截住触摸
 
-## 38. touch modal为什么可以命中region之外
-
-InputDispatcher 的判定是：
+r48 的公式是：
 
 ```cpp
 isTouchModal = !(NOT_FOCUSABLE | NOT_TOUCH_MODAL);
 if (isTouchModal || touchableRegionContainsPoint(x, y)) {
-    return thisWindow;
+    return window;
 }
 ```
 
-也就是说，默认 modal 窗口即使坐标不在显式 touchable region 内，也会截住该 display 上它覆盖层级以下的新触摸。
+默认 modal 的前景窗口即使 region 为空，仍能截住它下面的新触摸。设置 NOT_TOUCH_MODAL，或 NOT_FOCUSABLE 使该公式变为非 modal 后，region 外的点才继续扫描下层。
 
-只有设置 `FLAG_NOT_TOUCH_MODAL`（或者 NOT_FOCUSABLE 使这段公式非 modal）后，region 外触摸才继续寻找下层窗口。
+因此诊断“空 region 还挡住点击”时，先查 flags，而不是先怀疑 Region parser。
 
-所以“touchableRegion 空”不自动意味着窗口完全接不到触摸；还必须结合 flags。
+### 11.2 WATCH_OUTSIDE 不是第二个完整手势接收者
 
----
+DOWN 扫描经过可见且设置 WATCH_OUTSIDE_TOUCH 的窗口时，可将其加入 `DISPATCH_AS_OUTSIDE`；真正 foreground target 仍由 modal/region 规则决定。
 
-## 39. WATCH_OUTSIDE_TOUCH不是第二个完整目标
+OUTSIDE target 在本轮后会被从持续 TouchState 中过滤，不会与前景窗口共享后续完整 MOVE/UP。若 outside window 与 foreground window ownerUid 不同，Dispatcher 还加 ZERO_COORDS，避免向另一 UID 泄露真实点击位置。
 
-扫描过程中，可见窗口设置 `FLAG_WATCH_OUTSIDE_TOUCH` 时，DOWN 落在它外部可加入 `DISPATCH_AS_OUTSIDE` target。
+### 11.3 遮挡是投递 flag，不是简单换目标
 
-它收到的是用于感知外部点击的 OUTSIDE 语义，不是与前景窗口共享完整手势流。真正 foreground target 仍由 modal/region 规则选出。
+选中目标后，Dispatcher 查看它前面的不可信可见窗口，可能加 WINDOW_IS_OBSCURED 或 PARTIALLY_OBSCURED；投递时转成 MotionEvent flag。可信 overlay 等类型会被安全判断排除。
 
-不要在 dump 中看到 WATCH_OUTSIDE 就误判“一次手势完整投递给两个普通窗口”。
-
----
-
-## 40. 一次手势通常在DOWN时锁定目标
-
-新手势 DOWN 时建立 `TouchState`。后续 MOVE/UP 通常继续投递给已记录窗口，不会因为手指滑到另一个窗口坐标就自动重新做普通选窗。
-
-例外包括：
-
-- `FLAG_SLIPPERY` 单指 MOVE 可从旧窗生成 slippery exit，并给新窗 slippery enter；
-- split touch 的新 pointer down 可以为不同 pointer 选择窗口；
-- 显式 transferTouchFocus；
-- 窗口从快照消失时给旧目标 CANCEL；
-- portal/gesture monitor 的附加目标。
-
-因此分析“拖动过程中窗口移动了但事件仍去旧窗”，首先要记得 gesture target 的粘性。
+这解释了无 channel Layer 仍有价值：它不能获得事件，却可以改变送给下层窗口的安全上下文。
 
 ---
 
-## 41. split touch按pointer分配目标
+## 12. 一次手势通常粘在 DOWN 的 TouchState
 
-若首个触摸窗口支持 `FLAG_SPLIT_TOUCH`，非鼠标事件可以开启 split 状态。后续 `ACTION_POINTER_DOWN` 根据新 pointer 坐标再次找窗，并只把对应 pointerId 分给目标。
+新 DOWN 会为该 display 建临时 TouchState，记录 device/source、foreground window、pointerIds、portal windows 与 gesture monitors。成功后提交为持续状态。
 
-每个 InputTarget 保存 pointerIds 以及每个 pointer 的 offset/scale。若新窗口不支持 split，而手势已经 split，源码会忽略这个新候选。
+普通 MOVE、UP、CANCEL 不会每次按当前坐标重新执行一般命中测试。因此窗口移动或手指滑出 region 后，事件继续去原窗口通常是设计结果，不是快照失效。
 
-鼠标不会按这条逻辑拆分多 pointer；hover/scroll 也有独立瞬时选窗语义。
+重新选目标的主要例外有：
+
+- 单指 MOVE 遇到 `FLAG_SLIPPERY`：旧窗收到 slippery exit，新窗收到 enter；
+- split gesture 的新 `POINTER_DOWN`：可按新 pointer 坐标另选窗口；
+- 显式 transfer/pilfer 等状态操作；
+- portal 与 gesture monitor 的附加链；
+- 窗口从新快照消失：旧目标收到合成 CANCEL。
+
+### 12.1 split touch 按 pointerId 分配
+
+首个目标支持 SPLIT_TOUCH 且来源不是 mouse 时，可进入 split。后续 POINTER_DOWN 以 action pointer 的坐标重新找窗口，只把这个 pointerId 加到目标。
+
+如果新候选不支持 split，而手势已经 split，源码会忽略该候选；同一 InputChannel 也可能由多个窗口条目共享，最终 InputTarget 按 token 合并并保存每个 pointer 的 offset/scale。
+
+### 12.2 paused 或 unresponsive 窗口不会接新手势
+
+命中新窗口后还要检查 paused、connection 是否存在和 responsive。失败时可退化为只有 responsive gesture monitor；若 foreground 与 monitor 都没有，DOWN 失败。
+
+这与已有手势在窗口变更时被 CANCEL 是两条路径：前者拒绝建立新 TouchState，后者清理已建立的状态。
+
+### 12.3 portal 不等于第二份 App 交互副本
+
+portal 可把命中递归到另一 display，并把相关 monitor 纳入手势；clone/mirror 可约束 region。但是否真能把事件交给某 App，最终仍取决于目标 handle token 是否对应已注册 channel。
+
+看到镜像画面或 clone Layer，不能仅凭视觉复制推导出独立的交互连接。
 
 ---
 
-## 42. portal把触摸递归路由到另一个display
+## 13. 局部坐标由 frame offset 与 window scale 共同生成
 
-若命中的窗口有有效 `portalToDisplayId` 且不同于当前 display，InputDispatcher 递归在目标 display 以同一 `(x,y)` 选窗，并记录经过的 portal windows。
-
-相应 gesture monitors 也会加入，monitor 坐标 offset 使用 portal frame 的负 left/top。
-
-这里没有在 `findTouchedWindowAtLocked()` 里应用任意跨 display 缩放矩阵；复杂虚拟显示映射需要生产端把 portal frame/region 设置为契约期待的坐标。配置错误会表现为“画面投到副屏正确，但触摸落点整体偏移”。
-
----
-
-## 43. 最终窗口局部坐标怎样计算
-
-选中 Window 后，InputDispatcher 建立 target：
+选中窗口时，Dispatcher 保存：
 
 ```cpp
-xOffset = -window.frameLeft;
-yOffset = -window.frameTop;
+xOffset = -frameLeft;
+yOffset = -frameTop;
 windowXScale = info.windowXScale;
 windowYScale = info.windowYScale;
 globalScaleFactor = info.globalScaleFactor;
 ```
 
-发布 MotionEvent 时，offset 会乘 window scale，window scale/offset 作为事件参数送到客户端。若 `globalScaleFactor != 1`，Dispatcher 会先复制 PointerCoords，再调用：
-
-```cpp
-scaledCoords[i].scale(globalScaleFactor,
-                      1 /* windowXScale */,
-                      1 /* windowYScale */);
-```
-
-`PointerCoords::scale(global, 1, 1)` 对 X/Y 乘的是 1，只把 `TOUCH_MAJOR/MINOR` 与 `TOOL_MAJOR/MINOR` 乘 global。客户端读取相对坐标时再按 `rawX * xScale + xOffset`、`rawY * yScale + yOffset` 得到窗口逻辑坐标。
-
-简化心算：
+发布 MotionEvent 前，offset 也乘 window scale，并把 x/y scale、offset 一起写入 InputTransport。客户端得到相对坐标的心算式是：
 
 ```text
-屏幕点(600,900)
-窗口frame左上(500,700)
-→ 先平移到约(100,200)
-若Layer视觉缩放0.5，windowScale约2
-→ 客户端逻辑坐标约(200,400)
-globalScale不再重复乘X/Y；它主要补偿触摸接触面尺寸
+localX ≈ (rawX - frameLeft) * windowXScale
+localY ≈ (rawY - frameTop)  * windowYScale
 ```
 
-诊断偏移必须同时核对 frameLeft/Top、windowX/YScale 和 globalScaleFactor。
-
----
-
-## 44. syncInputWindows等到哪个完成点
-
-`Transaction.syncInputWindows()` 只把：
-
-```cpp
-mInputWindowCommands.syncInputWindows = true;
-```
-
-写进 transaction。SF 收到后，在需要更新时向 `IInputFlinger::setInputWindows()` 附带 listener；InputManager 调用 InputDispatcher `setInputWindows()` 返回后，listener 回 SF，SF 清 `mPendingSyncInputWindows` 并唤醒等待 transaction 的条件变量。
-
-在典型的非 SF 主线程 Binder 调用、且没有超时时，它建立的完成边界是：
-
-> 这笔 transaction 引起的输入窗口变化已经被发送并同步安装到 InputDispatcher 窗口快照。
-
-但源码不是无限等待。`applyTransactionState()` 每次用 `mTransactionCV.waitRelative(..., 5s)`；超时会记录日志，把 `mTransactionPending` 和 `mPendingSyncInputWindows` 都清为 false，然后让调用返回。若 `applyTransactionState()` 恰好运行在 SF 主线程，源码为了不阻塞合成主循环，根本不进入等待 while。
-
-因此严格表述应是：
+例如屏幕点 `(600,900)`、frame 左上 `(500,700)`、Layer 视觉缩放 0.5：
 
 ```text
-syncInputWindows提出“等输入窗口更新”的同步请求
-正常非主线程路径由InputDispatcher安装后的listener闭合
-但5秒超时或SF主线程调用可在没有该ACK时结束等待/直接返回
+window scale ≈ 2
+local ≈ ((600-500)*2, (900-700)*2)
+      ≈ (200,400)
 ```
 
-它不保证：
+### 13.1 global scale 不会再把 X/Y 乘一次
 
-- App 已经收到下一次 input event；
-- 旧手势已经自然 UP，而不是被 CANCEL；
-- Surface buffer 已 present；
-- 面板已显示对应视觉几何；
-- 应用已经处理完事件。
+WMS 的 `globalScaleFactor=1/mGlobalScale` 已包含在 SF 从 Layer transform 派生的 windowX/YScale 中。Dispatcher 若发现 global factor 非 1，会复制 PointerCoords 并调用：
 
----
+```cpp
+scaledCoords[i].scale(globalScaleFactor, 1, 1);
+```
 
-## 45. sync没有变化时为什么也能完成
+`PointerCoords::scale(global, windowX, windowY)` 用 windowX/Y 缩放 X/Y，用 global 缩放 TOUCH_MAJOR/MINOR 与 TOOL_MAJOR/MINOR。这里传 1、1，因此不会重复缩放坐标轴；真正 X/Y 变换通过随事件传送的 window scale/offset 在客户端读取相对坐标时体现。
 
-若 `mVisibleRegionsDirty` 和 `mInputInfoChanged` 都为 false，但带有 `syncInputWindows`，SF 不需要发送重复 vector，会直接调用 `setInputWindowsFinished()`。
+### 13.2 complex transform 是 r48 的诊断边界
 
-所以 sync 返回不能作为“确实调用过 InputDispatcher::setInputWindows”的证据；它只说明 SF 判断这笔同步要求已经满足。
-
-反过来，如果 SF 尚未取得 `mInputFlinger` 服务，`updateInputFlinger()` 一开始直接 return；本路径不会清命令或完成 listener。非主线程调用最多等待约 5 秒后由超时分支清 pending 标志并返回，而不是无限等到服务出现；SF 主线程路径则本来就不等待。不能把这种返回误写成“输入快照已经同步”。
+frame bounds 经过完整 Layer transform，region 和 window scale 主要依赖 sx/sy 对角项。旋转或倾斜时，不能只用上述轴对齐公式宣称完整可逆；需要把原矩阵、最终 input frame/region 与 App raw/local 坐标并排验证。
 
 ---
 
-## 46. 为什么画面正确但触摸仍错
+## 14. syncInputWindows 等快照安装，但有超时与主线程例外
 
-典型原因可以分层：
+`Transaction.syncInputWindows()` 只把一个 command bit 放入 transaction。SF 将它并入 pending input commands，并因该 bit 请求 traversal。
 
-| 层级 | 画面可能正确 | 输入为何错误 |
+有窗口变化时，前向调用与完成回调都是 oneway Binder：
+
+```text
+SF updateInputWindowInfo
+→ oneway IInputFlinger.setInputWindows(vector, listener)
+→ system_server Binder线程接收后，同步调用 Dispatcher.setInputWindows
+→ Dispatcher 持锁完成各 display 列表/焦点/手势收敛并返回
+→ InputManager 发 oneway listener callback
+→ SF Binder线程收到回调，清 mPendingSyncInputWindows 并 broadcast transaction CV
+```
+
+因此正常的非 SF 主线程路径能证明：这笔更新对应的 Dispatcher 快照安装调用已经返回，且回调已经到达 SF。它并不是靠前向 `setInputWindows()` 的 reply 闭合。
+
+前向 proxy 的接口返回 void，oneway `transact()` 状态也没有上传给调用者。若请求未能排入 Binder，回调不会到达，等待侧只能靠后述超时退出。
+
+### 14.1 没有 dirty 时会直接完成
+
+若 visible/input info 都不 dirty，但 command 要求 sync，SF 直接调用 `setInputWindowsFinished()`，不发送重复 vector。sync 返回不能证明本次一定执行过 Dispatcher `setInputWindows()`。
+
+### 14.2 最多等五秒，SF 主线程完全不等
+
+`applyTransactionState()` 只有 `!isMainThread` 才进入等待循环，每次 `waitRelative(..., 5s)`。超时会同时清 transaction pending 与 input pending 后返回；运行在 SF 主线程则为了避免阻塞合成循环根本不 wait。
+
+若 `mInputFlinger` 尚不可用，`updateInputFlinger()` 一开始 return，command 也没有在该调用中 clear/finish；非主线程仍可在约五秒后由超时返回，而不是获得 Dispatcher ACK。
+
+### 14.3 它不等待这些完成点
+
+```text
+不等 App 收到下一事件
+不等 App finishInputEvent
+不等旧手势自然 UP
+不等 Surface buffer latch/present
+不等面板 scanout
+```
+
+把 `syncInputWindows().apply()` 当成显示 fence，会把输入快照同步与画面完成混成一件事。
+
+---
+
+## 15. 诊断矩阵与九组静态源码练习
+
+先按证据职责分工：
+
+| 证据 | 最适合回答 | 不能单独证明 |
 |---|---|---|
-| WMS | Surface几何后来被其他transaction修正 | InputMonitor仍基于旧frame/region |
-| Java→JNI | 画面字段正常 | handle修改后未重新setInputWindowInfo |
-| SF | 显示transform正确 | fillInputInfo对scale/crop/复杂旋转表达不同 |
-| 快照时序 | 新画面已可见 | 新InputWindowInfo尚未安装或旧gesture已锁定 |
-| InputDispatcher | 正确显示窗口在下方 | InputConsumer/modal overlay抢先命中 |
-| 坐标转换 | 目标Window正确 | frameLeft/Top、windowScale/globalScale错误 |
-| portal/多屏 | 目标画面在副屏 | displayId或portal坐标契约错误 |
+| WMS trace | Window/Task/Display、focus 意图、frame 与更新上游 | 最终 native region/scale、Dispatcher TouchState |
+| SF layers proto | drawing Layer Z、transform、crop、InputWindowInfo | Dispatcher 恰在何时安装、App 是否收到 |
+| `dumpsys input` | 当前 WindowHandles、三类焦点、TouchState、connections/queues | 已结束手势的历史、跨进程原子时刻 |
+| App input log | 实际 token/事件与 raw/local 坐标 | 上游为何产生该快照 |
 
-“点错控件”首先分成“选错 Window”与“选对 Window 但局部坐标错”两类，排查速度会快很多。
+排查顺序：
 
----
-
-## 47. 触摸路由故障诊断图
-
-```mermaid
-flowchart TD
-    A["触摸异常"] --> B{"事件是否进入预期App进程?"}
-    B -- "否" --> C["先查InputDispatcher foreground target/token"]
-    C --> D{"display与Z序正确?"}
-    D -- "否" --> E["查focused display、portal、SF reverse-Z窗口快照"]
-    D -- "是" --> F{"overlay/consumer/modal/region拦截?"}
-    F -- "是" --> G["查flags、visible、touchableRegion、NO_INPUT_CHANNEL"]
-    F -- "否" --> H["查旧TouchState、slippery、transfer、窗口移除CANCEL"]
-    B -- "是" --> I{"App收到的局部坐标正确?"}
-    I -- "否" --> J["对照frameLeft/Top、windowScale、globalScale"]
-    I -- "是" --> K["进入ViewRootImpl/View命中与手势处理"]
+```text
+事件是否进入预期 InputChannel？
+├── 否：display → Z → visible → NOT_TOUCHABLE/modal/region
+│      → consumer/portal → 旧 TouchState → channel/token
+└── 是：raw 坐标是否合理？
+       ├── 否：设备映射/上游输入
+       └── 是：frameLeft/Top → windowX/YScale → App局部点 → View分发
 ```
 
-这张图强制先确定“路由错”还是“应用内部处理错”，避免一开始就在 View.onTouchEvent 里盲查。
+以下命令只读 `android-11.0.0_r48` 工作树。
 
----
-
-## 48. 三类现场怎样交叉读取
-
-### WMS trace
-
-看 WindowState、WindowFrames、hasFocus、InputMonitor 上游窗口层级、Task/Display/rotation，以及 InputConsumer 何时出现。
-
-限制：r48 WMS trace 的 WindowState Proto 没有完整序列化最终 native touchable region、windowX/YScale 和 InputDispatcher TouchState。
-
-### SF layers trace/dump
-
-打开 TRACE_INPUT 时可看到 Layer 的 InputWindowInfo、touchable region、crop Layer、transform、screen bounds 和 Layer Z 树。
-
-限制：第 170 章已说明文本 parser 会丢部分 input 字段，优先保存原始 proto；trace 采样仍不是 InputDispatcher 安装瞬间的原子回读。
-
-### dumpsys input
-
-看 InputDispatcher 当前 `WindowHandles`、focused display/application/window、TouchStates、connections、ANR tracker 和 dispatch queues。
-
-限制：静态 dump 只是一刻状态；手势已经结束后 TouchState 可能消失，必须与时间线或复现日志结合。
-
----
-
-## 49. macOS只读练习、复读审计与核心结论
-
-### 49.1 练习1：追完整元数据链
+### 练习 1：找到 WMS 更新调度与遍历边界
 
 ```bash
-rg -n "populateInputWindowHandle|setInputWindowInfo|eInputInfoChanged|fillInputInfo|setInputWindows" \
-  frameworks/base frameworks/native
+sed -n '45,190p' frameworks/base/services/core/java/com/android/server/wm/InputMonitor.java
+sed -n '320,375p' frameworks/base/services/core/java/com/android/server/wm/InputMonitor.java
+sed -n '430,575p' frameworks/base/services/core/java/com/android/server/wm/InputMonitor.java
 ```
 
-给每个命中标注：Java对象、JNI值复制、Layer current、Layer drawing、Binder vector 或 Dispatcher snapshot。
+标出 AnimationHandler、global lock、pending 合并、top-to-bottom 遍历和 pending transaction merge。
 
-### 49.2 练习2：手算scale与offset
+### 练习 2：核对 handle 的业务字段
 
-给定：
-
-```text
-屏幕点=(420, 360)
-input frame left/top=(300, 200)
-Layer x/y scale=0.5，因此windowX/YScale=2
-globalScaleFactor=1.25
+```bash
+sed -n '255,325p' frameworks/base/services/core/java/com/android/server/wm/InputMonitor.java
+sed -n '1,245p' frameworks/base/core/java/android/view/InputWindowHandle.java
 ```
 
-先算去掉窗口原点后的约 `(120,160)`，再理解 window scale 把它映射到约 `(240,320)`。不要再把 global scale 乘到 X/Y；去 `publishMotionEvent()` 和 `PointerCoords::scale()` 核对：它在这一步主要改变 touch/tool major/minor，而 X/Y 由 window scale 与 offset 转换。
+区分 token、frame、region、global scale、crop、portal、focus 与 channel 的职责。
 
-### 49.3 练习3：比较modal与non-modal
+### 练习 3：证明 JNI 是值复制
 
-窗口 A 在 B 上方，A 的 touchable region 只覆盖左半边：
-
-```text
-A为touch modal → 右半边点击仍被A截住
-A设置NOT_TOUCH_MODAL → 右半边可继续命中B
-A还设置WATCH_OUTSIDE → A额外收到OUTSIDE，B收到前景手势
+```bash
+sed -n '90,210p' frameworks/base/core/jni/android_hardware_input_InputWindowHandle.cpp
+sed -n '505,525p' frameworks/base/core/jni/android_view_SurfaceControl.cpp
 ```
 
-### 49.4 练习4：构造证据表
+观察 Java WeakReference crop 何时被清空，以及 updateInfo 与 transaction 写值的先后。
 
-| 观察 | 更可能在哪层 | 下一源码/证据 |
-|---|---|---|
-| InputDispatcher target就是错窗 | Z/flags/region/consumer | findTouchedWindowAtLocked、input dump |
-| target正确但坐标固定偏移 | frame/offset | fillInputInfo、addWindowTargetLocked |
-| target正确但坐标按比例偏差 | scale | Layer transform、global/window scale |
-| DOWN正确，MOVE仍去旧窗 | TouchState粘性 | findTouchedWindowTargetsLocked |
-| 旋转后短暂错位 | 快照传播代际 | WMS/SF trace时间、syncInputWindows |
+### 练习 4：追 current→drawing 与权限门
 
-### 49.5 复读审计：r48最容易误解的十八处
+```bash
+sed -n '1345,1375p' frameworks/native/libs/gui/SurfaceComposerClient.cpp
+sed -n '3805,3840p' frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
+sed -n '985,1010p' frameworks/native/services/surfaceflinger/Layer.cpp
+sed -n '2190,2210p' frameworks/native/services/surfaceflinger/Layer.cpp
+```
 
-1. InputWindowHandle、已注册 InputChannel、已安装 Dispatcher 快照是三个完成点。
-2. WMS 不是直接发布最终窗口 vector，而是把 InputInfo 挂进 Layer transaction。
-3. SF 用 drawing Layer 层级、transform 和 crop 再生成最终输入 frame/region。
-4. Java handle 在 JNI 调用时值复制，后续字段修改不会自动同步。
-5. 输入窗口 Z 序最终来自 SF drawing tree 的 reverse-Z traversal。
-6. 没有 channel 的 overlay 仍可能为了遮挡检测进入快照。
-7. BufferLayer 即使无真实 InputInfo，也可生成默认遮挡条目。
-8. 对真实窗口，input visible 使用 canReceiveInput，可能在第一块 buffer 前为 true。
-9. touch modal 窗口可在显式 touchable region 之外截住点击。
-10. 新触摸按坐标选窗；键盘/非触摸事件主要按 focused display/window 路由。
-11. focused application、per-display focused window、focused display不是一个变量。
-12. 普通 MOVE 不会每次重选窗口，一次手势通常粘在 DOWN 目标。
-13. crop replace 与 intersect 语义不同，WeakReference失效时 replace 可退回自身Layer bounds。
-14. globalScaleFactor 不会在 Dispatcher 再乘一次 X/Y；X/Y 补偿已包含于 SF 派生的 windowX/YScale，它主要额外缩放触摸接触面轴。
-15. `syncInputWindows` 只等快照安装边界，不等画面present或App处理事件。
-16. `syncInputWindows`还有5秒超时和SF主线程不等待例外，返回并非无条件ACK。
-17. 非privileged transaction不能更新Layer InputInfo，普通App无法伪造系统输入窗口。
-18. `inputflinger` 服务名不证明走独立进程；当前主路径由SystemServer native InputManager发布。
+不要把 setInputInfo current 写入误当成 drawing vector 已发送。
 
-### 49.6 本章核心结论
+### 练习 5：逐行重建 SF 几何
 
-> Android 11 r48 把输入窗口元数据作为 SurfaceControl Transaction 的一部分交给 SurfaceFlinger，SF 再基于 drawing Layer 的最终 Z、transform、buffer bounds、crop 和 visibility 生成 InputWindowInfo，经 Binder 安装到 system_server native InputDispatcher。这个设计让输入追随 Surface 层级，也引入了跨线程、跨进程和 current→drawing 的传播边界。
+```bash
+sed -n '2365,2490p' frameworks/native/services/surfaceflinger/Layer.cpp
+sed -n '145,165p' frameworks/native/services/surfaceflinger/BufferLayer.h
+```
 
-> 新触摸由 display 上前到后的窗口列表、visible、NOT_TOUCHABLE、modal 和 touchable region 共同选中；按键依赖 focused display/window，focused application 还负责“App已聚焦但窗口尚未出现”的等待与 ANR。一次手势通常在 DOWN 后锁定目标，MOVE 不会普通地随坐标重选。
+用一个 scale=0.5、非零 inset、replace crop 的例子手算 frame、region、visible。
 
-> 触摸错位必须先区分“选错 Window”和“Window 正确但坐标错误”。前者查 Z、display、portal、consumer、flags 与 region；后者查 SF 最终 frame、frame offset、window scale 和 global scale。WMS trace、SF input proto 与 dumpsys input 各覆盖一段，没有任何一份单独等于整条路由真相。
+### 练习 6：核对 SF→Dispatcher 快照安装
+
+```bash
+sed -n '2890,2940p' frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
+sed -n '95,120p' frameworks/native/services/inputflinger/InputManager.cpp
+sed -n '3600,3785p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
+
+记录 display 分组、id+token 复用、无 channel 过滤、focus 与 CANCEL 副作用。
+
+### 练习 7：推演 modal 与 portal 命中
+
+```bash
+sed -n '795,850p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+sed -n '1580,1815p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
+
+为两个重叠窗口分别设置 modal/non-modal、空/半屏 region，写出 DOWN 的 foreground 与 OUTSIDE targets。
+
+### 练习 8：验证坐标没有重复 global scale
+
+```bash
+sed -n '1988,2040p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+sed -n '220,250p' frameworks/native/libs/input/Input.cpp
+sed -n '2495,2550p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
+
+检查 offset 何时乘 window scale，以及 global factor 实际缩放哪些 axes。
+
+### 练习 9：界定 syncInputWindows 完成点
+
+```bash
+sed -n '25,90p' frameworks/native/libs/input/IInputFlinger.cpp
+sed -n '20,55p' frameworks/native/libs/input/ISetInputWindowsListener.cpp
+sed -n '3475,3535p' frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
+sed -n '2885,2940p' frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
+sed -n '5915,5935p' frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
+sed -n '6128,6145p' frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
+```
+
+分别回答：有 dirty、无 dirty、服务缺失、非主线程超时、SF 主线程调用会怎样结束。
 
 ---
 
-## 50. 自测题与下一章预告
+## 16. 本章结论与自检
 
-### 50.1 自测题
+核心模型：
 
-1. 为什么创建 InputWindowHandle 后窗口仍不一定能接收事件？
-2. Android 11 为什么让 InputInfo 先经过 SurfaceFlinger？
-3. WMS 为何给不可触摸 overlay 写 NO_INPUT_CHANNEL 信息？
-4. Java handle 修改后，已写入 transaction 的 InputWindowInfo 会自动更新吗？
-5. SF 用 current state 还是 drawing state 生成 Dispatcher 窗口列表？
-6. WMS frame 与 input dump frame 不同是否必然是 bug？
-7. `replaceTouchableRegionWithCrop` 与普通 crop 有何区别？
-8. 为什么 input visible=true 不能证明 Layer 已有可见 buffer？
-9. `touchableRegion` 为空时，一个 modal 窗口能否拦截新触摸？
-10. 按键和 ACTION_DOWN 的选窗依据有何不同？
-11. focused application 存在但 focused window 为空时会怎样？
-12. 手指移出窗口后 MOVE 为什么常继续发给原窗口？
-13. InputDispatcher怎样识别新旧快照中的同一窗口？
-14. `syncInputWindows()` 返回能否证明画面已显示？
-15. 固定偏移与比例偏移分别优先检查哪些字段？
-16. r48 的 `inputflinger` Binder 服务通常由哪个进程内对象发布？
+```text
+WMS 决定输入业务属性
++ JNI 在调用时值复制
++ SF drawing tree 决定最终 Z、frame、region 与部分 visible
++ IInputFlinger 把 vector 安装进 Dispatcher
++ DOWN 用快照建 TouchState
++ 后续 gesture 通常沿既有目标
+```
 
-### 50.2 下一章预告
+完成本章后，应能回答：
 
-第 174 章将继续沿输入完成协议深入：
+- InputWindowHandle、InputChannel 与已安装快照为什么是三个完成点？
+- 为什么 r48 要让 InputInfo 经过 SF drawing state？
+- 无 channel Layer 为什么仍可能留在窗口列表？
+- organized Task 的 replace crop 与普通 intersect 有何区别？
+- input visible=true 为什么不能证明已有 buffer？
+- id 与 token 为什么要一起判断窗口代际？
+- focused application/window/display 分别控制什么？
+- 空 region 的 modal 窗口为什么仍能挡住点击？
+- 普通 MOVE 为什么不会每次重新选窗？
+- globalScaleFactor 为什么不再重复缩放 X/Y？
+- syncInputWindows 的正常 ACK、五秒超时和主线程例外分别意味着什么？
 
-> **Android InputChannel、InputPublisher/Consumer、事件回执与输入 ANR**
-
-重点回答：
-
-- InputChannel socketpair、token 与 Connection 怎样建立？
-- InputDispatcher 如何把 EventEntry 变成 DispatchEntry 并写入通道？
-- App 主线程怎样通过 NativeInputEventReceiver 和 ViewRootImpl 读取事件？
-- `finishInputEvent()` 如何回传 handled 状态并推进 wait queue？
-- 输入 ANR 的 timeout 从哪里来，为什么“事件已写入 channel”仍可能超时？
-- broken channel、App死亡和窗口移除怎样清理在途事件？
+下一章进入 **InputChannel、InputTransport、应用事件接收与 FINISHED 回执**，继续追“目标已选中”以后，事件怎样进入 socket、应用主线程怎样消费，以及 Dispatcher 何时才把一笔投递结账。

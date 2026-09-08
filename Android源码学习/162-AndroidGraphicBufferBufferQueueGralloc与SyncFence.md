@@ -1,45 +1,59 @@
 # 162 Android GraphicBuffer、BufferQueue、Gralloc 与 Sync Fence
 
 > 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
-> 学习方式：macOS 只读源码，不要求编译、不要求连接设备  
+> 学习方式：macOS 静态阅读，不编译、不连接设备  
 > 前置章节：第 11、12、21、29、30、66、161 章
 
 ---
 
-## 1. 本章要解决什么
+## 1. 先把五个名词放到一条链上
 
-第 161 章已经能回答“谁画 Layer、谁 present”，但 `GraphicBuffer` 仍像一个黑盒。继续向下读，会遇到四组经常被混用的概念：
+第 161 章追到了 client target 和 HWC present，但“一张 buffer”仍可能被误解成普通 C++ 数组。本章先给出最短模型：
 
 ```text
-GraphicBuffer：C++对象和buffer元数据
-native_handle：可传输的fd/int集合
-Gralloc：分配、导入、映射底层图形内存
-BufferQueue：在producer与consumer之间循环buffer所有权
-Fence：不阻塞传递所有权时附带的完成条件
+GraphicBuffer
+  = buffer 元数据 + imported native handle 的 C++ 包装
+
+Gralloc allocator
+  = 创建新的底层图形分配
+
+Gralloc mapper
+  = 导入、校验、CPU 映射和释放当前进程的 handle
+
+BufferQueue
+  = 用 slot 循环 producer / consumer 对 buffer 的逻辑所有权
+
+Fence
+  = 所有权已经交出，但访问前仍须满足的异步完成条件
 ```
 
-本章解决：
+完整循环是：
 
-1. `GraphicBuffer` 是像素内存，还是内存的描述对象？
-2. `native_handle_t` 里的 fd 与 int 是什么关系？
-3. allocator 与 mapper 为什么分成两类 HAL？
-4. GraphicBuffer 跨 Binder 后为什么必须 `importBuffer()`？
-5. BufferQueue 的 64 个 slot 是否等于始终分配 64 张 buffer？
-6. `FREE → DEQUEUED → QUEUED → ACQUIRED → FREE` 每一步谁拥有 slot？
-7. 为什么首次 dequeue 后还要 `requestBuffer()`？
-8. queue/acquire/release/dequeue 四次操作分别传什么 fence？
-9. BufferQueue 为什么通常不替使用者同步等待 fence？
-10. async mode 如何丢帧，为什么还要合并 surface damage？
-11. generation number、frame number、buffer ID、slot 分别防什么问题？
-12. `NO_FENCE` 是错误，还是“无需等待”？
+```text
+consumer release fence
+  → producer dequeue 后等待
+  → producer 写 buffer
+  → producer queue acquire fence
+  → consumer acquire 后等待
+  → consumer 读 buffer
+  → consumer release fence
+```
 
-一句话总览：
+所以 BufferQueue 不复制像素，也通常不先替双方阻塞等完所有工作。它主要传递三样东西：
 
-> GraphicBuffer 封装一份可共享图形分配；BufferQueue 不搬运像素，而是循环 slot 所代表的 buffer 所有权，并用 fence 把“现在交给你，但要等某项工作完成后才能访问”的条件一起交给下一任。
+- slot 对应关系；
+- buffer 及帧元数据；
+- 下一任访问前必须等待的 fence。
+
+本章最重要的判断方法是：
+
+> 先问“slot 的逻辑所有权在谁手里”，再问“上一任的异步工作是否已由 fence 宣告完成”。状态已经迁移，不等于硬件工作已经结束。
 
 ---
 
-## 2. 源码地图
+## 2. 源码地图与对象边界
+
+主线文件：
 
 ```text
 frameworks/native/libs/ui/
@@ -50,8 +64,7 @@ frameworks/native/libs/ui/
 ├── Fence.cpp
 └── include/ui/
     ├── GraphicBuffer.h
-    ├── GraphicBufferAllocator.h
-    ├── GraphicBufferMapper.h
+    ├── BufferQueueDefs.h
     └── Fence.h
 
 frameworks/native/libs/gui/
@@ -59,9 +72,7 @@ frameworks/native/libs/gui/
 ├── BufferQueueCore.cpp
 ├── BufferQueueProducer.cpp
 ├── BufferQueueConsumer.cpp
-├── BufferSlot.cpp
 ├── Surface.cpp
-├── IGraphicBufferProducer.cpp
 └── include/gui/
     ├── BufferQueueCore.h
     ├── BufferSlot.h
@@ -69,126 +80,83 @@ frameworks/native/libs/gui/
 
 hardware/interfaces/graphics/
 ├── allocator/4.0/IAllocator.hal
-├── mapper/4.0/IMapper.hal
-└── common/1.2/types.hal
+└── mapper/4.0/IMapper.hal
 
 system/core/libcutils/
 ├── native_handle.cpp
 └── include/cutils/native_handle.h
 ```
 
-阅读时把对象分成三层：
+对象之间不是一一对应：
 
-| 层 | 对象 | 作用 |
+| 对象 | 主要身份 | 容易误解成什么 |
 |---|---|---|
-| 描述层 | `GraphicBuffer` | 尺寸、格式、usage、stride、ID、handle |
-| 内存层 | gralloc allocation + imported handle | 真正可被 GPU/HWC/CPU 访问的共享分配 |
-| 流转层 | `BufferQueueCore` + slot + `BufferItem` | 所有权、排队、时间戳、裁剪、fence |
+| `GraphicBuffer` | 当前进程的描述对象 | 像素数组本身 |
+| imported handle | 当前进程可用的 gralloc handle | 跨进程不变的指针 |
+| `BufferSlot` | 最多 64 个映射位置之一 | 一张永久固定的 buffer |
+| `BufferItem` | 一次排队提交的帧记录 | buffer 本体 |
+| `Fence` | 一个 sync_file fd 的 RAII 包装 | 全局固定名称的“完成信号” |
+
+`BufferQueueProducer` 与 `BufferQueueConsumer` 共享同一个 `BufferQueueCore`，因此同进程调用也要遵守同样的 slot/fence 协议；跨进程时，Binder 再负责对象与 fd 的传输。
 
 ---
 
-## 3. GraphicBuffer 不是 `std::vector<Pixel>`
+## 3. GraphicBuffer 描述分配，不内嵌像素
 
-### 3.1 继承关系
+`GraphicBuffer` 继承 `ANativeWindowBuffer`、引用计数基类和 `Flattenable`。核心字段可以分两组：
 
-`GraphicBuffer` 同时是：
+```text
+公开 buffer 属性
+  width / height / stride
+  format / layerCount / usage
+  handle
+
+管理属性
+  mId
+  mGenerationNumber
+  mOwner
+  mTransportNumFds / mTransportNumInts
+```
+
+`handle` 指向 `native_handle_t`。它描述如何引用底层共享分配，却不是 CPU 可直接解引用的像素地址。CPU 地址要到 mapper `lock()` 后才得到。
+
+### stride 不是 width 的别名
+
+`width` 是有效像素列数；`stride` 在其有意义时，是相邻行同一列之间的像素步长。allocator 可以为了对齐、硬件布局或压缩块让它大于 width。
+
+因此下面的通用估算并不可靠：
+
+```text
+allocation bytes = width × height × 4
+```
+
+YUV、多平面、压缩格式和 modifier 都可能打破它。r48 的 `GraphicBufferAllocator` dump 也只把 `stride × height × bytesPerPixel` 当作估算；当 stride 无意义、格式的 `bytesPerPixel()` 为 0，或存在 vendor 私有布局时，它不是实际显存占用的权威数据。
+
+### mId 的范围
+
+r48 生成逻辑 ID 的方式是：
 
 ```cpp
-class GraphicBuffer :
-    public ANativeObjectBase<
-        ANativeWindowBuffer,
-        GraphicBuffer,
-        RefBase>,
-    public Flattenable<GraphicBuffer>
+uint64_t id = static_cast<uint64_t>(getpid()) << 32;
+id |= static_cast<uint32_t>(android_atomic_inc(&nextId));
 ```
 
-因此它具备：
-
-- `ANativeWindowBuffer` 所需字段；
-- `sp<>` 引用计数；
-- Flattenable 跨 Binder 序列化能力。
-
-### 3.2 它保存什么
-
-核心字段可分为公开元数据和私有管理信息：
+flatten 会传输这个 ID，接收端重建的 `GraphicBuffer` 因而保留同一逻辑身份。但应区分：
 
 ```text
-width / height
-stride
-format
-layerCount
-usage
-handle
-
-mId
-mGenerationNumber
-mOwner
-mTransportNumFds / mTransportNumInts
+mId             逻辑 buffer ID，会随 flatten 传输
+handle 指针      当前进程地址
+fd 数字          当前进程 fd 表下标
+底层内核对象      fd 所引用的共享分配
 ```
 
-`handle` 指向 `native_handle_t`；像素内容通常不直接放在 GraphicBuffer C++ 对象内部。
-
-更准确的关系：
-
-```mermaid
-flowchart LR
-    GB["GraphicBuffer对象<br/>宽高/格式/usage/stride/ID"] --> H["buffer_handle_t<br/>native_handle_t指针"]
-    H --> FD["若干fd<br/>指向共享内存/驱动对象"]
-    H --> META["若干vendor ints<br/>布局/标识等私有数据"]
-    FD --> ALLOC["底层图形内存分配"]
-    META --> ALLOC
-    ALLOC --> GPU["GPU"]
-    ALLOC --> HWC["HWC"]
-    ALLOC --> CPU["CPU lock时映射"]
-```
-
-vendor handle 的具体 fd/int 布局不是 Framework 通用协议，不能把某一家 gralloc 私有 handle 结构当成所有设备标准。
-
-### 3.3 `GraphicBuffer::mId`
-
-r48 用：
-
-```cpp
-uint64_t id =
-    static_cast<uint64_t>(getpid()) << 32;
-id |= localCounter++;
-```
-
-它用于进程内创建时生成较稳定的逻辑标识；flatten 时会传输 ID，所以接收端重建的 GraphicBuffer 保留同一逻辑 ID。
-
-但要区分：
-
-```text
-mId                GraphicBuffer逻辑身份
-handle指针值        当前进程地址，跨进程无意义
-handle里的fd号      当前进程fd表编号，跨进程后数字可变
-底层内核对象         fd引用的共享分配
-```
-
-不能拿两个进程里的 handle 指针或 fd 数字直接比较 buffer 身份。
-
-### 3.4 `stride` 不一定等于 width
-
-allocator 可为对齐、压缩块或硬件要求增加行间 padding：
-
-```text
-width：有效像素列数
-stride：相邻行同列之间的像素步长（有定义时）
-```
-
-HAL 文档还明确说明某些格式下 stride 没有通用含义。估算内存也不能永远简单写成：
-
-```text
-width × height × 4
-```
-
-YUV、多平面、压缩格式和 modifier 都可能使公式失效。
+PID 复用和 32 位计数回绕决定了 `mId` 不是跨无限时间的密码学唯一 ID；排障时也不能比较两个进程里的 handle 指针或 fd 数字来判断是否同一 allocation。
 
 ---
 
-## 4. `native_handle_t`：可传输资源的容器
+## 4. native_handle 与 GraphicBuffer 所有权
 
-### 4.1 数据布局
+`native_handle_t` 的公共布局很简单：
 
 ```cpp
 typedef struct native_handle {
@@ -199,59 +167,44 @@ typedef struct native_handle {
 } native_handle_t;
 ```
 
-逻辑布局：
+```text
+data[0 ... numFds-1]                 fd
+data[numFds ... numFds+numInts-1]    普通整数
+```
+
+fd 引用共享内存或驱动对象；ints 可保存 vendor 私有元数据。具体字段布局属于 gralloc 实现，不是 Framework 的统一协议。
+
+`native_handle_clone()` 会逐个 `dup()` fd，再 `memcpy()` 普通整数。只复制整数值会让两个对象错误地共享同一 fd 所有权。
+
+资源释放也分两步：
 
 ```text
-data[0 ... numFds-1]              文件描述符
-data[numFds ... numFds+numInts-1] 普通整数
+native_handle_close()   关闭 handle 中的 fd
+native_handle_delete()  释放 native_handle 结构体内存
 ```
 
-`buffer_handle_t` 只是：
+不要用其中一个替代另一个。
 
-```cpp
-typedef const native_handle_t* buffer_handle_t;
-```
+### 四种 HandleWrapMethod
 
-它不是一个神秘的像素地址。
+| 模式 | 是否 import | 输入 handle 的所有权 | GraphicBuffer 析构 |
+|---|---:|---|---|
+| `WRAP_HANDLE` | 否 | 不接管 | 不释放 |
+| `TAKE_HANDLE` | 否 | 接管已 imported handle | mapper `freeBuffer()` |
+| `TAKE_UNREGISTERED_HANDLE` | 是 | 成功后接管 raw handle | 先关/删 raw，最终释放 imported handle |
+| `CLONE_HANDLE` | 是 | 不接管输入 | 释放自己得到的 imported handle |
 
-### 4.2 clone 为什么不能只 `memcpy`
+`initWithSize()` 创建的对象记为 `ownData`；析构时走 allocator `free()`。不过 r48 的 allocator `free()` 最终同样调用 mapper `freeBuffer()`，因为 allocator 返回的 raw handle 已在 Framework 内导入。
 
-`native_handle_clone()`：
-
-```cpp
-for each fd:
-    clone->data[i] = dup(original->data[i]);
-copy ordinary ints with memcpy
-```
-
-fd 是进程资源引用，必须 `dup()` 才建立独立所有权；普通整数才可直接复制。
-
-### 4.3 close 与 delete 是两件事
-
-```text
-native_handle_close() 关闭handle包含的fd
-native_handle_delete() 只释放native_handle结构内存
-```
-
-仅 delete 会泄漏 fd；仅 close 不释放结构内存。
-
-不过 imported handle 最终通常应交给 mapper 的 `freeBuffer()`，不能无视 HAL 的进程内导入状态而自行套用 close/delete。
+这解释了一个常见误区：所有权针对的是“当前进程这份 imported handle 及其引用”，不是宣称全系统再没有其他进程引用底层 allocation。
 
 ---
 
-## 5. allocator 与 mapper 为什么分开
+## 5. allocator 创建，mapper 让当前进程可用
 
-### 5.1 allocator：创建新分配
+Gralloc 把职责拆成两部分。
 
-Gralloc 4 `IAllocator::allocate()` 输入 descriptor 和数量，输出：
-
-```text
-Error
-stride
-raw handles[]
-```
-
-descriptor 包含：
+`IAllocator::allocate()` 接收 descriptor 和数量，返回 stride 与 raw handles。descriptor 包含：
 
 ```text
 name
@@ -262,12 +215,6 @@ usage
 reservedSize
 ```
 
-它回答：
-
-> 请按这些用途创建新的底层共享图形分配。
-
-### 5.2 mapper：让本进程使用已有分配
-
 `IMapper` 负责：
 
 ```text
@@ -276,773 +223,577 @@ importBuffer / freeBuffer
 validateBufferSize
 getTransportSize
 CPU lock / unlock
-读取buffer metadata
+读取或设置 metadata
 ```
 
-它回答：
-
-> 这个 raw handle 进入当前进程后，怎样变成可安全使用、可验证、可映射的 imported handle？
-
-### 5.3 r48 版本回退
-
-`GraphicBufferAllocator` 和 `GraphicBufferMapper` 都优先尝试：
+主分配链：
 
 ```text
-Gralloc 4 → Gralloc 3 → Gralloc 2
+GraphicBuffer(width, height, ...)
+  → GraphicBuffer::initWithSize()
+  → GraphicBufferAllocator::allocate()
+  → GrallocXAllocator::allocate()
+  → IMapper::createDescriptor()
+  → IAllocator::allocate() 得到 raw handle
+  → IMapper::importBuffer()
+  → GraphicBuffer 保存当前进程的 imported handle
 ```
 
-若一个支持版本都没有，进程 fatal。
+r48 的 mapper 和 allocator 都按 `Gralloc4 → Gralloc3 → Gralloc2` 尝试；没有可用实现会 fatal。Gralloc 4 mapper 还明确要求 passthrough，远程 mapper 会触发 fatal，因为 imported handle 和 CPU 映射结果必须在调用进程直接使用。allocator 则可以是 HAL 服务。
 
-Gralloc 4 mapper 要求 passthrough：
+### usage 会影响真实分配
 
-```cpp
-if (mMapper->isRemote()) {
-    LOG_ALWAYS_FATAL(
-        "gralloc-mapper must be in passthrough mode");
-}
-```
-
-原因是 mapper 返回的 imported handle 和 CPU 映射要在调用进程直接使用。allocator 则可通过 HAL 服务完成实际分配。
-
-### 5.4 分配路径
-
-```text
-GraphicBuffer(width,height,...)
-→ GraphicBuffer::initWithSize
-→ GraphicBufferAllocator::allocate
-→ GrallocXAllocator::allocate
-→ IMapper::createDescriptor
-→ IAllocator::allocate
-→ IMapper::importBuffer
-→ GraphicBuffer保存imported handle
-```
-
-Gralloc 4 的 allocator 返回 raw handle 后，Framework 默认再 import 成当前进程可用 handle。
-
-### 5.5 usage 不是权限注解
-
-usage 同时描述预期访问者和用途，例如：
+usage 不是文档注解，而是 allocator 的输入约束：
 
 ```text
 CPU read/write
-GPU texture
-GPU render target
-HWC
+GPU texture / render target
+composer
 video encoder
 protected content
 ```
 
-allocator 可据此选择内存堆、布局、缓存策略、压缩方式。申请时漏掉 consumer usage，可能得到下游不能访问的布局。
-
-所以 `BufferQueueProducer::dequeueBuffer()` 会：
+它可能影响 heap、缓存策略、布局与压缩方式。producer 申请时，`dequeueBuffer()` 会执行：
 
 ```cpp
 usage |= mCore->mConsumerUsageBits;
 ```
 
-把 producer 与 consumer 需求合并后再决定是否分配。
+也就是把 producer 和 consumer 的需求合并后再判断旧 buffer 能否复用。
+
+### r48 的三个包装边界
+
+1. 宽或高任一为 0 时，`allocateHelper()` 把两者一起改成 `1 × 1`，所以 `0 × 1080` 也不会变成 `1 × 1080`。
+2. `layerCount < 1` 被改成 1。
+3. HAL allocate 的非零错误向上统一变为 `NO_MEMORY`，细分的 unsupported/no-resources 等原因只能结合前置日志判断。
+
+另外，`GraphicBuffer::needsReallocation()` 对 usage 使用“已有 usage 是否覆盖新需求”的包含判断，但 protected bit 必须精确一致：
+
+```cpp
+if ((usage & inUsage) != inUsage) return true;
+if ((usage & USAGE_PROTECTED) !=
+        (inUsage & USAGE_PROTECTED)) return true;
+```
+
+旧 buffer 多出的普通 usage 通常可接受；protected 属性变化则强制重分配。
 
 ---
 
-## 6. GraphicBuffer 的所有权模式
+## 6. flatten 传描述，unflatten 后重新 import
 
-`HandleWrapMethod` 有四类：
+`GraphicBuffer::flatten()` 的固定头在新格式下是 13 个 `int32_t`：
 
-| 模式 | 是否复制/导入 | GraphicBuffer 是否负责释放 |
+```text
+[0]  magic = GB01
+[1]  width
+[2]  height
+[3]  stride
+[4]  format
+[5]  layerCount
+[6]  usage low 32
+[7]  mId high 32
+[8]  mId low 32
+[9]  generation number
+[10] transport fd count
+[11] transport int count
+[12] usage high 32
+后续 transport ints
+另行传 transport fds
+```
+
+这里用 `getTransportSize()`，不是盲目发送 imported handle 的所有 fd/int。Gralloc 4 允许 imported handle 在尾部附加当前进程的运行时数据，传输时可省略这些本地字段。
+
+Binder 传 fd 时，为接收进程建立新的 fd 引用；接收端看到的整数通常不同，但仍可引用同一底层内核对象。
+
+`unflatten()` 的关键步骤是：
+
+```text
+校验 magic、字节数、fd/int 数
+  → native_handle_create()
+  → 填入 Binder 交付的 fd 与 ints
+  → 恢复尺寸、usage、ID、generation
+  → GraphicBufferMapper::importBuffer(raw handle)
+  → validateBufferSize()
+  → 关闭并删除临时 raw handle
+  → 保存 imported handle
+```
+
+`IMapper` 规范明确规定：从另一进程、HAL 或 clone 得到的 raw handle 不能直接访问底层 buffer，必须先 import。import 是建立当前进程的有效 handle 与 bookkeeping，不是逐像素复制。
+
+### 格式兼容与输入防护
+
+```text
+GB01   13 words，64-bit usage
+GBFR   12 words，旧 32-bit usage
+```
+
+未知 magic 返回 `BAD_TYPE`。r48 还限制：
+
+```cpp
+numFds < 4096
+numInts < 4096 - flattenWordCount
+```
+
+并逐步检查 buffer 字节数和 fd 数，避免恶意或损坏输入造成溢出、越界分配。
+
+---
+
+## 7. CPU lock/unlock 也遵守 fence
+
+`GraphicBuffer::lockAsync()` 把 imported handle、usage、访问矩形和输入 fence fd 交给 mapper：
+
+```text
+输入 fence   之前的设备访问何时结束
+返回地址     CPU 可访问映射
+```
+
+矩形超出 width/height 会先返回 `BAD_VALUE`。即使持有 handle，也不保证任意 usage 都能 lock；protected buffer、特定压缩布局或 vendor 限制都可能拒绝 CPU 映射。
+
+`unlockAsync()` 返回一个 fence fd，表示 CPU 写入相关的异步 cache flush 等工作何时完成。下一任必须继承这个条件。
+
+同步包装 `GraphicBufferMapper::unlock()` 的行为更重：
+
+```cpp
+unlockAsync(handle, &fenceFd);
+if (fenceFd >= 0) {
+    sync_wait(fenceFd, -1);
+    close(fenceFd);
+}
+```
+
+也就是同步版本会在本线程等待完成；异步版本把 fence 交给调用者继续传递。不能因为 API 名叫 lock/unlock，就忽略 buffer 在 CPU、GPU、HWC 之间的同步。
+
+---
+
+## 8. BufferQueue 是槽位映射，不是 64 张常驻图片
+
+`BufferQueue::createBufferQueue()` 创建共享同一 Core 的 producer/consumer 两端：
+
+```text
+IGraphicBufferProducer
+          │
+          ▼
+BufferQueueCore
+  slots[64]
+  queue FIFO
+  free/active/unused 集合
+  mutex + conditions
+          ▲
+          │
+IGraphicBufferConsumer
+```
+
+`BufferQueueDefs::NUM_BUFFER_SLOTS = 64` 只是 Framework 能追踪的最大 slot 数。Core 初始化时只把当前计算出的可用数量放进 `mFreeSlots`，其余在 `mUnusedSlots`；buffer 更是按 dequeue 需要才分配。
+
+数量公式是：
+
+```cpp
+maxCount =
+    mMaxAcquiredBufferCount +
+    mMaxDequeuedBufferCount +
+    ((mAsyncMode || mDequeueBufferCannotBlock) ? 1 : 0);
+
+maxCount = min(mMaxBufferCount, maxCount);
+```
+
+默认 `maxAcquired = 1`、`maxDequeued = 1`、同步且可阻塞时，计算结果是 2；异步或不可阻塞时多留 1 个，常见为 3。运行时配置、consumer 限额和显式 max count 都会改变结果。
+
+因此：
+
+```text
+64 slots     映射表硬上限
+maxCount     当前允许纳入管理的 slot 数
+allocated    当前真的持有 GraphicBuffer 的 slot 数
+```
+
+三者不能互换。
+
+Core 还区分：
+
+| 集合 | 含义 |
+|---|---|
+| `mUnusedSlots` | 当前 maxCount 之外 |
+| `mFreeSlots` | 可用但没有可复用 GraphicBuffer |
+| `mFreeBuffers` | FREE 且保留可复用 GraphicBuffer |
+| `mActiveBuffers` | dequeued/queued/acquired，或 shared 特例 |
+| `mQueue` | 等 consumer acquire 的 `BufferItem` FIFO |
+
+“在 FIFO 中”与“slot 状态”高度相关，却不是同一个维度；shared mode、stale item 与 drop 路径尤其不能只看队列长度推断所有权。
+
+---
+
+## 9. slot 状态和 fence 必须一起读
+
+普通模式下最容易理解的状态环是：
+
+```text
+FREE
+  --dequeueBuffer--> DEQUEUED
+  --queueBuffer----> QUEUED
+  --acquireBuffer--> ACQUIRED
+  --releaseBuffer--> FREE
+```
+
+`cancelBuffer()` 则让 `DEQUEUED → FREE`。
+
+r48 的 `BufferState` 实际不是单 enum，而是三个计数加一个 shared 标志：
+
+```text
+mDequeueCount
+mQueueCount
+mAcquireCount
+mShared
+```
+
+普通模式下计数组合表现为 FREE、DEQUEUED、QUEUED、ACQUIRED；shared mode 可让同一 slot 同时拥有多种计数。
+
+| 状态 | 逻辑持有者 | slot.mFence 表示什么 |
 |---|---|---|
-| `WRAP_HANDLE` | 直接包已注册 handle | 不负责 |
-| `TAKE_HANDLE` | 直接接管已注册 handle | 负责 mapper free |
-| `TAKE_UNREGISTERED_HANDLE` | import 后接管 raw handle | 负责 |
-| `CLONE_HANDLE` | clone，再 import | 负责 imported handle |
+| FREE | BufferQueue | 上一 consumer 读完，或 cancel 前 producer 写完 |
+| DEQUEUED | producer | fence 已交 producer，slot 内重置为 `NO_FENCE` |
+| QUEUED | BufferQueue | producer 写完条件 |
+| ACQUIRED | consumer | fence 已交 consumer，slot 内重置为 `NO_FENCE` |
 
-内部 `mOwner` 又区分：
+所以 `mFence` 不能永久命名成 acquire fence 或 release fence；名字来自接收者视角：
 
 ```text
-ownNone   不拥有
-ownHandle mapper imported handle
-ownData   本对象通过allocator创建的分配
+producer queue 的 fence
+  = consumer 的 acquire fence
+
+consumer release 的 fence
+  = producer 下次 dequeue 的等待 fence
 ```
 
-析构时：
+最关键的反例是：
+
+> slot 进入 FREE，只说明逻辑所有权回到 BufferQueue；其 fence 可能尚未 signal。BufferQueue 可以把 slot 和 fence 一起交给 producer，由 producer 在覆盖写之前等待。
+
+`Fence::NO_FENCE` 是一个非空 `Fence` 对象，内部 fd 为 -1，表示无需等待。它与 `nullptr` 不同；queue/cancel/release 等接口会把 null fence 当作参数错误。
+
+---
+
+## 10. dequeue 与 requestBuffer：先定 slot，再补对象
+
+`BufferQueueProducer::dequeueBuffer()` 的主路径：
+
+```text
+检查连接、尺寸与 abandoned
+  → 合并 consumer usage，补默认尺寸/格式
+  → 等待 allocation 或可用 slot
+  → 优先 mFreeBuffers，其次允许分配时取 mFreeSlots
+  → slot 状态记为 DEQUEUED
+  → 判断现有 GraphicBuffer 是否满足属性
+  → 必要时清旧映射并在锁外分配
+  → 返回 slot、flags、buffer age、fence
+```
+
+普通 dequeue 优先复用 `mFreeBuffers.front()`；它不是扫描所有 64 个槽位，也不保证总选某个固定 slot。attach 恰好反过来优先空 slot，减少覆盖已有 buffer。
+
+### 超额检查的启动边界
+
+producer 的 `maxDequeued` 检查只在 `mBufferHasBeenQueued == true` 后执行：
 
 ```cpp
-if (mOwner == ownHandle)
-    mapper.freeBuffer(handle);
-else if (mOwner == ownData)
-    allocator.free(handle);
+if (mBufferHasBeenQueued &&
+        dequeuedCount >= mMaxDequeuedBufferCount) {
+    return INVALID_OPERATION;
+}
 ```
 
-在 r48 中 allocator free 最终也调用 mapper free，因为分配返回值已经被 import；额外的分配记录表用于 dump 估算。
+这是源码中的兼容边界，不应简化成“从连接第一刻起任何 dequeue 都严格被同一判断拒绝”。
 
----
+若没有 slot：
 
-## 7. GraphicBuffer 如何跨 Binder
+- 可阻塞模式在 condition 上等待；
+- async 或 cannot-block 模式通常返回 `WOULD_BLOCK`；
+- consumer 为原子 acquire+release 临时多持有 1 个时，producer 仍可等待，不立刻 `WOULD_BLOCK`；
+- 配置了非负 timeout 时可能返回 `TIMED_OUT`。
 
-### 7.1 flatten 传哪些数据
+### 分配为什么放在 Core 锁外
 
-新格式 magic 为 `GB01`，固定 13 个 int word：
+需要新 buffer 时，代码先：
 
 ```text
-magic
-width / height / stride / format / layerCount
-usage低32位
-mId高32位 / 低32位
-generation
-transport numFds / numInts
-usage高32位
-后续vendor ints
-另一路fd数组
-```
-
-重要点：
-
-> flatten 只传 mapper 声明的 transport fd/int 数，不把 imported handle 尾部的进程本地 runtime 数据硬搬到另一进程。
-
-### 7.2 Binder 如何处理 fd
-
-`flatten()` 把 fd 放入 Parcel 的 fd 区域；Binder 传输后，接收进程得到指向同一内核对象的新 fd 引用，fd 数字本身不要求相同。
-
-所以跨进程共享的是底层分配，不是发送进程虚拟地址。
-
-### 7.3 unflatten 后必须 import
-
-接收端先建立 raw native handle，再：
-
-```cpp
-mBufferMapper.importBuffer(
-    handle, width, height, layerCount,
-    format, usage, stride,
-    &importedHandle);
-```
-
-成功后关闭并删除临时 raw handle，保存 imported handle。
-
-HAL 文档明确规定：
-
-> 从其他进程或 HAL 收到的 raw handle 不能直接访问底层图形 buffer，必须先 import。
-
-### 7.4 安全检查
-
-r48 对传输的 fd/int 数设置小于 4096 的上限，并验证大小，避免恶意数量造成整数溢出或异常分配。
-
-`GraphicBufferMapper::importBuffer()` 还调用 `validateBufferSize()`，至少要保证分配足以支持调用方声称的宽高、格式、usage 与 stride。
-
-### 7.5 兼容旧格式
-
-unflatten 同时接受：
-
-```text
-GB01：64-bit usage
-GBFR：旧32-bit usage
-```
-
-这解释了为何序列化代码不能只按当前 struct 内存布局 `memcpy`。
-
----
-
-## 8. CPU lock/unlock 与 fence
-
-### 8.1 `lockAsync`
-
-CPU 访问不是直接解引用 handle，而是：
-
-```text
-GraphicBuffer::lockAsync
-→ GraphicBufferMapper::lockAsync
-→ IMapper::lock
-→ 返回当前进程CPU虚拟地址
-```
-
-调用者传入 acquire fence，表示 CPU 映射访问前必须等待此前设备工作完成。
-
-Gralloc 4 wrapper 把 fence 包成 handle 交给 mapper，并声明即使出错也由该调用消费/关闭传入 fd。
-
-### 8.2 `unlockAsync`
-
-CPU 写完后：
-
-```text
-IMapper::unlock
-→ 可返回release fence fd
-```
-
-若写入实际是异步 cache flush 等工作，下一任必须等待它。
-
-同步 `unlock()` 会在得到有效 fence 后直接 `sync_wait()` 并关闭，于是返回时 CPU 侧完成；异步接口把 fence 交给调用者继续流水线。
-
-### 8.3 protected buffer
-
-`USAGE_PROTECTED` 往往意味着不可普通 CPU 映射。是否支持以及返回什么错误由 allocator/mapper 和设备实现决定，不能假设“有 handle 就能 lock”。
-
----
-
-## 9. BufferQueue 的三个对象
-
-`BufferQueue::createBufferQueue()` 创建：
-
-```cpp
-sp<BufferQueueCore> core;
-sp<IGraphicBufferProducer> producer =
-    new BufferQueueProducer(core, ...);
-sp<IGraphicBufferConsumer> consumer =
-    new BufferQueueConsumer(core);
-```
-
-它们共享同一个 Core：
-
-```mermaid
-flowchart LR
-    APP["Producer<br/>App / EGL / Codec"] -->|"IGraphicBufferProducer Binder"| BP["BufferQueueProducer"]
-    BP --> CORE["BufferQueueCore<br/>64 slots + FIFO + lock"]
-    CONS["Consumer<br/>SurfaceFlinger / ImageReader / Codec"] --> BC["BufferQueueConsumer"]
-    BC --> CORE
-    CORE --> SLOT["slot → GraphicBuffer + state + fence"]
-```
-
-对普通 App 窗口：
-
-```text
-producer Surface对象在App进程
-IGraphicBufferProducer Proxy在App进程
-BufferQueueProducer/Core/Consumer通常在SurfaceFlinger进程
-```
-
-其他 BufferQueue 的承载进程取决于谁创建 consumer，不能把所有队列都写成位于 SurfaceFlinger。
-
----
-
-## 10. 64 个 slot 不等于 64 张已分配 buffer
-
-`NUM_BUFFER_SLOTS = 64` 只是映射表容量。
-
-Core 将 slot 分为：
-
-```text
-mFreeSlots    FREE且没有GraphicBuffer
-mFreeBuffers  FREE且仍挂有GraphicBuffer
-mActiveBuffers 非FREE且有buffer
-mUnusedSlots  当前最大buffer count之外
-mQueue        已queue、待consumer acquire的FIFO
-```
-
-构造时只把允许范围内的 slot 放入 free slots，并未给每个 slot 分配像素内存。
-
-实际最大活跃 buffer 数大致受：
-
-```text
-maxAcquired + maxDequeued
-+ (async或cannotBlock ? 1 : 0)
-```
-
-以及 consumer 设置的 `mMaxBufferCount` 上限共同限制。
-
-默认常见概念是“双缓冲/三缓冲”，但不能仅凭 slot 总数或公式断言具体 Surface 始终有几张 buffer；连接模式、consumer 限额和异步设置都会改变它。
-
-## 11. slot 状态机：所有权比队列位置更重要
-
-### 11.1 五种状态
-
-`BufferState` 用计数表达：
-
-| 状态 | shared | dequeueCount | queueCount | acquireCount |
-|---|---:|---:|---:|---:|
-| FREE | false | 0 | 0 | 0 |
-| DEQUEUED | false | 1 | 0 | 0 |
-| QUEUED | false | 0 | 1 | 0 |
-| ACQUIRED | false | 0 | 0 | 1 |
-| SHARED | true | 可组合 | 可组合 | 可组合 |
-
-普通模式主环：
-
-```mermaid
-stateDiagram-v2
-    [*] --> FREE
-    FREE --> DEQUEUED: producer dequeueBuffer
-    DEQUEUED --> QUEUED: producer queueBuffer
-    DEQUEUED --> FREE: producer cancelBuffer
-    QUEUED --> ACQUIRED: consumer acquireBuffer
-    QUEUED --> FREE: async/drop替换旧帧
-    ACQUIRED --> FREE: consumer releaseBuffer
-    DEQUEUED --> [*]: producer detachBuffer
-    ACQUIRED --> [*]: consumer detachBuffer
-```
-
-### 11.2 每个状态谁拥有
-
-| 状态 | 逻辑所有者 | 谁能访问内容 |
-|---|---|---|
-| FREE | BufferQueue | 无一方可随意访问 |
-| DEQUEUED | producer | 等 dequeue 返回 fence 后可写 |
-| QUEUED | BufferQueue | 只是等待交接，consumer尚未正式拥有 |
-| ACQUIRED | consumer | 等 acquire fence 后可读 |
-| SHARED | 特殊共享模式 | 可同时具备多种计数，需按特殊约定 |
-
-“在 mQueue FIFO 里”和“slot 处于某状态”相关但不完全等价，shared mode、stale item 和 drop 路径会打破简单的一一想象。
-
-### 11.3 `mFence` 的含义随状态变化
-
-`BufferSlot` 注释非常关键：
-
-```text
-FREE:
-  consumer读完或producer cancel后的工作何时完成
-QUEUED:
-  producer填充buffer何时完成
-DEQUEUED / ACQUIRED:
-  fence已随所有权交给下一任，slot内部重置NO_FENCE
-```
-
-所以 `mFence` 不是固定叫“release fence”或“acquire fence”的槽位。
-
-更好的理解：
-
-> 它保存当前 slot 下一次所有权交接需要携带的“上一任完成条件”。
-
----
-
-## 12. 第一次 dequeue 为什么有两步
-
-### 12.1 `dequeueBuffer()` 先返回 slot
-
-Producer 请求宽高、格式、usage。Core：
-
-1. 合并 consumer usage；
-2. 选已有 free buffer，优先复用；
-3. 没有则选 empty free slot；
-4. 检查是否需要 reallocate；
-5. 把状态改为 DEQUEUED；
-6. 返回 slot、fence、buffer age 和 flags。
-
-若需新分配：
-
-```cpp
-returnFlags |= BUFFER_NEEDS_REALLOCATION;
-```
-
-分配本身会暂时退出 Core 主锁，以免昂贵 HAL 调用长期阻塞所有队列操作；`mIsAllocating` 保证 producer 不并行改 free slots。
-
-### 12.2 Surface 再 `requestBuffer(slot)`
-
-App 进程的 `Surface` 有自己的：
-
-```text
-slot → sp<GraphicBuffer>
-```
-
-缓存。若：
-
-```text
+slot = DEQUEUED
+mGraphicBuffer = null
+mIsAllocating = true
 BUFFER_NEEDS_REALLOCATION
-或本地slot缓存为空
 ```
 
-它才调用 Binder `requestBuffer(slot)` 取得完整 GraphicBuffer。
+然后离开 Core 锁构造 `GraphicBuffer`，最后重新加锁提交结果。这样慢 HAL 调用不长期占住 `mMutex`；`mIsAllocating` 与 condition 防止其他相关路径并行破坏映射。
 
-之后同一个 slot 继续复用时，dequeue 常规只需传：
+若分配失败或期间队列被 abandoned，slot 会回到 free 并被清理，不保留半完成分配。
 
-```text
-slot + fence + age + flags
-```
+### 为什么 Surface 还要 requestBuffer
 
-无需每帧重复 flatten native handle。
-
-### 12.3 为什么 `requestBufferCalled` 要记账
-
-Core 要求 producer queue 前已经 request 过该 slot 的 buffer。`mRequestBufferCalled` 能发现错误 producer：
-
-```text
-dequeue得到slot
-却没有取得对应GraphicBuffer
-仍试图queue
-```
-
-这不是所有权本身必需，却是重要的协议一致性检查。
-
-### 12.4 reallocation 的触发
-
-典型条件：
-
-```text
-width变化
-height变化
-format变化
-layerCount变化
-usage新增了原buffer不具备的bit
-protected bit变化
-```
-
-`needsReallocation()` 对 usage 采用：
+`dequeueBuffer()` 的跨进程热路径首先返回 slot 和 flags。只有发生以下任一条件时，`Surface` 才调用：
 
 ```cpp
-(allocatedUsage & requestedUsage) != requestedUsage
+if ((result & BUFFER_NEEDS_REALLOCATION) ||
+        localSlotBuffer == nullptr) {
+    producer->requestBuffer(slot, &localSlotBuffer);
+}
 ```
 
-原分配 usage 是新请求的超集时可以复用；但 protected bit 要精确匹配，不能把普通和受保护分配混用。
+`requestBuffer()` 不负责分配；分配已经在 dequeue 内完成。它只校验 slot 当前属于 producer，设置 `mRequestBufferCalled = true`，再返回 Core 中的 `GraphicBuffer`。
 
----
+queue 前要求这个标志为 true，可发现 producer 收到新映射却仍使用旧 slot cache 的错误。首次、重分配、consumer attach 以及 `RELEASE_ALL_BUFFERS` 后都可能需要重取对象。
 
-## 13. Producer 路径：dequeue、写、queue
-
-### 13.1 dequeue 选择顺序
-
-普通 dequeue 优先：
-
-```text
-mFreeBuffers中已有分配
-→ mFreeSlots中空slot并允许allocation
-→ 没有则等待/超时/WOULD_BLOCK
-```
-
-这减少重新分配。
-
-producer 不能超过 `mMaxDequeuedBufferCount`。不过该检查只在队列已经成功 queue 过至少一帧后启用，允许初始化阶段建立所需 buffer。
-
-### 13.2 dequeue fence
-
-FREE slot 里的 `mFence` 通常来自 consumer 上次 release。dequeue 时：
+### dequeue fence 的交接
 
 ```cpp
 *outFence = mSlots[found].mFence;
 mSlots[found].mFence = Fence::NO_FENCE;
 ```
 
-producer 获得所有权，但要等该 fence 后才能覆盖写 buffer。
+producer 已获得 slot，但必须等返回 fence 后才能覆盖写。shared buffer 除首帧外会返回 `NO_FENCE`，这是其并发状态模型的特殊协议，不能推广到普通模式。
 
-注意：
+旧 `EGLSyncKHR` 路径最多等 1 秒；失败或超时只记录日志仍返回 buffer，因为所有权已经转移、此处太晚回滚。现代 sync-file fence 主路径则把 fence 交给 producer。
 
-> `dequeueBuffer()` 返回并不等于旧 consumer 已经完成；返回 fence 正是为了把等待推迟到真正写入前，让 CPU/GPU 流水线继续。
+---
 
-### 13.3 queue 输入
+## 11. queue 与 cancel：提交帧不等于显示帧
 
-producer 写完后构造 `QueueBufferInput`，包括：
+`queueBuffer(slot, input, output)` 先校验：
 
 ```text
-requested present timestamp
-auto timestamp标记
-dataspace
-crop
-scaling mode
-transform / sticky transform
-写完成fence
-surface damage
-HDR metadata
-是否请求frame timestamps
+连接仍有效
+slot 范围合法且当前 DEQUEUED
+requestBuffer 已调用
+fence 非 null
+scaling mode 与 crop 合法
 ```
 
-这里变量叫 `acquireFence`，因为它是下一任 consumer 的 acquire 条件。
+`QueueBufferInput` 携带的不只是 fence：
 
-### 13.4 queue 状态变化
+```text
+requested present timestamp / auto timestamp
+dataspace / HDR metadata
+crop / scaling / transform / sticky transform
+surface damage
+producer 完成 fence
+是否请求 frame timestamps
+```
+
+UNKNOWN dataspace 会换成 consumer 默认值。随后：
 
 ```cpp
 mSlots[slot].mFence = acquireFence;
 mSlots[slot].mBufferState.queue();
-++mFrameCounter;
+++mCore->mFrameCounter;
 mSlots[slot].mFrameNumber = currentFrameNumber;
 ```
 
-然后建立 `BufferItem` 放入 FIFO，通知 consumer `onFrameAvailable()` 或 `onFrameReplaced()`。
+变量叫 `acquireFence`，是因为它将成为 consumer 的获取条件；从 producer 角度，它表达本次写入何时完成。
 
-callback 在 Core 主锁外执行，以免 consumer 回调反向进入队列造成锁问题；另用 callback ticket 保证多 producer 调用产生的回调顺序。
+queue 只把 `BufferItem` 放入 FIFO 或替换一个可丢尾项，然后通知 consumer。它不表示：
 
-### 13.5 EGL producer 的节流
+- SurfaceFlinger 已经 acquire；
+- GPU 写 fence 已 signal；
+- HWC 已 present；
+- 屏幕已经扫描到这帧。
 
-若连接 API 是 EGL，queue 返回前可能等待上一张 queued fence：
+`cancelBuffer()` 不生成帧。它把 DEQUEUED 计数减掉，非 shared slot 放回 free buffers，并保存调用者 fence，保证下一次复用不会踩到 cancel 前仍在进行的写。
+
+### 回调顺序与 EGL 节流
+
+queue 在释放 Core 主锁后才调用 consumer listener，避免外部回调重入主状态机；另一个 callback mutex 加 ticket 保证多个 producer 调用的回调顺序与 queue 顺序一致。
+
+若 producer API 是 EGL，回调后还会等待“上一笔 queue 的 acquire fence”：
 
 ```cpp
 lastQueuedFence->waitForever(
-    "Throttling EGL Production");
+        "Throttling EGL Production");
 ```
 
-源码说明这是让最多两张完整 buffer 在排队，而不让第三张无界领先，在吞吐与延迟间偏向延迟。
-
-这不是 BufferQueue 每次 queue 都等待“本帧 fence”；只针对 EGL 路径的上一 queue fence 节流。
+代码注释给出的目标是允许两张完整 buffer 排队，但阻止第三张继续拉大队列；这是偏向延迟的 producer 节流，不等于等待当前帧显示完成。
 
 ---
 
-## 14. Consumer 路径：acquire、读、release
+## 12. acquire 与 release：consumer 也靠 slot cache
 
-### 14.1 acquire 上限允许暂时多 1
-
-consumer 通常最多持有 `mMaxAcquiredBufferCount`，但 `acquireBuffer()` 允许达到 `max + 1` 之前再获取一张。
-
-用途是支持原子式：
-
-```text
-先acquire新buffer完成设置
-再release旧buffer
-```
-
-例如纹理消费者更新时，可避免先释放旧内容后新内容设置失败造成空窗。
-
-这不是允许长期多持有一张。
-
-### 14.2 acquire 的结果
-
-从 FIFO 取 front 后：
+`BufferQueueConsumer::acquireBuffer()` 首先统计已 acquired 数量。判断条件是：
 
 ```cpp
-mBufferState.acquire();
-mSlots[slot].mFence = Fence::NO_FENCE;
+numAcquiredBuffers >=
+        mMaxAcquiredBufferCount + 1
 ```
 
-`BufferItem` 携带 producer queue 的写完成 fence，consumer 必须等它再读。
+也就是 consumer 可短暂比配置上限多持有 1 张，以便先建立新内容，再释放旧内容；若已经达到“上限 + 1”，继续 acquire 才返回 `INVALID_OPERATION`。
 
-BufferQueue 本身通常不在 Core 锁内替 consumer 等待；否则一个慢 GPU fence 会堵住所有 queue/dequeue 状态操作。
-
-### 14.3 为什么后续 acquire 可不给 GraphicBuffer
-
-`mAcquireCalled` 表示 consumer 已见过该 slot 的 buffer。
-
-第一次：
+普通获取会拿 FIFO front：
 
 ```text
-BufferItem含GraphicBuffer
-consumer建立本地slot映射
+QUEUED → ACQUIRED
+BufferItem 交给 consumer
+slot.mFence → NO_FENCE
+FIFO 删除该 item
 ```
 
-后续同 slot：
+结果需要区分：
+
+```text
+NO_ERROR             成功获得帧
+NO_BUFFER_AVAILABLE  队列确实没有可取帧
+PRESENT_LATER        有帧，但时间或 frame 上限尚不允许取
+INVALID_OPERATION    consumer 已超出临时获取上限
+```
+
+### mAcquireCalled 为什么能省 GraphicBuffer
+
+第一次让 consumer 见到某 slot 时，`BufferItem` 带真实 `GraphicBuffer`，consumer 建立本地：
+
+```text
+slot → GraphicBuffer
+```
+
+以后同一映射再次 acquire，producer 预先记录到 item 的 `mAcquireCalled` 为 true，于是 Core 可把：
 
 ```cpp
-if (outBuffer->mAcquireCalled) {
-    outBuffer->mGraphicBuffer = nullptr;
+outBuffer->mGraphicBuffer = nullptr;
+```
+
+这表示“沿用 consumer 的 slot cache”，不是没有 buffer。consumer attach 的映射可能频繁变化，所以相关路径把 `mAcquireCalled` 设为 false，强制下一次发送对象。
+
+### release 的两个校验
+
+`releaseBuffer(slot, frameNumber, releaseFence, ...)` 要求 slot 正在 ACQUIRED，且 fence 非 null。普通模式还要求 frame number 与 slot 当前值一致：
+
+```cpp
+if (frameNumber != mSlots[slot].mFrameNumber &&
+        !mSlots[slot].mBufferState.isShared()) {
+    return STALE_BUFFER_SLOT;
 }
 ```
 
-只传 slot、metadata 与 fence，减少 Binder flatten/import 流量。consumer 必须维护可靠的 slot cache。
+这是防止“旧帧的迟到 release”释放掉同 slot 后来装入的新一代 buffer。shared mode 中 queue/acquire 可并发改变 frame number，因此豁免此检查。
 
-### 14.4 release
-
-consumer 使用完后：
-
-```cpp
-mSlots[slot].mFence = releaseFence;
-mSlots[slot].mBufferState.release();
-mFreeBuffers.push_back(slot);
-notify producer;
-```
-
-release fence 表示 consumer 的读/设备工作何时结束。slot 已变 FREE，但下一次 producer dequeue 得到它时仍需等待该 fence。
-
-因此：
+成功后：
 
 ```text
-FREE是逻辑所有权空闲
-≠ 底层硬件工作必然已经signal
+slot.mFence = consumer release fence
+ACQUIRED → FREE
+非 shared slot 进入 mFreeBuffers
+通知等待中的 producer
 ```
 
-这正是 fence 能让状态流转与硬件完成解耦的价值。
-
-### 14.5 stale frame number
-
-`releaseBuffer(slot, frameNumber, ...)` 会检查当前 slot frame number。
-
-若 slot 已被重分配或代表另一代 frame，旧 release 返回：
-
-```text
-STALE_BUFFER_SLOT
-```
-
-shared buffer 例外，因为它可在 queue/acquire 同时发生，frame number 容易按设计不同步。
+通知时 release fence 完全可能尚未 signal；producer 下一次 dequeue 取得它后再等待。
 
 ---
 
-## 15. 一轮完整 fence 接力
+## 13. 丢帧、时间戳与 damage 的真实规则
 
-```mermaid
-sequenceDiagram
-    participant P as Producer
-    participant BQ as BufferQueue
-    participant C as Consumer
-
-    C->>BQ: releaseBuffer(slot, consumerDoneFence)
-    Note over BQ: slot=FREE<br/>mFence=consumerDoneFence
-    P->>BQ: dequeueBuffer()
-    BQ-->>P: slot + dequeueFence
-    Note over P: 等dequeueFence后才覆盖写
-    P->>P: CPU/GPU生产新内容
-    P->>BQ: queueBuffer(slot, producerDoneFence)
-    Note over BQ: slot=QUEUED<br/>mFence=producerDoneFence
-    C->>BQ: acquireBuffer()
-    BQ-->>C: BufferItem + acquireFence
-    Note over C: 等acquireFence后才采样/读取
-    C->>C: 合成/编码/读取
-    C->>BQ: releaseBuffer(slot, consumerDoneFence)
-```
-
-同一个 fence 在不同接口处的称呼取决于角色：
-
-| 来源 | 在下一接口中的名字 |
-|---|---|
-| consumer 完成 fence | producer dequeue fence |
-| producer 完成 fence | consumer acquire fence |
-| GPU client target ready fence | HWC client target acquire fence |
-
-名字不是对象固有类型，而是当前所有权交接中的方向语义。
-
----
-
-## 16. async/drop：为什么可以丢帧
-
-### 16.1 droppable 条件
-
-`BufferItem.mIsDroppable` 在这些情况可为 true：
+queue 创建 `BufferItem` 时，根据下列条件决定它是否可丢：
 
 ```text
 async mode
-consumer是SurfaceFlinger且双方允许drop
-legacy buffer drop条件
-shared buffer slot
+或 SurfaceFlinger consumer + queueBufferCanDrop
+或 legacy drop + queueBufferCanDrop
+或 shared buffer
 ```
 
-若队列尾项可丢，新 queue 的 item 可覆盖尾项，而不是继续增长 FIFO。
+若 FIFO 非空且最后一项 `last.mIsDroppable`，新 item 会覆盖队尾，而不是继续增长。非 stale 的旧 slot 执行 `freeQueued()`，在非 shared 情况下回到 free buffers。
 
-被替换旧 slot 从 QUEUED 回 FREE，producer 可收到 buffer released 通知。
+注意判断的是“已有尾项是否可丢”，不是新来的 item 自称可丢就能覆盖任意不可丢帧。
 
-### 16.2 为什么要合并 surface damage
+### 为什么必须合并 surface damage
 
-旧帧没显示，但它声明的局部变化可能仍需要反映到新帧。
+假设：
 
-所以 drop 时：
+```text
+帧 A 只更新左上角
+帧 B 只更新右下角
+A 被 B 替换
+```
+
+若只保留 B 的 damage，consumer 可能永远不知道 A 对左上角的修改。r48 因而执行：
 
 ```cpp
-newDamage |= droppedDamage;
+item.mSurfaceDamage |= last.mSurfaceDamage;
 ```
 
-若任一 damage 是 `INVALID_REGION`（表示全区域/未知），合并结果也变为 invalid/full。
+任一方为 `INVALID_REGION` 时，结果也是 invalid/full。这里 damage 合并的是更新语义，不是复制被丢 buffer 的像素。
 
-否则 consumer 若只重绘新帧声明的小区域，可能把被丢帧独有的更新永久漏掉。
+被 drop 的 slot 中仍保存它原来的 producer 完成 fence。slot 虽已逻辑 FREE，后续 dequeue 会把该 fence 交回 producer，防止它在上一笔写尚未完成时重写同一分配。
 
-### 16.3 acquire 也可能按时间戳丢旧帧
+### acquire 也会按 desired-present 丢旧 front
 
-consumer 提供 `expectedPresent` 时，如果 queue 至少两项，后一个 buffer 的 desired present 合理且已到期，acquire 可循环丢掉更旧的 front。
+consumer 提供 `expectedPresent` 且队列至少两项时，代码检查第二项：
 
-但源码留有 TODO：
+- 它不能超过 `maxFrameNumber`；
+- timestamp 必须落在 `expectedPresent - 1s` 到 `expectedPresent`；
+- front 不能因下一项明显太早或异常 timestamp 而被丢。
+
+满足时可循环 drop 更老的 front。r48 源码还留有 TODO：这里没有先确认第二项 fence 已 signal。因此准确表述是“选择时间上更合适的帧”，不能说“只会丢掉且切换到已经完全 ready 的帧”；consumer 取得后仍须等待它的 acquire fence。
+
+最后再判断 front：
 
 ```text
-可能还应检查后一个buffer的fence是否已signal
+desired present 尚未来到
+或 frameNumber 超过 maxFrameNumber
+  → PRESENT_LATER
 ```
 
-r48 当前判定主要基于时间戳和 frame 上限，不先要求候选下一帧 fence signal。因此应表述为“允许选择更新、更合时的帧”，不能写成“只丢已经完全准备好的帧”。
-
-### 16.4 `PRESENT_LATER`
-
-若 front 的 desired timestamp 尚未来到，或超过 `maxFrameNumber`，acquire 返回 `PRESENT_LATER`，没有改变所有权。
-
-它和 `NO_BUFFER_AVAILABLE` 不同：
-
-```text
-NO_BUFFER_AVAILABLE：没有可取帧
-PRESENT_LATER：有帧，但现在不该取
-```
+`PRESENT_LATER` 不改变 slot 所有权，也不等于空队列。
 
 ---
 
-## 17. 四种标识不要混
+## 14. 四种标识、shared mode 与连接生命周期
 
-| 标识 | 作用域 | 主要用途 |
+排障时至少分开四种标识：
+
+| 标识 | 范围 | 用途 |
 |---|---|---|
-| slot index | 单个 BufferQueue 映射表 | 避免每帧重传完整 GraphicBuffer |
-| `GraphicBuffer::mId` | 逻辑 buffer 身份，序列化保留 | cache、trace、死亡通知 |
-| frame number | 单队列成功 queue 的递增代际 | 时间线、stale release、buffer age |
-| generation number | 队列连接/attach 兼容代际 | 阻止旧队列 buffer attach 到新代际 |
+| slot index | 当前 BufferQueue，0–63 | 双方缓存映射键 |
+| `GraphicBuffer::mId` | buffer 逻辑对象 | 跟踪同一分配描述 |
+| generation number | attach 兼容代 | 阻止旧队列世代的 buffer 重新挂入 |
+| frame number | 单队列成功 queue 序列 | 时间线、stale release、buffer age |
 
-### 17.1 generation number
+`attachBuffer()` 会比较 buffer 与 Core 的 generation，不一致返回 `BAD_VALUE`。slot 自身会复用，不能当永久 buffer ID。
 
-新分配后，Core 设置：
-
-```cpp
-graphicBuffer->setGenerationNumber(
-    mCore->mGenerationNumber);
-```
-
-producer 或 consumer `attachBuffer()` 时必须和队列 generation 相同，否则 `BAD_VALUE`。
-
-它主要保护 detach/attach 或队列重建后的跨代误挂，不是每帧递增号。
-
-### 17.2 frame number
-
-每次成功 queue：
+`buffer age` 在复用旧 buffer 时按：
 
 ```cpp
-++mFrameCounter;
-slot.mFrameNumber = mFrameCounter;
+mFrameCounter + 1 - slot.mFrameNumber
 ```
 
-同一 GraphicBuffer 多次循环会有不同 frame number。
+计算；新分配时为 0。它帮助 producer 决定需要累计多少历史 damage，不是 buffer 的年龄秒数，也不是 fence 时间。
 
-### 17.3 buffer age
+### shared buffer mode 是有意的状态机例外
 
-dequeue 复用旧 buffer 时：
-
-```cpp
-age = currentFrameCounter + 1
-    - slot.lastFrameNumber;
-```
-
-例如下一帧号为 11，该 buffer 上次作为 frame 9 queue：
+shared mode 可让同一 slot 同时 dequeued、queued、acquired，普通四态互斥模型不再成立：
 
 ```text
-age = 11 - 9 = 2
+第一次 dequeue/queue 确立 shared slot
+后续 dequeue 总返回该 slot
+队列空且 autoRefresh 时 consumer 可重建 BufferItem
+cancel、producer/consumer detach、attach 都被禁止
+除首帧外 dequeue 可返回 NO_FENCE
 ```
 
-含义是其内容距上次呈现请求经历的帧代数，可帮助 producer 计算需要重绘的历史 damage。
+因此 shared mode 是“反复共享同一分配并靠专门协议协调”，不是“普通 BufferQueue 恰好只有一张图”。
 
-新分配或重分配时 age 为 0，通常表示内容不可依赖。
+### disconnect、abandon 与 Binder death
+
+consumer `disconnect()` 会：
+
+```text
+mIsAbandoned = true
+清 listener 与 FIFO
+freeAllBuffersLocked()
+清 shared slot
+唤醒 producer
+```
+
+之后 producer 的 dequeue/request/queue/cancel 等返回 `NO_INIT`。producer 正常 disconnect 则清理它的连接 API、buffer 和死亡通知，但不等同于 consumer 永久 abandon。
+
+producer listener 若是远端 Binder，会注册 death recipient；远端死亡触发 producer 断开，避免 Core 永远保留一条已失效的生产连接。
 
 ---
 
-## 18. shared buffer mode 是状态机例外
+## 15. Fence 实现和 r48 的失败边界
 
-shared mode 让同一 slot 可同时存在 dequeue、queue、acquire 计数，且可多次；auto refresh 时，即使 FIFO 为空，consumer 也可用缓存元数据重建 `BufferItem` 再次 acquire。
-
-特殊行为包括：
-
-```text
-第一次dequeue后记录shared slot
-后续dequeue通常不返回fence
-不能cancel shared buffer
-不能detach/attach
-auto refresh可无新queue重复消费
-```
-
-因此初学阶段先掌握普通五态环，再单独看 shared mode。不能用 shared 例外否定普通模式所有权规则，也不能把普通单计数假设套到 shared 模式。
-
-典型用途偏向前后端约定反复使用同一 buffer 的场景，而不是普通动画窗口的默认工作方式。
-
----
-
-## 19. connect、abandon 与死亡边界
-
-### 19.1 producer API
-
-BufferQueue 记录连接的 producer API：
-
-```text
-CPU
-EGL
-Media
-Camera
-```
-
-同一时刻只允许协议规定的 producer 连接，queue 的 `BufferItem.mApi` 也保存来源。
-
-### 19.2 consumer disconnect
-
-consumer disconnect 后 `mIsAbandoned=true`。此后多数 producer 操作返回 `NO_INIT`。
-
-abandoned 不是暂时没帧，而是该队列消费端生命周期结束；producer 应停止使用并重建链路。
-
-### 19.3 Binder death
-
-Core 可保存 producer listener 并 link death，处理跨进程 producer 异常退出。
-
-但 GraphicBuffer 底层 fd 的引用计数由内核管理；一个进程退出会关闭它持有的 fd，不代表其他进程对同一分配的 fd 立即失效。
-
----
-
-## 20. `Fence` 的实现语义
-
-### 20.1 Fence 包装一个 sync_file fd
+`Fence` 本质是：
 
 ```cpp
 class Fence {
@@ -1050,409 +801,119 @@ class Fence {
 };
 ```
 
-析构自动 close。
-
-`NO_FENCE` 是一个 fd 为 -1 的共享对象。大多数方法把它当成已无需等待：
-
-```cpp
-if (mFenceFd == -1)
-    return NO_ERROR;
-```
-
-所以：
+`unique_fd` 负责析构关闭 fd。`NO_FENCE` 内部 fd 为 -1，多数操作把它当作“已经满足”：
 
 ```text
-NO_FENCE通常表示没有异步前置条件
-不等于nullptr
-也不等于一次等待错误
+NO_FENCE.wait(...)       → NO_ERROR
+NO_FENCE.isValid()       → false
+NO_FENCE.getSignalTime() → SIGNAL_TIME_INVALID
 ```
 
-queue/cancel/release 接口会拒绝 `nullptr` fence，但可接受 `Fence::NO_FENCE`。
+`wait(timeoutMs)` 调用 `sync_wait`；`waitForever(name)` 先等 3000 ms，超时就打印 sync_file 和内部 sync points，再无限等待。三秒是告警阈值，不是最终超时。
 
-### 20.2 `wait` 与 `waitForever`
+`Fence::merge(name, A, B)` 返回同时等待 A、B 的新 sync_file：
 
-`wait(timeout)` 调 `sync_wait()`。
+- 两者有效：正常 merge；
+- 只有一个有效：把该 fence 与自身 merge，以得到指定名称的新 fence；
+- 两者都无效：返回 `NO_FENCE`；
+- `sync_merge` 失败：记录错误并返回 `NO_FENCE`。
 
-`waitForever()` 先等 3 秒，超时会打印 sync_file 与其内部 sync point 信息，然后继续无限等待。
-
-名字里的 Forever 不表示前三秒无日志，也不表示发生三秒超时后放弃。
-
-### 20.3 `merge`
+`getSignalTime()` 返回：
 
 ```text
-Fence::merge(A,B)
+有效且已 signal   所有内部 sync point 的最晚 timestamp
+有效但未 signal   INT64_MAX / SIGNAL_TIME_PENDING
+无效或查询失败    -1 / SIGNAL_TIME_INVALID
 ```
 
-返回一个只有 A、B 都 signal 才 signal 的新 sync_file。
+Fence flatten 固定写一个 fd 数；有效 fence 另传 1 个 fd，接收端 unflatten 接管交付的 fd。
 
-若一边是 NO_FENCE，代码会把有效 fence 与自身 merge 以生成指定名字的新 fence；两边都无效则返回 NO_FENCE。
+### 两条“记录错误但继续”的路径
 
-### 20.4 `getSignalTime`
+1. 前述旧 `EGLSyncKHR` dequeue 等待失败或 1 秒超时后仍返回 buffer。
+2. `Surface::dequeueBuffer()` 把 `Fence` 转成 native-window fd 时，`fence->dup()` 若失败只记录日志并继续，输出 fd 会是 -1。源码注释承认最坏可能出现短暂可见损坏。
 
-返回：
+两者都是既有所有权迁移后的错误恢复策略，不能推广成“fence 可以随便忽略”。
+
+### 线程与锁的边界
 
 ```text
-有效已signal：所有内部sync point中最晚timestamp
-有效未signal：INT64_MAX
-无效/错误：-1
+BufferQueue 状态迁移
+  受 Core mMutex 保护
+
+gralloc allocation
+  通过 mIsAllocating 标记，在 Core 锁外执行
+
+consumer callbacks
+  在 Core 锁外调用，另用 ticket 串行化顺序
+
+fence 等待
+  尽量留给真正访问资源的一方或设备依赖
 ```
 
-所以不能用简单 `time < 0` 来同时表示 pending 和 invalid；二者常量不同。
-
-### 20.5 Fence 跨 Binder
-
-Fence flatten 固定写一个 `numFds`，有效时附 1 个 fd；接收端 unflatten 接管 Parcel 提供的 fd。
-
-同 GraphicBuffer handle 一样，跨进程后 fd 数字可不同，但引用同一 sync_file/内核时间线条件。
-
-## 21. 一张表串起全部接口
-
-| 操作 | 前状态 | 后状态 | 返回/传入的 fence | 内容意义 |
-|---|---|---|---|---|
-| producer `dequeueBuffer` | FREE | DEQUEUED | 返回 consumer done fence | 等后可写 |
-| producer `queueBuffer` | DEQUEUED | QUEUED | 传入 producer done fence | consumer 等后可读 |
-| consumer `acquireBuffer` | QUEUED | ACQUIRED | 返回 producer done fence | 等后可读 |
-| consumer `releaseBuffer` | ACQUIRED | FREE | 传入 consumer done fence | producer 下次等后可写 |
-| producer `cancelBuffer` | DEQUEUED | FREE | 传入 producer/cancel done fence | 下次 dequeue 等待 |
-| async drop | QUEUED | FREE | 保留该 slot 已有完成条件 | 被丢帧不进入 consumer |
-
-要特别注意：
-
-> 状态变化表达逻辑所有权；fence 表达异步硬件工作完成。两者共同构成“何时真的可访问”。
+这套设计追求的是缩短临界区并保留异步流水，不是保证所有 API 都永不阻塞。无 free slot、EGL 节流、CPU 同步 unlock 和 `waitForever()` 都可能等待。
 
 ---
 
-## 22. 常见误解纠正
+## 16. 用一轮生命周期收束本章
 
-### 误解 1：GraphicBuffer 对象跨进程后是同一个 C++ 对象
-
-错误。两端是不同 C++ 对象和 imported handle；底层分配通过 fd 引用共享。
-
-### 误解 2：handle 指针就是像素地址
-
-错误。它指向 native handle 描述；CPU 像素地址由 mapper lock 返回。
-
-### 误解 3：有 64 个 slot 就分配 64 张图
-
-错误。slot 是映射容量，实际分配受 buffer count 公式和按需 allocation 限制。
-
-### 误解 4：FREE 说明所有硬件都已用完
-
-错误。FREE 只说明 slot 逻辑上归 BufferQueue；其 `mFence` 可能尚未 signal，下一 producer 要等待。
-
-### 误解 5：dequeue 返回就能立即写
-
-错误。还要等待随 dequeue 返回的 fence；EGL/CPU API 可能替上层安排等待，但协议不能省略。
-
-### 误解 6：queue 时传的是 release fence
-
-从 producer 的角度可说“我的完成 fence”，但在 BufferQueue API 字段和下一任 consumer 视角，它是 acquire fence。名称要带角色。
-
-### 误解 7：BufferQueue 总是先等 fence 再转状态
-
-错误。常见路径先转移逻辑所有权并把 fence 一起交给下一任，由下一任在访问前等待。
-
-### 误解 8：同一 slot 永远对应同一个 buffer
-
-错误。重分配、detach/attach、freeAllBuffers 都会改变映射；flags、generation、frame number 和本地 slot cache共同防 stale。
-
-### 误解 9：releaseBuffer 后 producer 必须马上收到同一 slot
-
-错误。slot 进入 free buffers，只是成为候选；dequeue 采用 free-buffer列表顺序和容量策略选择。
-
-### 误解 10：丢帧只要删除 FIFO 项即可
-
-错误。还要释放 slot、通知 producer，并把被丢帧 damage 合并进替代帧。
-
-### 误解 11：`NO_FENCE` 与 `nullptr` 一样
-
-错误。`NO_FENCE` 是合法对象，表示无需等待；多个接口将 `nullptr` 当协议错误。
-
-### 误解 12：importBuffer 会复制全部像素
-
-错误。import 建立当前进程对同一底层分配的可用 handle 与本地 bookkeeping，不是逐像素复制。
-
----
-
-## 23. 三个手算例子
-
-### 23.1 三缓冲流水线
-
-某时刻：
+把普通模式的一张 buffer 从 consumer 归还开始串起来：
 
 ```text
-slot 0：ACQUIRED，consumer正在显示frame 20
-slot 1：QUEUED，frame 21等待consumer
-slot 2：DEQUEUED，producer正在画frame 22
+1. consumer:
+   releaseBuffer(slot, consumerDoneFence)
+   ACQUIRED → FREE
+
+2. producer:
+   dequeueBuffer()
+   FREE → DEQUEUED
+   得到 consumerDoneFence，访问前等待
+
+3. Surface:
+   若 flags 要求或本地 cache 缺失
+   requestBuffer(slot) 取得 GraphicBuffer
+
+4. producer:
+   GPU/CPU 写入
+   queueBuffer(slot, producerDoneFence)
+   DEQUEUED → QUEUED
+
+5. consumer:
+   acquireBuffer()
+   QUEUED → ACQUIRED
+   得到 producerDoneFence，读取前等待
+
+6. consumer:
+   合成、编码或显示读取完成后
+   再提交新的 release fence
 ```
 
-三张 buffer 同时处于流水线不同阶段。producer 能否再 dequeue 第四张，取决于 maxDequeued、maxAcquired、async/cannotBlock 和 maxBufferCount，而不是只看是否还有 64-slot 空位。
-
-### 23.2 release 已调用但 fence 未 signal
+读源码时可按下面的核对顺序定位问题：
 
 ```text
-consumer release slot 0，附fence F
-slot 0逻辑变FREE
-producer dequeue到slot 0，得到F
+1. 这是 slot、GraphicBuffer、allocation 还是 BufferItem？
+2. 当前普通状态/三个计数分别是什么？
+3. mGraphicBuffer 为空是待分配，还是接收端 slot cache 命中？
+4. fence 是上一 producer 写完，还是上一 consumer 读完？
+5. fence 已随所有权交出，还是仍保存在 slot？
+6. maxCount、队列长度、dequeued/acquired 数分别是多少？
+7. 是否处于 async、cannot-block 或 shared 特例？
+8. frame/generation 是否匹配，是否遇到 stale release？
+9. drop 时旧 slot、旧 fence 与 damage 是否都正确继承？
+10. 错误路径是回滚、返回，还是仅记录后继续？
 ```
 
-producer 可以立即获得 slot 和 handle，但 GPU 写命令必须等待 F。这样 CPU/Binder 不必同步阻塞，GPU 依赖由 fence 表达。
-
-### 23.3 slot 5 重分配
-
-```text
-旧slot 5：1080×1920 RGBA
-新请求：1440×2560 RGBA
-```
-
-Core 判断 `needsReallocation=true`：
-
-1. 清 slot 中旧 GraphicBuffer；
-2. 返回 `BUFFER_NEEDS_REALLOCATION`；
-3. 锁外调用 allocator 分配新 buffer；
-4. 设置 queue generation；
-5. Surface 看到 flag 后 `requestBuffer(5)`；
-6. App 更新本地 slot 5 映射。
-
-slot 数字相同，不代表新旧 GraphicBuffer ID、handle 或内容相同。
-
----
-
-## 24. r48 源码审计边界
-
-### 24.1 allocator 的内存大小 dump 是估算
-
-`GraphicBufferAllocator` 用：
-
-```text
-stride × height × bytesPerPixel
-```
-
-估算大小；对 stride 无意义或异常时退回 width。
-
-源码自身的 dump 文案写 `estimate`。压缩、多平面、vendor metadata 和实际 heap 对齐都可能使其不等于真实物理内存占用。
-
-### 24.2 0×N / N×0 被改成 1×1
-
-allocator helper 注释说 API 层允许零维，因此底层分配时：
-
-```cpp
-if (!width || !height)
-    width = height = 1;
-```
-
-注意这会把 `(0, 1080)` 也改成 `(1,1)`，不是只把为零的单独维度替换为 1。
-
-这属于底层防御行为，不能反推调用方的逻辑 Surface 尺寸已经变成 1×1。
-
-### 24.3 分配失败统一映射为 `NO_MEMORY`
-
-allocator wrapper 内部 HAL 失败后，`GraphicBufferAllocator::allocateHelper()` 记录原 error，但向上返回 `NO_MEMORY`。
-
-因此上层看到 NO_MEMORY 不一定只表示物理内存彻底耗尽，也可能掩盖 HAL 的 unsupported/no-resources 等更细原因；需结合前面的日志。
-
-### 24.4 旧 EGL fence 等待失败后仍返回 buffer
-
-`dequeueBuffer()` 对已弃用 EGLSyncKHR 最多等待 1 秒；若失败或超时，只记日志，仍返回 buffer，因为 slot 所有权已转移、此时太晚回滚。
-
-现代主路径优先 `mFence` sync fd 并把它返回 producer，不应把旧 EGL 行为推广成所有 fence 都只等 1 秒。
-
-### 24.5 acquire 丢帧 TODO
-
-如前所述，consumer 按 expectedPresent 选择丢 front 时，r48 没有先检查下一项 fence 是否 signal。文档只记录为代码策略与 TODO，不能直接断言必然造成卡顿或画面错误；consumer 后续仍会等待取得帧的 acquire fence。
-
-### 24.6 Surface 的 `dup()` 失败继续前进
-
-Surface 把 `Fence` 转为 native window fence fd 时若 `dup()` 失败，会记录“最坏可能短暂可见损坏”，但仍继续。
-
-这是错误恢复策略，不是正常情况下可以忽略 fence 的许可。
-
-### 24.7 GraphicBuffer `mId` 的唯一性边界
-
-`mId = pid高32位 + 进程局部32位计数`，对正常进程生命周期足够用于跟踪；理论上计数回绕或 PID 重用会限制全局永久唯一性。
-
-所以准确叫“逻辑唯一标识/实践上的 buffer ID”，不要扩大为跨无限时间绝不碰撞的密码学 ID。
-
----
-
-## 25. 线程、进程和锁
-
-| 路径 | 执行位置 | 锁/阻塞特点 |
-|---|---|---|
-| `Surface::dequeueBuffer` | producer进程调用线程 | 调 Binder 前放开 Surface mutex，允许阻塞时其他操作继续 |
-| `BufferQueueProducer` | Core 所在进程的 Binder线程或本地调用线程 | 用 Core mutex；分配时锁外调HAL |
-| allocator HAL | allocator服务/实现 | 可能跨HIDL并进入vendor驱动 |
-| mapper HAL | 当前进程passthrough | 直接导入、lock、unlock |
-| consumer acquire/release | consumer线程 | Core mutex内只改状态，通常不等GPU fence |
-| listener callback | Core锁外 | callback ticket保持producer回调顺序 |
-
-BufferQueue 的设计重点不是“完全不阻塞”，而是：
-
-- 不在 Core 主锁中等待昂贵分配、外部 callback 或 GPU fence；
-- 需要等待 free slot 时用 condition variable；
-- 非阻塞/async 模式按协议返回 `WOULD_BLOCK`；
-- dequeue timeout 非负时可返回 `TIMED_OUT`。
-
----
-
-## 26. macOS 只读练习
-
-### 练习 1：画 GraphicBuffer 传输格式
-
-```bash
-rg -n "getFlattenedSize|flatten\\(|unflatten\\(" \
-  frameworks/native/libs/ui/GraphicBuffer.cpp
-```
-
-目标：列出 13 个固定 word、vendor ints 与 fd 分别放在哪里。
-
-### 练习 2：比较 allocator 与 mapper
-
-```bash
-rg -n "allocate\\(|importBuffer|freeBuffer|lock\\(|unlock\\(" \
-  frameworks/native/libs/ui/GraphicBufferAllocator.cpp \
-  frameworks/native/libs/ui/GraphicBufferMapper.cpp \
-  frameworks/native/libs/ui/Gralloc4.cpp
-```
-
-目标：每个函数标注“创建新分配”还是“让本进程使用已有分配”。
-
-### 练习 3：复述普通状态环
-
-```bash
-sed -n '20,170p' \
-  frameworks/native/libs/gui/include/gui/BufferSlot.h
-```
-
-目标：不看图写出五态、所有者和每个 transition API。
-
-### 练习 4：追首次 requestBuffer
-
-```bash
-rg -n "BUFFER_NEEDS_REALLOCATION|requestBuffer" \
-  frameworks/native/libs/gui/Surface.cpp \
-  frameworks/native/libs/gui/BufferQueueProducer.cpp
-```
-
-目标：解释为什么 GraphicBuffer 不必每帧跨 Binder。
-
-### 练习 5：对照 fence 接力
-
-```bash
-rg -n "mSlots\\[.*\\]\\.mFence|outFence|acquireFence|releaseFence" \
-  frameworks/native/libs/gui/BufferQueueProducer.cpp \
-  frameworks/native/libs/gui/BufferQueueConsumer.cpp
-```
-
-目标：每个赋值旁写出“上一任是谁、下一任是谁”。
-
-### 练习 6：验证 drop damage
-
-```bash
-rg -n -A25 -B15 "mIsDroppable|mSurfaceDamage \\|=" \
-  frameworks/native/libs/gui/BufferQueueProducer.cpp
-```
-
-目标：解释不合并 damage 会漏掉什么变化。
-
-### 练习 7：理解 Fence 状态
-
-```bash
-sed -n '1,260p' frameworks/native/libs/ui/Fence.cpp
-```
-
-目标：区分 invalid fd、pending、signaled、merge 和 wait timeout。
-
----
-
-## 27. 复读后补强的易错边界
-
-### 27.1 “共享 buffer”不等于共享 C++ 指针
-
-跨进程共享的是 fd 所引用的底层分配；两端 GraphicBuffer、native_handle结构、handle指针和 CPU 映射地址都可以不同。
-
-### 27.2 slot cache 是性能协议，也带来 stale 风险
-
-正因为两端缓存 `slot → GraphicBuffer`，常规帧才能只传 slot。重分配 flag、release-all、acquire-called、generation 和 frame number 都是在修复映射代际问题。
-
-### 27.3 FREE 与 fence signal 是两个维度
-
-FREE 只允许 Core 把 slot 交给 producer；producer 是否能立即写，要看随 dequeue 返回的 fence。状态机与硬件时间线不能画成一条同步直线。
-
-### 27.4 `requestBuffer()` 不是分配入口
-
-分配已在 `dequeueBuffer()` 的需要重分配分支完成；`requestBuffer()` 只是把该 slot 已分配的 GraphicBuffer 交给 producer，并设置协议记账。
-
-### 27.5 acquire 后 GraphicBuffer 为 null 不表示没图
-
-若 consumer 已缓存 slot 映射，BufferItem 故意清空 GraphicBuffer 以减少 Binder 流量；consumer 应按 slot 找缓存，不能把 null 直接解释为无 buffer。
-
-### 27.6 fd 数字不是全局身份
-
-Binder、`dup()` 和 import 后的 fd 可变化；比较 fd 整数来判断两端是否同一 allocation 是错误方法。
-
-### 27.7 `releaseBuffer()` 的 release fence 可能尚未 signal
-
-release 是交还逻辑所有权，并附上完成条件，不是 CPU 同步等待完成后才交还。
-
-### 27.8 async drop 不保证下一帧已经signal
-
-它优化时效性，取得的新 BufferItem仍带 acquire fence，consumer在真正读取前负责等待。
-
-### 27.9 allocator dump 不等于真实显存工具
-
-Framework 记录表只覆盖经该进程 allocator wrapper 创建且仍持有的 imported handle，并且大小是估算；不能当作全系统 DMA-BUF/显存真值。
-
-### 27.10 mapper import 不是像素复制
-
-它创建本进程 imported handle、校验和可能的本地 bookkeeping；底层 fd仍引用共享 allocation。
-
----
-
-## 28. 本章核心结论
-
-1. GraphicBuffer 是共享图形分配的元数据与 handle 封装，不是 C++ 堆上的像素数组。
-2. native handle 由 fd 和 vendor ints 组成；跨进程共享依靠 fd 引用底层内核对象。
-3. allocator 创建新分配，mapper 导入、验证、映射和释放当前进程 handle。
-4. raw handle 跨进程后必须 import，不能直接访问。
-5. BufferQueue 有 64 个 slot 容量，但只按实际 max-buffer策略分配少量 buffer。
-6. 普通所有权环是 FREE→DEQUEUED→QUEUED→ACQUIRED→FREE。
-7. 状态表示逻辑所有权，fence表示异步工作完成，两者必须一起读。
-8. 首次或重分配才传完整 GraphicBuffer；稳定复用主要传 slot、metadata 与 fence。
-9. producer queue fence就是consumer acquire fence，consumer release fence就是下次producer dequeue fence。
-10. async/drop 释放旧 slot 时必须把旧 damage并入新帧，避免局部更新丢失。
-11. slot、buffer ID、frame number、generation number分别服务于映射、身份、帧代际和队列代际。
-12. `NO_FENCE` 是合法的“无需等待”，不是 null，也不是等待失败。
-
----
-
-## 29. 自测题
-
-1. 为什么 GraphicBuffer 跨进程后不能比较 handle 指针？
-2. allocator 与 mapper 分别负责什么？
-3. raw handle 为什么必须 import？
-4. `stride > width` 是否一定错误？
-5. 64 个 slot 为什么不代表 64 张已分配 buffer？
-6. FREE slot 的 fence 可能表达什么？
-7. producer dequeue 后为什么不能无条件立即写？
-8. `requestBuffer()` 为什么不必每帧调用？
-9. consumer acquire 时 GraphicBuffer 为 null 为什么可能完全正常？
-10. queue 的 producer done fence 到 consumer 侧叫什么？
-11. release 已调用但 fence 未 signal，slot 为什么仍可变 FREE？
-12. async drop 为什么合并 surface damage？
-13. generation number 与 frame number有什么不同？
-14. `NO_FENCE`、`nullptr`、pending fence 有何区别？
-15. CPU `unlockAsync()` 返回 fence 后，下一任该怎样处理？
-
-能独立讲清这 15 题，就已经能阅读绝大多数 Surface、ImageReader、MediaCodec 和 SurfaceFlinger 中的 buffer 生命周期代码。
-
----
-
-## 30. 下一章预告
-
-第 163 章将把 BufferQueue 放回 App 渲染链：
-
-> Android ViewRootImpl、ThreadedRenderer、RenderThread、BLAST/Surface 与应用一帧如何生产。
-
-重点追 Java UI draw、RenderNode、RenderThread、EGL dequeue/queue、frame timeline 和 SurfaceFlinger latch 之间的线程边界。
-
+本章最终应记住：
+
+1. `GraphicBuffer` 是底层共享分配的描述与 handle 包装，不内嵌整块像素。
+2. raw handle 跨边界后必须 import；handle 指针和 fd 数字都不是跨进程身份。
+3. allocator 创建分配，mapper 导入、验证、映射并释放进程内 handle。
+4. 64 是 slot 硬上限，实际可用数由 acquired、dequeued、async 和 max count 共同决定。
+5. `requestBuffer()` 获取 slot 对应对象，不是分配入口。
+6. slot 状态表达逻辑所有权，fence 表达异步完成；必须同时判断。
+7. queue 只表示提交，acquire 只表示取得，二者都不等于 present。
+8. FREE 不保证硬件已完成，下一 producer 仍要等待 dequeue fence。
+9. async replacement 和 expected-present 都可丢帧，但规则不同；replacement 还必须合并 damage。
+10. `NO_FENCE` 是合法的无需等待对象，`nullptr` 才是多数接口拒绝的参数。
+
+下一章转向应用侧的一帧生产链：`ViewRootImpl`、`ThreadedRenderer`、`RenderNode`、RenderThread 与 `Surface` 怎样把 Java UI 绘制变成一次真实的 dequeue、渲染和 queue。

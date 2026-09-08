@@ -1,642 +1,313 @@
 # 174 Android InputChannel、InputTransport 与应用事件接收
 
 > 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
-> 学习方式：macOS 只读源码，不要求编译、不要求连接设备  
+> 学习方式：macOS 静态只读源码，不要求编译或连接设备  
 > 前置章节：第 20、113、163、173 章
 
 ---
 
-## 1. 本章目标：选中窗口以后，事件怎样真正到达应用
+## 1. 选中窗口以后，事件还要跨四个完成点
 
-第 173 章结束在 InputDispatcher 已经选出目标 Window。此时仍有一个关键问题：一个 native `MotionEntry` 怎样跨进程变成应用主线程看到的 Java `MotionEvent`，应用处理完成后系统又怎样知道它没有卡住？
-
-本章追踪下面这条闭环：
+第 173 章停在 InputDispatcher 已选出目标 Window。本章继续追一笔 MotionEntry 怎样跨进程成为 App 主线程看到的 MotionEvent，以及完成回执怎样反向结账：
 
 ```text
-Window建立InputChannel pair
-→ server端注册给InputDispatcher
-→ client端经Binder传给App
-→ Dispatcher为每个目标创建DispatchEntry
-→ InputPublisher把InputMessage写入Unix socket
-→ App主Looper唤醒NativeInputEventReceiver
-→ InputConsumer构造KeyEvent/MotionEvent
-→ ViewRootImpl输入阶段链处理
-→ finishInputEvent(seq, handled)
-→ FINISHED消息沿同一socket反向返回
-→ Dispatcher移除waitQueue条目、取消ANR deadline
+为目标 Connection 创建 DispatchEntry
+→ 进入 outboundQueue
+→ InputPublisher 把 packet 写入 server socket
+→ DispatchEntry 移到 waitQueue
+→ App Looper 从 client socket 读取
+→ native InputConsumer 构造 InputEvent
+→ JNI 回调 Java InputEventReceiver
+→ ViewRootImpl InputStage / View 处理
+→ Java finishInputEvent(seq, handled)
+→ native 把 FINISHED packet 写回同一 socket
+→ Dispatcher 读取 FINISHED 并移除 wait entry
 ```
 
-读完后应能区分四个完成点：
+必须分清：
 
-1. 事件已经进入某连接的 `outboundQueue`；
-2. 消息已经写入 socket，并进入 `waitQueue`；
-3. App 已从 socket 读出并开始处理；
-4. Dispatcher 已收到 `FINISHED` 回执。
+| 完成点 | 能证明 | 仍不能证明 |
+|---|---|---|
+| entry 在 outbound | 已决定向该连接派发 | packet 已进入内核 |
+| publish 返回 OK / entry 在 wait | 内核接受完整 packet，Dispatcher 开始等回执 | App 已读或已处理 |
+| Java callback 开始 | App Looper 已读到并创建 Java 事件 | View 已完成 |
+| Dispatcher 移除 wait entry | FINISHED 已被系统处理 | handled=true、画面已更新 |
 
-前三个都不能替代第四个。
-
----
-
-## 2. 先做版本纠偏：不是“一次Binder调用发送一次触摸”
-
-InputChannel 的建立确实借助 Binder 把文件描述符交给应用，但稳定运行时，输入事件并不逐个走 WMS Binder：
-
-```text
-建立阶段：system_server --Binder/Parcel+FD--> App
-运行阶段：InputDispatcher --Unix socket--> App
-回执阶段：InputDispatcher <--同一Unix socket-- App
-```
-
-另一个容易受 Java 注释影响的误解是“必须完成一个事件才会收到下一个事件”。`InputEventReceiver.onInputEvent()` 的注释这样描述了使用契约，但 r48 实现不是严格的一发一回传输：
-
-- Dispatcher 会连续发送，只要 socket 仍可写；
-- 每次发送成功的 `DispatchEntry` 都进入 `waitQueue`；
-- App native receiver 会循环读取，直到返回 `WOULD_BLOCK`；
-- Java `mSeqMap` 可以同时保存多个在途事件；
-- 异步 IME/native stage 还可能延迟某个事件的最终 finish。
-
-因此正确模型是“允许多笔在途、按 `seq` 回执、每笔都有 deadline”，而不是 stop-and-wait 协议。
+“事件发给 App 了”若不注明属于哪一行，几乎没有诊断价值。
 
 ---
 
-## 3. 本章要回答的十五个问题
+## 2. Binder 只交接 client FD，运行期走全双工 socket
 
-1. InputChannel 为什么是一对，而不是一个 Binder 对象？
-2. server/client 两端各由谁持有？
-3. socket 类型为什么是 `SOCK_SEQPACKET`？
-4. Binder 在哪一步传 FD，事件为什么不继续走 Binder？
-5. connection token、event id、dispatch seq 有什么区别？
-6. `outboundQueue` 和 `waitQueue` 分别表示什么？
-7. `sendMessage()==OK` 到底证明了什么？
-8. socket 满时为什么不丢掉当前事件？
-9. App 主 Looper 怎样被 client fd 唤醒？
-10. native InputMessage 怎样变成 Java InputEvent？
-11. MOVE 为什么会被合成一个带 history 的 MotionEvent？
-12. 合批后多个原始 seq 怎样全部收到回执？
-13. `handled=false` 对 Motion 和 Key 的后果是否相同？
-14. 输入 ANR 从哪个时间点开始计算？
-15. App 死亡或窗口移除时，队列怎样清理？
-
----
-
-## 4. 源码地图
-
-### 4.1 通道与线协议
-
-- `frameworks/native/include/input/InputTransport.h`
-- `frameworks/native/libs/input/InputTransport.cpp`
-- `frameworks/native/libs/input/tests/InputChannel_test.cpp`
-- `frameworks/native/libs/input/tests/InputPublisherAndConsumer_test.cpp`
-- `frameworks/native/libs/input/tests/StructLayout_test.cpp`
-
-### 4.2 system_server 创建与注册
-
-- `frameworks/base/services/core/java/com/android/server/wm/WindowState.java`
-- `frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java`
-- `frameworks/base/services/core/java/com/android/server/input/InputManagerService.java`
-- `frameworks/base/services/core/jni/com_android_server_input_InputManagerService.cpp`
-- `frameworks/native/services/inputflinger/dispatcher/Connection.h`
-- `frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp`
-
-### 4.3 App 接收与 ViewRootImpl
-
-- `frameworks/base/core/java/android/view/InputChannel.java`
-- `frameworks/base/core/jni/android_view_InputChannel.cpp`
-- `frameworks/base/core/java/android/view/InputEventReceiver.java`
-- `frameworks/base/core/jni/android_view_InputEventReceiver.cpp`
-- `frameworks/base/core/java/android/view/ViewRootImpl.java`
-
----
-
-## 5. 全链路图：同一个socket既发事件也收回执
-
-```mermaid
-sequenceDiagram
-    participant WMS as "WMS / WindowState"
-    participant ID as "InputDispatcher"
-    participant Sock as "Unix SOCK_SEQPACKET"
-    participant NR as "NativeInputEventReceiver"
-    participant VR as "ViewRootImpl / View"
-
-    WMS->>WMS: "openInputChannelPair()"
-    WMS->>ID: "注册server端"
-    WMS-->>NR: "Binder返回client FD+token"
-    ID->>ID: "DispatchEntry进入outboundQueue"
-    ID->>Sock: "InputMessage(KEY/MOTION/FOCUS)"
-    ID->>ID: "移到waitQueue并登记deadline"
-    Sock->>NR: "client fd可读，App Looper唤醒"
-    NR->>VR: "Java InputEvent回调"
-    VR->>VR: "输入阶段链/View处理"
-    VR->>NR: "finishInputEvent(seq, handled)"
-    NR-->>Sock: "InputMessage(FINISHED)"
-    Sock-->>ID: "server fd可读"
-    ID->>ID: "按seq移除waitQueue和ANR记录"
-```
-
-注意箭头中的 Binder 只出现在初始化交接。运行期 socket 是全双工的，同一个端点既能发送也能接收。
-
----
-
-## 6. WindowState怎样创建一对InputChannel
-
-普通窗口在 WMS `addWindow` 路径需要输入通道时进入：
+普通 WindowState 建立：
 
 ```java
-InputChannel[] inputChannels = InputChannel.openInputChannelPair(name);
-mInputChannel = inputChannels[0];
-mClientChannel = inputChannels[1];
+InputChannel[] pair = InputChannel.openInputChannelPair(name);
+mInputChannel = pair[0];   // server
+mClientChannel = pair[1];  // client
 mWmService.mInputManager.registerInputChannel(mInputChannel);
 mInputWindowHandle.token = mInputChannel.getToken();
 ```
 
-命名约定是：
+server/client 是用途名称，不是单向通信限制。两端属于同一 Unix socketpair，都能 send/recv：
 
 ```text
-index 0 → "窗口名 (server)" → system_server / InputDispatcher
-index 1 → "窗口名 (client)" → 应用进程 / InputEventReceiver
+建立阶段：system_server -- Binder Parcel(name, token, FD) --> App
+事件阶段：InputDispatcher -- server socket --> client socket -- App
+回执阶段：InputDispatcher <-- server socket <-- client socket -- App
 ```
 
-这里的 server/client 是用途标签，不表示 socket 能否双向通信；两端实际上是对等、全双工的本地 socket。
+逐个 Key/Motion 不走 WMS Binder。把 Binder trace 中没有每次触摸当成“输入没发送”，是观察层选错了。
+
+### 2.1 token 与 FD 分别是什么身份
+
+创建 pair 时只 new 一个 `BBinder` token，两端共享它。Dispatcher 用 InputWindowInfo.token 找已注册 connection；token 也让 server/client 被识别为同一逻辑连接。
+
+但两个 InputChannel 对象和两个 FD 不是同一个。FD 经 Binder 复制到 App 的进程 FD 表，整数值可变化；比较两进程的 fd 数字不能判断是否同一 endpoint。
+
+### 2.2 transferTo 是所有权转移
+
+WMS 通过 addWindow 的 out 参数交出 client channel，随后 dispose 自己的 wrapper 并把 `mClientChannel=null`。正常模式下 system_server 不应长期多持一份 client endpoint，否则 App 死亡时额外引用可能拖延 EOF/HANGUP 的出现。
+
+server channel 注册成功也不代表窗口已能命中；还要等上一章的 InputWindowInfo 快照带着相同 token 安装到 Dispatcher。
 
 ---
 
-## 7. 底层不是pipe，而是Unix domain SOCK_SEQPACKET
+## 3. 源码地图
 
-真实创建代码：
+通道、线协议与测试：
+
+```text
+frameworks/native/include/input/InputTransport.h
+frameworks/native/libs/input/InputTransport.cpp
+frameworks/native/libs/input/tests/
+├── InputChannel_test.cpp
+├── InputPublisherAndConsumer_test.cpp
+└── StructLayout_test.cpp
+```
+
+system_server 创建、注册与 Dispatcher：
+
+```text
+frameworks/base/services/core/java/com/android/server/wm/
+├── WindowState.java
+└── WindowManagerService.java
+
+frameworks/base/services/core/java/com/android/server/input/InputManagerService.java
+frameworks/base/services/core/jni/com_android_server_input_InputManagerService.cpp
+
+frameworks/native/services/inputflinger/dispatcher/
+├── Connection.h
+├── Connection.cpp
+└── InputDispatcher.cpp
+```
+
+App 接收链：
+
+```text
+frameworks/base/core/java/android/view/
+├── InputChannel.java
+├── InputEventReceiver.java
+├── InputEventCompatProcessor.java
+└── ViewRootImpl.java
+
+frameworks/base/core/jni/
+├── android_view_InputChannel.cpp
+└── android_view_InputEventReceiver.cpp
+```
+
+---
+
+## 4. 底层是非阻塞 AF_UNIX SOCK_SEQPACKET
+
+真正的创建调用是：
 
 ```cpp
-int sockets[2];
 socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sockets);
 ```
 
-三个关键词分别意味着：
+- AF_UNIX：只在本机内核传输；
+- socketpair：一次得到两个已连接 endpoint；
+- SOCK_SEQPACKET：可靠、有序且保留 packet 边界；
+- O_NONBLOCK + MSG_DONTWAIT：Dispatcher 与 App Looper 不在 send/recv 系统调用中睡死。
 
-- `AF_UNIX`：仅本机内核中的 Unix domain 通信；
-- `socketpair`：一次得到两个已连接端点，不需要 bind/listen/connect；
-- `SOCK_SEQPACKET`：保留消息边界，并按序可靠传递完整 packet。
+源码日志偶尔仍写 pipe full，这是历史用词，不能把架构画成匿名 pipe 或字节流 SOCK_STREAM。
 
-这与字节流 `SOCK_STREAM` 很不同。接收端一次 `recv()` 期望得到一个完整 `InputMessage`，不会自己设计长度前缀再拼流。
-
-源码日志仍把“socket full”称作 pipe full，这只是历史措辞，不应据此画成匿名 pipe。
-
----
-
-## 8. 为什么两端都设置成non-blocking
-
-`InputChannel::create()` 调用：
-
-```cpp
-fcntl(fd, F_SETFL, O_NONBLOCK);
-```
-
-发送和接收又显式使用 `MSG_DONTWAIT`。目的不是让事件神奇地异步完成，而是保证 Dispatcher 线程和 App Looper 不会卡死在一次系统调用中：
+### 4.1 send/recv 的状态边界
 
 ```text
-当前无数据 → receiveMessage返回WOULD_BLOCK
-发送缓冲已满 → sendMessage返回WOULD_BLOCK
-对端关闭 → 返回DEAD_OBJECT
-其他errno → 返回对应负错误码
+send/recv 遇 EINTR → 重试
+EAGAIN/EWOULDBLOCK → WOULD_BLOCK
+对端关闭类错误/EOF → DEAD_OBJECT
+其他 errno → 对应负 status
 ```
 
-是否稍后重试由各自 Looper 的 fd readable/writable 事件和队列状态决定。
+sender 还使用 MSG_NOSIGNAL，避免对端关闭时用 SIGPIPE 杀死进程。重试和队列策略由上层 Looper/Connection 决定，不是 socket 自动完成。
+
+### 4.2 32 KiB 只是 setsockopt 请求，而且错误被忽略
+
+r48 对两个 endpoint 的 SO_SNDBUF 与 SO_RCVBUF 都请求 32 KiB，总共调用四次 `setsockopt()`。源码既不读取实际值，也不检查这四个返回码；内核还可能调整缓冲口径。
+
+因此这只能说明设计期背压目标，不能证明运行设备每个方向恰好有 32768 字节。它也不持久化事件：进程死亡后 packet 不会留下。
 
 ---
 
-## 9. 32 KiB缓冲是背压空间，不是事件数据库
+## 5. InputMessage 是固定 ABI packet，seq 才配对 FINISHED
 
-r48 将两个端点的发送与接收缓冲请求值都设为：
-
-```cpp
-static const size_t SOCKET_BUFFER_SIZE = 32 * 1024;
-setsockopt(fd, SOL_SOCKET, SO_SNDBUF, ...);
-setsockopt(fd, SOL_SOCKET, SO_RCVBUF, ...);
-```
-
-注释说这足以容纳数十个较大的多指 Motion 消息，以吸收应用暂时落后的抖动。这里应称“请求值”：Linux 可能对 `SO_SNDBUF` 做内部调整，不能只凭常量断言设备运行时 `getsockopt()` 读到的有效容量恰好是 32768 字节。
-
-但它不提供持久化，也不是无限队列：
-
-- 进程崩溃后数据不会保留；
-- socket 满会形成背压；
-- Dispatcher 的 `waitQueue` 才是“已经发送、仍等 App finish”的逻辑账本；
-- socket 内核缓冲和 waitQueue 数量相关，却不是同一个对象。
-
----
-
-## 10. token把两个端点认成同一条连接
-
-创建 pair 时同时创建：
-
-```cpp
-sp<IBinder> token = new BBinder();
-```
-
-server 和 client 两个 `InputChannel` 保存同一个 token。它的用途是连接身份：
+r48 线协议只有四类：
 
 ```text
-InputWindowInfo.token
-→ InputDispatcher按token找到Connection
-→ client端也可用getToken()指代同一连接
+KEY
+MOTION
+FOCUS
+FINISHED
 ```
 
-源码特别警告：不要用 token 判断两个具体 `InputChannel` 对象是否相等，因为 pair 的两端本来就共享 token。
+KEY/MOTION 带 dispatch seq、eventId、时间、设备/source/display、HMAC 及类型字段；MOTION 还带 scale/offset、pointer 属性与坐标。FINISHED 只需 seq 和 handled。
+
+### 5.1 三种编号不要混用
+
+| 编号 | 产生位置 | 职责 |
+|---|---|---|
+| eventId | Reader/Dispatcher IdGenerator | 逻辑事件、trace 与部分验证语义 |
+| DispatchEntry.seq | 每个目标派发条目 | socket 请求与 FINISHED 精确配对；0 禁用 |
+| Java InputEvent sequenceNumber | App 内 Java 对象 | 让 receiver 找回 native dispatch seq |
+
+同一个 EventEntry 投向多个窗口会有多个 DispatchEntry 与 seq。App 回执不能拿 eventId 代替 seq。
+
+r48 的 VerifiedInputEvent 结构没有 eventId；Motion 也只对 DOWN/UP 生成有效签名，普通 MOVE 是 INVALID_HMAC。eventId 是身份，不是不可伪造证明。
+
+### 5.2 layout 必须跨 32/64 位一致
+
+InputMessage 使用显式 padding、8 字节对齐，并由 StructLayout 测试守护。MOTION 的 pointers 固定数组必须是最后一个字段；实际长度按 pointerCount 截短：
+
+```cpp
+sizeof(Motion) - sizeof(Pointer) * MAX_POINTERS
+               + sizeof(Pointer) * pointerCount
+```
+
+接收端要求实际 packet size 精确匹配，并验证 `1 <= pointerCount <= MAX_POINTERS`。它不是 Java Parcel，也不会尝试拼接部分结构。
+
+### 5.3 sanitized copy 防止 padding 泄漏
+
+发送前 `getSanitizedCopy()` 先 memset 整个对象为零，再逐字段复制有效数据；PointerCoords 只复制 bitset 声明存在的 axis。
+
+这是 ABI 与安全边界：若直接发送含未初始化 padding 的 C++ 结构，可能把旧栈字节泄露给另一进程。
 
 ---
 
-## 11. client端怎样通过Binder交给应用
+## 6. Connection 用两个用户态队列记录发送前后
 
-`InputChannel` 实现 `Parcelable`。native 写 Parcel 时依次写：
+注册 server channel 时，Dispatcher：
 
-```cpp
-name
-strong Binder token
-unique file descriptor
+```text
+检查 token 尚未注册
+→ new Connection(inputChannel)
+→ mConnectionsByFd[fd] = connection
+→ mInputChannelsByToken[token] = inputChannel
+→ Looper addFd(serverFd, ALOOPER_EVENT_INPUT)
 ```
 
-Binder 驱动负责把 FD 安全复制到目标进程的 FD 表；数字本身可能改变，但仍引用同一个 socket endpoint。
+server fd 被监听为 INPUT，是因为 App 的 FINISHED 是 Dispatcher 的入站 packet。
 
-WMS 随 `addToDisplay` 的 out 参数把 client 端交给 App。`transferTo(outInputChannel)` 转移 Java native wrapper 的所有权，原 `mClientChannel` 随后失效/释放，避免 system_server 意外长期持有 client 端副本。
-
-所以“App 里的 fd 数字与 system_server 创建时不同”完全正常，判断连接应看 token 和通道名，不看 fd 数字相等。
-
----
-
-## 12. registerInputChannel注册的到底是什么
-
-`InputManagerService.registerInputChannel()` 经 JNI 进入 native Dispatcher：
+Connection 的核心状态：
 
 ```cpp
-sp<Connection> connection =
-        new Connection(inputChannel, false, mIdGenerator);
-
-mConnectionsByFd[fd] = connection;
-mInputChannelsByToken[token] = inputChannel;
-mLooper->addFd(fd, 0, ALOOPER_EVENT_INPUT,
-               handleReceiveCallback, this);
-```
-
-注册完成产生三种查找能力：
-
-1. 用 token 从 InputWindowInfo 找到目标 connection；
-2. 用 server fd 找到 connection；
-3. server fd 变得可读时，Dispatcher 可接收 App 的 `FINISHED`。
-
-注册通道不等于窗口已经可命中。还必须等第 173 章的 InputWindowInfo 快照含有这个 token，并满足 display/Z/flags/region 条件。
-
----
-
-## 13. Connection保存的是每个目标独立的派发状态
-
-`Connection` 的核心字段：
-
-```cpp
-Status status;                 // NORMAL/BROKEN/ZOMBIE
-sp<InputChannel> inputChannel;
-bool monitor;
-InputPublisher inputPublisher;
-InputState inputState;
-bool responsive = true;
+Status status;                 // NORMAL / BROKEN / ZOMBIE
+bool responsive;
 std::deque<DispatchEntry*> outboundQueue;
 std::deque<DispatchEntry*> waitQueue;
 ```
 
-同一个 MotionEntry 可以同时面向前景窗口、OUTSIDE watcher、gesture monitor 等多个目标。每个目标 connection 都拥有自己的 `DispatchEntry`、seq、坐标变换、发送状态和回执时间。
+### 6.1 outboundQueue
 
-因此“一个硬件事件”并不等于“一个 socket message”或“一个 finish”。
+表示已为这个 target 创建、但尚未成功写入 socket 的条目。此时 delivery/timeout 不构成已发送完成账，App 不可能仅凭该队列已经看到事件。
+
+同一个硬件事件面向 foreground、OUTSIDE、wallpaper 或 monitor 时，各 connection 有独立 DispatchEntry、seq、坐标变换和 deadline。
+
+### 6.2 waitQueue
+
+表示 packet 已 publish，但尚未收到对应 FINISHED。send 成功后，Dispatcher 在同一锁内把 entry 从 outbound 移到 wait，并在 connection responsive 时向 AnrTracker 登记 deadline。
+
+waitQueue 与内核 socket 缓冲不是同一对象：packet 可能还躺在内核接收缓冲，逻辑 entry 已经在 wait 中。
 
 ---
 
-## 14. 三类身份：eventId、dispatch seq、Java sequenceNumber
+## 7. Dispatcher 会连续 publish，不是 stop-and-wait
 
-这三个数字最容易在日志里混为一谈：
+`startDispatchCycleLocked()` 在 connection NORMAL 且 outbound 非空时循环：
 
-| 身份 | 产生位置 | 主要用途 |
-|---|---|---|
-| `eventId` | InputReader/Dispatcher IdGenerator | 描述逻辑事件并贯穿native/Java trace；同一逻辑事件通常可投多个目标，转化出的派发模式也可能获得新id |
-| `DispatchEntry.seq` | 每个目标的DispatchEntry | socket请求与FINISHED回执精确配对，0保留不用 |
-| Java `InputEvent.getSequenceNumber()` | Java InputEvent对象 | App进程内对象代际，映射回native dispatch seq |
+```text
+取队头
+→ deliveryTime = 本轮 currentTime
+→ timeoutTime = currentTime + window timeout
+→ publish KEY/MOTION/FOCUS
+→ 成功：outbound 删除，wait 尾部加入，登记 ANR，继续下一条
+```
 
-`InputEventReceiver.dispatchInputEvent()` 建立：
+它不会每发一条就等待 App 回执。Java `InputEventReceiver.onInputEvent()` 的注释声称 finish 前不会再收到新事件，但 r48 native producer/consumer 实现允许一个 connection 多笔在途；诊断应以代码和队列为准。
+
+### 7.1 publish OK 只到内核边界
+
+InputChannel 要求 `send()` 返回字节数恰好等于完整 msgLength，否则当作 DEAD_OBJECT。OK 能证明完整 seqpacket 被本机内核接受，不证明：
+
+- client fd 已变为 App Looper 当前处理对象；
+- native consumer 已 recv；
+- Java Event 已创建；
+- View callback 已结束；
+- FINISHED 已返回。
+
+### 7.2 WOULD_BLOCK 的两种解释
+
+若 socket 满且 waitQueue 非空，当前 entry 留在 outbound，Dispatcher等待 App 处理已有 packet、发来 FINISHED 后再调用 startDispatchCycle。
+
+若 WOULD_BLOCK 时 waitQueue 反而为空，源码认为“没有任何已发送在途账却写满”不合预期，直接 abort broken dispatch cycle。它不会无条件丢掉当前 entry 后继续。
+
+非 WOULD_BLOCK 的 publish 错误也进入 broken 清理。deliveryTime 在每次发送尝试前重写，只有成功 publish 后该 timeout 才进入 AnrTracker。
+
+---
+
+## 8. App Looper 会一次读到 WOULD_BLOCK，但 Java 回调可延迟 finish
+
+ViewRootImpl 用 client channel 和当前 Looper 创建 WindowInputEventReceiver。JNI 把 client fd 注册到对应 MessageQueue Looper；普通应用窗口通常就是主线程 Looper。
+
+fd readable 后，native `consumeEvents(..., consumeBatches=false)` 循环：
+
+```text
+InputConsumer.consume
+→ KEY/MOTION/FOCUS native 对象
+→ Key/Motion 转 Java 对象并同步 dispatchInputEvent
+→ FOCUS 调专用 onFocusEvent 并自动 finish true
+→ 继续读，直到 WOULD_BLOCK / 错误 / 待帧 batch
+```
+
+所以“packet 已进入 App 进程的内核缓冲”与“主线程开始 callback”之间仍可被长任务、锁、GC 或消息队列调度拉开。
+
+### 8.1 Java mSeqMap 是对象编号到派发编号的桥
+
+native callback 同时传 dispatch seq 与 Java event。InputEventReceiver 保存：
 
 ```java
 mSeqMap.put(event.getSequenceNumber(), seq);
 ```
 
-App 完成时先用 Java sequenceNumber 找回真正的 Dispatcher seq，再发 native finish。不要拿 eventId 直接去 waitQueue 找回执。
+`finishInputEvent(event, handled)` 再按 Java sequenceNumber 找回真正 seq、删 map、进入 native finish。重复 finish、错误对象或 dispose 后 finish 只会告警；event 最后仍会 recycle。
 
-还要特别纠正一个安全细节：r48 的 HMAC 对 `VerifiedKeyEvent` / `VerifiedMotionEvent` 中允许验证的字段签名，但 verified 结构不含 eventId。Motion 又只对 DOWN/UP 生成有效签名，纯 MOVE 使用 `INVALID_HMAC`。所以 eventId 是事件身份，不是 HMAC 防篡改强度的一部分。
+### 8.2 Java callback 抛异常会吞掉同轮后续可读事件
 
----
+native receiver 若在 `dispatchInputEvent()` 回调后发现 Java exception，会把本次 `consumeEvents` 的 `skipCallbacks` 置 true。当前以及随后从 socket 读到的事件不再回调 Java，而是直接发送 `FINISHED(..., false)`，直到读到 WOULD_BLOCK 返回；外层再 raise-and-clear exception。
 
-## 15. InputMessage是固定ABI的进程间线格式
-
-`InputMessage` 的类型只有：
-
-```cpp
-KEY
-MOTION
-FINISHED
-FOCUS
-```
-
-结构需要在 32 位和 64 位进程中布局一致，源码用显式 padding、8 字节对齐和 `StructLayout_test` 保护这个契约。
-
-MOTION 携带：
-
-```text
-seq/eventId/eventTime/downTime
-device/source/display/action/flags
-HMAC/classification
-x/y scale与offset、precision、cursor position
-pointerCount
-每根手指的PointerProperties与PointerCoords
-```
-
-它是原生结构体 packet，不是 Java Parcel，也不是 AIDL 对象。
+这条异常清理直接调用 `mInputConsumer.sendFinishedSignal()`，忽略返回值，不经过能缓存 WOULD_BLOCK 的 receiver `finishInputEvent()` 包装。若反向 socket 恰好写满，完成信号还可能没有进入 `mFinishQueue`。它不是永久关闭 channel，下一次 fd callback 会重新开始；但同轮事件可被自动判未处理，极端拥塞时还可能留下未结 wait entry。
 
 ---
 
-## 16. 为什么发送前要做sanitized copy
+## 9. ViewRootImpl 阶段链决定 handled，但 finish 才终止等待
 
-C/C++ 结构体字段之间可能有未初始化 padding。若直接把整块内存送给另一个进程，会泄漏栈上的旧字节。
+WindowInputEventReceiver 先让 InputEventCompatProcessor 处理兼容逻辑，再按接收顺序进入 ViewRoot pending queue。队列不会按 eventTime 重排，因为注入事件的时间戳不保证单调。
 
-r48 的 `sendMessage()` 先：
+r48 内置 compat 只对 targetSdk < 23 的 stylus button 做原对象修改并返回单元素列表；接口虽然允许 0/N 个事件，不能据此断言当前内置路径一定把一笔输入拆成多笔。
 
-```cpp
-InputMessage cleanMsg;
-msg->getSanitizedCopy(&cleanMsg);
-send(fd, &cleanMsg, msgLength,
-     MSG_DONTWAIT | MSG_NOSIGNAL);
-```
-
-`getSanitizedCopy()` 先清零整个对象，再逐字段复制有效数据。对于 PointerCoords，只复制 bitset 声明存在的 axis values。
-
-这一步既是 ABI 稳定措施，也是跨进程数据最小化与信息泄漏防护。
-
----
-
-## 17. Motion消息为什么只发送实际pointer数量
-
-结构中预留 `MAX_POINTERS`，但 `Motion::size()` 计算：
-
-```cpp
-sizeof(Motion)
-- sizeof(Pointer) * MAX_POINTERS
-+ sizeof(Pointer) * pointerCount
-```
-
-所以单指事件不会传输整块最大数组。代价是 `pointers` 必须保持 Motion body 的最后一个字段；否则变长截断会把后续字段直接丢掉。
-
-接收端验证实际 packet 长度正好等于计算长度，并检查：
-
-```text
-1 <= pointerCount <= MAX_POINTERS
-```
-
-长度或类型不合法返回 `BAD_VALUE`，而不是尝试容错解析未知字节流。
-
----
-
-## 18. outboundQueue表示“计划发送但尚未成功写socket”
-
-目标确定后，Dispatcher 为每种 dispatch mode 建立条目：
-
-```text
-HOVER_EXIT
-OUTSIDE
-HOVER_ENTER
-AS_IS
-SLIPPERY_EXIT
-SLIPPERY_ENTER
-```
-
-适用的条目进入 connection 的 `outboundQueue`。这时：
-
-- 事件还可能没有进入内核 socket 缓冲；
-- `deliveryTime/timeoutTime` 尚未成为有效发送时间；
-- App 不可能仅凭此队列状态已经看到事件；
-- 若 connection 已 BROKEN/ZOMBIE，新的条目会被跳过。
-
-`outboundQueue` 是用户态待发送队列。
-
----
-
-## 19. startDispatchCycle怎样连续发送
-
-只要 connection 为 NORMAL 且 outbound 非空，Dispatcher 循环：
-
-```cpp
-dispatchEntry->deliveryTime = currentTime;
-dispatchEntry->timeoutTime = currentTime + timeout;
-
-status = inputPublisher.publish...(...);
-```
-
-发送成功后，它不是等待 App 再返回循环，而是：
-
-```cpp
-outboundQueue移除当前entry
-waitQueue.push_back(entry)
-登记ANR timeout
-继续尝试下一个outbound entry
-```
-
-这正是多笔在途的源码证据。socket 缓冲能够吸收短时 burst，而 seq 与 waitQueue 保存可靠的完成账。
-
----
-
-## 20. waitQueue表示“已经publish但还没有FINISHED”
-
-`Connection.h` 的注释非常直接：
-
-```cpp
-// events that have been published ... but have not
-// yet received a "finished" response
-std::deque<DispatchEntry*> waitQueue;
-```
-
-因此看到 waitQueue 条目可以断言：
-
-- `send()` 曾经成功把完整 packet 交给内核；
-- Dispatcher 已开始按该窗口 timeout 计时；
-
-但不能断言：
-
-- App Looper 已经读取；
-- View 已经收到；
-- 事件被 handled；
-- 业务回调已经完成。
-
----
-
-## 21. 两个队列和socket缓冲的状态机
-
-```mermaid
-stateDiagram-v2
-    [*] --> Outbound: "创建DispatchEntry"
-    Outbound --> Socket: "send完整packet成功"
-    Socket --> Wait: "同一临界流程移入waitQueue"
-    Wait --> AppNative: "client fd读取"
-    AppNative --> AppPipeline: "Java回调/输入阶段链"
-    AppPipeline --> FinishSocket: "FINISHED(seq, handled)"
-    FinishSocket --> Released: "Dispatcher读回并按seq删除"
-    Released --> [*]
-    Outbound --> Outbound: "WOULD_BLOCK，保留待重试"
-    Wait --> ANR: "超过timeout仍未回执"
-    Socket --> Broken: "对端关闭/协议错误"
-```
-
-图中的 Socket 与 Wait 不是严格互斥的物理阶段：消息写入后可能仍躺在内核缓冲，同时逻辑 entry 已在 waitQueue 中。状态机表达的是系统账本，而非内核 packet 的可观测生命周期。
-
----
-
-## 22. sendMessage返回OK究竟证明什么
-
-`SOCK_SEQPACKET` 下，r48 检查写入字节数必须恰好等于 `msgLength`。所以 `OK` 证明：
-
-> 这一整个 sanitized InputMessage 已被本机内核接受到该 socket 的发送路径，没有发生部分 packet。
-
-它不证明：
-
-- 对端线程已经运行；
-- App 已读出 packet；
-- Java 对象已创建；
-- View 回调已返回；
-- 用户已经看到界面反馈。
-
-这是输入延迟分析中第一个必须守住的完成边界。
-
----
-
-## 23. socket满时为什么当前entry不会丢
-
-若 `send()` 返回 `EAGAIN/EWOULDBLOCK`，InputChannel 转成 `WOULD_BLOCK`。
-
-Dispatcher 分两种情况：
-
-1. `waitQueue` 非空：说明已有事件占着通道，当前 entry 仍留在 outbound，等待 App finish 后重试；
-2. `waitQueue` 为空：源码认为“管道满但没有任何在途账”是不符合预期的异常，直接中止 broken dispatch cycle。
-
-正常背压链是：
-
-```text
-App处理较慢
-→ waitQueue增长/socket发送缓冲变满
-→ 当前outbound暂停
-→ App发送FINISHED
-→ server fd可读
-→ Dispatcher移除wait条目
-→ startDispatchCycle再次尝试outbound
-```
-
----
-
-## 24. App端怎样把client fd挂到主Looper
-
-ViewRootImpl 获得 client InputChannel 后创建：
-
-```java
-mInputEventReceiver = new WindowInputEventReceiver(
-        inputChannel, Looper.myLooper());
-```
-
-JNI 的 `NativeInputEventReceiver.initialize()` 调用：
-
-```cpp
-mMessageQueue->getLooper()->addFd(
-        clientFd, 0, ALOOPER_EVENT_INPUT, this, nullptr);
-```
-
-这里使用构造 ViewRootImpl 的 Looper，通常就是应用主线程 Looper。事件抵达只是让这个 fd 变为 readable；必须等主 Looper 从其他消息、同步屏障或长任务中获得执行机会，回调才会运行。
-
-所以“事件已经进入 App 进程内核缓冲”和“主线程开始处理”仍有一段可观测等待。
-
----
-
-## 25. client fd可读后native receiver会循环消费
-
-`handleEvent(ALOOPER_EVENT_INPUT)` 进入：
-
-```cpp
-consumeEvents(env,
-        false /* consumeBatches */,
-        -1 /* frameTime */,
-        nullptr);
-```
-
-`consumeEvents()` 循环调用 `InputConsumer.consume()`，直到：
-
-- socket 暂无消息，返回 `WOULD_BLOCK`；
-- 出现错误/对端关闭；
-- 内存不足；
-- MOVE 被保留成待下一帧消费的 batch。
-
-对 KEY/MOTION，它创建 native event，再转换成 Java `KeyEvent`/`MotionEvent`，同步调用 Java receiver。Focus 不创建给 View 树处理的普通 InputEvent，而是走专门回调并自动 finish。
-
----
-
-## 26. Native到Java不是把InputMessage对象直接暴露出去
-
-转换步骤是：
-
-```text
-recv InputMessage
-→ InputConsumer initializeKeyEvent/initializeMotionEvent
-→ NativeInputEventReceiver持有native InputEvent
-→ JNI创建或复制Java KeyEvent/MotionEvent
-→ dispatchInputEvent(dispatchSeq, javaEvent)
-```
-
-Java 对象有自己的生命周期和 sequenceNumber。native packet 中的 scale/offset 会进入 MotionEvent 内部，使 `getX()` 能按窗口坐标解释，而 raw 坐标仍保留不同语义。
-
-因此抓到 App Java MotionEvent 时，不能假定它的内存布局等于 socket 的 InputMessage。
-
----
-
-## 27. Java mSeqMap为什么必不可少
-
-native 回调同时传入 Dispatcher seq 和 Java event：
-
-```java
-private void dispatchInputEvent(int seq, InputEvent event) {
-    mSeqMap.put(event.getSequenceNumber(), seq);
-    onInputEvent(event);
-}
-```
-
-完成时：
-
-```java
-int index = mSeqMap.indexOfKey(event.getSequenceNumber());
-int seq = mSeqMap.valueAt(index);
-mSeqMap.removeAt(index);
-nativeFinishInputEvent(mReceiverPtr, seq, handled);
-```
-
-好处是 App 只能 finish 仍被该 receiver 跟踪的具体 Java event。重复 finish、错误对象或 dispose 后 finish 只会打印警告，不能随意伪造另一个在途 seq。
-
----
-
-## 28. WindowInputEventReceiver收到事件先做什么
-
-ViewRootImpl 的 receiver 先运行兼容处理：
-
-```text
-processInputEventForCompatibility(event)
-→ 可能原样返回null
-→ 可能转换成0个、1个或多个事件
-→ enqueueInputEvent(..., receiver, ..., processImmediately=true)
-```
-
-若转换结果为空，原事件直接 `finishInputEvent(event, true)`；否则把结果逐个加入队列。接口形状允许返回多个事件，但 r48 内置实现只针对 targetSdk&lt;23 的 stylus button 兼容：它原地修改同一个 MotionEvent，并返回单元素列表。不要仅凭通用 `List` 类型断言当前系统一定把一笔输入拆成多个 Java 事件。
-
-普通路径把事件包装为 `QueuedInputEvent`，按接收顺序加入 ViewRootImpl pending queue，然后立即执行 `doProcessInputEvents()`。队列顺序按接收次序，不按不可信的 event timestamp 重新排序。
-
----
-
-## 29. ViewRootImpl输入阶段链不是只有View.dispatchTouchEvent
-
-r48 建立的主要阶段：
+主要 InputStage：
 
 ```text
 NativePreImeInputStage
@@ -648,496 +319,344 @@ NativePreImeInputStage
 → SyntheticInputStage
 ```
 
-其中可能经过：
+其中包含 native InputQueue、pre-IME key、IME、touch mode、View key/touch/generic motion、unhandled key 和 synthetic fallback。只有阶段链最终调用 ViewRoot `finishInputEvent(q)`，Java receiver 才开始反向回执。
 
-- native activity 的 InputQueue；
-- View 的 pre-IME key；
-- IME 异步分发；
-- touch mode、坐标兼容与滚动 offset；
-- View 层次的 key/touch/generic motion；
-- 未处理按键的合成/fallback。
+### 9.1 AsyncInputStage 可延长 wait，但按 deviceId 防越序
 
-只有阶段链最终到达 `finishInputEvent(q)`，回执才开始反向发送。
+IME 与 native stage 可以返回 DEFER，把事件放入各自异步队列，等待 callback 后 finish 或 forward。
 
----
+某个 deferred 事件前面还有同 deviceId 条目时，后继不能越过；不同 deviceId 则可独立前进。这意味着同一 connection 的 Java finish 不必总是严格按 waitQueue 头顺序发生。
 
-## 30. AsyncInputStage为什么会延长waitQueue时间
-
-IME 和 native input queue 可返回 `DEFER`：
+### 9.2 handled 与 finish 是两个事实
 
 ```text
-事件进入异步stage
-→ 保存在该stage队列
-→ 等IME/native callback
-→ handled则finish
-→ 未handled则继续下游
+finish=true/发生了 finish
+= 这笔 seq 的处理生命周期结束
+
+handled=true
+= App/阶段链声称消费了事件
 ```
 
-为了避免同一设备的后续事件越过被 defer 的前一事件，`AsyncInputStage.forward()` 会按 deviceId 串行阻塞相关 successor；其他 device 的事件仍可能前进。
+handled=false 仍必须发送合法 FINISHED，Dispatcher 仍应删 wait entry。Motion 的 `afterMotionEvent...()` 在 r48 直接返回 false，不做类似 fallback；Key 未处理则可能询问 policy 生成 fallback key，甚至把原 DispatchEntry 放回 outbound 重派。
 
-所以 App 主线程没有在 Java 业务代码里死循环，也可能因 IME/native stage 回调迟迟不到而保持 Dispatcher waitQueue。
+因此“未消费”不是“没有回执”，“回执了”也不等于“消费成功”。
 
 ---
 
-## 31. handled表示消费结果，不表示回执是否成功
+## 10. FINISHED 也受反向背压，真正结账在 Dispatcher
 
-`finishInputEvent(event, handled)` 同时包含两个独立事实：
+正常 Java finish 进入 NativeInputEventReceiver：
 
 ```text
-finish → 这个dispatch seq的处理生命周期结束
-handled → App/阶段链是否认为自己消费了事件
+InputConsumer.sendFinishedSignal(seq, handled)
+→ client socket send FINISHED
 ```
 
-即使 `handled=false`，FINISHED 仍是有效回执，Dispatcher 应移除 waitQueue、停止该条 ANR 计时。
+若反向 send WOULD_BLOCK，receiver 把 `(seq, handled)` 加入 `mFinishQueue`，把 App Looper 监听从 INPUT 改为 INPUT|OUTPUT；fd 可写时按序重发，清空后恢复只监听 INPUT。
 
-反过来，即使 Java 传 `handled=true`，若 FINISHED packet 还在 App 的 finish queue 或通道已经断开，Dispatcher 尚未看到回执。
+所以 Java `finishInputEvent()` 返回时，FINISHED 可能仍在 App native 用户态队列。非 WOULD_BLOCK/DEAD_OBJECT 的错误可经 JNI 抛 RuntimeException；DEAD_OBJECT 则不抛，但系统侧也不会收到正常回执。
 
----
+### 10.1 Dispatcher 不是只 pop waitQueue 头
 
-## 32. handled=false对Key与Motion的后续不同
-
-r48 的 `afterMotionEventLockedInterruptible()` 直接返回 false，Motion 的 handled 值当前不触发类似按键 fallback 的 Dispatcher 动作。
-
-Key 则不同：前景目标返回未处理时，Dispatcher 可询问 policy 的 `dispatchUnhandledKey()`，生成并跟踪 fallback key；若原 key 后来被处理，还要取消已经建立的 fallback 状态。
-
-因此：
+server fd readable 后，Dispatcher 循环 `receiveFinishedSignal()` 到 WOULD_BLOCK。每个 seq 先生成完成 command，随后执行：
 
 ```text
-Motion handled=false → 主要是完成账/统计语义
-Key handled=false → 还可能进入系统policy fallback链
+findWaitQueueEntry(seq)
+→ 计算 finishTime - deliveryTime
+→ Key/Motion 后处理（期间可解 Dispatcher lock）
+→ 再按 seq 查一次
+→ erase wait entry 与 AnrTracker deadline
+→ release 或按 Key fallback 放回 outbound
+→ startDispatchCycle 重试待发条目
 ```
 
-不要把 View 的事件冒泡规则与 InputDispatcher 的跨进程 fallback 规则混在一起。
+两次查找是必须的：policy 调用可解锁，队列可能在中途被其他清理路径 drain。搜索整个 deque 也允许不同设备/异步 stage 的回执不严格按队头到达。
+
+### 10.2 同一轮读到的多个 FINISHED 共用一个 finishTime
+
+`handleReceiveCallback()` 在进入 recv 循环前只调用一次 `now()`，把同一个 currentTime 交给该轮全部 FINISHED command。slow duration 是“这次 server fd 处理批次的近似时刻”，不是每个 packet 单独调用 clock 的精确收包时间。
+
+通常误差很小，但做亚毫秒级事件时间分析时不应从这些 duration 反推每个 App finish 的精确先后间隔。
 
 ---
 
-## 33. FINISHED消息怎样沿原socket反向发送
+## 11. MOVE 合批用 seq chain 展开多个回执
 
-App native 端构造：
+普通 fd callback 以 `consumeBatches=false` 读取。连续兼容的 MOVE/HOVER_MOVE 按 deviceId+source 等条件进入 InputConsumer Batch，暂不立即创建 Java Event；读到 WOULD_BLOCK 后，native 通知 `onBatchedInputEventPending()`。
 
-```cpp
-InputMessage msg;
-msg.header.type = InputMessage::Type::FINISHED;
-msg.body.finished.seq = seq;
-msg.body.finished.handled = handled ? 1 : 0;
-mChannel->sendMessage(&msg);
-```
+ViewRoot 通常把消费安排到 Choreographer INPUT 阶段。以下情况立即 consume：
 
-不需要另建回调 Binder，也不需要请求/响应共用同一线程。`socketpair` 的 client 端把 packet 发回后，system_server 的 server fd readable，Dispatcher Looper 的 `handleReceiveCallback()` 被调用。
+- unbuffered input dispatch；
+- 指定 source 请求 unbuffered；
+- ViewRoot `mStopped`，因为之后可能没有 Choreographer callback。
 
-这解释了为什么注册 server fd 时监听的是 `ALOOPER_EVENT_INPUT`：对 Dispatcher 而言，App 回执就是这个 fd 的入站数据。
+不兼容事件、UP/CANCEL 等也可促使旧 batch 先消费或被特殊清理。
 
----
+### 11.1 一个 Java MotionEvent 对应多条 wait entry
 
-## 34. finish发送也可能WOULD_BLOCK
-
-双向通道意味着反向发送缓冲也会满。`NativeInputEventReceiver::finishInputEvent()` 遇到 `WOULD_BLOCK` 时不会立刻把错误抛给 Java，而是：
+假设 batch 有：
 
 ```text
-把(seq, handled)加入mFinishQueue
-→ Looper监听INPUT | OUTPUT
-→ fd可写时按序重发
-→ 全部发完后恢复只监听INPUT
+MOVE seq 101 → 102 → 103
 ```
 
-因此 Java `finishInputEvent()` 返回，只能说明 native receiver 接受了完成请求；正常情况下它很快写出，但不等价于 Dispatcher 已经从 server fd 读到 FINISHED。
-
-这个短暂边界通常不显眼，在严重拥塞或诊断极端卡顿时却非常重要。
-
----
-
-## 35. Dispatcher收到FINISHED后怎样结账
-
-server fd readable 后循环读取所有可用 FINISHED：
-
-```cpp
-receiveFinishedSignal(&seq, &handled);
-finishDispatchCycleLocked(now, connection, seq, handled);
-```
-
-真正结账经 command 执行：
+`consumeSamples()` 以 103 为 outSeq，创建链：
 
 ```text
-按seq查找waitQueue entry
-→ 计算finishTime-deliveryTime
-→ 运行Key/Motion完成后策略
-→ 再次按seq复核entry仍存在
-→ 从waitQueue删除
-→ 从AnrTracker删除timeout
-→ release DispatchEntry
-→ startDispatchCycle重试剩余outbound
-```
-
-中途策略调用可能解锁，所以源码必须再次查找，不能继续相信旧 iterator。
-
----
-
-## 36. 回执可以不按waitQueue头严格到达吗
-
-协议用 `findWaitQueueEntry(seq)` 搜索整个 deque，而不是只弹 front。这使实现能处理按 seq 定位的完成信号。
-
-App 的常规主线程阶段链大多维持同设备顺序，但：
-
-- 多个设备可独立前进；
-- 异步 stage 支持延迟与有限的乱序完成；
-- 一个 connection 可同时有多个在途事件；
-- policy 回调期间 connection/queue 还可能变化。
-
-所以不能用“收到一个 FINISHED 就机械删除最老 entry”的简化实现理解源码。
-
----
-
-## 37. MOVE合批为什么存在
-
-连续 MOVE/HOVER_MOVE 的频率可能高于显示刷新率。App 对每个 sample 都单独走 Java 回调，会增加 JNI、对象与主线程调度开销。
-
-`InputConsumer` 因而按 deviceId + source 建立 batch：
-
-```text
-首个MOVE → 新建Batch
-可兼容后续MOVE → append sample
-普通fd回调consumeBatches=false → 暂缓吐给Java
-Choreographer INPUT阶段 → consumeBatchedInputEvents(frameTime)
-→ 生成一个带历史samples的MotionEvent
-```
-
-UP/CANCEL 或不兼容事件会促使已有 batch 先被消费，不能无限等待下一帧。
-
----
-
-## 38. 一次Java MotionEvent怎样确认多个原始seq
-
-假设三个 MOVE packet 的 Dispatcher seq 是：
-
-```text
-101 → 102 → 103
-```
-
-`consumeSamples()` 把它们合成一个 Java MotionEvent，out seq 使用最后的 103，同时记录链：
-
-```text
-103 → 102
 102 → 101
+103 → 102
 ```
 
-App 对这个 MotionEvent finish 时，`InputConsumer.sendFinishedSignal(103, handled)` 先沿链发送 101、102 的 FINISHED，再发送 103，三笔使用同一个 handled。
+Java 只 finish 一次 103；`sendFinishedSignal(103, handled)` 沿链先发 101、102，再发 103，三条使用同一个 handled。若中途 send 失败，InputConsumer 会重建尚未完成的链，让上层重试仍有 bookkeeping。
 
-所以 Dispatcher waitQueue 中三个 entry 都能结账，不会因为 Java 只看到一个对象而留下两个假 ANR。
+`MotionEvent.getHistorySize()` 是合并的采样历史；mSeqChains 是 native 回执账。两者相关但不是同一个容器。
+
+### 11.2 CANCEL 丢弃待合批 MOVE 时也会回执
+
+某些 pointer CANCEL 到来时，InputConsumer 会直接为 batch 中旧 MOVE 逐条发送 handled=false 的 FINISHED，再清 batch。这里同样直接调用 sendFinishedSignal；代码未把返回状态接入 NativeInputEventReceiver 的 mFinishQueue。
+
+在正常通道中这些小 FINISHED 通常写出；极端反向背压下，旧 batch 的直接清理路径也存在完成信号未被缓存的边界。
 
 ---
 
-## 39. batch、history与seq链示意
+## 12. resampling 改坐标样本，不新增 dispatch seq
 
-```mermaid
-flowchart LR
-    A["MOVE seq=101"] --> B["InputConsumer Batch"]
-    C["MOVE seq=102"] --> B
-    D["MOVE seq=103"] --> B
-    B --> E["一个Java MotionEvent<br/>history: 101,102<br/>current: 103"]
-    E --> F["finish(event, handled)"]
-    F --> G["FINISHED 101"]
-    F --> H["FINISHED 102"]
-    F --> I["FINISHED 103"]
-```
-
-`MotionEvent.getHistorySize()` 描述采样历史，不是 ViewRootImpl pending queue 长度；seq chain 则是 native InputConsumer 私有的回执 bookkeeping，Java 无需逐条感知。
-
----
-
-## 40. resampling不是伪造一次新的硬件事件
-
-r48 默认由只读属性 `ro.input.resampling` 控制，默认启用。消费 batch 时以：
+r48 读取只读属性 `ro.input.resampling`，默认 true。Choreographer 消费 batch 时使用：
 
 ```text
 sampleTime = frameTime - 5ms
 ```
 
-在满足样本时间差条件时做插值或有限外推，目标是让坐标更接近当前渲染帧的时间，减少滚动抖动。源码还限制：
+只对 pointer MOVE 且 tool 为 finger/unknown 做 resample。它可能用下一条消息插值，也可能用最近两条历史有限外推。
 
-- 相邻样本至少相差 2ms 才考虑；
-- 超过 20ms 不做跨得过远的推断；
-- 最多向前预测 8ms，且还受最近间隔 50% 限制；
-- 只对 finger/unknown tool 进行 resample。
+### 12.1 插值与外推的限制不对称
 
-resampled sample 不获得一个新的 Dispatcher seq；回执仍对应承载它的原始 message chain。
+两种分支不能合并成一句“样本间隔必须 2—20ms”：
 
----
+| 分支 | 约束 |
+|---|---|
+| 有 future sample 的插值 | delta < 2ms 时拒绝；本分支没有 20ms 上限检查 |
+| 无 future、用两条历史外推 | delta < 2ms 或 >20ms 时拒绝；最多预测 `min(delta/2, 8ms)` |
 
-## 41. 为什么ViewRootImpl停止时反而立即消费batch
+输出 sampleTime 可能被限制，坐标加到同一个 MotionEvent history/current 语义中。它不创建新的 EventEntry、DispatchEntry 或 seq；FINISHED 仍对应承载这些样本的原始 message chain。
 
-`WindowInputEventReceiver.onBatchedInputEventPending()` 通常把消费安排到 Choreographer INPUT callback，使 sample 与 frameTime 对齐。
-
-但以下情况立即消费：
-
-```text
-mUnbufferedInputDispatch
-指定source请求unbuffered
-mStopped
-```
-
-尤其 `mStopped` 时不会再有正常 Choreographer callback；若仍把 batch 留到“下一帧”，它可能永远得不到消费并最终触发输入 ANR。
-
-这说明批处理是一种延迟优化，不能破坏最终回执活性。
+因此 resampled 坐标不是新的硬件采样事实。需要还原真实采集点时，要看原始 eventTime/history 与 resampled 标记，而不是把 View 读到的最后坐标直接当传感器时刻。
 
 ---
 
-## 42. 输入ANR从deliveryTime开始，不从硬件时间开始
+## 13. 输入 ANR 从成功 publish 的 deliveryTime 开始
 
-发送前 Dispatcher 设置：
+每次发送尝试前 Dispatcher 设置：
 
 ```cpp
-dispatchEntry->deliveryTime = currentTime;
-dispatchEntry->timeoutTime = currentTime
-        + getDispatchingTimeoutLocked(token);
+deliveryTime = currentTime;
+timeoutTime = currentTime + getDispatchingTimeoutLocked(token);
 ```
 
-普通窗口默认 timeout 为 5 秒，但窗口/应用 handle 可以提供具体值。`AnrTracker` 保存 responsive connection 的 deadline，dispatch loop 每轮取最早超时决定下次唤醒。
+只有 publish 成功并把 entry 加入 waitQueue 后，responsive connection 的 timeout 才写入 AnrTracker。WOULD_BLOCK 留在 outbound 的时间不属于这条 wait deadline；下次尝试会重写 deliveryTime。
 
-因此 ANR 等待时长覆盖：
+默认 dispatch timeout 为 5 秒，窗口/应用 handle 可提供具体值。计时覆盖：
 
 ```text
-消息写入socket后等待App Looper
-+ native/Java转换
-+ ViewRoot pending/stage处理
-+ IME/native异步阶段
-+ FINISHED反向排队并抵达Dispatcher
+内核接收缓冲等待 App Looper
++ native/Java 构造
++ ViewRoot pending queue 与 InputStage
++ IME/native DEFER
++ App finish 逻辑
++ FINISHED 反向排队并到达 Dispatcher
 ```
 
-它不包含事件在 InputReader/inbound queue 中尚未投递给该窗口的全部早期时间。
+它不包含事件仍在 InputReader/Dispatcher inbound、尚未向这个窗口成功 publish 的全部早期延迟。
+
+### 13.1 2 秒 slow log 不是 5 秒 ANR
+
+处理 FINISHED command 时，`finishTime-deliveryTime > 2s` 会打印 slow processing 日志。它：
+
+- 只有事件最终 finish 后才能计算；
+- 使用第 10 节所说的批次 currentTime；
+- 不等于已触发 ANR；
+- 不包括 FINISHED 被 Dispatcher 读到之后的后处理耗时。
+
+真正 ANR 由 AnrTracker 最早 deadline 触发。
+
+### 13.2 unresponsive 是政策状态，不是 socket 状态
+
+到期时 Dispatcher 先设 `responsive=false`、删除该 token 的 AnrTracker 条目并异步通知 policy。policy 可返回正 extension，使 connection 恢复 responsive 并重登记需要延长的 wait entries；否则取消该 connection 的事件。
+
+若迟到 FINISHED 到达，移除 entry 后 `isConnectionResponsive()` 可依据剩余 deadline 重新判健康。响应慢并不自动说明 FD 已断开。
 
 ---
 
-## 43. 2秒slow日志与5秒ANR不是同一个阈值
+## 14. BROKEN、ZOMBIE、死亡窗口与注入等待是四种收尾
 
-收到 FINISHED 后，Dispatcher 计算：
-
-```text
-eventDuration = finishTime - deliveryTime
-```
-
-超过 2 秒会打印该 connection 处理事件过慢的日志。这个 2 秒是警告阈值：
-
-- 不等于默认 5 秒 dispatch timeout；
-- 不直接弹 ANR 对话框；
-- 只有收到 finish 后才能算出这条完成耗时；
-- 真正超时由 AnrTracker/`processAnrsLocked()` 在 deadline 到达时触发。
-
-“日志写 spent 2300ms”与“系统已经判 ANR”是两个不同结论。
-
----
-
-## 44. 超时后responsive怎样变化
-
-最早 deadline 到达时：
-
-```cpp
-connection->responsive = false;
-mAnrTracker.eraseToken(token);
-onAnrLocked(connection);
-```
-
-系统不再为这个 unresponsive connection 的旧 entry 反复设置相同唤醒；新的 gesture 选目标时也会避开不响应窗口/monitor。
-
-policy 处理 ANR 后可以：
-
-- 返回正 timeout extension：把 connection 恢复 responsive，并延长仍在 waitQueue 的期限；
-- 不再等待：取消该 connection 的事件状态；
-- 后续旧 FINISHED 抵达：若 waitQueue 已恢复健康，可重新判定 responsive。
-
-ANR 是带 policy 决策和恢复路径的状态变化，不只是打印一行超时日志。
-
----
-
-## 45. broken、zombie与unresponsive不要混用
-
-| 状态 | 含义 | 通道是否物理可用 |
+| 状态/路径 | 含义 | 主要动作 |
 |---|---|---|
-| `responsive=false` | 通道仍存在，但在途事件超时 | 可能仍可读写，App也可能恢复 |
-| `STATUS_BROKEN` | 不可恢复通信错误 | 认为连接已坏，清空派发队列 |
-| `STATUS_ZOMBIE` | 已显式注销 | 不再作为注册连接使用 |
+| responsive=false | 通道存在但事件超时 | policy 延长或取消，可能恢复 |
+| STATUS_BROKEN | publish/receive/HANGUP 等不可恢复错误 | drain outbound+wait，可通知 WMS |
+| STATUS_ZOMBIE | 显式 unregister | 移除 fd/token/Looper 监听后 drain，不再使用 |
+| DeadWindow receiver | App 已死但窗口暂留可见 | system_server dummy client 立即 finish true |
 
-`abortBrokenDispatchCycleLocked()` 会 drain outbound/wait queue，按需要通知 WMS；显式 unregister 则先移除 fd/token 表和 Looper 监听，再 abort，最后标 ZOMBIE。
+### 14.1 主动销毁先 unregister，再关 FD
 
-响应慢不是 socket 断开，socket 断开也不需要再等待 5 秒才识别。
+WMS `disposeInputChannel()` 先向 Dispatcher unregister server channel，再 dispose server/client。这样正常窗口移除不会因先出现 HANGUP 被误报为 broken。
 
----
+意外 client 关闭时，server fd 收到 HANGUP/ERROR 或 DEAD_OBJECT。Dispatcher 只有对非 monitor 且仍存在 WindowHandle 的 connection 才请求 broken 通知，随后注销通道。policy 可沿 token 找 WindowState 并 `removeIfPossible()`。
 
-## 46. App关闭client端后系统怎样清理窗口
+drain queue 会 release 每个 DispatchEntry；若它是注入事件的 foreground target，也会减少 pendingForegroundDispatches。因此清理可以终止等待，但不代表 App 正常处理过事件。
 
-server fd 收到 HANGUP/ERROR，或 `receiveFinishedSignal()` 返回 `DEAD_OBJECT` 时，Dispatcher 注销 connection 并可通知 policy：
+### 14.2 DeadWindowEventReceiver 不把事件交给旧 View 树
 
-```text
-InputDispatcher
-→ NativeInputManager policy callback
-→ InputManagerService.notifyInputChannelBroken(token)
-→ InputManagerCallback.notifyInputChannelBroken(token)
-→ WMS mInputToWindowMap找到WindowState
-→ windowState.removeIfPossible()
-```
+某些 App 死亡后窗口会暂留可见以便点击触发重启。`openInputChannel(null)` 不把 client 交给 App，而在 WMS Handler Looper 创建 dummy receiver，所有输入立即 finish true。
 
-但若窗口 handle 已经先被移除，Dispatcher 会避免重复警告。WMS 主动销毁窗口时也刻意“先 unregister server，再 dispose fd”，避免正常关闭被误报成 broken window。
+它保证 socket 有消费者并让 input monitor 看见触摸；旧 App View 树已经不存在，handled=true 只是 dummy 的确认。
 
----
+### 14.3 WAIT_FOR_FINISHED 只等 foreground 派发账归零
 
-## 47. 可见但客户端已死的窗口为什么有dummy receiver
-
-WindowState 的特殊路径可能让死亡窗口暂时保持可见，以便点击后触发重启。若 `openInputChannel(null)` 没有把 client 端交给 App，WMS 创建：
-
-```java
-final class DeadWindowEventReceiver extends InputEventReceiver {
-    public void onInputEvent(InputEvent event) {
-        finishInputEvent(event, true);
-    }
-}
-```
-
-它运行在 system_server 的 WMS Handler Looper，立即确认事件。这样：
-
-- socket 不会因无人读取而塞满；
-- input monitor 仍能观察点击；
-- 系统可借点击重新拉起窗口对应应用；
-- 这个 dummy 并不会把触摸交给已经死亡的旧 View 树。
-
----
-
-## 48. 注入事件的WAIT_FOR_FINISHED等的也是回执账
-
-`injectInputEvent()` 的同步模式要分开：
+注入模式：
 
 ```text
 SYNC_NONE → 入队后不等结果
-WAIT_FOR_RESULT → 等目标选择/注入结果
-WAIT_FOR_FINISHED → 结果成功后还等foreground dispatch数归零
+WAIT_FOR_RESULT → 等选目标/注入结果
+WAIT_FOR_FINISHED → 成功后再等 pendingForegroundDispatches == 0
 ```
 
-每创建一个 foreground DispatchEntry 就增加 `pendingForegroundDispatches`，release 时减少；只有归零才唤醒 `WAIT_FOR_FINISHED` 注入者。
-
-这等待的是前景目标的 FINISHED/清理完成，不代表 View 一定 handled，也不等待由事件触发的绘制、SurfaceFlinger present 或业务异步网络任务。
+每个 foreground DispatchEntry 创建时计数加一，release 时减一。正常 FINISHED、broken drain、ANR cancel 等都可能让它归零；它不要求 handled=true，也不等待由事件触发的绘制、present 或业务异步任务。
 
 ---
 
-## 49. 现场诊断、macOS练习与复读审计
+## 15. 诊断矩阵与九组静态源码练习
 
-### 49.1 一张诊断决策图
+先按队列定位：
 
-```mermaid
-flowchart TD
-    A["输入卡顿或ANR"] --> B{"dumpsys input有目标Connection吗?"}
-    B -- "否" --> C["回第173章查窗口快照/token/选窗"]
-    B -- "是" --> D{"outboundQueue很长?"}
-    D -- "是" --> E["查socket背压、旧waitQueue、connection状态"]
-    D -- "否" --> F{"waitQueue有超龄entry?"}
-    F -- "否" --> G["查InputReader/inbound/policy或问题已恢复"]
-    F -- "是" --> H["对齐App主线程与deliverInputEvent trace"]
-    H --> I{"主线程尚未读client fd?"}
-    I -- "是" --> J["查Looper长任务、锁、GC、同步屏障"]
-    I -- "否" --> K["查IME/native AsyncInputStage、View回调、finish反向拥塞"]
-```
+| 现场 | 更可能的阶段 | 下一证据 |
+|---|---|---|
+| 找不到目标 Connection | 上一章的窗口快照/token/选窗 | `dumpsys input` WindowHandles |
+| outbound 很长、wait 非空 | App 落后导致正向背压 | connection 状态、App finish、socket 错误 |
+| wait 有超龄 entry | packet 已发但完成链未闭合 | App Looper、InputStage、mFinishQueue、ANR |
+| App 有 callback，Dispatcher wait 不退 | finish 未调用、反向阻塞/错误、seq 错 | mSeqMap、JNI、FINISHED receive |
+| 单个 Java MOVE 对应多条 wait | 正常 batch | history、mSeqChains、逐 seq FINISHED |
+| slow >2s 但无 ANR | 已完成但较慢 | window timeout 是否仍未到 |
 
-### 49.2 macOS只读练习1：追通道所有权
+以下命令只读 `android-11.0.0_r48` 工作树。
+
+### 练习 1：追 server/client 所有权
 
 ```bash
-rg -n "openInputChannelPair|registerInputChannel|transferTo|disposeInputChannel" \
-  frameworks/base/services/core/java/com/android/server/wm \
-  frameworks/base/services/core/java/com/android/server/input \
-  frameworks/base/core/java/android/view
+sed -n '2450,2520p' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+rg -n 'writeToParcel|readFromParcel|transferTo' frameworks/base/core/java/android/view/InputChannel.java frameworks/base/core/jni/android_view_InputChannel.cpp
 ```
 
-给每个命中标注：server/client、所在进程、是否仍拥有 FD、何时转移或关闭。
+标出 pair、共享 token、server 注册、client transfer 与主动注销顺序。
 
-### 49.3 macOS只读练习2：追事件与回执
+### 练习 2：核对 socket 与错误映射
 
 ```bash
-rg -n "startDispatchCycleLocked|publishMotionEvent|waitQueue|receiveFinishedSignal|finishDispatchCycle" \
-  frameworks/native/services/inputflinger/dispatcher \
-  frameworks/native/libs/input
+sed -n '235,370p' frameworks/native/libs/input/InputTransport.cpp
 ```
 
-尝试回答：`deliveryTime` 在哪里设置，entry 在哪里从 outbound 移到 wait，seq 在哪里查回。
+确认四次 buffer 设置是否检查返回码，并区分 WOULD_BLOCK、DEAD_OBJECT 与部分写。
 
-### 49.4 macOS只读练习3：追App接收线程
+### 练习 3：检查线协议与 sanitized copy
 
 ```bash
-rg -n "NativeInputEventReceiver|addFd|consumeEvents|dispatchInputEvent|finishInputEvent" \
-  frameworks/base/core/jni/android_view_InputEventReceiver.cpp \
-  frameworks/base/core/java/android/view/InputEventReceiver.java \
-  frameworks/base/core/java/android/view/ViewRootImpl.java
+sed -n '75,190p' frameworks/native/include/input/InputTransport.h
+sed -n '115,235p' frameworks/native/libs/input/InputTransport.cpp
 ```
 
-把 native callback、Java receiver、ViewRoot pending queue、InputStage 和 FINISHED 标成五段。
+说明 pointers 为什么必须最后，以及 padding 为什么不能原样跨进程。
 
-### 49.5 macOS只读练习4：手算合批回执
+### 练习 4：画出 Connection 双队列迁移
 
-假设 waitQueue 有 seq 31、32、33 三个连续 MOVE，InputConsumer 合成一个 history size=2 的 MotionEvent，并以 33 作为 outSeq。回答：
+```bash
+sed -n '45,75p' frameworks/native/services/inputflinger/dispatcher/Connection.h
+sed -n '2450,2620p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
 
-1. Java 调用几次 `finishInputEvent`？
-2. socket 反向发送几个 FINISHED packet？
-3. 三个 packet 的 handled 是否相同？
-4. 哪个组件保存 33→32→31 的 seq chain？
+逐条标出 delivery/timeout、publish、WOULD_BLOCK、outbound erase、wait push 与 ANR insert。
 
-答案：一次、三个、相同、native `InputConsumer`。
+### 练习 5：观察 App receiver 的 drain 与异常路径
 
-### 49.6 复读审计：r48最容易误解的二十一处
+```bash
+sed -n '110,220p' frameworks/base/core/jni/android_view_InputEventReceiver.cpp
+sed -n '220,365p' frameworks/base/core/jni/android_view_InputEventReceiver.cpp
+sed -n '105,195p' frameworks/base/core/java/android/view/InputEventReceiver.java
+```
 
-1. InputChannel 初始化借 Binder 传 FD，但逐个事件运行期走 Unix socket。
-2. 底层是 `SOCK_SEQPACKET`，不是字节流 socket，也不是匿名 pipe。
-3. server/client 是用途名称，两端本身都可发送和接收。
-4. 一对端点共享 connection token，但不是同一个具体 InputChannel 对象。
-5. fd 数字是进程局部的，跨 Binder 后数字不同很正常。
-6. 注册 server channel 不代表窗口已进入可命中的 InputWindowInfo 快照。
-7. eventId、per-target dispatch seq、Java event sequenceNumber 是三类身份。
-8. outbound 表示尚未成功 publish，wait 表示已 publish 但未收到 FINISHED。
-9. waitQueue 与内核 socket 缓冲不是同一份队列。
-10. send OK 只证明内核接受完整 packet，不证明 App 已读取或处理。
-11. r48 可连续 publish 多个事件，不是严格“一发一回”。
-12. `handled=false` 仍是有效完成；它和通信失败完全不同。
-13. Motion 的 handled 在本版本不触发 Dispatcher fallback，Key 可能触发 policy fallback。
-14. Java finish 返回时，FINISHED 仍可能在 native `mFinishQueue` 等 fd 可写。
-15. App receiver 回调通常在 ViewRoot 所在线程，也就是主 Looper，而不是 Binder 线程。
-16. MOVE batch 把多个 packet 合成一个带 history 的 Java MotionEvent。
-17. 一个合批 Java finish 会沿 native seq chain 回执全部原始 message。
-18. resampling生成坐标样本，不生成新的 Dispatcher seq 或硬件事件。
-19. 输入ANR从成功 publish 的 deliveryTime计时，不从触摸硬件eventTime计时。
-20. unresponsive、BROKEN、ZOMBIE是不同状态；显式注销会主动清队列和监听。
-21. eventId不在r48 VerifiedInputEvent的HMAC签名字段中；Motion也只有DOWN/UP获得有效签名，不能把id当安全认证值。
+比较正常 finish 的 mFinishQueue 与 skipCallbacks 直接 send 的错误处理差异。
 
-### 49.7 本章核心结论
+### 练习 6：核对 ViewRoot 同设备异步顺序
 
-> InputChannel 是“一对共享token的非阻塞Unix seqpacket端点”。WMS把server端注册给system_server内的InputDispatcher，把client端FD经一次Binder交接给App；之后事件和完成回执都走这个全双工socket，不再为每个触摸发Binder事务。
+```bash
+sed -n '5295,5575p' frameworks/base/core/java/android/view/ViewRootImpl.java
+sed -n '7968,8125p' frameworks/base/core/java/android/view/ViewRootImpl.java
+```
 
-> Dispatcher用outboundQueue记录待publish事件，用waitQueue记录已publish但未FINISHED事件；每个目标DispatchEntry拥有独立seq和deadline。publish成功只到内核缓冲，真正完成必须等App把同一seq的FINISHED送回并由Dispatcher移除wait entry。
+说明 DEFER、deviceId 阻塞、handled flag 与最终 receiver finish 的关系。
 
-> App主Looper上的NativeInputEventReceiver把InputMessage变成Java事件，ViewRootImpl可经过IME/native异步阶段再finish。连续MOVE还会按帧合批和resample，一个Java MotionEvent的finish由InputConsumer展开为多个原始seq回执。输入ANR因此覆盖socket后等待、主线程、阶段链和反向回执，而不只是View.dispatchTouchEvent本身。
+### 练习 7：手算 batch seq chain
+
+```bash
+sed -n '620,820p' frameworks/native/libs/input/InputTransport.cpp
+sed -n '1060,1125p' frameworks/native/libs/input/InputTransport.cpp
+```
+
+用 seq 101/102/103 验证链建立顺序、FINISHED 发送顺序和失败时重建逻辑。
+
+### 练习 8：区分插值与外推上限
+
+```bash
+sed -n '45,82p' frameworks/native/libs/input/InputTransport.cpp
+sed -n '925,1060p' frameworks/native/libs/input/InputTransport.cpp
+```
+
+找到 future 插值没有 20ms 上限检查、历史外推才有 2—20ms 与 8ms cap 的源码证据。
+
+### 练习 9：闭合 FINISHED、ANR 与注入计数
+
+```bash
+sed -n '2690,2770p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+sed -n '3420,3570p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+sed -n '4725,4820p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+sed -n '4500,4710p' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
+
+回答 FINISHED 收包、wait erase、slow log、policy ANR、foreground 计数分别在哪个完成点。
 
 ---
 
-## 50. 自测题与下一章预告
+## 16. 本章结论与自检
 
-### 50.1 自测题
+核心模型：
 
-1. 为什么 socketpair 要用 `SOCK_SEQPACKET` 而不是 `SOCK_STREAM`？
-2. WMS 把哪一端注册给 Dispatcher，哪一端传给 App？
-3. connection token 为什么不能用于判断 server/client 对象相等？
-4. `outboundQueue` 与 `waitQueue` 的边界是什么？
-5. `publishMotionEvent()==OK` 为什么不代表 View 已收到？
-6. 为什么 r48 不是严格 stop-and-wait 输入协议？
-7. eventId、dispatch seq、Java sequenceNumber 各做什么？
-8. App `handled=false` 为什么仍必须发送 FINISHED？
-9. 三个 MOVE 合批为一个 Java MotionEvent 后，三个 wait entry 怎样清除？
-10. 输入 ANR 的 timeout 从哪个时间点起算？
-11. `responsive=false` 与 `STATUS_BROKEN` 有什么区别？
-12. `WAIT_FOR_FINISHED` 注入完成为什么仍不等画面显示？
+```text
+InputChannel
+= Binder 一次性交接 FD 与 token
++ 运行期全双工非阻塞 seqpacket
 
-### 50.2 下一章
+Dispatcher 完成账
+= outbound（未成功 publish）
++ wait（已 publish、未 FINISHED）
++ per-target seq/deadline
 
-第 175 章继续研究：
+App 完成账
+= Looper recv
++ Java sequenceNumber → dispatch seq
++ InputStage handled
++ FINISHED 正常发送或 finish queue
+```
 
-> Android ViewRootImpl InputStage、IME 前后阶段与 View 事件分发
+完成本章后，应能回答：
 
-重点回答：
+- 为什么 server/client 是用途名而不是单向 socket？
+- 32 KiB 为什么只是未经确认的请求值？
+- eventId、dispatch seq 与 Java sequenceNumber 分别做什么？
+- publish OK 为什么只证明内核接受 packet？
+- r48 为什么不是一发一回的 stop-and-wait？
+- Java callback 抛异常为何可能自动 finish 同轮后续事件，甚至在反向拥塞时漏回执？
+- handled=false 为什么仍是有效完成，Key 又为何可能 fallback？
+- 一个合批 Java MOVE 怎样关闭多条 wait entry？
+- 插值与外推为何不能共用“2—20ms”一句话？
+- ANR 从何时计时，2 秒 slow log 与 5 秒默认 timeout 有何区别？
+- WAIT_FOR_FINISHED 为什么可因清理归零且不等画面 present？
 
-- Key、Touch、GenericMotion 怎样穿过 pre-IME/post-IME 阶段？
-- ViewGroup 怎样拦截、拆分和取消触摸目标？
-- `dispatchTouchEvent` 返回值怎样变成跨进程 `handled`？
-- 异步 IME 与 native InputQueue 怎样保持同设备事件顺序？
-- `ACTION_CANCEL` 在焦点丢失、窗口移除与手势转移时怎样生成和消费？
+下一章进入 **ViewRootImpl InputStage、IME 前后阶段与 View 事件分发**，把本章概览的 App 阶段链展开到 pre-IME/post-IME、ViewGroup 命中、intercept、CANCEL 与最终 handled。

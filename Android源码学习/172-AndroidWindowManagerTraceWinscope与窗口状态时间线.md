@@ -1,108 +1,93 @@
 # 172 Android WindowManager Trace、Winscope 与窗口状态时间线
 
 > 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
-> 学习方式：macOS 只读源码，不要求编译、不要求连接设备  
+> 学习方式：macOS 静态只读源码，不要求编译或连接设备  
 > 前置章节：第 168—171 章
 
 ---
 
-## 1. 本章目标：把“窗口曾经怎样变化”变成时间线
+## 1. WindowManager Trace 保存的是状态序列，不是字段变更日志
 
-`dumpsys window` 很适合回答：
-
-> 采集这一刻，WMS 认为有哪些 Display、Task、Activity 和 Window？
-
-但转场卡住、窗口闪现、焦点短暂错误、旋转中间态、IME 一闪而过等问题，真正要问的是：
-
-> 在故障发生前后，WMS 状态按什么顺序变化？
-
-WindowManager Trace 会连续保存多份 WMS Proto 快照。Winscope 再把这些快照放到时间轴上，帮助我们逐步观察窗口树、可见性、焦点、几何和转场集合。
-
-本章要建立的模型是：
+`dumpsys window` 适合回答“现在 WMS 认为有哪些 Display、Task、Activity 和 Window”。窗口闪现、旋转中间态、焦点短暂错误、IME 一闪或转场卡住则需要回答：
 
 ```text
-WMS发生一个可记录的Surface transaction关闭点
-→ transaction模式立即采样，或frame模式合并到下一帧采样
-→ 在WMS全局锁内把窗口树序列化为Proto
-→ 写入按字节容量淘汰旧条目的内存环形缓冲
-→ stop/bugreport时写成wm_trace.pb
-→ Winscope按elapsedRealtimeNanos展示时间线
+故障前后
+→ 窗口树怎样变化
+→ visible/draw/focus 在哪一项停住
+→ 几何何时偏离
+→ WMS 意图与 SF Layer 何时分叉
 ```
 
-最重要的一句话：
+Android 11 r48 的 WindowManager Trace 会反复序列化一份 WMS Proto 快照，按字节预算放入内存 FIFO；stop 或 bugreport 路径再尝试写成 `wm_trace.pb`。每个 entry 是一份完整或按 level 裁剪的状态，不是对上一条的 delta。
 
-> WindowManager Trace 是“采样到的一系列 WMS 状态”，不是每次字段赋值的完整事件日志，也不是 SurfaceFlinger 最终画面的录像。
+它能证明“某个采样点的 WMS Java 对象状态”，不能自动证明：
+
+- 两个采样点之间每次字段赋值；
+- App 进程的所有 SurfaceControl.Transaction；
+- SurfaceFlinger 同时刻的 drawing tree；
+- InputDispatcher 已消费同一窗口快照；
+- HWC present 或面板 scanout。
+
+Winscope 是解析和对齐这些文件的查看器，不会补回生产端没有采到的中间状态。
 
 ---
 
-## 2. 先做版本纠偏：以r48内置旧版Winscope为准
+## 2. r48 有 transaction 与 frame 两种触发语义
 
-当前源码树内同时包含：
+基础链路是：
 
 ```text
-frameworks/base/services/core/java/com/android/server/wm/WindowTracing.java
-development/tools/winscope/
+WMS closeSurfaceTransaction(where)
+→ WindowTracing.logState(where)
+→ transaction：当前线程立即 log
+   frame：只预约 DisplayThread 下一帧 callback
+→ 写 timestamp + where
+→ 获取 WMS global lock
+→ dumpDebugLocked
+→ TraceBuffer.add
 ```
 
-它们代表 Android 11 时期的 trace 生产和查看方案。后来版本的 Winscope UI、统一抓取工具、Perfetto 集成和 Proto 字段已经有明显变化。
+两种模式的取舍：
 
-本章不把新版文档反套到 r48，尤其不假设：
+| 模式 | 保存什么 | 主要损失 |
+|---|---|---|
+| transaction（默认） | 每个 WMS 自己选定的 close 点 | 不覆盖 WMS 外部 transaction；序列化阻塞触发线程 |
+| frame | 一次或多次触发合并后的下一帧状态 | 同帧 A→B→C 中间态与原始 where 丢失 |
 
-- trace 可以在 `user` build 上启用；
-- WMS trace 是 Perfetto 数据源；
-- `frame` 模式无条件记录每个 VSync；
-- `transaction` 模式记录系统中每一笔 SurfaceControl Transaction；
-- WMS 与 SF trace 的同索引条目属于同一原子帧；
-- 新版 Winscope 页面显示的所有字段都存在于 r48 Proto。
+“frame”并非每个 VSync 无条件采样。必须先有 `logState()` 才预约一次 callback；系统只有 VSync、没有 WMS 触发点时不会重复写相同状态。
 
 ---
 
-## 3. 本章要回答的十二个问题
+## 3. 源码地图
 
-1. `cmd window tracing` 怎样进入 `WindowTracing`？
-2. 为什么 user build 不能启用这套 trace？
-3. start、stop、status、frame、transaction、level、size 分别做什么？
-4. transaction 频率到底记录哪些 transaction？
-5. frame 频率为什么会合并多次状态变化？
-6. 一个 trace entry 的时间戳和 `where` 分别代表什么？
-7. WMS 在什么锁、什么线程上序列化状态？
-8. ALL、TRIM、CRITICAL 三种 level 怎样影响内容和容量？
-9. `TraceBuffer` 如何淘汰旧快照、怎样落盘？
-10. WMS trace 能看见哪些窗口状态，又看不见哪些像素事实？
-11. Winscope 怎样对齐 WMS、SF、ProtoLog 和录像？
-12. 如何诊断窗口错位、焦点错误、转场卡住与 IME 异常？
-
----
-
-## 4. 源码地图
-
-### 4.1 trace控制与采集
+采集与控制：
 
 ```text
 frameworks/base/services/core/java/com/android/server/wm/
 ├── WindowTracing.java
 ├── WindowTraceLogLevel.java
 ├── WindowManagerShellCommand.java
-└── WindowManagerService.java
+├── WindowManagerService.java
+├── WindowContainer.java
+├── DisplayContent.java
+├── ActivityRecord.java
+└── WindowState.java
 ```
 
-### 4.2 通用内存缓冲
+通用缓冲与 Proto：
 
 ```text
 frameworks/base/core/java/com/android/internal/util/TraceBuffer.java
-```
 
-### 4.3 Proto结构
-
-```text
 frameworks/base/core/proto/android/server/
 ├── windowmanagertrace.proto
 ├── windowmanagerservice.proto
-├── windowcontainerthumbnail.proto
-└── surfaceanimator.proto
+├── windowcontainer.proto
+├── windowstate.proto
+└── windowtoken.proto
 ```
 
-### 4.4 r48内置Winscope
+r48 内置 Winscope：
 
 ```text
 development/tools/winscope/
@@ -110,11 +95,10 @@ development/tools/winscope/
 ├── src/transform_wm.js
 ├── src/transform_sf.js
 ├── src/App.vue
-├── adb_proxy/winscope_proxy.py
-└── trace.sh
+└── adb_proxy/winscope_proxy.py
 ```
 
-### 4.5 测试
+测试：
 
 ```text
 frameworks/base/services/tests/wmtests/src/com/android/server/wm/WindowTracingTest.java
@@ -123,155 +107,46 @@ frameworks/base/services/tests/servicestests/src/com/android/server/utils/TraceB
 
 ---
 
-## 5. 从shell命令到WindowTracing
+## 4. shell 命令定义 session，但 user build 只封锁启停
 
-入口命令是：
-
-```text
-adb shell cmd window tracing <subcommand>
-```
-
-调用链如下：
-
-```mermaid
-sequenceDiagram
-    participant SH as "adb shell"
-    participant BS as "WindowManager Binder shell入口"
-    participant SC as "WindowManagerShellCommand"
-    participant WT as "WindowTracing"
-    participant WMS as "WindowManagerService"
-    participant TB as "TraceBuffer"
-
-    SH->>BS: "cmd window tracing start/frame/..."
-    BS->>SC: "onCommand(tracing)"
-    SC->>WT: "onShellCommand(this)"
-    WT->>WT: "修改enabled/frequency/level/size"
-    WMS->>WT: "closeSurfaceTransaction后logState(where)"
-    WT->>WMS: "全局锁内dumpDebugLocked"
-    WT->>TB: "add(ProtoOutputStream)"
-    SH->>WT: "tracing stop"
-    WT->>TB: "writeTraceToFile(wm_trace.pb)"
-```
-
-`WindowManagerShellCommand` 对 `tracing` 分支直接访问内部 `mWindowTracing`。这是 system_server 内部对象调用，不是另起一个独立 trace daemon。
-
----
-
-## 6. 默认文件和magic header
-
-默认落盘位置是：
+入口是：
 
 ```text
-/data/misc/wmtrace/wm_trace.pb
+adb shell cmd window tracing <start|stop|status|frame|transaction|level|size>
 ```
 
-文件开头写入固定 magic number。按字节观察是：
+`WindowManagerShellCommand` 在 system_server 内直接调用 `mWindowTracing.onShellCommand()`，没有独立 trace daemon。
 
-```text
-09 57 49 4e 54 52 41 43 45
-   W  I  N  T  R  A  C  E
-```
+### 4.1 start 是重置，不是续写
 
-`development/tools/winscope/src/decode.js` 用这个头识别 `WindowManagerTraceFileProto`，避免仅靠文件扩展名猜类型。
+非 user build 上，`startTrace()`：
 
-文件主体是：
+1. 在 `mEnabledLock` 内启动 ProtoLog；
+2. 清空 TraceBuffer；
+3. 同时设置锁内 boolean 与 volatile 快速开关；
+4. 离锁后直接记录 `where="trace.enable"`。
 
-```proto
-message WindowManagerTraceFileProto {
-    optional fixed64 magic_number = 1;
-    repeated WindowManagerTraceProto entry = 2;
-}
-```
+重复 start 也没有“已经开启就拒绝”的门，会再次清空历史。初始 entry 若序列化失败，start 的命令文案也不会变成失败。
 
-每个 entry 都是一份完整或裁剪后的 WMS 状态快照，而不是相对前一条的字段 delta。
+### 4.2 stop 先关开关，再同步尝试写盘
+
+正常 stop 在 `mEnabledLock` 内设两个 enabled 值为 false，随后写文件；离锁后停止 ProtoLog。运行期不是每条 entry 持续 append 到文件，system_server 崩溃或重启前未落盘的内存历史可能丢失。
+
+源码打印“Waiting for traces to flush”，但没有 in-flight 计数、条件变量或 callback 取消。设 false 后同一锁内立刻检查 `if (mEnabled)` 也必然为 false，不能证明其他 log 已结束。
+
+### 4.3 user build 的边界不是“所有子命令禁用”
+
+只有 start/stop 显式检查 `Build.IS_USER` 并返回错误。status 仍可读，frame/transaction/level/size 仍能改内存配置并重置 buffer，只是无法通过这两个入口开启采集。
+
+### 4.4 status 只描述当前内存对象
+
+它显示 enabled、log level、容量、已用字节和 element 数量，不证明丢失计数为零、文件已写盘、Proto 可解析或 SF trace 同步运行。
 
 ---
 
-## 7. user build明确不支持启停
+## 5. transaction 模式只跟随 WMS 自己的 close 点
 
-`startTrace()` 和 `stopTrace()` 开头都检查：
-
-```java
-if (IS_USER) {
-    logAndPrintln(pw,
-            "Error: Tracing is not supported on user builds.");
-    return;
-}
-```
-
-因此这套 r48 trace 主要面向 `userdebug`/`eng` 调试环境。命令能进入 shell handler，不代表 trace 真正启用；要看返回文本或 `status`。
-
-本套笔记按用户要求在 macOS 上只读源码，不执行编译，也不假装已有 userdebug 设备数据。文中的 adb 命令只用于理解接口和未来可选验证。
-
----
-
-## 8. start不只是把enabled设为true
-
-`startTrace()` 在 `mEnabledLock` 下执行：
-
-1. 启动 `ProtoLogImpl`；
-2. 打印目标文件；
-3. 清空旧 `TraceBuffer`；
-4. 同时把锁内 `mEnabled` 和 volatile `mEnabledLockFree` 设为 true；
-5. 离开锁后立即记录一条 `where="trace.enable"` 的初始快照。
-
-所以 start 是新 session 边界：旧内存历史会被丢弃，不是继续追加。
-
-初始 entry 很重要，它给时间线一个起点；也解释了测试中“start 后再主动 log 一次”会调用两次 `dumpDebugLocked()`。
-
----
-
-## 9. stop先禁用，再把内存快照写入文件
-
-正常 `stopTrace()` 会：
-
-```text
-enabled=false
-→ writeTraceToFileLocked()
-→ 停止ProtoLog并选择是否落盘
-```
-
-文件并不是每生成一个 entry 就持续 append。运行期主体保存在内存 `TraceBuffer`，stop 才写文件。
-
-这带来两个结论：
-
-- system_server 崩溃或设备重启前没有落盘，内存中的最新窗口历史可能丢失；
-- stop 返回表示代码已尝试写文件，不等价于文件内容一定完整，后文会看到异常只记录日志。
-
----
-
-## 10. status只报告采集器与缓冲状态
-
-`getStatus()` 输出：
-
-```text
-Status: Enabled/Disabled
-Log level: ...
-Buffer size: ... bytes
-Buffer usage: ... bytes
-Elements in the buffer: ...
-```
-
-它可以回答：
-
-- 当前是否允许新 entry；
-- 当前 log level；
-- 分配的字节容量；
-- 已使用多少字节、保存多少个 entry。
-
-它不能证明：
-
-- 每个应该发生的采样都成功；
-- 没有老 entry 被淘汰；
-- 文件已经写盘；
-- Proto 中每个窗口字段都齐全；
-- SF trace 正同步运行。
-
----
-
-## 11. transaction模式的真实触发点
-
-WMS 封装了：
+WMS 封装：
 
 ```java
 void closeSurfaceTransaction(String where) {
@@ -280,139 +155,84 @@ void closeSurfaceTransaction(String where) {
 }
 ```
 
-默认 `mLogOnFrame=false`，所以 `logState(where)` 立即调用 `log(where)`。
+调用点包括 layout/place surfaces、WindowAnimator、app transition、wallpaper、secure/opaque 设置、remote animation finish 等。`where` 是采样调用点标签，不是经过因果分析得出的“变化原因”。
 
-常见 `where` 包括：
+App 进程独立 apply 的 Transaction、SurfaceFlinger 内部事务都不会自动调用 system_server 的 `logState()`。所以：
 
 ```text
-performLayoutAndPlaceSurfaces
-WindowAnimator
-handleAppTransitionReady
-setWallpaperOffset
-setSecure
-RemoteAnimationController#finished
+WMS trace 没有 entry
+≠ 全系统没有 SurfaceControl transaction
 ```
 
-因此这里的 transaction 更准确地说是：
+要读 SF 收到的 transaction，应结合 transaction trace；要读最终 Layer 状态，应结合 layers trace。
 
-> WMS 代码路径通过自己的 `closeSurfaceTransaction(where)` 关闭 legacy global Surface transaction 后，记录一份 WMS 状态。
+### 5.1 触发线程承担完整序列化
+
+非 frame 模式直接调用 `log(where)`，没有专用 worker。哪个线程执行 `closeSurfaceTransaction()`，哪个线程就创建 Proto、等待 WMS global lock、遍历窗口树并入队。
+
+许多路径在 DisplayThread、AnimationThread 或其他 WMS 执行线程上；不能把所有样本说成固定后台线程。ALL level 和复杂窗口树会直接增加触发路径耗时，trace 本身也可能扰动被观察系统。
 
 ---
 
-## 12. transaction模式不记录全系统所有SurfaceControl Transaction
+## 6. frame 模式把触发合并到 DisplayThread 的 Choreographer
 
-App 进程可以创建和 apply 自己的 `SurfaceControl.Transaction`，SurfaceFlinger 内部也会处理许多事务。它们不会自动调用 system_server 里的 `mWindowTracing.logState()`。
+`WindowManagerService.main()` 用 `DisplayThread.getHandler().runWithScissors()` 构造 WMS；构造器调用当前线程的 `Choreographer.getInstance()` 并交给 WindowTracing。因此 frame callback 属于 DisplayThread 的普通 Choreographer。
 
-所以不能从：
+它不是 WindowAnimator 在 AnimationThread 获取的 `Choreographer.getSfInstance()`。名字相同不代表 Looper 或 VSync source 相同。
 
-```text
-WMS trace中没有一条transaction entry
-```
-
-推出：
-
-```text
-这段时间没有任何SurfaceControl Transaction
-```
-
-若要研究 SF 接收到的事务本身，应结合 SurfaceFlinger transaction trace；若要看最终 Layer 状态，应结合 layers trace。WMS transaction 模式只代表 WMS 自己选定的采样点。
-
----
-
-## 13. transaction模式在哪个线程做序列化
-
-`logState()` 在非 frame 模式直接调用 `log()`，没有切到专用 worker。也就是说：
-
-> 哪个线程执行了 WMS `closeSurfaceTransaction(where)`，哪个线程就继续构造 Proto、获取 WMS 全局锁并把 entry 加入缓冲。
-
-许多主路径位于 WMS 的 DisplayThread 或动画相关线程，但不能把所有 entry 一概写成“固定后台 trace 线程”。
-
-序列化整棵窗口树会增加当前路径耗时；`ALL` 级别和复杂窗口树尤其明显。这也是 level 和 frequency 需要取舍的原因。
-
----
-
-## 14. frame模式不是无条件每VSync记录
-
-执行：
-
-```text
-cmd window tracing frame
-```
-
-只是设置 `mLogOnFrame=true`。之后必须先有某个 WMS `closeSurfaceTransaction(where)` 调用 `logState()`，才会执行 `schedule()`：
-
-```java
-if (mScheduled) return;
-mScheduled = true;
-mChoreographer.postFrameCallback(mFrameCallback);
-```
-
-如果系统连续有 VSync、但没有 WMS 状态触发点，WindowTracing 不会凭空为每个 VSync 写重复快照。
-
----
-
-## 15. frame模式怎样合并多次变化
+### 6.1 合并状态机
 
 ```mermaid
 sequenceDiagram
-    participant W1 as "WMS变化A"
-    participant W2 as "WMS变化B/C"
-    participant WT as "WindowTracing"
-    participant CH as "DisplayThread Choreographer"
-    participant TB as "TraceBuffer"
-
-    W1->>WT: "logState(whereA)"
-    WT->>CH: "postFrameCallback"
-    WT->>WT: "mScheduled=true"
-    W2->>WT: "logState(whereB)"
-    WT-->>W2: "已scheduled，直接返回"
-    W2->>WT: "logState(whereC)"
-    WT-->>W2: "仍直接返回"
-    CH->>WT: "frame callback"
-    WT->>TB: "log(onFrame)：只保存回调时状态"
-    WT->>WT: "mScheduled=false"
+    participant A as "WMS close A"
+    participant B as "WMS close B/C"
+    participant T as "WindowTracing"
+    participant C as "DisplayThread Choreographer"
+    A->>T: "logState(whereA)"
+    T->>T: "mScheduled=true"
+    T->>C: "postFrameCallback"
+    B->>T: "logState(whereB/C)"
+    T-->>B: "已预约，返回"
+    C->>T: "log(onFrame)"
+    T->>T: "序列化回调时状态"
+    T->>T: "mScheduled=false"
 ```
 
-这减少重复快照与性能开销，却会主动丢掉 A→B→C 的中间状态。如果错误只存在于同一帧内很短的一段，frame 模式可能看不见。
+whereA/B/C 都不会保留，最终 entry 统一叫 `onFrame`。这能降低重复序列化，却可能漏掉只存在于同一帧内的错误中间态。
 
 ---
 
-## 16. frame回调运行在DisplayThread的普通Choreographer
+## 7. mScheduled 不是严格的线程安全 session 屏障
 
-WMS 自身通过：
+`mScheduled` 是普通 boolean，不是 volatile，也没有专用锁。`logState()` 可由不同 WMS 路径调用，callback 又在 DisplayThread 复位；WindowTracing 自身没有声明完整的 happens-before 前提。
+
+### 7.1 异常可让当前 frame 采集停住
+
+`log()` 只有在序列化和 `mBuffer.add()` 全部成功后才执行：
 
 ```java
-DisplayThread.getHandler().runWithScissors(
-        () -> new WindowManagerService(...));
+mScheduled = false;
 ```
 
-在 DisplayThread 构造；构造器调用 `Choreographer.getInstance()`，再交给 `WindowTracing`。
+复位不在 finally。若单条过大或序列化抛异常，catch 只 Log.wtf，`mScheduled` 保持 true；后续 schedule 会一直返回。当前 run 可能不再产生 frame entry，直到一次成功的直接 log/start 等路径把它复位。
 
-所以本章 frame trace 回调绑定的是 DisplayThread 的普通 Choreographer。不要与 `WindowAnimator` 在 AnimationThread 中取得的 `Choreographer.getSfInstance()` 混为一谈。
+### 7.2 切模式不会取消旧 callback
 
-名字都叫 Choreographer，但 looper、VSync source 和用途不同。
+frame/transaction 子命令会切 boolean 并清 buffer，却不 `removeFrameCallback()`，也不重置 scheduled。旧 onFrame 仍可能越过模式边界写进新空 buffer。
+
+stop 同样不取消 callback；callback 直接调用 `log("onFrame")`，不重新检查 enabled。于是 stop 写盘后仍可能出现一条只留在内存的晚到 entry。
+
+快速 stop→start 更复杂：start reset 并直接 log trace.enable，旧 callback 仍在 Choreographer 队列；新触发又可能预约另一 callback，旧新两次 onFrame 有机会进入同一新 session。
+
+### 7.3 transaction 也有 enabled 检查竞态
+
+线程 A 可先从 volatile 快速开关读到 true，线程 B 随后 stop 并写盘，A 再获得 global lock、完成序列化并 add。晚到 entry 是否进已写文件取决于它与 TraceBuffer 文件锁的先后，不存在严格 flush barrier。
 
 ---
 
-## 17. 切换frequency会立即清空缓冲
+## 8. 一个 entry 的时间戳早于真正的锁内状态读取
 
-`frame` 和 `transaction` 子命令在修改模式后都会调用：
-
-```java
-mBuffer.resetBuffer();
-```
-
-因此切换模式不是保留前半段后继续采集，而是丢弃已收集的 entry。
-
-正确使用顺序应是先选 frequency，再 start 并复现问题。若在故障后才切换 frame/transaction，先前现场会从内存中消失。
-
-还有一个更隐蔽的边界：切换模式不会调用 `removeFrameCallback()`。如果 frame 模式已经预约了回调，随后切到 transaction，旧回调仍可能到达并写一条 `where="onFrame"`。所以模式切换后的第一条样本不一定完全属于新模式。
-
----
-
-## 18. 每个entry的三个顶层字段
-
-`WindowManagerTraceProto` 只有三个顶层字段：
+顶层 Proto 只有：
 
 ```proto
 optional fixed64 elapsed_realtime_nanos = 1;
@@ -420,684 +240,428 @@ optional string where = 2;
 optional WindowManagerServiceDumpProto window_manager_service = 3;
 ```
 
-可以理解为：
-
-```text
-when  = elapsedRealtimeNanos
-why-ish = where
-what  = window_manager_service快照
-```
-
-这里故意把 `where` 说成 “why-ish”：它只是采样调用点标签，并不是经过因果分析后的“状态为什么变化”。frame 模式中统一写 `onFrame`，原始的 whereA/whereB 都被合并丢失。
-
----
-
-## 19. 时间戳写在获取WMS全局锁之前
-
-`log()` 的顺序是：
+`log()` 先写 `elapsedRealtimeNanos()` 和 where，随后才：
 
 ```java
-os.write(ELAPSED_REALTIME_NANOS,
-        SystemClock.elapsedRealtimeNanos());
-os.write(WHERE, where);
-
 synchronized (mGlobalLock) {
     mService.dumpDebugLocked(os, mLogLevel);
 }
 ```
 
-若等待 `mGlobalLock` 很久，entry 时间戳更接近“开始尝试记录”的时间，而真正窗口状态是稍后拿到锁后才读取的。
+WMS global lock 使同一 entry 中 Root、Display、Task、Activity、Window、焦点和转场集合形成一份 Java 对象锁内视图；它不提供与 App、SF、InputDispatcher、HWC 的跨进程原子性。
 
-因此时间戳不是状态树所有字段的硬件级原子采样时刻。正常负载下偏差通常小；锁竞争严重时，这个边界本身就可能影响时间线判断。
-
----
-
-## 20. WMS全局锁提供了什么一致性
-
-`dumpDebugLocked()` 在 `mGlobalLock` 内遍历 WMS 对象树，所以同一个 entry 中的 Root、Display、Task、Activity、Window、焦点和转场集合通常来自一个受 WMS 主锁保护的状态。
-
-它提供的是：
-
-> WMS Java 对象状态的锁内一致视图。
-
-它不提供：
-
-- 与 App UI 线程状态的跨进程原子性；
-- 与 SurfaceFlinger drawing state 的跨进程原子性；
-- 与 InputDispatcher 当前窗口快照的原子性；
-- 与 HWC present 或面板 scanout 的原子性。
+锁竞争严重时，entry timestamp 接近“开始记录”的时刻，窗口树却来自稍后拿到锁的时刻。跨 trace 对齐时要把这段等待看作采样误差，而不是认为时间戳精确标记整棵树同时存在的瞬间。
 
 ---
 
-## 21. WMS顶层快照记录什么
+## 9. 快照的骨架是 WindowContainer 树，顶层另存焦点与全局状态
 
-`WindowManagerService.dumpDebugLocked()` 写入：
-
-- `WindowManagerPolicyProto`；
-- RootWindowContainer 窗口层级树；
-- 当前 focused window；
-- focused app；
-- 当前 IME window；
-- display 是否 frozen；
-- 默认 display rotation；
-- last orientation；
-- top focused display id。
-
-这些字段非常适合回答“WMS 想把输入/窗口/方向交给谁”，但不直接说明该窗口的 buffer 是否已经被 SF latch。
-
----
-
-## 22. WindowContainer树是理解trace的骨架
-
-Android 11 已通过统一 `WindowContainerProto.children` 表示混合类型层级：
-
-```mermaid
-flowchart TD
-    R["RootWindowContainer"] --> D["DisplayContent"]
-    D --> DA["DisplayArea"]
-    DA --> T["Task / ActivityStack"]
-    T --> A["ActivityRecord"]
-    A --> WT["WindowToken"]
-    WT --> W["WindowState"]
-    W --> CW["Child Window"]
-```
-
-每个 `WindowContainerChildProto` 一次只选择一种具体类型。Winscope 的 `transform_wm.js` 根据 `displayContent/displayArea/task/activity/windowToken/window` 恢复树。
-
-这比只搜窗口名更有价值，因为同名窗口可能处于不同用户、Task、Display 或 starting-window 代际。
-
----
-
-## 23. Proto中的children顺序与UI展示顺序
-
-`WindowContainer.dumpDebug()` 按 `getChildAt(0)...getChildAt(n-1)` 写 children。r48 Winscope 转换代码常对 children 调用 `.reverse()` 后展示。
-
-这说明工具 UI 为了按更直观的 top-to-bottom 方向展示，改变了原始数组阅读方向。
-
-直接用 `protoc` 或脚本解析原始 Proto 时，不应假设第一项就是最上层窗口；先核对容器内部排序和查看器是否 reverse。
-
----
-
-## 24. DisplayContent可诊断什么
-
-每个 DisplayContent 可包含：
-
-- display id、density 与 DisplayInfo；
-- 当前 rotation 与 DisplayFrames；
-- screen rotation animation；
-- focused app；
-- AppTransition 状态；
-- opening/closing/changing apps；
-- overlay windows；
-- focused root task id 与 resumed activity；
-- display ready；
-- 完整子容器树。
-
-转场卡住时，应把 `app_transition_state`、opening/closing/changing 集合、Activity 可见状态和 Window draw state 放在相邻 entry 中一起看。
-
----
-
-## 25. ActivityRecord可见性不是一个布尔值
-
-Activity Proto 同时保留：
+`WindowManagerService.dumpDebugLocked()` 写入的顶层内容很克制：
 
 ```text
-visible
-visible_requested
-client_visible
-reported_visible
-reported_drawn
-all_drawn / last_all_drawn
-num_interesting_windows / num_drawn_windows
-app_stopped
-state
-is_animating
-starting_window / starting_displayed / starting_moved
+WindowManagerServiceDumpProto
+├── policy
+├── root_window_container
+│   └── Display / Task / ActivityRecord / WindowToken / WindowState ...
+├── focused_window
+├── focused_app
+├── input_method_window
+├── display_frozen
+├── rotation
+├── last_orientation
+└── focused_display_id
 ```
 
-这些字段处于不同责任层：
+真正的大头是 `mRoot.dumpDebug()` 递归得到的 WindowContainer 树。基类公共字段包括 configuration、orientation、visible、surface animator 和 children；子类再补自己的 Proto 字段。
 
-- `visible_requested` 更接近系统希望 Activity 可见；
-- `client_visible` 涉及通知客户端可见；
-- `reported_*` 来自窗口绘制/可见性汇总；
-- `all_drawn` 是一组相关窗口的完成条件；
-- `visible` 是当前 WMS 综合状态。
+阅读时应把信息分成四层：
 
-“Activity 已 resumed”不等于“其所有窗口已画好”，更不等于“SF 已 present”。
+1. **组织关系**：Display、Task、Activity、Token、Window 的父子层级；
+2. **意图状态**：requested visibility、configuration、orientation、focus；
+3. **窗口实现状态**：frame、insets、surface position、has surface、animator；
+4. **派生判断**：ready for display、on screen、visible 等由 WMS 条件组合出的结果。
 
----
+同名的 `visible` 也要看所属类型。WindowContainer 的可见性、ActivityRecord 的 `visible_requested/client_visible/reported_drawn`、WindowState 的 `is_on_screen/is_visible` 并不是一个状态机里的同一 bit。
 
-## 26. WindowState能提供哪些直接证据
+### 9.1 children 的写入顺序与界面显示顺序可能相反
 
-Window Proto 包括：
+`WindowContainer.dumpDebug()` 按 `getChildAt(0)` 到 `getChildAt(n-1)` 写 children。r48 的 `transform_wm.js` 在多个入口对 children 调用 `.reverse()` 再构造查看树。
 
-- identifier：identity hash、user id、窗口 title；
-- display id 与 root task id；
-- LayoutParams attributes；
-- requested width/height；
-- WindowFrames 和 surface insets/position；
-- `has_surface`；
-- `is_ready_for_display`；
-- `is_on_screen`、`is_visible`；
-- view/system UI visibility；
-- animator draw state 与 surface shown/layer；
-- animatingExit、removeOnExit、destroying、removed；
-- seamless rotation pending/finished frame。
+所以 UI 中的上到下顺序不能只凭 Proto 数组下标猜测；应同时核对：
 
-它能证明 WMS 的窗口对象和 Surface 生命周期判断，却不能直接证明对应 GraphicBuffer 内容正确。
+- 生产端容器约定的 bottom-to-top / top-to-bottom；
+- transform 是否对该数组反转；
+- 当前看到的是专用字段（如 tasks/windows）还是通用 children。
 
----
+还有一个容易忽略的编码细节：父容器先 `start(CHILDREN)`，再调用 child 的 `dumpDebug()`。CRITICAL 下不可见 child 会立刻 return，因此外层仍可能留下一个没有具体 child payload 的包装。不能笼统地说“CRITICAL Proto 里不可见节点连占位都绝不会有”。
 
-## 27. 窗口几何要同时看frames与surface position
+### 9.2 焦点必须做三点核对
 
-窗口错位不能只看一个 `frame`。至少要核对：
+窗口 trace 顶层分别保存 focused window、focused app 与 focused display id。它们回答的是 WMS 视角，而且可以在切换过程中暂时不同步：
 
 ```text
-parent/content/display/decor/visible frame
-content/visible/stable/surface insets
-surface position
-requested width/height
-DisplayInfo logical size与rotation
-父WindowContainer bounds/configuration
+focused_display_id
+→ 该 Display 的 mCurrentFocus
+→ topFocusedDisplayContent.mFocusedApp
 ```
 
-WMS 负责计算策略布局和 Surface 位置；SF 还会叠加 Layer transform、crop、buffer transform、父层矩阵。WMS trace 中矩形正确，只能把疑点向 WMS 后段/SF 移动，不能证明最终像素位置正确。
+如果问题是“按键或触摸为什么还去了旧窗口”，还要把 InputDispatcher 的 focused application / focused window 与 input window snapshot 加进来。WMS 顶层焦点本身不能证明 native input dispatcher 已消费更新。
+
+### 9.3 drawn 是窗口生命周期证据，不等于已显示到屏幕
+
+WindowState、WindowStateAnimator、ActivityRecord 中能看到 draw state、has surface、ready/on-screen/visible、all drawn 等线索。它们适合判断 WMS 是否仍在等待首帧、转场参与方或 relayout。
+
+但 WMS 的 HAS_DRAWN 只说明窗口绘制生命周期推进到相应阶段，不证明：
+
+- BufferQueue 当前确有可显示 buffer；
+- SF latch 了该帧；
+- Layer 未被父节点、crop、alpha 或 occlusion 隐藏；
+- HWC 已 present 到物理屏幕。
+
+这就是为什么“WMS 显示为 visible/drawn，用户仍看不到”必须继续对照 SF layers、frame timeline 或截图链路。
 
 ---
 
-## 28. draw state是连接WMS与App绘制的重要桥
+## 10. level、frequency、size 都会清空历史
 
-`WindowStateAnimatorProto.DrawState` 包括：
+r48 的三个预设为：
+
+| level | 默认容量 | 主要语义 |
+|---|---:|---|
+| CRITICAL | 512 KiB | 主要保留可见容器，字段最少 |
+| TRIM | 2 MiB | 保留全部容器，字段裁剪；构造默认值 |
+| ALL | 4 MiB | 保留最完整字段，单条也最大 |
+
+level 同时改变序列化详细度和容量。它不是只改变 Winscope 展示过滤器；旧 entry 也不会被“升级”为新 level。命令执行完会 reset buffer，因此：
 
 ```text
-NO_SURFACE
-DRAW_PENDING
-COMMIT_DRAW_PENDING
-READY_TO_SHOW
-HAS_DRAWN
+tracing level all
+≠ 从此以后在旧历史后追加 ALL entry
+= 先换 level/容量，再丢弃已有历史
 ```
 
-简化理解：
+`frame`、`transaction`、`level`、`size` 四类命令都会清空当前缓冲。若要保留故障前历史，应先 stop/复制结果，再改配置。
 
-```text
-无Surface
-→ 已要求客户端绘制
-→ 客户端报告完成，等待提交/布局处理
-→ 满足显示准备
-→ 已进入绘制完成状态
-```
+### 10.1 保存时长由 entry 大小决定，不是固定秒数
 
-但 `HAS_DRAWN` 仍是 WMS 生命周期状态，不是当前 buffer 的 present fence。把它写成“用户已经看见”是不准确的。
+TraceBuffer 按 raw Proto 字节计费。窗口树规模、level、变化频率都影响单条大小，因此同样 2 MiB：
 
----
+- 小窗口树可能保存较长时间；
+- ALL + 多窗口可能很快淘汰旧 entry；
+- frame 模式通常减少条目数，但不承诺固定采样率；
+- transaction 模式在高频动画期可能极快滚动。
 
-## 29. 焦点要看window、app和display三层
+status 中的 element 数与 used bytes 只能描述当前保留量，不能反推出遗漏条数。实现没有累计 dropped/evicted counter。
 
-多显示、多窗口和转场时，至少有：
+### 10.2 size 参数没有稳健的边界验证
 
-- WMS 顶层 `focused_window`；
-- WMS 顶层 `focused_app`；
-- `focused_display_id`；
-- 每个 DisplayContent 的 `focused_app`；
-- resumed activity；
-- InputDispatcher 自己的 focused window/application。
-
-焦点错误诊断不能只看“Activity resumed”。正确问题是：
-
-```text
-哪个display被聚焦
-→ WMS选择了哪个app token
-→ 当前WindowState是谁
-→ InputDispatcher何时收到对应窗口快照
-```
-
----
-
-## 30. ALL、TRIM、CRITICAL的语义
-
-`WindowTraceLogLevel` 定义：
-
-| level | 树范围 | 配置细节 | 默认容量 |
-|---|---|---|---:|
-| ALL | 所有元素 | 最大信息量，含完整/合并配置 | 4 MiB |
-| TRIM | 所有元素 | 减少配置等冗长信息 | 2 MiB |
-| CRITICAL | 主要保留可见元素 | 最低开销 | 512 KiB |
-
-默认是 TRIM。
-
-“TRIM”不是只记录可见窗口；它仍遍历所有元素，只省掉部分重信息。“CRITICAL”才会在 Root、Display、Task/Activity、Token、WindowContainer 等多层按 `isVisible()` 提前裁剪。
-
----
-
-## 31. level不是过滤已有entry，而是改变后续序列化
-
-执行：
-
-```text
-cmd window tracing level all|trim|critical
-```
-
-会同时：
-
-1. 改变 `mLogLevel`；
-2. 把 buffer 容量设成对应默认值；
-3. 清空当前 buffer。
-
-因此无法对已有 TRIM entry 事后“升级成 ALL”，也不能用切换 level 的方式保留同一现场的前后两种粒度。
-
-若问题涉及不可见但错误残留的窗口，CRITICAL 可能正好把关键对象过滤掉，应在复现前选 TRIM 或 ALL。
-
----
-
-## 32. size按KB设置，也会清空历史
-
-`size` 子命令执行：
+`size N` 直接做：
 
 ```java
-setBufferCapacity(
-        Integer.parseInt(arg) * 1024, pw);
-mBuffer.resetBuffer();
+Integer.parseInt(arg) * 1024
 ```
 
-这里按二进制 `1024` 换算，但没有对负数、零或乘法溢出做显式校验。异常或非正容量可能使后续任何非空 entry 被判为“对象大于 buffer”，进而记录失败。
+源码没有显式拒绝零、负数或乘法溢出。坏值可能得到非正容量；之后普通 entry 会触发“object too large”异常。静态分析时不要把 shell help 中的“maximum log size”误当成已经完成范围校验的契约。
 
-正常使用时应给合理正整数，并在复现前设置；不要把 `size` 当成不破坏现场的在线扩容命令。
-
----
-
-## 33. TraceBuffer按字节容量，不按固定条数
-
-每次 `add(proto)` 先读取 entry 的 raw byte size。若剩余空间不足，就从队头不断 `poll()` 最老 entry，直到新 entry 放得下。
-
-```mermaid
-flowchart LR
-    O1["旧entry 1"] --> O2["旧entry 2"] --> N1["较新entry"]
-    X["新entry较大"] --> C{"剩余字节够吗?"}
-    C -- "否" --> D["逐个丢弃队头旧entry"]
-    D --> C
-    C -- "是" --> A["追加新entry"]
-```
-
-所以“2 MiB 大约能保存多少帧”没有固定答案。窗口树越复杂、level 越详细，单条越大，保留时长越短。
+未知 level 字符串也不会报错，而是静默落到 TRIM。自动化脚本应在设置后读 status，不能只看命令返回码。
 
 ---
 
-## 34. 单个entry超过总容量会怎样
+## 11. TraceBuffer 是按字节淘汰的 FIFO，不是固定槽位环形数组
 
-`TraceBuffer.add()` 在加锁前检查：
-
-```java
-if (protoLength > mBufferCapacity) {
-    throw new IllegalStateException(...);
-}
-```
-
-`WindowTracing.log()` 用大范围 `catch (Exception)` 捕获并 `Log.wtf`，所以 system_server 通常不会因此直接崩溃，但这一条不会进入 buffer。
-
-若复杂窗口树在 CRITICAL 或自定义小容量下仍大于总容量，trace 可能持续缺条；`status` 只显示 buffer 内现有元素，不会累计“丢了多少条”的计数。
-
----
-
-## 35. frame模式发生异常后可能永久不再预约
-
-frame 模式先把 `mScheduled=true`，只有 `log()` 正常执行到 `mBuffer.add(os)` 后才设置：
-
-```java
-mScheduled = false;
-```
-
-这个复位不在 `finally` 中。若序列化或 `add()` 抛异常，catch 只记日志，`mScheduled` 仍为 true。后续 `schedule()` 会一直认为已经预约，从而不再 post 新回调。
-
-transaction 模式下下一触发点还能再次直接 `log()`；frame 模式则可能在一次异常后静默停止增长。这是复读源码才能发现的重要 r48 边界。
-
----
-
-## 36. mScheduled本身没有同步保护
-
-`mScheduled` 是普通 boolean，不是 volatile，也没有专用锁。`logState()` 可能由不同 WMS 代码线程触发，而 frame callback 又在 DisplayThread 复位它。
-
-源码通常依赖 WMS 操作和 transaction 关闭点的线程/全局锁约束来减少竞争，但 `WindowTracing` 类自身没有完整声明这些并发前提。
-
-因此不能把 frame 合并器描述成严格的线程安全状态机；极端并发下可能重复预约或可见性延迟。诊断工具自身也有工程边界。
-
----
-
-## 37. stop并没有真正等待所有in-flight log完成
-
-输出文字写着：
+内部数据结构是 `ArrayDeque`：
 
 ```text
-Waiting for traces to flush.
+add(newEntry)
+→ 计算 newEntry raw size
+→ 若单条 > capacity，直接抛 IllegalStateException
+→ 持 mBufferLock
+→ 从队头 poll，直到空间足够
+→ 从队尾 add
 ```
 
-但 `log()` 不持有 `mEnabledLock`。一种可能竞态是：
+因此它具有“保留最新、淘汰最旧”的环形效果，但槽位数并不固定。文章或工具把它简称 ring buffer 时，应记住真正的上限单位是字节。
 
-```text
-线程A先看到mEnabledLockFree=true
-→ 线程B执行stop、写文件
-→ 线程A稍后才把entry加入内存buffer
-```
+### 11.1 单条超限不是截断保存
 
-这样晚到 entry 可能不在刚写出的文件中。stop 内部将 `mEnabled=false` 后立即检查 `if (mEnabled)`，在同一锁内该条件也无法检测另一个 start 介入。
+如果一条 Proto 比整个 capacity 还大，TraceBuffer 不裁字段、不拆分，也不先丢光队列后保存；它在进入 buffer lock 前直接抛异常。WindowTracing 捕获异常并 Log.wtf，所以调用者通常看不到 shell 失败。
 
-frame callback 还有更直接的边界：
+frame 模式下这还会触发第 7 节的 scheduled 卡住问题，因为 `mScheduled=false` 没有执行。
 
-```java
-private final Choreographer.FrameCallback mFrameCallback =
-        frameTimeNanos -> log("onFrame");
-```
+### 11.2 写盘与 add 由同一个 buffer lock 串行化
 
-它直接调用 `log()`，不会再次执行 `isEnabled()` 检查；stop 也没有取消已预约 callback。因此 stop 写盘之后，旧 callback 仍可能向内存 buffer 追加一条晚到的 `onFrame`，只是这条通常已经赶不上刚写出的文件。
+`writeTraceToFile()` 持有 `mBufferLock` 遍历整个队列。已经进入 add 临界区的 entry 会先完成；在写盘期间到来的 add 要等文件写完。
 
-如果紧接着快速 start，新 session 会 reset buffer 并直接 `log("trace.enable")`；该 `log()` 又会把 `mScheduled=false`，但旧 callback 仍在 Choreographer 队列中。此时新状态变化可以再 post 一个 callback，最终出现旧、新两个 `onFrame` 回调进入同一新 session 的可能。
+但这只是 TraceBuffer 层的互斥，不等于 session flush：某个 log 线程可能还在 buffer lock 之前计算/序列化，stop 也没有等待它。它随后仍可能入队。
 
-所以“Waiting for traces to flush”是意图描述，不是由显式 in-flight 计数、callback取消或 condition 构成的严格 session 屏障。
+### 11.3 配置与状态读取并非全部同步
+
+`setCapacity()`、`getAvailableSpace()`、`size()` 本身没有统一持锁；add 的单条容量判断也在锁外。WindowTracing 常见 shell 路径会在 setCapacity 后 reset，但 TraceBuffer 类本身并未提供“改容量与所有 add 原子互斥”的保证。
+
+这不是说每次一定损坏，而是说明不能从一个瞬时 status 或 setCapacity 返回推导出严格的并发线性化顺序。
 
 ---
 
-## 38. writeTraceToFile的可靠性边界
+## 12. 文件有 magic header，但写盘不是事务提交
 
-`TraceBuffer.writeTraceToFile()` 在 buffer lock 下：
+默认目标为：
+
+```text
+/data/misc/wmtrace/wm_trace.pb
+```
+
+文件外层 `WindowManagerTraceFileProto` 先写 fixed64 magic，再顺序写各 entry。小端字节可识别为：
+
+```text
+09 57 49 4e 54 52 41 43 45
+   W  I  N  T  R  A  C  E
+```
+
+开头的 `09` 是 fixed64 字段 tag，后八字节对应 WINTRACE。它能帮助 decoder 判断文件类型，却不是完整性校验或 commit marker。
+
+### 12.1 写文件的失败窗口
+
+TraceBuffer 的实现是：
 
 1. 删除旧文件；
-2. 新建 FileOutputStream；
-3. 把文件设为所有用户可读；
-4. 写 magic proto 和所有 entry bytes；
-5. flush 并关闭。
+2. 直接创建 `FileOutputStream`；
+3. 调用 `setReadable(true, false)`；
+4. 写 header 与全部 entry；
+5. flush 并 close。
 
-它不是 AtomicFile 流程。若写入中断，旧文件已经删除，可能只剩不完整新文件。
+这里没有 AtomicFile 临时文件替换，也没有显式 fsync；delete 和 setReadable 的 boolean 返回也被忽略。进程崩溃、存储错误或权限异常可能留下缺失/半写文件。
 
-更重要的是 `WindowTracing.writeTraceToFileLocked()` 自己捕获 IOException，只写 log；调用它的 stop 随后仍打印 `Trace written to ...`。因此 shell 成功文案不能替代文件大小、magic 和可解析性检查。
+更隐蔽的是 `writeTraceToFileLocked()` 捕获 IOException 后只记 Log.e；stop 随后仍打印 `Trace written to ...`。所以这句 shell 文案不是落盘成功证明。应继续检查文件存在、大小、magic，并让 decoder 实际解析。
 
----
+`setReadable(..., ownerOnly=false)` 只尝试修改文件 mode，不会自动绕过父目录执行权限、SELinux 或 adb 身份限制。r48 的 winscope proxy 使用 `su root` 获取文件，不能据此假定普通 `adb pull` 在所有 build 上都能读。
 
-## 39. 文件可读不等于普通App可以访问
+### 12.2 bugreport 会制造一次采集断点
 
-代码调用：
-
-```java
-traceFile.setReadable(true, false /* ownerOnly */);
-```
-
-这尝试把 Unix 读权限开放给所有用户，但目录 `/data/misc/wmtrace`、SELinux 和 Android 权限边界仍会限制访问。
-
-r48 自带 Winscope proxy 使用 `su root` 启停和读取 trace。不能因为文件 mode 可读，就推断任意第三方 App 能打开它。
-
-同时 Proto 可能含窗口 title、组件名、用户 id 和布局状态，采集与分享时仍应按敏感诊断数据处理。
-
----
-
-## 40. bugreport采集会短暂停止、异步写盘再重启
-
-WMS 的 critical proto dump 路径发现 tracing 已启用时，会：
+WMS 的 bugreport critical section 在 trace 已开启时会：
 
 ```text
-stopTrace(writeToFile=false)
-→ BackgroundThread异步writeTraceToFile()
-→ startTrace()
+stop(false)
+→ 把 writeTraceToFile 投递到 BackgroundThread
+→ start()
 ```
 
-这样避免 bugreport 的文本和 proto 阶段重复保存同一 trace，但它不是无缝切片：停止到重新 start 之间有空窗；重新 start 又会 reset buffer 并写新的 `trace.enable`。
-
-所以 bugreport 本身可能改变 trace session 边界，分析时间线结尾时要留意这一点。
+重新 start 会 reset 内存并写 trace.enable。写盘任务何时得到调度没有严格上界，所以连续时间线可能出现空档；同时旧 session 的文件与重启后的新内存不是一个原子的滚动切换。
 
 ---
 
-## 41. 静态window --proto与trace entry复用同一主体schema
+## 13. Winscope 负责解码与近邻对齐，不创造同步快照
 
-`dumpsys window --proto` 也调用：
-
-```java
-dumpDebugLocked(proto, WindowTraceLogLevel.ALL);
-```
-
-它直接输出一份 `WindowManagerServiceDumpProto`，而 trace 每个 entry 在时间戳和 where 外层中嵌入同样的 WMS dump Proto。
-
-区别是：
+加载 `wm_trace.pb` 后，r48 Winscope 大致执行：
 
 ```text
-window dump = 一次ALL快照
-window trace = 多次可配置level快照 + 时间戳 + where + 环形缓冲
+识别 magic / Proto 类型
+→ decode entry
+→ transform_wm 重建查看树和矩形
+→ 以 elapsedRealtimeNanos 生成 timeline
+→ 用户选中一条轨道的时刻 t
+→ 其他轨道选择最后一个 timestamp <= t 的样本
 ```
 
-Winscope 的 `decode.js` 也分别把它们识别为 `window_dump` 和 `window_trace`。
+WMS trace 与 SF layers trace 都用 elapsed realtime nanos，因而同一次开机里可以按单调时钟近似对齐。但“最后一条不晚于 t”只是查看策略，不代表两个生产者在同一锁、同一 VSync 或同一事务边界采样。
 
----
+### 13.1 r48 的二分函数有一个开头边界行为
 
-## 42. Winscope不是采集器本身
+`findLastMatchingSorted()` 默认从 index 0 开始。如果另一条轨道连第一条都晚于 t，最终仍可能返回 index 0，而不是“无匹配”。界面于是可能显示一个未来样本。
 
-r48 Winscope 大致分成三层：
+因此分析 trace 开头时必须手工比较 timestamp：
 
 ```text
-设备生产Proto文件
-→ adb proxy负责启停、root读取和传输
-→ 浏览器端decode/transform/UI负责解析和展示
+other[0].timestamp > selectedTimestamp
+→ UI 中 other[0] 不是过去最近状态
+→ 它是未来第一条，仅由边界实现选中
 ```
 
-浏览器页面不会神奇补回设备端未采样的中间状态。它把 Proto 字段转成树、矩形、chips 和时间线，仍受生产端 frequency、level、buffer 淘汰与错误路径限制。
+### 13.2 静态 dumpsys Proto 与 trace entry 不同
 
-分析时应先问“数据如何产生”，再问“UI 怎样显示”。
+`dumpsys window --proto` 复用 `WindowManagerServiceDumpProto`，适合拿一次当前状态；trace entry 则在外层附带 elapsed realtime timestamp 和 where，并有多条历史。
+
+静态 dump 没有这两个 trace entry 字段，不能伪装成时间线，也不能凭文件生成时刻推回内部快照的精确触发点。
+
+### 13.3 transform 后的树不等于原始 wire layout
+
+Winscope 会缩短 component 名称、生成展示节点、隐藏部分不可见矩形，并反转某些 children 数组。定位解析器问题时，应同时保存：
+
+- 原始 pb；
+- decoder 得到的原始对象；
+- transform 后 UI 树；
+- 对应版本的 `.proto` 与 `transform_wm.js`。
+
+只截图 UI 会丢掉“字段未采集、decoder 默认值、transform 重排”之间的区别。
 
 ---
 
-## 43. Winscope怎样对齐不同trace
+## 14. WMS 与 SF 要靠证据链关联，不能靠一个通用 id join
 
-WMS trace 和 SF layers trace 都记录 `elapsed_realtime_nanos`。r48 Winscope 选中一个文件的时间点 `t` 时，对其他时间线使用：
+WMS WindowState identifier 常含 title 与进程内 hash；SF Layer trace 使用 layer id、name、parent、layer stack 等字段。r48 没有一个覆盖所有窗口、SurfaceControl 与 Layer 生命周期的稳定共享主键。
 
-```text
-找到 timestamp <= t 的最后一个样本
-```
+常用关联证据从强到弱可组织为：
 
-而不是要求两边 timestamp 完全相等。
-
-这是一种“最近的历史状态”对齐：
-
-- 非常适合跨 trace 大致观察因果顺序；
-- 不表示两份状态在同一个锁或同一个 VSync 原子采集；
-- 采样稀疏的一侧可能在 UI 上长时间沿用旧 entry。
-
----
-
-## 44. WMS对象与SF Layer没有统一稳定ID
-
-WMS `IdentifierProto.hash_code` 使用 Java `System.identityHashCode()`；SF Layer 有自己的 layer id/sequence。两者不是可直接 join 的同一 ID。
-
-跨层匹配通常依赖：
-
-```text
-窗口/Layer名称
-父子树关系
-display与layerStack
-窗口frame与Layer bounds/transform
-创建/销毁时间顺序
-starting window、thumbnail、leash等角色
-```
-
-名称可能重复，动画 leash 和 starting surface 还会改变树形。因此匹配结论应写成“由多项证据推断”，不要伪装成主键关联。
-
----
-
-## 45. WMS trace与SF trace的责任分工
-
-| 问题 | WMS trace更擅长 | SF trace更擅长 |
+| 证据 | 用途 | 陷阱 |
 |---|---|---|
-| 窗口为什么存在 | token/task/activity/策略状态 | 只看到对应Layer结果 |
-| 谁应获得焦点 | focused app/window/display | 输入Layer信息有限，非WMS决策源 |
-| 窗口目标几何 | frames、insets、configuration | 最终Layer bounds/crop/transform |
-| 是否已请求可见 | Activity/Window visible状态 | drawing Layer是否可见、alpha/遮挡 |
-| 是否有Surface | `has_surface`、draw state | 是否有active buffer及Layer类型 |
-| 最终如何合成 | 无HWC最终类型 | visible region、CLIENT/DEVICE等 |
-| 是否已经present | 不能直接证明 | 仍需present fence/frame timeline证据 |
+| 时间范围 | 缩小同一故障阶段 | 采样不原子、WMS timestamp 早于拿锁 |
+| title / layer name | 找候选窗口与 Layer | 名称可重复、可截断、可含包装层 |
+| 父子树 | 核对 Task/Window 与 Layer hierarchy | 两棵树职责不同，不是一一同构 |
+| display / layerStack | 排除错误显示目标 | display 配置切换期也会变化 |
+| frame、crop、transform | 证明几何是否一致 | 坐标空间和继承变换不同 |
+| visible/alpha/hidden/buffer | 解释“有窗口但看不到” | WMS 与 SF 字段含义不同 |
 
-两者不是替代关系，而是“窗口管理意图”与“合成执行状态”的上下游证据。
+不要把 Java `identityHashCode` 当作 SF layer id，也不要仅凭相似名称下唯一结论。
 
----
-
-## 46. 窗口错位的诊断模板
-
-按顺序检查：
-
-1. WMS DisplayInfo 的 logical width/height、rotation 是否在预期时间变化；
-2. 父 DisplayArea/Task/Activity configuration 与 bounds 是否一致；
-3. WindowFrames、surfaceInsets、surfacePosition 是否正确；
-4. pending seamless rotation 是否长期不消失；
-5. 同时刻 SF Layer 的 parent、bounds、crop、transform 是否跟随；
-6. Input 窗口 touchable region/transform 是否也收敛。
-
-判断方式：
+### 14.1 窗口闪现或消失
 
 ```text
-WMS已错 → 优先查布局、Insets、rotation/config传播
-WMS正确但SF错 → 优先查Surface transaction、leash、Layer transform
-画面正确但触摸错 → 优先查Input窗口快照与坐标变换
+1. 用 WMS entry 找 Activity/Window 何时进入树
+2. 比较 requested-visible、visible、has-surface、draw-state
+3. 用 SF layers 找对应 Layer 创建、parent、hidden、alpha、buffer
+4. 检查两条轨道真实 timestamp，而非只看 UI 游标
+5. 判断是 WMS 意图迟、Surface 迟，还是合成可见性迟
 ```
 
----
+如果错误状态只存在于同帧多个 WMS close 点之间，frame 模式可能完全看不到，需用 transaction 模式或更专门的 transaction trace。
 
-## 47. 焦点错误与转场卡住的诊断图
+### 14.2 旋转、缩放或裁剪错误
 
-```mermaid
-flowchart TD
-    A["窗口/转场异常"] --> B{"focused display/app/window一致吗?"}
-    B -- "否" --> C["查Task层级、resumed Activity、focus更新顺序"]
-    B -- "是" --> D{"Activity visible链是否收敛?"}
-    D -- "否" --> E["查visibleRequested/clientVisible/reportedVisible"]
-    D -- "是" --> F{"allDrawn与Window drawState收敛?"}
-    F -- "否" --> G["查客户端绘制、starting window、等待窗口"]
-    F -- "是" --> H{"opening/closing/changing与AppTransition仍卡住?"}
-    H -- "是" --> I["查动画、remote animation、rotation/freeze完成门"]
-    H -- "否" --> J["转到SF Layer/transaction/present证据"]
+先在 WMS 看 Display rotation、last orientation、configuration、WindowFrames、insets 和 surfacePosition；再在 SF 看 Layer transform、crop、buffer transform、parent transform 与 display/layer stack。
+
+“矩形数值不同”本身不一定是 bug：WMS frame 常在窗口/显示逻辑坐标，SF 最终几何还会叠加父节点和 buffer 变换。应先明确两边比较的坐标空间。
+
+### 14.3 焦点或输入错误
+
+```text
+WMS focused display/app/window
+→ WindowState visibility/touchability 相关状态
+→ InputDispatcher focused window/application
+→ input window handles 的 frame、flags、region、displayId
+→ 触摸目标与实际事件流
 ```
 
-trace 的价值不在某一个字段，而在于找出“哪个门从某一条 entry 起再也没有变化”。
+WMS trace 是这条链的起点，不是完整输入路由证明。下一章会把 InputWindowHandle 到 InputDispatcher 的窗口快照单独拆开。
+
+### 14.4 IME 卡住或位置错误
+
+同时观察 WMS 顶层 `input_method_window`、IME token/window 在树中的位置、target/focus 变化、frame/insets、draw/visibility；再用 SF 验证 IME Layer 的 parent、crop、transform 与 buffer。
+
+若只看到 WMS IME window 已存在，仍不能断言键盘内容已被合成。
 
 ---
 
-## 48. IME一闪、遮挡或位置异常怎样读
+## 15. 九组静态源码练习
 
-建议同时追：
+以下命令只读取 `android-11.0.0_r48` 工作树。
 
-- WMS 顶层 `input_method_window` 身份；
-- IME WindowState 是否创建、hasSurface、draw state、visible；
-- IME 所在 DisplayArea/WindowToken 的层级；
-- focused window/app/display 的切换时序；
-- WindowFrames 与 Insets 变化；
-- Activity 是否 `adjusted_for_ime` 及相关 Task 调整量；
-- SF 中 IME Layer/leash 的 Z、crop、transform 和 buffer；
-- InputMethodManagerService 的绑定/session证据。
-
-如果 frame 模式只显示“出现前”和“消失后”，应考虑中间状态被同帧合并，而不是直接得出“IME Window 从未创建”。
-
----
-
-## 49. macOS只读练习、复读审计与核心结论
-
-### 49.1 练习1：追采样入口
+### 练习 1：还原采集状态机
 
 ```bash
-rg -n "closeSurfaceTransaction|logState|mLogOnFrame|postFrameCallback" \
-  frameworks/base/services/core/java/com/android/server/wm
+sed -n '85,335p' frameworks/base/services/core/java/com/android/server/wm/WindowTracing.java
 ```
 
-列出每个 `where`，并标记它是 transaction 模式的直接标签，还是 frame 模式中会被合并成 `onFrame`。
+标出 enabled、frequency、scheduled、global lock、buffer add 和异常处理的顺序。
 
-### 49.2 练习2：比较三种level
+### 练习 2：确认 transaction 采样边界
 
-阅读：
-
-```text
-WindowTraceLogLevel.java
-ConfigurationContainer.dumpDebug()
-WindowContainer.dumpDebug()
-ActivityRecord.dumpDebug()
-WindowState.dumpDebug()
+```bash
+sed -n '1035,1058p' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+rg -n 'closeSurfaceTransaction\\(' frameworks/base/services/core/java/com/android/server/wm
 ```
 
-回答：TRIM 少了哪些配置，CRITICAL 又在哪些层过滤不可见对象。
+区分 WMS 封装的 close 点与全系统所有 SurfaceControl.Transaction。
 
-### 49.3 练习3：手推环形淘汰
+### 练习 3：区分两个 Choreographer
 
-假设容量 1000 字节，已有 entry 大小为 200、300、250，新 entry 为 500：
-
-```text
-当前使用750，剩250
-→ 丢200，剩450，仍不足
-→ 再丢300，剩750
-→ 加500
-→ 最终保留250与500，共750
+```bash
+sed -n '1095,1135p' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+sed -n '88,115p' frameworks/base/services/core/java/com/android/server/wm/WindowAnimator.java
 ```
 
-这说明一次大 entry 可能同时淘汰多条小 entry。
+确认 WindowTracing 来自 DisplayThread 当前 Looper，WindowAnimator 使用 AnimationThread 的 SF Choreographer。
 
-### 49.4 练习4：建立跨trace匹配表
+### 练习 4：证明缓冲按字节 FIFO 淘汰
 
-| WMS证据 | SF证据 | 结论边界 |
-|---|---|---|
-| Window visible + hasSurface | Layer不可见 | 可疑点在WMS→SF提交/Layer可见计算 |
-| Window frame错误 | Layer也同样错 | 更像WMS布局上游问题 |
-| WMS frame正确 | Layer transform错误 | 更像leash/transaction/SF状态问题 |
-| focused window正确 | Input目标错误 | 查Input窗口快照更新与dispatch |
+```bash
+sed -n '1,230p' frameworks/base/core/java/com/android/internal/util/TraceBuffer.java
+```
 
-### 49.5 复读审计：r48最容易误解的十六处
+记录单条超限、队头淘汰、write 锁与容量更新各自的同步边界。
 
-1. WindowManager Trace 不是字段变更日志，而是多份状态快照。
-2. user build 上 start/stop 明确拒绝。
-3. start 会清空旧 buffer，并额外记录 `trace.enable`。
-4. stop 才主要落盘，运行中 entry 只保存在内存。
-5. transaction 模式只跟随 WMS 自己的 `closeSurfaceTransaction()`，不是全系统 transaction。
-6. transaction 模式没有专用写线程，会在触发线程序列化。
-7. frame 模式要先发生 `logState()` 才预约，不是每个 VSync 无条件采样。
-8. 同一帧前的多次变化合并成一个 `onFrame`，中间态会丢。
-9. entry 时间戳写在等待 WMS 全局锁之前，锁竞争时可能早于真实状态读取。
-10. TRIM 保留所有元素但减少配置；CRITICAL 才过滤不可见树节点。
-11. frequency、level、size 的切换都会清空已有历史。
-12. buffer 按字节淘汰，不按帧数，保留时长随 entry 大小变化。
-13. frame 模式异常后 `mScheduled` 未在 finally 复位，可能停止后续预约。
-14. stop/切模式不取消已预约 frame callback，晚到 `onFrame` 可能越过模式或 session 边界。
-15. stop 没有严格等待所有 in-flight log，打印写入成功也不能证明文件完整。
-16. Winscope 用最近的 `timestamp <= t` 对齐其他 trace，不代表跨进程原子帧。
+### 练习 5：核对文件外层与 WMS 顶层字段
 
-### 49.6 本章核心结论
+```bash
+sed -n '1,90p' frameworks/base/core/proto/android/server/windowmanagertrace.proto
+sed -n '6035,6075p' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+```
 
-> Android 11 r48 的 WindowManager Trace 在 WMS 关闭自己管理的 Surface transaction 后触发：transaction 模式直接在触发线程采样，frame 模式把一次或多次触发合并到 DisplayThread 下一帧回调；二者都在 WMS 全局锁内序列化窗口状态，但不能覆盖每次字段变化或全系统每笔 transaction。
+回答 magic、entry timestamp/where 与 WMS dump 的字段分别在哪一层。
 
-> TraceBuffer 是按字节容量保存完整 entry 的先进先出缓冲，level/frequency/size 切换都会重置历史，stop 才尝试写出 `wm_trace.pb`。采集本身存在锁扰动、单条过大、frame 预约卡死、旧 callback 跨模式/session、stop 与 in-flight 竞态和非原子落盘等 r48 边界。
+### 练习 6：追踪 CRITICAL 裁剪
 
-> Winscope 通过 elapsed realtime 把 WMS 的窗口管理意图与 SF 的 Layer 合成状态放在相邻时间轴上，但没有共同稳定对象 ID，也不是同一时刻的原子快照。可靠结论来自名称、树、几何、状态迁移和时间顺序的多证据交叉。
+```bash
+sed -n '1920,1970p' frameworks/base/services/core/java/com/android/server/wm/WindowContainer.java
+sed -n '555,600p' frameworks/base/services/core/java/com/android/server/wm/ConfigurationContainer.java
+```
+
+观察不可见容器 return 的位置，以及 configuration 在不同 level 下保留到什么粒度。
+
+### 练习 7：区分 Activity 与 Window 的可见/绘制状态
+
+```bash
+rg -n 'dumpDebug.*ProtoOutputStream|VISIBLE_REQUESTED|CLIENT_VISIBLE|REPORTED_DRAWN' frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n 'dumpDebug.*ProtoOutputStream|IS_ON_SCREEN|IS_VISIBLE|HAS_SURFACE' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+```
+
+不要把不同对象的 visible 字段合并成一个真值。
+
+### 练习 8：验证 Winscope 的对齐与树反转
+
+```bash
+sed -n '45,115p' development/tools/winscope/src/App.vue
+sed -n '20,245p' development/tools/winscope/src/transform_wm.js
+```
+
+手算“另一轨第一条晚于 t”时的返回下标，并列出 `.reverse()` 出现的位置。
+
+### 练习 9：检查 bugreport 与代理取文件路径
+
+```bash
+sed -n '480,520p' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+sed -n '70,115p' development/tools/winscope/adb_proxy/winscope_proxy.py
+```
+
+说明 stop(false)、后台写盘、restart 之间为何不是连续无缝 session，并确认代理使用的权限路径。
 
 ---
 
-## 50. 自测题与下一章预告
+## 16. 本章结论与自检
 
-### 50.1 自测题
+核心模型可以压缩为：
 
-1. 为什么静态 `dumpsys window` 很难解释窗口闪现？
-2. user build 执行 `cmd window tracing start` 会怎样？
-3. start 为什么会产生一条 `trace.enable` entry？
-4. transaction 模式能否记录 App 进程所有 SurfaceControl Transaction？
-5. frame 模式没有 WMS transaction 触发时，会否每个 VSync 采样？
-6. 同一帧内 A→B→C 三次变化，frame 模式通常保留什么？
-7. entry 时间戳为何可能早于真实窗口树读取？
-8. TRIM 与 CRITICAL 的过滤范围有何区别？
-9. 为什么 2 MiB buffer 不能换算成固定帧数？
-10. frame 模式一次过大 entry 为什么可能让后续采样停住？
-11. stop 为什么不能阻止已经预约的 frame callback 晚到？
-12. stop 输出 `Trace written` 为什么不能证明文件完整？
-13. Winscope 选中 WMS 时间点时，如何选择 SF 的对应 entry？
-14. WMS Window identity hash 能否直接与 SF Layer id关联？
-15. `HAS_DRAWN` 能否证明用户已经看到像素？
-16. 诊断窗口错位时，WMS 与 SF 各应看什么？
+```text
+WindowManager Trace
+= WMS 选定触发点
++ 一份 global-lock 内的 Java 对象快照
++ timestamp/where 外层元数据
++ 按字节保留最新 entry 的内存 FIFO
++ stop/bugreport 时的非事务式文件写入
 
-### 50.2 下一章预告
+Winscope
+= 对已存在样本做 decode、transform、展示和近邻对齐
+≠ 跨 WMS/SF/Input/HWC 的原子真相
+```
 
-第 173 章继续补齐 WMS 到输入系统的诊断链：
+完成本章后，应能回答：
 
-> **Android InputWindowHandle、InputDispatcher 窗口快照与触摸路由**
+- transaction 与 frame 模式分别漏掉什么？
+- 为什么 frame callback 能跨越 stop 或模式切换？
+- entry timestamp 为什么可能早于窗口树真实读取时刻？
+- CRITICAL、TRIM、ALL 如何同时影响字段、容量与历史长度？
+- 为什么 TraceBuffer 是字节 FIFO，而不是固定条数数组？
+- 为什么 stop 打印成功仍需检查文件和 decoder？
+- Winscope 为什么可能在 trace 开头选中未来样本？
+- WMS visible/drawn 为什么不能证明 Layer 已显示？
+- WMS Window 与 SF Layer 为什么不能用一个通用 id 直接 join？
 
-重点回答：
-
-- WMS 怎样把 WindowState 转换成 InputWindowHandle？
-- SurfaceFlinger Transaction 中的 InputWindowCommands 怎样进入 InputDispatcher？
-- focus、touchable region、transform、display id 和 inputFeatures 如何共同选中目标？
-- 为什么画面位置正确但触摸仍可能错位？
-- WMS trace、SF Layer trace、InputDispatcher dump 应怎样按状态代际交叉验证？
+下一章进入 **InputWindowHandle、InputDispatcher 窗口快照与触摸路由**，把 WMS 窗口状态如何投递到 native 输入系统，以及触摸目标如何从窗口列表中选出串起来。

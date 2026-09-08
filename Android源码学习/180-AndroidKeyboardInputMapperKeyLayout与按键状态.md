@@ -1,138 +1,100 @@
 # 180 Android KeyboardInputMapper、Key Layout 与按键状态
 
-> 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
-> 学习方式：macOS 只读源码，不要求编译、不要求连接 Android 设备  
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`（`frameworks/base` 提交 `1d9b9ab5`）  
+> 学习方式：macOS 只读源码，不要求编译，不要求连接设备  
 > 前置章节：第 20、174、176、179 章
 
 ---
 
-## 1. 本章目标：把一个物理按键拆成四层含义
+## 1. 本章只追一个问题：一笔 EV_KEY 怎样成为稳定的 KeyEvent
 
-键盘上按下字母 A，看起来只是一个动作，源码里却至少经过四种编号或语义：
+当 `getevent` 已看到按键，App 却收到错误 keyCode、组合键状态粘住、长按不重复，或切换物理布局后 DOWN/UP 对不上时，需要把 Reader 的键盘状态机与 Dispatcher 的后处理拆开。读完本章，应能从一组 `MSC_SCAN/EV_KEY` 手算 Mapper 输出，并判断问题属于 KL/KCM、按下记录、meta/LED、repeat 还是下游 fallback；窗口选取、IME 消费和 InputChannel 回执沿用第 174—176 章，不在这里重讲。
+
+按下键盘上的 A，看似只有一个动作，源码却要依次回答：
+
+1. 驱动报告的是哪个 Linux `scanCode`，前面有没有一次性 HID `usageCode`；
+2. 合并后的 Key Character Map 与 Key Layout 谁先把它映射成 Android `keyCode`；
+3. 这是不是首次 DOWN，是否需要旋转、抑制虚拟键或取消触摸；
+4. DOWN 与 UP 如何配对，modifier、锁定灯和 `downTime` 如何更新；
+5. Dispatcher 是否再改键、生成 repeat/long-press，或在未处理后生成 fallback；
+6. App 最终如何从 `keyCode + metaState` 查询字符。
+
+主链可以先压成一行：
 
 ```text
-Linux scanCode(KEY_A=30)
-        + 可选 HID usage(0x00070004)
-        ↓ .kcm map / .kl map
-Android keyCode(AKEYCODE_A)
-        + metaState / policyFlags / downTime
-        ↓ InputDispatcher
-KeyEvent(action, repeatCount, flags, displayId...)
-        ↓ App按需查询KCM
-字符 'a'、'A'，或一个fallback按键
+MSC_SCAN(optional) + EV_KEY
+  → KeyboardInputMapper
+  → combined KCM usage/scan
+  → KL usage/scan
+  → KCM replacement
+  → scanCode-keyed DOWN/UP bookkeeping
+  → rotation + meta + LED + policy flags
+  → NotifyKeyArgs
+  → InputDispatcher policy/repeat/meta shortcut
+  → KeyEvent
+  → App按KCM解释字符，或在未处理后走fallback
 ```
 
-本章不把“按键编号”“字符”“组合键状态”“重复次数”混成一个概念，而是逐层追踪它们在哪生成、由谁保存、何时失效。
+最重要的边界是：Mapper 的 `mKeyDowns` 只锁住 `scanCode → keyCode`。它不会锁住 `displayId`、`policyFlags`、`metaState` 或 `downTime`；这些字段在后续 raw event 到来时仍可能使用新状态。
 
 ---
 
-## 2. 先记住十二条结论
+## 2. 先建立四套编号与三份状态
 
-1. `scanCode` 是 Linux evdev code，`keyCode` 是 Android 语义编号；二者不是同一套枚举。
-2. `MSC_SCAN` 可携带 HID usage，Mapper 只把它临时关联给紧随其后的一个 `EV_KEY`。
-3. 映射时先查当前合并后的 `.kcm`，再查 `.kl`；每张表内部都优先 usage、再查 scanCode。
-4. `.kl` 主要给出 keyCode 和 WAKE/VIRTUAL/FUNCTION/GESTURE policy flag；`.kcm` 还描述字符、fallback、replacement 与键盘类型。
-5. KCM 的 replacement 在 InputReader 映射阶段发生，fallback 则要等原事件未处理后才发生。
-6. `EV_KEY.value==2` 没有独立 action；Mapper 将所有非 0 value 都视为 DOWN。
-7. Mapper 用 `mKeyDowns` 保证 UP 沿用 DOWN 时确定的 keyCode，即使屏幕方向或布局后来变化。
-8. `mMetaState` 是每个 KeyboardInputMapper 的状态，InputReader 再把所有设备的 meta state 按位 OR 成全局状态供触摸、鼠标等事件使用。
-9. Shift 等瞬时 modifier 在 DOWN 打开、UP 关闭；Caps/Num/Scroll Lock 在 UP 时翻转锁定状态。
-10. EventHub 尝试关闭内核重复；正常重复由 InputDispatcher 的 timeout/delay 定时器生成。
-11. Mapper 的 `mDownTime` 在 r48 是一份共享字段，不是每个 scanCode 各保存一份；多键并按时不要套用“每键独立 downTime”的想象。
-12. `.kcm` 不会让 InputReader直接输出字符；App拿到 KeyEvent 后才可按 keyCode+metaState 查询字符。
+### 四套编号不是同一枚举
 
----
+| 名称 | 示例 | 定义者 | 在链路中的意义 |
+|---|---:|---|---|
+| event type | `EV_KEY` | Linux input API | 说明 raw event 是键状态变化 |
+| scanCode | `KEY_A = 30` | Linux evdev | 驱动上报的 code，也是 Mapper 配对键 |
+| HID usage | `0x00070004` | USB HID | 可比 scanCode 更明确地描述用途 |
+| Android keyCode | `AKEYCODE_A = 29` | Android | Framework 与 App 使用的逻辑键 |
+| Unicode 字符 | `'a'` / `'A'` | KCM + meta | App 层文本含义 |
 
-## 3. 本章要回答的二十五个问题
+`KEY_A=30` 与 `AKEYCODE_A=29` 只是碰巧接近，不能相加减。真正映射必须查表。
 
-1. 哪些设备会创建 KeyboardInputMapper？
-2. scanCode、usageCode、keyCode 各是谁定义的？
-3. `MSC_SCAN` 为什么不是一笔 KeyEvent？
-4. usage 与 scan 同时可映射时谁优先？
-5. `.kcm` 和 `.kl` 谁先参与映射？
-6. `.kl` 后面的 WAKE/VIRTUAL/FUNCTION/GESTURE 是什么？
-7. KCM replacement 与 fallback 有什么本质差别？
-8. 未知 scanCode 为什么仍可能生成 `KEYCODE_UNKNOWN`？
-9. value=2 为什么仍被 Mapper 当成 DOWN？
-10. 重复 DOWN 为什么不重复加入 `mKeyDowns`？
-11. UP 找不到对应 DOWN 时为什么直接丢弃？
-12. 旋转中按下、旋转后抬起为什么 keyCode 不变？
-13. Shift 与 Caps Lock 的状态更新时间为何不同？
-14. KCM replacement 为什么可能临时消费 meta bit？
-15. 全局 meta state 怎样影响触摸或鼠标事件？
-16. LED 何时通过 ioctl 写回键盘？
-17. 外接键盘为什么默认能唤醒？
-18. 媒体键为什么不自动添加 WAKE？
-19. `handlesKeyRepeat=true` 为什么反而设置“禁用重复”flag？
-20. Dispatcher 怎样识别驱动自己产生的重复 DOWN？
-21. long-press flag 是谁加的？
-22. key state 查询读 Mapper 缓存还是 kernel？
-23. usage-only/KCM-only 映射为何可能无法被 supported-key 查询发现？
-24. keyboard layout overlay 怎样替换 KCM，又为何不必重建 Mapper？
-25. reset 后已按下的键怎样收尾？
+### 三份状态分别回答不同问题
 
----
+| 状态 | 所有者 | 回答什么 |
+|---|---|---|
+| `mCurrentHidUsage` | 单个 KeyboardInputMapper | 下一笔 EV_KEY 可否用某个 usage 辅助映射 |
+| `mKeyDowns` | 单个 KeyboardInputMapper | 哪些 scanCode 已 DOWN、它们首次选出的 keyCode 是什么 |
+| `mMetaState` | 单个 KeyboardInputMapper | 这台键盘当前的 Shift/Alt/Caps 等状态 |
 
-## 4. 源码地图
+InputReader 还把所有逻辑设备的 meta state 按位 OR 成 `mGlobalMetaState`，供鼠标、触摸等其他 Mapper 使用。这份全局状态不保存“是哪台键盘贡献了某一位”。
+
+### 源码地图
 
 ```text
 frameworks/native/services/inputflinger/reader/
 ├── EventHub.cpp
 ├── InputDevice.cpp
 ├── InputReader.cpp
-└── mapper/
-    ├── KeyboardInputMapper.cpp
-    └── KeyboardInputMapper.h
+└── mapper/KeyboardInputMapper.cpp
 
 frameworks/native/libs/input/
 ├── Keyboard.cpp
 ├── KeyLayoutMap.cpp
 └── KeyCharacterMap.cpp
 
-frameworks/native/include/input/
-├── Input.h
-├── Keyboard.h
-├── KeyLayoutMap.h
-└── KeyCharacterMap.h
-
-frameworks/native/services/inputflinger/dispatcher/
-└── InputDispatcher.cpp
-
-frameworks/base/data/keyboards/
-├── Generic.kl
-├── Generic.kcm
-├── Virtual.kl / Virtual.kcm
-└── Vendor_xxxx_Product_xxxx*.kl/.kcm
-
-frameworks/base/core/java/android/view/
-├── KeyEvent.java
-├── KeyCharacterMap.java
-└── ViewRootImpl.java
+frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+frameworks/base/services/core/java/com/android/server/policy/PhoneWindowManager.java
+frameworks/base/core/java/android/view/{KeyEvent,KeyCharacterMap,ViewRootImpl}.java
+frameworks/base/data/keyboards/{Generic,Virtual}.kl
+frameworks/base/data/keyboards/{Generic,Virtual}.kcm
 ```
 
----
-
-## 5. KeyboardInputMapper 在什么进程、什么线程
-
-Android 11 r48 中：
-
-- Java `InputManagerService` 位于 `system_server`；
-- native InputManager、InputReader、InputDispatcher 也由 system_server 承载；
-- `KeyboardInputMapper::process()` 在 InputReader 线程上执行；
-- Mapper 通过 `QueuedInputListener` 先排队 NotifyArgs；
-- InputReader 解锁后 flush，进入 Dispatcher 的 notify 入口；
-- 最终通过 InputChannel 把 KeyEvent 发给目标进程的 Looper 线程。
-
-因此 Mapper 里不能直接调用 App，也不决定哪个窗口收到按键。
+这些 native 组件与 Java `InputManagerService` 都在 `system_server`。`KeyboardInputMapper::process()` 跑在 InputReader 线程；它只向 `QueuedInputListener` 排队，Reader 解锁后才 flush 给 Dispatcher，不会直接调用 App。
 
 ---
 
-## 6. 哪些 class 会汇成一个 KeyboardInputMapper
+## 3. 哪些设备会创建 Mapper，raw event 又怎样进入它
 
-`InputDevice::addEventHubDevice()` 先汇总键类 source：
+### 一个 Mapper 不只代表全尺寸键盘
+
+`InputDevice::addEventHubDevice()` 根据 EventHub class 组合 source：
 
 ```cpp
-uint32_t keyboardSource = 0;
 if (classes & INPUT_DEVICE_CLASS_KEYBOARD) {
     keyboardSource |= AINPUT_SOURCE_KEYBOARD;
 }
@@ -147,29 +109,13 @@ if (keyboardSource != 0) {
 }
 ```
 
-同一个 Mapper 的 `mSource` 可以同时含 KEYBOARD、DPAD、GAMEPAD。它不是“只处理全尺寸键盘”的类；遥控器方向键、手柄按键也可能走这里。
+所以遥控器方向键、手柄按钮也可能进入 KeyboardInputMapper。同一 EventHub 子设备若兼具鼠标、触摸能力，还会同时创建其他 Mapper；一笔 raw event 会按顺序交给该子设备的各 Mapper。
 
-`INPUT_DEVICE_CLASS_ALPHAKEY` 让对外 `keyboardType` 成为 `ALPHABETIC`，否则是 `NON_ALPHABETIC`。这与某一笔事件是否能映射成字母不是同一个判断。
+`INPUT_DEVICE_CLASS_ALPHAKEY` 只决定 Mapper 对外的 `keyboardType` 是 `ALPHABETIC` 还是 `NON_ALPHABETIC`；EventHub 以设备能否通过 KL/capability 找到 `AKEYCODE_Q` 作为这项廉价判据。KCM 的 `type FULL` 是另一份配置属性，并不会直接把 Mapper 的 `keyboardType` 设为 alphabetic，更不保证某一笔键一定能产字符。
 
----
+### EV_KEY 的 value 没有直接变成 repeatCount
 
-## 7. 四层编号对照表
-
-| 名称 | 示例 | 来源 | 主要用途 |
-|---|---:|---|---|
-| evdev event type | `EV_KEY` | Linux input API | 表示这是一笔键状态变化 |
-| scanCode | `KEY_A = 30` | Linux input-event-codes | 描述驱动报告的 code |
-| HID usage | `0x00070004` | USB HID usage page/id | 更稳定地描述某个HID用途 |
-| Android keyCode | `AKEYCODE_A = 29` | Android KeyEvent | 面向Framework/App的语义键 |
-| Unicode character | `'a'` / `'A'` | KCM + meta state | 文本输入含义 |
-
-不要因为示例里的 30 和 29 很接近，就认为能做加减换算。映射必须查配置表。
-
----
-
-## 8. RawEvent 中 EV_KEY 的三个字段
-
-一笔键事件的关键内容是：
+典型 raw event 是：
 
 ```text
 type  = EV_KEY
@@ -177,25 +123,17 @@ code  = Linux scanCode
 value = 0 / 1 / 2
 ```
 
-Linux 通常约定：
-
-- `0`：释放；
-- `1`：首次按下；
-- `2`：自动重复。
-
-但 `KeyboardInputMapper::process()` 只做：
+Linux 常用语义是释放、首次按下、自动重复，但 r48 Mapper 只做：
 
 ```cpp
 processKey(rawEvent->when, rawEvent->value != 0, scanCode, usageCode);
 ```
 
-所以 1 与 2 在 Mapper 入口都是 `down=true`。重复次数不是在这里由 value 直接写进 KeyEvent。
+因此 `1` 和 `2` 在这里都只是 `down=true`；`NotifyKeyArgs` 根本没有 `repeatCount` 字段。
 
----
+### MSC_SCAN 是只活到下一笔键的一次性前缀
 
-## 9. MSC_SCAN 是“一次性前缀”
-
-HID 设备可能先报告：
+常见 HID 序列：
 
 ```text
 EV_MSC / MSC_SCAN / usage
@@ -203,52 +141,24 @@ EV_KEY / scanCode / value
 EV_SYN / SYN_REPORT
 ```
 
-Mapper 把 usage 暂存在 `mCurrentHidUsage`：
+Mapper 收到 `MSC_SCAN` 时覆盖 `mCurrentHidUsage`。下一笔 `EV_KEY` 先取它，再立即清零；若没有 EV_KEY，`SYN_REPORT` 也会清零。连续多个 `MSC_SCAN` 只有最后一个留下，且任何 EV_KEY——即使随后因按钮范围被 KeyboardInputMapper 过滤——都会消费它。
 
-```cpp
-case EV_MSC:
-    if (rawEvent->code == MSC_SCAN) {
-        mCurrentHidUsage = rawEvent->value;
-    }
-    break;
-```
-
-下一笔 `EV_KEY` 取出后立即清 0；若一直没有 EV_KEY，到 `SYN_REPORT` 也清 0。这意味着 usage 不是长期设备状态，也不会单独生成 KeyEvent。
+`usageCode` 只参与查表，不会覆盖发给 App 的 `KeyEvent.scanCode`。
 
 ---
 
-## 10. usage 优先不是“usage 替换 scanCode”
+## 4. 映射顺序不是“KL 先定键，KCM 只定字符”
 
-映射函数同时收到两者：
+`EventHub::mapKey()` 的真实顺序是：
 
 ```text
-mapKey(scanCode, usageCode, metaState, ...)
-```
-
-每张映射表的查找规则都是：
-
-1. usageCode 非 0 且有对应项，使用 usage 项；
-2. 否则再按 scanCode 查；
-3. 都没有才失败。
-
-但发给 App 的 `KeyEvent.scanCode` 仍是原 EV_KEY code。usage 只辅助选择 keyCode，不会覆盖 scanCode 字段。
-
----
-
-## 11. Android 11 的真实映射优先级
-
-`EventHub::mapKey()` 的顺序容易被概念教程简化错：
-
-```mermaid
-flowchart TD
-    A["scanCode + usageCode + 当前metaState"] --> B{"合并后的KCM能map?"}
-    B -->|"能；内部usage优先"| C["得到keyCode；policyFlags=0"]
-    B -->|"不能"| D{"KL能map?"}
-    D -->|"能；内部usage优先"| E["得到keyCode + KL policyFlags"]
-    D -->|"不能"| F["KEYCODE_UNKNOWN + flags=0"]
-    C --> G["KCM tryRemapKey"]
-    E --> G
-    G --> H["最终keyCode + 可能调整后的metaState"]
+combined KCM:
+  usageCode → scanCode
+        ↓ 未命中
+Key Layout:
+  usageCode → scanCode
+        ↓
+KCM tryRemapKey(keyCode, oldMetaState)
 ```
 
 也就是：
@@ -257,49 +167,71 @@ flowchart TD
 KCM usage → KCM scan → KL usage → KL scan → UNKNOWN
 ```
 
-多数基础 KCM 没写 `map key`，日常看起来像总由 KL 完成；但源码契约不能因此写成“永远先 KL”。布局 overlay 可以向合并 KCM 加入 scan/usage 映射。
+两张表内部都只在 code 非零时查对应 map；usage 命中便不再看 scan。
+
+### KCM 命中会绕过 KL flag
+
+代码不是把两张表的结果合并：
+
+```cpp
+if (kcm != nullptr && !kcm->mapKey(...)) {
+    *outFlags = 0;
+    status = NO_ERROR;
+}
+if (status != NO_ERROR && haveKeyLayout()) {
+    keyLayoutMap->mapKey(..., outKeycode, outFlags);
+}
+```
+
+因此 combined KCM 若直接完成 scan/usage 映射，`outFlags` 从零开始；同一个 scan 在 KL 上写的 `WAKE`、`VIRTUAL`、`FUNCTION` 或 `GESTURE` 不会再补入。
+
+### replacement 改 keyCode，不重算 flag
+
+无论 keyCode 来自 KCM 还是 KL，最后都会用同一份 KCM 调 `tryRemapKey()`。replacement 可改 `keyCode/metaState`，但不会拿 replacement 后的 keyCode 回头再查 KL，所以 policy flag 仍属于 replacement 之前的映射结果。
+
+### 完全映射失败仍可产生 UNKNOWN
+
+失败时 Mapper设：
+
+```cpp
+keyCode = AKEYCODE_UNKNOWN; // 0
+keyMetaState = mMetaState;
+policyFlags = 0;
+```
+
+随后仍可将该 scanCode 加入 `mKeyDowns` 并发出 UNKNOWN DOWN/UP。只有 `isKeyboardOrGamepadKey()` 排除的鼠标/数字化器按钮区间会在进入 `processKey()` 前被忽略，以免和 Cursor/Touch Mapper 重复解释。
 
 ---
 
-## 12. `.kl` 到底负责什么
+## 5. KL、KCM 与 layout overlay 各自负责什么
 
-`Generic.kl` 里有：
+### Key Layout：硬件编号与输入策略
 
-```text
-key 30    A
-key 42    SHIFT_LEFT
-key 143   WAKEUP
-key usage 0x0c006F BRIGHTNESS_UP
-```
-
-格式核心是：
+`Generic.kl` 的核心格式是：
 
 ```text
-key [usage] <linux-code或hid-usage> <Android-keyCode-label> [flags...]
+key 30                  A
+key 42                  SHIFT_LEFT
+key 143                 WAKEUP
+key usage 0x0c006f      BRIGHTNESS_UP
+key 465                 ESCAPE FUNCTION
+led 0x01                CAPS_LOCK
 ```
 
-`.kl` 还可描述 axis 与 LED。对按键而言，它将硬件编号映射为 Android keyCode，并附带输入策略 flag。
+按键条目给出 Android keyCode 和四种可选 raw policy flag：
 
----
-
-## 13. `.kl` 的四种按键 flag
-
-Android 11 r48 接受：
-
-| KL flag | native policy flag | 含义 |
+| KL flag | native flag | Reader/Dispatcher 中的作用 |
 |---|---|---|
-| `WAKE` | `POLICY_FLAG_WAKE` | 允许此键参与唤醒策略 |
-| `VIRTUAL` | `POLICY_FLAG_VIRTUAL` | 虚拟/电容硬键，可触发抑制与触觉语义 |
-| `FUNCTION` | `POLICY_FLAG_FUNCTION` | 特殊Fn语义，Dispatcher补 `AMETA_FUNCTION_ON` |
-| `GESTURE` | `POLICY_FLAG_GESTURE` | 固件手势键，首次按下时取消同设备触摸 |
+| `WAKE` | `POLICY_FLAG_WAKE` | 交给 policy 判断唤醒 |
+| `VIRTUAL` | `POLICY_FLAG_VIRTUAL` | 首次 DOWN 可防误触，Dispatcher 转成虚拟硬键 flag |
+| `FUNCTION` | `POLICY_FLAG_FUNCTION` | Dispatcher 只给这一笔事件补 `AMETA_FUNCTION_ON` |
+| `GESTURE` | `POLICY_FLAG_GESTURE` | 首次 DOWN 取消同一逻辑设备的触摸 |
 
-这些是 native policy flags，不等同于 App 最终看到的 `KeyEvent.flags`。Dispatcher会把其中一部分转换、消费或用于策略判断。
+KL 还可描述 axis 与 LED；它不是字符表。
 
----
+### Key Character Map：字符、行为与可选硬件映射
 
-## 14. `.kcm` 不只是字符表
-
-`Generic.kcm` 的常见内容是：
+`Generic.kcm` 常见内容：
 
 ```text
 type FULL
@@ -313,20 +245,16 @@ key A {
 
 KCM 能表达：
 
-- 键盘类型；
-- keyCode 在不同 meta state 下对应的字符；
+- 键盘类型和 keyCode 的字符行为；
 - dead key / combining accent；
-- fallback keyCode；
-- replacement keyCode；
-- `map key` 的 scan/usage→keyCode overlay。
+- `fallback` 与 `replace`；
+- overlay 格式中的 `map key`，即 scan/usage → keyCode。
 
-因此“KL负责键位、KCM负责字符”适合作为入门近似，不足以完整解释 r48 的 `EventHub::mapKey()`。
+InputReader 不会因 KCM 的字符规则额外发送一个字符事件。App 收到 KeyEvent 后，才通过设备 KCM 和 `keyCode + metaState` 查询 Unicode。
 
----
+### overlay 是热替换，不是 reopen
 
-## 15. base KCM 与 layout overlay 怎样合并
-
-EventHub 设备初始持有 base KCM。用户为物理键盘选择布局后，IMS 读取布局资源，native 解析为 overlay KCM：
+`CHANGE_KEYBOARD_LAYOUTS` 时，`InputDevice::configure()` 向 policy 取 KCM overlay，然后对每个 EventHub 子设备执行：
 
 ```cpp
 device->overlayKeyMap = map;
@@ -334,102 +262,60 @@ device->combinedKeyMap =
         KeyCharacterMap::combine(device->keyMap.keyCharacterMap, map);
 ```
 
-`CHANGE_KEYBOARD_LAYOUTS` 到来时：
+只要 overlay 的 `sp<>` 指针与旧指针不同，EventHub 就返回 changed，逻辑 InputDevice 随后 bump generation；它不比较内容是否等价，也不销毁 KeyboardInputMapper。
 
-1. InputDevice向policy获取当前 overlay；
-2. 每个子设备更新合并 KCM；
-3. 内容对象变化则 bump generation；
-4. 现有 Mapper 不必销毁重建。
+`combine()` 的语义也不是任意深合并：
 
-这是“配置对象热替换”，不是 EventHub fd reopen。
+- 先复制 base；
+- overlay 中同 keyCode 的整份 `Key/Behavior` 替换 base 条目；
+- scan 与 usage map 按 code 覆盖或追加；
+- base 与 overlay 都存在时，结果保留 base 对象的 keyboard type。
+
+已经按下的键不会因 overlay 更新立即重放。后续 raw event 会用新 combined KCM 先映射，但 UP/重复 DOWN 的 keyCode 最后仍会被 `mKeyDowns` 中的旧值覆盖。
 
 ---
 
-## 16. replacement 与 fallback 必须分开
+## 6. replacement 与 fallback 不在同一阶段
 
-两者都写在 KCM，却发生在完全不同阶段：
-
-| 机制 | 触发时机 | 原事件是否先发给App | 主要执行位置 |
+| 机制 | 何时发生 | 原键是否先送到 App | 谁执行 |
 |---|---|---|---|
-| replacement | InputReader映射原始键时 | 否，直接换成新keyCode | `KeyCharacterMap::tryRemapKey()` |
-| fallback | 原按键未被应用/策略处理后 | 是，先尝试原事件 | PhoneWindowManager / Dispatcher 或 ViewRoot synthetic path |
+| KCM `replace` | Reader 映射 raw key 时 | 否 | `KeyCharacterMap::tryRemapKey()` |
+| policy fallback | 前台目标报告原键未处理后 | 是 | Dispatcher + PhoneWindowManager |
+| App synthetic fallback | 调用方显式重投 unhandled event 后 | 已经离开原派发轮次 | ViewRoot SyntheticInputStage |
 
-replacement 适合“这个组合本来就应成为另一个逻辑键”；fallback 适合“原键没人处理时，尝试兼容导航键”。
+### replacement 会临时消费部分 meta
 
----
+`tryRemapKey()` 先按原 keyCode 和旧 `mMetaState` 选择 behavior；命中 replacement 后：
 
-## 17. replacement 为什么还会修改 metaState
+1. 改成 replacement keyCode；
+2. 清 behavior 声明的 modifier；
+3. 对 ALT、CTRL、SHIFT 额外清理通用位与左右位的依赖；
+4. `normalizeMetaState()` 再补仍有左右位支撑的通用位。
 
-KCM behavior 可以声明 replacement key，并消费触发该替换的 modifier。例如某组合被替换后，不能还把原 Ctrl/Alt 留给下游。
+它并未对 META 做与 ALT/CTRL/SHIFT 对称的依赖清理；若自定义 KCM 用 META 触发 replacement，左右 META 位可能经 normalize 把通用 `META_ON` 补回来。这是 r48 实现边界，不应外推成“所有 modifier 都一定被完整消费”。
 
-`tryRemapKey()` 会：
+### fallback 不是 Reader 重映射
 
-1. 输出 replacement keyCode；
-2. 从 metaState 中清掉 behavior 使用的位；
-3. 同步清理通用位与 left/right 依赖位；
-4. 再调用 `normalizeMetaState()` 恢复仍然有效的通用位。
+普通窗口返回未处理后，Dispatcher 才调用 policy 的 `dispatchUnhandledKey()`。初次 DOWN 有两层锁存：
 
-这正是 Mapper 后面为何保留 `keyMetaState`：非 meta 键若发生 replacement，事件可携带一个临时调整后的状态，而不是无条件使用设备完整 `mMetaState`。
+- `PhoneWindowManager.mFallbackActions` 按原 keyCode 保存 `FallbackAction`；
+- connection 的 `InputState` 保存 original keyCode → fallback keyCode。
 
----
+后续 repeat/UP 继续询问 policy，但 Dispatcher 要求 fallback keyCode 与首次一致；变化或取消会触发 fallback cancel。原 UP 后映射被移除。
 
-## 18. fallback 有两条路径，配对强度不同
+这两张表都不是按完整 `deviceId + keyCode + target` 统一建模：policy 的 `SparseArray` 只按 keyCode，connection 表也只按 original keyCode。多设备同键交叠时，不应声称 fallback 状态天然完全隔离。
 
-r48不能只画一条fallback链：
+### App synthetic fallback 是另一条入口
 
-### 路径A：native Dispatcher → policy
+`ViewRootImpl.dispatchUnhandledInputEvent()` 会发 `MSG_SYNTHESIZE_INPUT_EVENT`，打上内部 `FLAG_UNHANDLED`，随后 `SyntheticKeyboardHandler` 对当前这一笔重新查 KCM。它不是普通 View 树返回 false 时必经的自动路径，本类也没有 DOWN→UP fallback 表。
 
-前台App返回“未处理”后，Dispatcher的 `afterKeyEventLockedInterruptible()` 调用policy `dispatchUnhandledKey()`。首次DOWN若得到替代键：
-
-- 生成带 `FLAG_FALLBACK` 的替代DOWN；
-- connection `InputState`记录original→fallback；
-- 后续repeat与UP必须复用首次选择；
-- 原UP到来后释放映射；若原键后来被处理，还会取消已有fallback。
-
-这条路径明确锁存生命周期，避免meta/layout中途变化导致DOWN、UP换键。
-
-### 路径B：App侧 ViewRoot SyntheticInputStage
-
-未处理KeyEvent也可能到达 `SyntheticKeyboardHandler`。它对当前这一笔调用 `kcm.getFallbackAction()`，生成带 `FLAG_FALLBACK` 的事件并重新排入App队列；该类本身没有original→fallback表，而是依赖每笔事件的keyCode/meta和KCM查询结果。
-
-两条路径都会检查/设置 `FLAG_FALLBACK` 以阻止递归，但只有路径A能声称由connection状态显式保证配对。
+而且 r48 使用不带 displayId 的 `KeyEvent.obtain(...)` 重载，synthetic fallback 的 displayId 会变成 `INVALID_DISPLAY`。这条路径的行为不能套用 Dispatcher/PhoneWindowManager 的两层锁存保证。
 
 ---
 
-## 19. 映射失败为什么仍发送 UNKNOWN
+## 7. DOWN/UP 状态机只用 scanCode 配对
 
-Mapper 调用 `mapKey()` 失败时不是直接 return：
-
-```cpp
-keyCode = AKEYCODE_UNKNOWN;
-keyMetaState = mMetaState;
-policyFlags = 0;
-```
-
-随后仍按 scanCode 建立 down 记录并发出 KeyEvent。好处是调试或低层接收者仍能看到原 scanCode。
-
-但若这笔 code 被 `isKeyboardOrGamepadKey()` 判为鼠标按钮等其他 Mapper 的范围，则 KeyboardInputMapper根本不会进入 `processKey()`。
-
----
-
-## 20. 为什么要过滤 mouse button 范围
-
-复合设备的一笔 EV_KEY 会被同一子设备的多个 Mapper 依次看到。若 KeyboardInputMapper也把 BTN_LEFT 当普通键，CursorInputMapper又把它当鼠标按钮，就可能重复解释。
-
-`isKeyboardOrGamepadKey()` 用 Linux BTN 范围做筛选：
-
-- 普通键盘 code 保留；
-- joystick/gamepad 按钮保留；
-- 典型鼠标按钮留给 CursorInputMapper；
-- 其他特定 BTN 区段按源码范围处理。
-
-这再次说明 Mapper 是按能力分工，而不是每种 raw type 只可能被一个 Mapper看到。
-
----
-
-## 21. mKeyDowns 保存的不是完整 KeyEvent
-
-每个按下记录只有：
+`mKeyDowns` 的元素只有：
 
 ```cpp
 struct KeyDown {
@@ -438,154 +324,150 @@ struct KeyDown {
 };
 ```
 
-它解决两个问题：
+### 首次 DOWN
 
-1. 判断同 scanCode 的新 DOWN 是否是重复；
-2. UP 必须沿用 DOWN 时实际发出的 keyCode。
+顺序是：
 
-它没有逐键保存 downTime、metaState、policyFlags、usageCode。因此这些字段不能被想象成从 DOWN 记录完整回放。
+1. 用当前 KCM/KL 和旧 meta 映射；
+2. 若 `orientationAware`，旋转 keyCode；
+3. 按 scanCode 查 `mKeyDowns`；
+4. 首次虚拟键可被 `shouldDropVirtualKey()` 丢弃；
+5. GESTURE 键可调用 `cancelTouch()`；
+6. 保存最终 `scanCode → keyCode`；
+7. 更新共享 `mDownTime`、meta/LED，再发 NotifyKey。
 
----
+虚拟键若在第 4 步被抑制，不会进入 `mKeyDowns`；随后的 UP 因找不到 DOWN 也会被丢弃。
 
-## 22. 首次 DOWN、重复 DOWN、UP 的状态机
+### 重复 DOWN
 
-```mermaid
-stateDiagram-v2
-    [*] --> Up
-    Up --> Down: "EV_KEY value!=0；map/rotate；加入mKeyDowns"
-    Down --> Down: "再次value!=0；复用已存keyCode；不再加入"
-    Down --> Up: "value==0；取已存keyCode并删除记录"
-    Up --> Up: "孤立UP；记录日志并丢弃"
-```
+若 scanCode 已存在：
 
-方向旋转、KCM overlay变化或其他映射变化发生在按住期间时，UP 仍从 `mKeyDowns` 取旧 keyCode，以保持逻辑序列一致。
+- 不再新增记录；
+- 使用保存的 keyCode，抵抗旋转或 layout 变化；
+- 对已经成功入表的键，不再执行 virtual suppression 或 gesture cancel；若首次虚拟 DOWN 被抑制而未入表，后来的 value=2/重复报告仍会再次按“首次 DOWN”评估；
+- 但映射已在查找记录之前重新跑过，新的 `policyFlags/keyMetaState` 没有从旧记录恢复；
+- `mDownTime` 仍会被这笔 DOWN 覆盖。
 
----
+### UP
 
-## 23. 初次 DOWN 上的虚拟键与手势处理
+UP 也先按当前 KCM/KL 映射，再按 scanCode 找旧记录：
 
-只有 `findKeyDown(scanCode)<0` 的首次 DOWN 执行：
+- 找到：只把 `keyCode` 换回 DOWN 时保存的值，然后删记录；
+- 找不到：记录日志并直接丢弃，不更新 meta，也不发 UNKNOWN UP。
 
-```cpp
-if ((policyFlags & POLICY_FLAG_VIRTUAL) &&
-        shouldDropVirtualKey(...)) {
-    return;
-}
-if (policyFlags & POLICY_FLAG_GESTURE) {
-    cancelTouch(when);
-}
-```
+因此“按住期间换 layout/旋转，UP keyCode 仍配对”成立；“UP 是 DOWN 全字段回放”不成立。UP 的 policy flag、keyMetaState、displayId 与 downTime 都可能不同。
 
-含义是：
+### usage-only 的配对弱点
 
-- 屏幕边缘触摸后，邻近电容键可被防误触窗口抑制；被抑制的 DOWN 不进 `mKeyDowns`，其后 UP 也会因“未按下”被丢弃；
-- 固件把某个动作报告成 gesture key 时，先取消同设备正在进行的触摸流；
-- 重复 DOWN 不会反复执行这两个首次动作。
+`mKeyDowns` 不保存 usageCode。若设备把多枚 usage 键的 EV_KEY code 都报告为 0，同时按下时它们会竞争同一个 scanCode=0 记录；第二枚会被视作重复并沿用第一枚 keyCode。源码测试覆盖单枚 usage-only 键，不证明多键并发安全。
 
 ---
 
-## 24. 方向键旋转发生在何时
+## 8. 旋转与 displayId 是两条相关但不同的链
 
-只有首次 DOWN 且 `keyboard.orientationAware=true` 时，Mapper按 viewport orientation 旋转 DPAD 与 SYSTEM_NAVIGATION 方向键。
+### viewport 选择
 
-r48测试体现的 DPAD 映射是：
+`findViewport()` 的顺序：
 
-| 显示方向 | 物理 UP 最终 keyCode |
-|---|---|
-| 0° | DPAD_UP |
-| 90° | DPAD_LEFT |
-| 180° | DPAD_DOWN |
-| 270° | DPAD_RIGHT |
-
-之后重复 DOWN 和 UP 都复用 `mKeyDowns` 中的结果。因此按住期间旋转屏幕不会把 UP 变成另一个方向。
-
----
-
-## 25. viewport 与 displayId 的选择
-
-`findViewport()` 先看设备是否通过 `.idc` 关联 display port：
-
-1. 有 associated display port：直接取对应 viewport；
-2. 没有关联，但 `orientationAware=true`：取内部显示 viewport；
+1. 设备有 associated display port：取该 port 对应 viewport；
+2. 否则若 `keyboard.orientationAware=true`：取内部显示 viewport；
 3. 否则没有 viewport。
 
-有 viewport 时 NotifyKey 携带其 displayId；没有则为 `ADISPLAY_ID_NONE`。
+有 viewport 时，NotifyKey 携带其 displayId；没有则是 `ADISPLAY_ID_NONE`。关联 port 即使不做方向旋转，也仍可给键事件指定 displayId。
 
-注意：是否携带 displayId 与是否旋转不是完全同一个条件。有明确 associated viewport 的设备即使不做方向旋转，也能拥有 displayId。
+### DPAD/SYSTEM_NAVIGATION 只在 DOWN 分支旋转
 
----
+例如物理 `DPAD_UP`：
 
-## 26. stem key 的 180° 特殊重映射
+| viewport orientation | 首次 DOWN 的最终 keyCode |
+|---|---|
+| 0° | `DPAD_UP` |
+| 90° | `DPAD_LEFT` |
+| 180° | `DPAD_DOWN` |
+| 270° | `DPAD_RIGHT` |
 
-可穿戴等设备的 `STEM_PRIMARY/STEM_1/2/3` 在 180° 时可通过 IDC 属性换成指定 keyCode：
+重复 DOWN 先计算新旋转值，却最终复用记录中的旧 keyCode；UP 直接复用旧 keyCode。于是按键期间屏幕转向不会拆坏 keyCode 配对。
+
+不过 `mKeyDowns` 没保存 displayId。`CHANGE_DISPLAY_INFO` 会热更新 `mViewport`，所以 DOWN 在 display A、UP 在 display B 是实现上可能出现的组合。
+
+### stem 键只有 180° 特例
+
+`STEM_PRIMARY/STEM_1/2/3` 可由 IDC 配置：
 
 ```text
 keyboard.rotated.stem_primary = ...
 keyboard.rotated.stem_1 = ...
 ```
 
-这与 DPAD 四方向表不同：stem map 只处理 180°，并由 `configureParameters()` 首次读取。
+它只在 180° 时替换。更危险的边界是 `stemKeyRotationMap` 为文件级可变 static 数组：
 
-源码里的 `stemKeyRotationMap` 是文件级可变静态数组，不是每个 Mapper 独立成员。这意味着一个设备写入的 rotated stem 配置可能影响同进程其他 orientation-aware Mapper；这是 r48 实现边界，不能按理想设计假定完全设备隔离。
+- 不是每个 Mapper 一份；
+- `configureParameters()` 只在首次配置调用；
+- 缺失某属性时不会把旧 static 槽重置为 identity。
 
----
-
-## 27. metaState 的两类生命周期
-
-Android 将 modifier 粗分为：
-
-### 瞬时状态
-
-- SHIFT_LEFT/RIGHT
-- ALT_LEFT/RIGHT
-- CTRL_LEFT/RIGHT
-- META_LEFT/RIGHT
-- SYM
-- FUNCTION
-
-按下设置，抬起清除。
-
-### 锁定状态
-
-- CAPS_LOCK
-- NUM_LOCK
-- SCROLL_LOCK
-
-r48 的 `toggleLockedMetaState()` 在 `down==false` 时异或对应位，所以是“释放时翻转”。如果只看到 Caps DOWN 就断言灯已切换，会与源码相反。
+所以一个 orientation-aware 设备写入的 stem 映射可能污染同进程后来创建、却没写对应属性的 Mapper。
 
 ---
 
-## 28. normalizeMetaState 做什么
+## 9. metaState：瞬时键、锁定键与事件临时值
 
-左右侧位与通用位同时存在。例如左 Shift 按下后应同时拥有：
+### 瞬时 modifier
 
-```text
-AMETA_SHIFT_LEFT_ON | AMETA_SHIFT_ON
+`ALT/SHIFT/CTRL/META` 左右键以及 `SYM/FUNCTION` 的 keyCode 走 `setEphemeralMetaState()`：
+
+- DOWN：设置对应位；
+- UP：清侧位以及 ALT/SHIFT/CTRL/META 四个通用位；
+- `normalizeMetaState()` 根据仍按下的另一侧重新补通用位。
+
+所以左右 Shift 同时按下、只抬起一侧时，`SHIFT_ON` 仍保持。
+
+### 锁定 modifier 在 UP 翻转
+
+`CAPS_LOCK/NUM_LOCK/SCROLL_LOCK` 走：
+
+```cpp
+if (down) {
+    return oldMetaState;
+}
+return oldMetaState ^ mask;
 ```
 
-`normalizeMetaState()` 根据 LEFT/RIGHT 位补通用 ALT/SHIFT/CTRL/META 位。
+Caps DOWN 自身不打开锁定位；配对 UP 才翻转。孤立 UP 在 `processKey()` 更早处被丢弃，因此也不会翻转。
 
-释放一侧 modifier 时，`setEphemeralMetaState()` 先清侧位和通用位，再 normalize；若另一侧仍按住，normalize 会把通用位重新补回。因此左右 Shift 同时按下、只释放一个时，SHIFT_ON 不会错误消失。
+### 当前事件携带哪份 meta
+
+映射和更新的时序：
+
+```text
+old mMetaState
+  → mapKey / tryRemapKey 得到 keyMetaState
+  → 用最终且已锁存的 keyCode 更新 mMetaState
+  → 若设备meta真的变化：事件使用新 mMetaState
+  → 否则：事件保留 keyMetaState
+```
+
+于是：
+
+- Shift DOWN 携带“Shift 已按下”；
+- Shift UP 携带“Shift 已释放”；
+- Shift+A 中 A 的 DOWN/UP 都可携带 Shift；
+- replacement 若消费 Shift，普通键事件可携带临时去掉 Shift 的 `keyMetaState`，但设备自己的 `mMetaState` 仍保留 Shift。
+
+若 replacement 把普通键变成 modifier，Mapper 会按 replacement 后 keyCode 更新真实 `mMetaState`；这说明 replacement 不只是改展示标签。
+
+### KL FUNCTION flag 不等于 FUNCTION key 状态
+
+`POLICY_FLAG_FUNCTION` 到 Dispatcher 才给“这一笔”事件 OR `AMETA_FUNCTION_ON`。它不会更新 KeyboardInputMapper 的 `mMetaState`，也不会让随后另一笔键自动携带 FUNCTION。
+
+相反，真正映射成 `AKEYCODE_FUNCTION` 的 DOWN/UP 会走 Mapper 的瞬时 meta 状态机，并影响后续事件与全局 meta。两种机制必须分开。
 
 ---
 
-## 29. 当前按键的 metaState 怎样确定
+## 10. global meta 与 LED 是状态的两个投影
 
-顺序非常关键：
+### InputReader 的全局 meta 是 OR
 
-1. 先以“事件到来前”的 `mMetaState` 调用 KCM/KL 映射；
-2. KCM replacement 可产生临时 `keyMetaState`；
-3. 再用最终 keyCode 和当前 down/up 更新设备 `mMetaState`；
-4. 若本键真的改变 meta state，事件携带更新后的 `mMetaState`；
-5. 否则保留 KCM 给出的 `keyMetaState`。
-
-所以 Shift DOWN 本身携带“Shift 已按下”；Shift UP 携带“Shift 已释放”。普通 A 在 Shift 按住时携带 Shift；若 A 被 replacement 且消费 Shift，则它可携带被清理后的临时状态。
-
----
-
-## 30. 全局 metaState 为什么是 OR
-
-InputReader重新计算：
+每次某个 Mapper 的本地 meta 发生变化，它调用：
 
 ```cpp
 mGlobalMetaState = 0;
@@ -594,468 +476,389 @@ for (each InputDevice) {
 }
 ```
 
-用途是让其他输入源知道系统当前 modifier。例如按住外接键盘 Ctrl 再滚动鼠标，CursorInputMapper生成的 MotionEvent 能带全局 Ctrl 状态。
+逻辑 InputDevice 又 OR 自己所有 Mapper 的 meta。于是键盘 A 按住 Ctrl 时，鼠标 Mapper 可把全局 Ctrl 带入 MotionEvent；键盘 B 抬起自己的 Ctrl 不会清掉 A 的贡献。
 
-OR 的代价是“不记录来自哪台键盘”。设备 A 按左 Shift、设备 B 抬自己的 Shift 时，各 Mapper仍维护各自状态，重新 OR 后只要 A 还按住，全局 Shift 就保持。
+这不是全局按键集合，也没有引用计数。正确性依赖每个 Mapper 先维护好自己的位，再重新 OR。
+
+### LED 不是 meta 的输入源
+
+reset 时 KeyboardInputMapper：
+
+1. 只通过 KL 的 scan-code `led` 条目和 EventHub LED capability 判断 Caps/Num/Scroll 是否可用；虽然 KeyLayoutMap 还能解析 usage LED，EventHub 的 `mapLed()` 在此不查它；
+2. 把本地 `LedState.on` 初始化为 false；
+3. 强制调用 `setLedState(..., false)`。
+
+因此 r48 不会读取硬件灯的初始开关来恢复锁定状态，反而会把支持的三盏灯先关闭。之后锁定 meta 在 UP 翻转时，只有期望值变化才写 `EV_LED`。
+
+EventHub 写 LED 时只对 `EINTR` 重试；最终写入长度或其他错误没有反馈给 Mapper。`LedState.on` 仍会更新成期望值，所以它是“我们认为灯是什么状态”，不是硬件确认。
+
+### 程序化 toggleCapsLock
+
+`InputReader::toggleCapsLockState(deviceId)` 直接调用逻辑 InputDevice 的 `updateMetaState(AKEYCODE_CAPS_LOCK)`；KeyboardInputMapper 把它当 `down=false`，因此会翻转并更新 LED/global meta，却不生成 Caps KeyEvent。
+
+若一个逻辑复合设备拥有多个 KeyboardInputMapper，`InputDevice::updateMetaState()` 会对全部 Mapper 调用，可能一次翻转多份本地 Caps 状态；全局 OR 只能显示最终是否至少一份为 on。
 
 ---
 
-## 31. LED 状态怎样写回硬件
+## 11. policyFlags 决定的是前后处理，不是 App flags 原样复制
 
-reset 时 Mapper查询 Caps/Num/Scroll LED 是否存在，并先认为关闭，然后强制同步一次。
+### VIRTUAL 与 GESTURE 只在首次 DOWN触发 Reader 副作用
 
-meta state 变化后：
+`POLICY_FLAG_VIRTUAL` 让首次 DOWN 经过 `shouldDropVirtualKey()`；通过后，Dispatcher 还把它转换为 `AKEY_EVENT_FLAG_VIRTUAL_HARD_KEY`。
+
+`POLICY_FLAG_GESTURE` 让首次 DOWN 调 `InputDevice::cancelTouch()`，它遍历同一逻辑 InputDevice 的所有 Mapper，而不只是产生该按键的 EventHub 子设备。重复 DOWN 不再取消。
+
+### 外接设备的默认 WAKE 是附加规则
+
+Mapper 仅在以下条件同时成立时 OR `POLICY_FLAG_WAKE`：
 
 ```text
-CAPS_LOCK_ON   → ALED_CAPS_LOCK
-NUM_LOCK_ON    → ALED_NUM_LOCK
-SCROLL_LOCK_ON → ALED_SCROLL_LOCK
+DOWN
+AND logical InputDevice isExternal
+AND keyboard.doNotWakeByDefault == false
+AND final keyCode 不在 isMediaKey() 列表
 ```
 
-最终 EventHub通过 `EV_LED` 写入设备 fd。Mapper只在 LED 可用且期望状态变化（或reset强制）时写，减少无意义操作。
+因此普通外接键的自动 WAKE 只出现在 DOWN。`isMediaKey()` 硬编码名单内的媒体/音量键不自动添加；它不是“所有名字含 MEDIA 的 keyCode”，例如 r48 的 `MEDIA_CLOSE`、`MEDIA_EJECT`、`MEDIA_TOP_MENU` 不在名单中，仍可能获得默认 WAKE。若 KL 明确写 `WAKE`，它可在 DOWN 与 UP 都保留，`doNotWakeByDefault` 也不会删除它。
 
-LED 是锁定 meta state 的外部显示，不是决定 meta state 的权威输入源。
+`isExternal()` 是逻辑复合设备聚合后的 class。只要合并进来的任一 EventHub 子设备带 EXTERNAL，所有 KeyboardInputMapper 都会观察到逻辑设备为 external。
+
+### KCM precedence 可让 KL flag 消失
+
+若 overlay KCM 自己 `map key` 命中，EventHub 直接令 flags=0，不再查 KL。于是 overlay 不只是改变字符布局，还可能无意间让 WAKE/VIRTUAL/FUNCTION/GESTURE 消失。
+
+反过来，KCM replacement 不重查 KL，可能让新 keyCode 继续携带原 keyCode 的 flag。这两种行为都来自第 4 节那条非合并映射链。
 
 ---
 
-## 32. downTime 的简单情况
+## 12. downTime 与 repeat：Reader、驱动、Dispatcher 是三本账
 
-单键 A 的时间线：
+### Mapper 只有一份共享 mDownTime
+
+单键时看似正常：
 
 ```text
-t=100 A DOWN  → mDownTime=100，发 DOWN(downTime=100,eventTime=100)
-t=180 A UP    → 发 UP  (downTime=100,eventTime=180)
+t=100 A DOWN → A DOWN(downTime=100)
+t=180 A UP   → A UP  (downTime=100)
 ```
 
-这符合“同一按键序列共享首次按下时间”的直觉。
-
-但这个直觉只在没有其他 DOWN/重复 DOWN 插入时可靠，因为 r48 Mapper只有一个 `mDownTime` 字段。
-
----
-
-## 33. 多键并按的 downTime 反直觉边界
-
-手算下面序列：
+多键并按时暴露共享字段：
 
 ```text
-t=100 A DOWN → mDownTime=100，A DOWN携带100
-t=120 B DOWN → mDownTime=120，B DOWN携带120
-t=150 A UP   → 当前共享mDownTime仍是120，A UP携带120
-t=170 B UP   → B UP也携带120
+t=100 A DOWN → mDownTime=100
+t=120 B DOWN → mDownTime=120
+t=150 A UP   → A UP(downTime=120)
+t=170 B UP   → B UP(downTime=120)
 ```
 
-`mKeyDowns` 没有逐键 downTime，所以 A UP 不能恢复 100。
+任何 DOWN——包括同 scanCode 的重复 DOWN——都会执行 `mDownTime=when`。`mKeyDowns` 没有逐键时间，所以 UP 无法恢复各自首次时间。
 
-这不是建议的应用语义模型，而是 Android 11 r48 这段 Mapper 实现的真实边界。排查组合键时应直接查看事件，而不要从某个 DOWN 推测所有后续 UP 的 downTime。
+### EventHub 总会尝试关闭内核 repeat
 
----
-
-## 34. 重复 DOWN 也会覆盖 mDownTime
-
-即使 scanCode 已在 `mKeyDowns`，代码仍在 DOWN 分支末尾执行：
-
-```cpp
-mDownTime = when;
-```
-
-因此驱动若仍发送 value=2 或连续相同 DOWN，Mapper 发出的那笔 DOWN 使用新的 downTime。随后 UP 也可能带这个最近时间。
-
-相对地，Dispatcher自己合成 repeat 时复制保存的 `KeyEntry.downTime`，不会每次合成时改为当前时间。硬件重复路径与Dispatcher合成路径在这一细节上不能混写。
-
----
-
-## 35. EventHub 为什么关闭内核重复
-
-打开 keyboard class fd 后，EventHub尝试：
+只要设备带 `INPUT_DEVICE_CLASS_KEYBOARD`，打开以及重新 enable fd 时调用的 `configureFd()` 都会执行：
 
 ```cpp
 unsigned int repeatRate[] = {0, 0};
-ioctl(device->fd, EVIOCSREP, repeatRate);
+ioctl(fd, EVIOCSREP, repeatRate);
 ```
 
-目的是让 InputDispatcher统一控制初次等待时间和后续重复间隔，避免内核与Framework各自生成一套重复。
+失败只写 warning。这个动作不读取 `keyboard.handlesKeyRepeat`；IDC 参数要到 Mapper 配置时才读。因此 `handlesKeyRepeat=1` 并不会阻止 EventHub 先尝试关闭内核 repeat。
 
-ioctl 可能失败，设备也可能自己发送重复 DOWN，所以 Dispatcher仍包含“识别连续同 keyCode DOWN”的兼容逻辑。
+### Dispatcher 合成 repeat
 
----
+Reader 进入 `InputDispatcher::notifyKey()` 时 repeatCount 固定为 0。对可信、未带 `DISABLE_KEY_REPEAT` 的初次 DOWN：
 
-## 36. Mapper 为什么没有 repeatCount 参数
+1. Dispatcher 保存全局 `lastKeyEntry`；
+2. `eventTime + keyRepeatTimeout` 后合成 repeatCount=1；
+3. 后续每隔 `keyRepeatDelay` 递增；
+4. synthetic repeat 保留保存 entry 的 `downTime`；
+5. 仅 repeatCount==1 时加 `AKEY_EVENT_FLAG_LONG_PRESS`，更高 repeat 会清掉该 flag。
 
-`NotifyKeyArgs` 不携带 repeatCount；进入 `InputDispatcher::notifyKey()` 时固定：
+### 驱动重复与 handlesKeyRepeat 的反直觉
 
-```cpp
-constexpr int32_t repeatCount = 0;
-```
+若后续 raw DOWN 仍以 repeatCount=0 进入，且全局 `lastKeyEntry.keyCode` 相同，Dispatcher 把它识别为 driver repeat、递增 count，并关闭自己的 timer。r48 条件没有比较 deviceId 或 scanCode，所以两台设备连续按同一 keyCode 也可能被误判为同一重复序列。
 
-Dispatcher接管重复状态后：
+若 `keyboard.handlesKeyRepeat=1`，Mapper 给每笔事件加 `POLICY_FLAG_DISABLE_KEY_REPEAT`。这会绕过上述识别和合成；raw `value=2` 又已被 Reader 压成普通 DOWN，所以 App 会收到多笔 DOWN，但每笔仍是 `repeatCount=0`，也不会由这条逻辑加 LONG_PRESS。
 
-- 首次可信 DOWN：保存为 `lastKeyEntry`，设置 `nextRepeatTime`；
-- 超过初始 timeout：合成 repeatCount=1；
-- 之后每隔 delay 递增；
-- UP、不同按键或其他不合条件事件会重置重复状态。
-
-所以 App看到的 repeatCount 是 Dispatcher语义，不是 Linux value 原样透传。
+若 EventHub 的 `EVIOCSREP` 又成功关闭了设备内核 repeat，则该设置甚至可能同时没有硬件 repeat 与 Framework repeat；它只适合仍能自行产生重复报告的设备实现。
 
 ---
 
-## 37. 驱动重复怎样被 Dispatcher 识别
+## 13. Mapper 出口之后仍可能再次改键
 
-若两笔正常、可信、repeatCount仍为0的 DOWN 连续进入，且保存的上一笔 `keyCode` 相同，Dispatcher认为驱动在自动重复：
+### NotifyKeyArgs 的完成边界
 
-1. 当前 entry.repeatCount = 上一笔 + 1；
-2. 取消Framework自己的repeat timer；
-3. `nextRepeatTime=LONG_LONG_MAX`；
-4. 以后继续依据驱动 DOWN 递增。
+Mapper 输出字段：
 
-r48 此处分支只比较 keyCode，没有同时比较 deviceId/scanCode。两台设备连续按同一 keyCode 理论上也可能被归入重复序列，这是实现层的交叉设备边界。
+| 字段 | 来源 |
+|---|---|
+| id | InputReader id generator |
+| eventTime | `RawEvent.when` |
+| deviceId/source | 逻辑 InputDevice / Mapper source |
+| displayId | 当前 viewport，或 NONE |
+| policyFlags | 当前 KCM/KL 映射 + 自动 WAKE + DISABLE_REPEAT |
+| action | DOWN / UP |
+| flags | 固定含 `FROM_SYSTEM` |
+| keyCode | replacement、旋转、按下记录后的结果 |
+| scanCode | 原 EV_KEY code |
+| metaState | 当前设备 meta 或 KCM 临时 meta |
+| downTime | Mapper 共享 `mDownTime` |
 
----
+这只证明 Reader 的解释已完成，不证明最终 App KeyEvent 字段不再变化。
 
-## 38. handlesKeyRepeat 的名字为何容易误读
+### Dispatcher 的 Meta 快捷键是第二层 replacement
 
-IDC 可配置：
+`notifyKey()` 先处理：
 
 ```text
-keyboard.handlesKeyRepeat = 1
+Meta + DEL   → BACK
+Meta + ENTER → HOME
 ```
 
-含义是“设备/驱动自己处理重复”，于是 Mapper在 NotifyKey policyFlags 中加：
+`mReplacedKeys` 用 `original keyCode + deviceId` 锁存，UP 即使 Meta 已释放也能得到同一 replacement，并清 Meta 位。它与 KCM replacement 是两套独立机制：前者发生在 Dispatcher，后者已在 Reader。
 
-```cpp
-POLICY_FLAG_DISABLE_KEY_REPEAT
-```
+Dispatcher 还会：
 
-这个 flag 的主语是 Dispatcher：禁止 Dispatcher再合成重复。它并不是让硬件停止重复。
+- 把 FUNCTION policy flag OR 到事件 meta；
+- 把 VIRTUAL policy flag转成 KeyEvent flag；
+- 调 `interceptKeyBeforeQueueing()`；
+- 经过 filter、目标选择、窗口通道与 FINISHED 结账；
+- 维护 repeatCount/long-press；
+- 在真正未处理后尝试 policy fallback。
 
-默认 false 时，EventHub尝试关内核重复，Dispatcher负责合成；true 时，系统信任设备提供重复序列。
+### App 看到字符的完成点
 
----
+KeyEvent 只携带 keyCode/meta 等字段。`getUnicodeChar()`、`getDisplayLabel()` 或输入法再通过 deviceId 取得 KeyCharacterMap。字符解释发生得比 Reader 映射晚，也可能受 App 当前拿到的 KCM 对象与 event meta 影响。
 
-## 39. long press flag 从哪里来
-
-Dispatcher在正式 dispatch key 时：
-
-```cpp
-if (entry->repeatCount == 1) {
-    entry->flags |= AKEY_EVENT_FLAG_LONG_PRESS;
-} else {
-    entry->flags &= ~AKEY_EVENT_FLAG_LONG_PRESS;
-}
-```
-
-也就是说第一笔重复 DOWN 带 LONG_PRESS，后续 repeatCount>1 反而不再带这个 flag。
-
-长按不是 Mapper在首次 DOWN 时预先判断的；它依赖 Dispatcher重复计时或驱动重复序列。
-
----
-
-## 40. 外接键盘的默认 WAKE 规则
-
-Mapper对外接设备额外做：
-
-```cpp
-if (down && isExternal() && !doNotWakeByDefault && !isMediaKey(keyCode)) {
-    policyFlags |= POLICY_FLAG_WAKE;
-}
-```
-
-因此：
-
-- 仅 DOWN 自动添加；
-- 仅外接设备；
-- `keyboard.doNotWakeByDefault` 可关闭；
-- media/volume 一组键不自动添加；
-- `.kl` 明确写的 WAKE 不受这段默认规则移除，UP 也可继续携带显式 WAKE。
-
-媒体键排除是为了避免耳机/遥控播放控制随意唤醒，确需唤醒应在设备 KL 中逐键声明。
-
----
-
-## 41. NotifyKeyArgs 在 Mapper 出口有哪些字段
-
-最终构造：
+所以：
 
 ```text
-id          = InputReader生成的新event id
-eventTime   = RawEvent.when
-deviceId    = 逻辑InputDevice id
-source      = KEYBOARD/DPAD/GAMEPAD组合
-displayId   = viewport id或NONE
-policyFlags = KL flags + 自动WAKE + DISABLE_KEY_REPEAT等
-action      = DOWN或UP
-flags       = FROM_SYSTEM
-keyCode     = map/replacement/rotation后的Android keyCode
-scanCode    = 原EV_KEY code
-metaState   = 当前或KCM临时调整后的状态
-downTime    = Mapper共享mDownTime
+EV_KEY → keyCode
 ```
 
-repeatCount 要到 Dispatcher 的 KeyEntry 阶段才出现。
-
----
-
-## 42. 完整单键链路图
-
-```mermaid
-sequenceDiagram
-    participant D as "evdev driver"
-    participant E as "EventHub"
-    participant K as "KeyboardInputMapper"
-    participant M as "KCM / KL"
-    participant Q as "QueuedInputListener"
-    participant I as "InputDispatcher"
-    participant A as "App / ViewRoot"
-
-    D->>E: "MSC_SCAN(optional) + EV_KEY"
-    E->>K: "RawEvent(scan,value,when)"
-    K->>M: "mapKey(scan,usage,oldMeta)"
-    M-->>K: "keyCode,keyMeta,policyFlags"
-    K->>K: "track down / rotate / update meta / LED"
-    K->>Q: "NotifyKeyArgs"
-    Q->>I: "flush outside Reader lock"
-    I->>I: "policy, target, repeat state"
-    I->>A: "KeyEvent over InputChannel"
-    A-->>I: "FINISHED handled?"
-    opt "initial event unhandled"
-        I->>A: "paired fallback KeyEvent"
-    end
-```
-
----
-
-## 43. keyCodeState 查询读取谁的状态
-
-`getScanCodeState()` 不查 `mKeyDowns`，而是 EventHub 对设备 fd 调：
+与：
 
 ```text
-ioctl(EVIOCGKEY)
+keyCode + metaState → Unicode
 ```
 
-并用 device key capability 校验 scanCode。
-
-`getKeyCodeState()` 则先用 `.kl` 反查所有可能 scanCode，再看 kernel key bitmap 中是否任一个按下。
-
-所以查询反映“驱动此刻状态”，不是“Mapper最后发出了什么”。设备 disabled、fd无效、ioctl失败或映射不存在时返回 UNKNOWN。
+是两个不同问题。
 
 ---
 
-## 44. supported-key 查询为什么可能漏项
+## 14. 查询、reset 与失败边界：事件账不等于硬件账
 
-`markSupportedKeyCodes()` 同样只通过 `KeyLayoutMap::findScanCodesForKey()` 反查 scanCode，并与设备 `keyBitmask` 相交。
+### key state 查询直接读内核
 
-因此它的能力边界是：
+`getScanCodeState()`：
 
-- 能确认 KL 中按 scanCode 定义、且驱动声明支持的键；
-- 不直接遍历 KCM overlay 的 `map key`；
-- 不用 HID usage capability 反查 usage-only 映射；
-- 不代表当前按键是否按下。
+- 检查 scanCode 范围、设备 fd 和 key capability；
+- 用 `EVIOCGKEY` 读取当前 bitmap；
+- 不读取 `mKeyDowns`。
 
-“运行时 mapKey 能成功”与“markSupportedKeyCodes 报告支持”不是严格双向等价。
+`getKeyCodeState()`：
 
----
+- 只用 KL 反查该 keyCode 的所有 scanCode；
+- 读取 `EVIOCGKEY`；
+- 任一对应 bit 按下即返回 DOWN；它没有先把每个反查 scanCode 与设备 capability `keyBitmask` 相交。
 
-## 45. reset 清什么，谁负责取消下游状态
+因此它反映“驱动现在报告什么”，不等于“Mapper 曾向 Dispatcher 发过什么”。设备 disabled、fd 失效、ioctl 失败或 KL 无 scan 映射时返回 UNKNOWN。KL 有映射但驱动未声明该 capability 时，成功读取 bitmap 后仍可能报告 UP；同一个键却会被下述 supported-key 查询判为不支持。
 
-KeyboardInputMapper reset 会：
+### supported-key 查询同样偏向 KL scan
+
+`markSupportedKeyCodes()` 只把 KL 的 `findScanCodesForKey()` 与 EventHub `keyBitmask` 相交。它不会遍历：
+
+- combined KCM 的 `map key`；
+- KL 的 usage-only 映射；
+- 当前 `mKeyDowns`。
+
+所以“运行时 mapKey 可成功”与“hasKeys 报支持”不是双向等价。
+
+r48 KL parser 对 scan 数字本身没有 KEY_MAX 范围校验，而 `markSupportedKeyCodes()` 在 `test_bit(scanCode, keyBitmask)` 前也没有局部范围检查；恶意或错误 KL 的越界 code 是配置可信边界，不是普通设备能力语义。
+
+### reset 的两层收尾
+
+KeyboardInputMapper reset：
 
 ```text
 mMetaState = NONE
 mDownTime = 0
 mKeyDowns.clear()
 mCurrentHidUsage = 0
-重置并同步LED
-调用InputMapper::reset()
+重新探测并强制关闭三类lock LED
 ```
 
-它不会逐个发普通 Key UP。设备整体 reset 通知进入 Dispatcher 后，Dispatcher依据每条 connection 的 InputState 合成 canceled UP/CANCEL，使窗口侧状态收尾。
+它不逐键发送正常 UP。`InputDevice::reset()` 在所有 Mapper reset 后更新 global meta，并排队 `NotifyDeviceResetArgs`；Dispatcher 再根据每条 connection 的 `InputState` 合成 canceled key/pointer events。
 
-这是两层职责：Mapper丢弃硬件解释缓存；Dispatcher按已实际派发给各窗口的状态做取消。
+### DeviceReset 没清所有 Dispatcher 全局表
 
----
+r48 `dispatchDeviceResetLocked()` 只按 deviceId 给所有 connection 合成 cancel。它没有：
 
-## 46. 常见误解与正确说法
+- `resetKeyRepeatLocked()`；
+- 按 deviceId 清 `mReplacedKeys`。
 
-### 误解一：scanCode 就是 KeyEvent.KEYCODE
-
-错误。前者是Linux编号，后者是Android语义，必须经过映射。
-
-### 误解二：`.kl` 永远先把scan转keyCode，`.kcm`只产字符
-
-错误。r48先查合并KCM的scan/usage map，失败才查KL；KCM还可replacement/fallback。
-
-### 误解三：EV_KEY value=2 会直接成为repeatCount=2
-
-错误。Mapper只看是否非0；Dispatcher从0开始维护repeatCount。
-
-### 误解四：每个按键都有自己的downTime缓存
-
-错误。r48 KeyboardInputMapper只有共享 `mDownTime`。
-
-### 误解五：Caps Lock在按下时翻转
-
-错误。r48在UP时翻转locked meta bit。
-
-### 误解六：fallback就是InputReader重映射
-
-错误。replacement才是早期重映射；fallback发生在原键未处理之后。
+`ConfigurationChangedEntry` 会重置 key repeat，全局 `resetAndDropEverythingLocked()` 才清 replacement 表；但一次孤立的 `SYN_DROPPED → InputDevice::reset() → DeviceReset` 不自带这两个保证。于是“窗口侧已收到 canceled UP”不能单独证明 Dispatcher 的全局 repeat/meta-shortcut 缓存也已清空。
 
 ---
 
-## 47. macOS 只读源码练习
+## 15. 九个 macOS 只读练习
 
-无需编译，可在源码根目录执行：
+以下命令都在 `/Users/ninebot/androidSource` 执行，不编译、不改源码。
 
-### 练习一：找 Mapper 主状态机
+### 练习一：确认 Mapper 创建条件
 
 ```bash
-sed -n '210,365p' \
+sed -n '125,190p' \
+  frameworks/native/services/inputflinger/reader/InputDevice.cpp
+```
+
+回答：KEYBOARD、DPAD、GAMEPAD 如何组合成一个 `mSource`？ALPHAKEY 改的是 source 还是 keyboardType？
+
+### 练习二：手工走一遍 raw 状态机
+
+```bash
+sed -n '198,365p' \
   frameworks/native/services/inputflinger/reader/mapper/KeyboardInputMapper.cpp
 ```
 
-标出 usage 清零、首次/重复 DOWN、孤立 UP、meta、WAKE 和 NotifyKeyArgs。
+标出 usage 的两个清零点、首次/重复 DOWN、孤立 UP、共享 downTime、WAKE 与 NotifyKeyArgs。
 
-### 练习二：验证 KCM→KL 优先级
+### 练习三：证明 KCM 先于 KL
 
 ```bash
 sed -n '540,580p' \
   frameworks/native/services/inputflinger/reader/EventHub.cpp
+sed -n '80,120p' frameworks/native/libs/input/KeyLayoutMap.cpp
+sed -n '325,400p' frameworks/native/libs/input/KeyCharacterMap.cpp
 ```
 
-不要只看配置文件名称，要按 `status != NO_ERROR` 分支写出精确顺序。
+写出 `KCM usage → KCM scan → KL usage → KL scan`，并解释 KCM 命中为何令 flags=0。
 
-### 练习三：对比 Generic KL/KCM
+### 练习四：检查 overlay 的合并粒度
 
 ```bash
-sed -n '20,75p' frameworks/base/data/keyboards/Generic.kl
-sed -n '20,75p' frameworks/base/data/keyboards/Generic.kcm
-rg -n "fallback|map key|key usage" frameworks/base/data/keyboards
+sed -n '155,200p' frameworks/native/libs/input/KeyCharacterMap.cpp
+sed -n '235,270p' \
+  frameworks/native/services/inputflinger/reader/InputDevice.cpp
+sed -n '665,690p' \
+  frameworks/native/services/inputflinger/reader/EventHub.cpp
 ```
 
-回答：哪个文件定义 scan 30，哪个文件定义 Shift+Caps 下的字符？
+回答：同 keyCode 的 behaviors 是逐条合并还是整项替换？“变化”按内容还是 `sp<>` 指针判断？
 
-### 练习四：追重复生成者
+### 练习五：验证 meta 与 LED
 
 ```bash
-rg -n "EVIOCSREP|synthesizeKeyRepeatLocked|DISABLE_KEY_REPEAT|repeatCount" \
-  frameworks/native/services/inputflinger
+sed -n '175,255p' frameworks/native/libs/input/Keyboard.cpp
+sed -n '380,445p' \
+  frameworks/native/services/inputflinger/reader/mapper/KeyboardInputMapper.cpp
 ```
 
-画出 kernel repeat、driver repeat、Dispatcher synthetic repeat 三条可能路径。
+手算左右 Shift 与 Caps Lock；再找出 reset 为什么先把支持的 lock LED 关掉。
 
-### 练习五：观察源码测试里的边界
+### 练习六：追三类 repeat
 
 ```bash
-sed -n '2420,3030p' \
-  frameworks/native/services/inputflinger/tests/InputReader_test.cpp
+sed -n '1498,1518p' \
+  frameworks/native/services/inputflinger/reader/EventHub.cpp
+sed -n '1000,1050p' \
+  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+sed -n '1105,1148p' \
+  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
 ```
 
-重点看 usage映射、unknown键、meta、方向变化中UP一致性和外接设备wake测试。
+区分内核 repeat、raw driver repeat、Dispatcher synthetic repeat，并说明 `handlesKeyRepeat=1` 时 App 的 repeatCount。
+
+### 练习七：对比两类 replacement 与两条 fallback
+
+```bash
+sed -n '350,400p' frameworks/native/libs/input/KeyCharacterMap.cpp
+sed -n '3035,3080p' \
+  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+sed -n '3070,3150p' \
+  frameworks/base/services/core/java/com/android/server/policy/PhoneWindowManager.java
+sed -n '7100,7140p' \
+  frameworks/base/core/java/android/view/ViewRootImpl.java
+```
+
+回答：谁锁存 UP 配对？哪条 App synthetic 路径丢失 displayId？
+
+### 练习八：确认查询不读 mKeyDowns
+
+```bash
+sed -n '430,535p' \
+  frameworks/native/services/inputflinger/reader/EventHub.cpp
+```
+
+分别写出 scan state、keyCode state 与 supported-key 的数据源和盲区。
+
+### 练习九：核准 reset 的完成点
+
+```bash
+sed -n '315,338p' \
+  frameworks/native/services/inputflinger/reader/InputDevice.cpp
+sed -n '1055,1080p' \
+  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+sed -n '4018,4050p' \
+  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
+
+比较 DeviceReset 与全局 reset：谁取消 connection 状态，谁清 repeat 和 `mReplacedKeys`？
 
 ---
 
-## 48. 手算题：Shift+A、Caps 与 fallback
+## 16. 用三条时间线验收本章
 
-### 场景一：Shift+A
+### 时间线一：Shift + A
 
 ```text
-t1 Shift DOWN
-t2 A DOWN
-t3 A UP
-t4 Shift UP
+t1 Shift DOWN → Mapper meta = SHIFT_LEFT_ON | SHIFT_ON
+t2 A DOWN     → KeyEvent携带Shift；App按KCM可解释为'A'
+t3 A UP       → Shift仍按住，meta仍含Shift
+t4 Shift UP   → Mapper meta = NONE
 ```
 
-预期 meta：
+字符 `'A'` 不是 Mapper 另发的事件。
 
-| 时刻 | 事件 | metaState |
-|---|---|---|
-| t1 | Shift DOWN | SHIFT_LEFT_ON + SHIFT_ON |
-| t2 | A DOWN | SHIFT_LEFT_ON + SHIFT_ON |
-| t3 | A UP | SHIFT_LEFT_ON + SHIFT_ON |
-| t4 | Shift UP | NONE |
-
-字符 `'A'` 是 App按KCM查询的结果，不是 Mapper另发的字符事件。
-
-### 场景二：Caps Lock
-
-Caps DOWN 时锁定位不变；Caps UP 时 `CAPS_LOCK_ON` 翻转并更新LED。再次完整按下/抬起后关闭。
-
-### 场景三：fallback
-
-原键DOWN先投给应用。若走native Dispatcher/policy路径，只有initial DOWN能建立并锁存fallback，后续UP复用；若走ViewRoot SyntheticInputStage，则处理器按当前每笔事件查询KCM，本类自身没有锁存表。分析日志时要先确认是哪条路径。
-
----
-
-## 49. 复读审计：最容易写错的十个边界
-
-### 边界一：KCM先于KL，但KCM命中时policyFlags从0开始
-
-若 combined KCM直接 map成功，EventHub把 `outFlags=0`，不会再把同scan在KL上的WAKE/VIRTUAL flag合进来。overlay映射设计不当可能改变策略flag来源。
-
-### 边界二：usage只活到下一EV_KEY或SYN_REPORT
-
-它不是“当前HID键”的持久缓存；两笔EV_KEY不会自动共享同一usage。
-
-### 边界三：UP按scanCode配对，而不是usageCode
-
-`mKeyDowns` 只存scanCode/keyCode。依赖usage但EV_KEY scanCode恒为0的设备同时按多个usage键时，所有键会竞争同一个scanCode 0记录；协议/驱动必须提供可配对序列，源码本身没有按usage建立第二把索引。
-
-### 边界四：共享mDownTime不是逐键语义
-
-任意新DOWN或重复DOWN都会覆盖它；多键UP读取最近值。
-
-### 边界五：旋转只在首次DOWN决定
-
-屏幕中途旋转不会改变已按键的repeat/UP keyCode，但新按键使用新方向。
-
-### 边界六：stem配置表是进程级静态可变数据
-
-不同设备配置存在相互影响可能，不应声称每个Mapper有独立stem表。
-
-### 边界七：自动WAKE只加在外接非媒体键DOWN
-
-KL显式WAKE可在DOWN/UP保留；两种来源必须分开。
-
-### 边界八：key state与supported查询偏向KL scan映射
-
-它们不完整覆盖KCM-only或usage-only映射。
-
-### 边界九：Dispatcher识别driver repeat只比较keyCode
-
-r48没有在该条件同时比较deviceId，存在跨设备同键连续DOWN的理论混淆窗口。
-
-### 边界十：fallback并非只有一条锁存路径
-
-native Dispatcher/Policy按connection保存original→fallback；ViewRoot SyntheticKeyboardHandler逐笔查询KCM。不能把前者的配对机制笼统归给所有fallback事件。
-
-### 边界十一：reset清Mapper缓存，不逐键发送正常UP
-
-下游取消依赖DeviceReset与Dispatcher按connection保存的真实已派发状态。
-
----
-
-## 50. 最终模型、检查题与下一章
-
-### 一句话模型
+### 时间线二：多键 downTime
 
 ```text
-KeyboardInputMapper把EV_KEY及一次性MSC_SCAN usage交给“合并KCM优先、KL兜底”的映射链，
-在首次DOWN确定replacement/旋转/keyCode并以scanCode维护按下集合，再更新每设备meta与LED、补策略flag后生成NotifyKey；
-InputDispatcher继续负责policy、窗口路由、repeatCount/long-press和未处理fallback，App最后才用KCM把keyCode+meta解释成字符。
+t=100 A DOWN
+t=120 B DOWN
+t=150 A UP
 ```
 
-### 检查题
+r48 的 A UP 使用共享 `mDownTime=120`，不是 100。若 t=130 还有 A 的 raw repeat DOWN，`mDownTime` 还会先变成 130。
 
-1. `KEY_A=30` 与 `AKEYCODE_A=29` 为什么不能直接换算？
-2. KCM、KL以及各自的usage/scan查找顺序是什么？
-3. replacement 和 fallback 分别发生在哪个阶段？
-4. value=2 到 repeatCount=1 中间经过哪些逻辑？
-5. 为什么旋转后UP仍与原DOWN同keyCode？
-6. Shift和Caps Lock分别在什么时机改变meta？
-7. 多键并按时为什么A UP的downTime可能变成B DOWN时间？
-8. 外接媒体键如何显式允许唤醒？
-9. supported-key查询为何可能漏掉usage-only键？
-10. Mapper reset为何不应直接对所有窗口广播普通UP？
+### 时间线三：layout 在按住期间变化
 
-### 下一章
+```text
+旧layout: scan 30 → A，DOWN时保存 (A, 30)
+切换overlay与display viewport
+新layout: scan 30 → B
+UP到来：先映射成B及新flags/meta，随后只把keyCode换回A
+```
 
-第 181 章进入 CursorInputMapper：拆解相对位移、鼠标按钮、滚轮、pointer capture、加速度、显示关联与 MotionEvent 坐标生成。
+因此 UP 的 keyCode 与 DOWN 配对，但 displayId、policyFlags、metaState 和 downTime 不受同一记录保护。
+
+### 最终模型
+
+```text
+KeyboardInputMapper把一次性usage与EV_KEY交给“combined KCM优先、KL兜底”的映射链，
+用scanCode只锁存最终keyCode，再处理旋转、meta、LED和policy flag，生成NotifyKey；
+InputDispatcher仍会补FUNCTION/VIRTUAL、做Meta快捷键替换、repeat/long-press和policy fallback，
+App最后才把keyCode+metaState解释成字符。
+```
+
+检查自己能否回答：
+
+1. KCM 命中为什么可能让 KL 的 WAKE 消失？
+2. replacement 后为何不能按新 keyCode 重新推断 policy flag？
+3. usage-only 多键为何会在 scanCode=0 上冲突？
+4. `mKeyDowns` 究竟锁住哪些字段、没锁住哪些字段？
+5. KL `FUNCTION` 与 `AKEYCODE_FUNCTION` 如何不同？
+6. `handlesKeyRepeat=1` 为什么可能使所有 raw repeat 的 count 都是 0？
+7. DeviceReset 为什么不等于清空 Dispatcher 的全部键状态？
+8. supported-key 为什么看不到 KCM-only/usage-only 映射？
+
+下一章进入第 181 章 CursorInputMapper：继续追相对位移、鼠标按钮、滚轮、pointer capture、加速度、显示关联与 MotionEvent 坐标生成。

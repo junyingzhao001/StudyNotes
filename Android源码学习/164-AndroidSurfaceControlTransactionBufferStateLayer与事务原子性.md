@@ -1,85 +1,90 @@
 # 164 Android SurfaceControl Transaction、BufferStateLayer 与事务原子性
 
 > 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
-> 学习方式：macOS 只读源码，不要求编译、不要求连接设备  
-> 前置章节：第 12、19、21、160、161、162、163 章
+> 学习方式：macOS 静态阅读；不编译，不连接设备  
+> 前置章节：第 160～163 章
 
 ---
 
-## 1. 本章要解决什么
+## 1. 本章要回答的问题
 
-第 163 章已经追到 BLAST 把一张应用 buffer 写入 `SurfaceControl::Transaction`。现在需要回答：
+第 163 章已经追到 BLAST 把应用 buffer 放进 `SurfaceControl::Transaction`。这一章继续回答：
 
-> 一个 Transaction 里的 buffer、位置、裁剪、变换和回调，怎样跨 Binder 进入 SurfaceFlinger，并在同一个显示状态提交边界生效？
+> buffer、acquire fence、位置、裁剪、变换和回调，如何作为一个提交单元进入 SurfaceFlinger；所谓“原子”又具体保证到哪一层？
 
-“事务”这个词很容易让人联想到数据库，但 SurfaceControl Transaction 的保证不同：
+先给出主线：
 
 ```text
-它能把多项Layer状态组织成一个提交单元
-不提供数据库式持久化
-不保证apply返回时屏幕已经显示
-不保证不同applyToken的独立事务自动合并
-不保证硬件失败后回滚到旧屏幕状态
+Java SurfaceControl.Transaction
+  收集多次 setter
+        ↓ apply
+native SurfaceComposerClient::Transaction
+  layer_state_t + what 位图
+        ↓ Binder
+SurfaceFlinger::setTransactionState
+  就绪检查 / 按 applyToken 排队
+        ↓
+applyTransactionState
+  写 Layer current state
+        ↓ SF 主循环
+Layer::doTransaction
+  current → drawing
+        ↓
+BufferLayer::latchBuffer
+  drawing buffer → active buffer
+        ↓
+composition / present / transaction callback
 ```
 
-本章解决：
+读完应能区分五个完成点：
 
-1. Java `SurfaceControl.Transaction` 保存的是 Layer 对象，还是变更记录？
-2. `layer_state_t.what` 为什么比字段值本身更重要？
-3. 一个 Transaction 如何同时修改多个 Layer 和 Display？
-4. `merge()` 冲突时谁覆盖谁，另一个 Transaction 还可否继续用？
-5. `apply()` 经过哪些 Java/JNI/native/Binder 边界？
-6. 普通 apply 为什么仍是异步语义？
-7. `apply(true)` 同步到 commit、latch 还是 present？
-8. desired present time 与 acquire fence 为什么会让整个事务排队？
-9. apply token 如何保证同一来源事务不越过前序事务？
-10. SF 的 global current/drawing state 与 Layer current/drawing state有何区别？
-11. `eTransactionNeeded` 与 `eTraversalNeeded` 分别表达什么？
-12. BufferStateLayer 什么时候把 buffer 写进 current，什么时候真正 latch？
-13. 一帧内连续提交多个 buffer 时，哪个回调拿 previous release fence？
-14. transaction completed callback 返回时，present fence 是否已经 signal？
-15. BLAST 为什么能依靠 callback 安全 release 本地 consumer buffer？
+1. setter 写进客户端收集器；
+2. Binder 调用把数据交给 SF；
+3. SF 把 patch 写进 current state；
+4. 主循环把 current 推进到 drawing，并 latch buffer；
+5. 显示管线最终令 present fence signal。
 
-一句话总览：
-
-> Transaction 在客户端按 SurfaceControl handle 聚合 `layer_state_t` 增量，`what` 位决定哪些字段有效；apply 将多 Layer/Display 状态一次跨 Binder 交给 SF。SF 先按 apply token、desired time 和 acquire fence决定立即应用或排队，再把字段写入 Layer current state；主合成循环通过 `doTransaction()` 和 commit 把可用状态推进到 drawing state，随后 BufferStateLayer 才按 buffer/fence条件 latch。事务 callback 携带 latch/present/release 信息，但 callback 到达不等于其中的 present fence 已 signal。
+它们不是同一时刻。
 
 ---
 
-## 2. 先限定“原子性”
+## 2. “事务原子性”的准确边界
 
-本章所说原子性是：
+Java 注释把 `Transaction` 定义为一组针对多个 `SurfaceControl` 的原子变更。对 r48 源码，更稳妥的理解是：
 
-> 同一个 Transaction 中通过权限和对象有效性检查、且满足应用条件的一组 Layer/Display 增量，在一次 SF 事务提交中形成一致的 drawing-state 快照，不暴露这些已接受变更逐字段推进的中间状态。
+> 同一 Transaction 中被 SF 接受的 Layer/Display patch，共享一次 Binder 提交和一次受 `mStateLock` 保护的 current-state 更新；主循环从稳定的 drawing state 工作，不会把 setter 逐字段暴露成显示中间态。
 
-这不是“全有或全无校验”：无效 Layer、无权限字段可以被单独忽略或登记为 unpresented callback，同一事务中其他合法 Layer/字段仍可应用。这里的原子性强调合法变更共享提交边界，而不是任一字段失败就回滚整笔事务。
+这不等于数据库事务：
 
-它不等于：
-
-| 数据库直觉 | SurfaceControl 实际边界 |
+| 容易误解成 | 实际含义 |
 |---|---|
-| 写入磁盘后永久存在 | 全是运行期显示状态 |
-| apply 成功就完成外部效果 | 普通 apply 只把状态交给 SF |
-| 失败自动回滚硬件 | 后续合成/显示有独立错误处理 |
-| 所有客户端事务全局串行 | 不同 apply token 有各自队列，仍受 SF 调度 |
-| callback 到达表示画面已扫出 | callback 可携带尚未 signal 的 present fence |
+| 任一字段失败就整笔回滚 | 无效 Layer、无权限字段、无效 cache id 可局部跳过，其余字段仍可能生效 |
+| `apply()` 返回就已经上屏 | 普通 apply 不等 commit、latch 或 present |
+| 所有客户端全局串行 | r48 主要按 `applyToken` 维持各自的 pending FIFO |
+| buffer 与几何已写 current 就一定本帧显示 | 还要经过 drawing、latch、composition 和 fence |
+| callback 到达表示扫描完成 | callback 可以携带尚未 signal 的 present fence |
+| 显式 defer 仍不破坏同时性 | legacy defer 本来就是调用者要求某个 Layer 延后提交 |
+
+还有一个重要限定：buffer 是 Layer state 的字段，但真正替换 active buffer 发生在 latch 阶段。因此“状态原子提交”不能被扩写成“所有硬件动作同时完成”。
 
 ```mermaid
 flowchart LR
-    BUILD["客户端构造Transaction"] --> IPC["apply：Binder提交"]
-    IPC --> READY{"时间与fence条件满足?"}
-    READY -->|"否"| QUEUE["按applyToken排队"]
-    READY -->|"是"| CUR["写Layer Current State"]
-    QUEUE --> CUR
-    CUR --> DRAW["SF事务阶段提交到Drawing State"]
-    DRAW --> LATCH["BufferStateLayer latch"]
-    LATCH --> PRESENT["合成 / 发起present"]
-    PRESENT --> CB["事务完成回调携带fence与stats<br/>不先等fence signal"]
+    A["客户端收集patch"] --> B["一次Binder提交"]
+    B --> C{"时间/fence就绪?"}
+    C -->|否| D["applyToken队列"]
+    C -->|是| E["写current state"]
+    D --> E
+    E --> F["提交drawing state"]
+    F --> G["latch buffer"]
+    G --> H["发起present"]
+    H --> I["present fence稍后signal"]
 ```
 
 ---
 
-## 3. 源码地图
+## 3. 源码地图与对象关系
+
+主要文件：
 
 ```text
 frameworks/base/core/java/android/view/
@@ -94,8 +99,7 @@ frameworks/native/libs/gui/
 ├── ISurfaceComposer.cpp
 └── include/gui/
     ├── SurfaceComposerClient.h
-    ├── LayerState.h
-    └── ISurfaceComposer.h
+    └── LayerState.h
 
 frameworks/native/services/surfaceflinger/
 ├── SurfaceFlinger.cpp
@@ -109,23 +113,24 @@ frameworks/native/services/surfaceflinger/
 对象关系：
 
 ```text
-Java SurfaceControl.Transaction
-  → native SurfaceComposerClient::Transaction
-      → map<surface handle, ComposerState>
-          → layer_state_t + what bitmask
-      → DisplayState列表
-      → InputWindowCommands
-      → listener callbacks
-      → transaction-level desiredPresentTime/flags
-  → ISurfaceComposer.setTransactionState()
-  → SurfaceFlinger
+Java Transaction
+  └─ long mNativeObject
+       └─ native SurfaceComposerClient::Transaction
+            ├─ map<surface handle, ComposerState>
+            │    └─ layer_state_t { what, position, crop, buffer, fence, ... }
+            ├─ DisplayState 列表
+            ├─ InputWindowCommands
+            ├─ listener callbacks
+            └─ 事务级 flags / desiredPresentTime
 ```
+
+`SurfaceControl` 的 Binder handle 是 map 的 key。一个 Transaction 可以同时修改多个 Layer；同一个 Layer 的多次 setter 则累积到同一份 `layer_state_t`。
 
 ---
 
-## 4. Java Transaction 是一个可复用的变更收集器
+## 4. Java Transaction 只是变更收集器
 
-Java 构造函数创建 native 对象：
+构造 Java 对象时，JNI 创建 native Transaction：
 
 ```java
 public Transaction() {
@@ -135,57 +140,45 @@ public Transaction() {
 }
 ```
 
-JNI 对应：
-
 ```cpp
 return reinterpret_cast<jlong>(new SurfaceComposerClient::Transaction);
 ```
 
-因此 Java 对象主要是 native Transaction 的拥有者，还保存两类只在 Java 侧维护的辅助映射：
-
-```text
-mResizedSurfaces     apply前更新Java SurfaceControl宽高缓存
-mReparentedSurfaces  apply前通知reparent listener
-```
-
-### 4.1 setter 只是积累，不立刻跨进程
-
-调用位置、alpha、crop、layer、reparent 等 setter 时，通常只是找到该 SurfaceControl handle 对应的 `layer_state_t`，写字段并设置 `what` 位。
+调用 `setPosition()`、`setAlpha()`、`setCrop()`、`setBuffer()` 等 API，通常只修改这个 native 收集器：
 
 ```text
 t.setPosition(a, 10, 20)
 t.setAlpha(a, 0.8)
 t.setLayer(b, 100)
 
-此时：都还在客户端Transaction中
-apply：才统一发送给SurfaceFlinger
+此时没有向 SurfaceFlinger 提交
+t.apply() 才统一跨 Binder
 ```
 
-### 4.2 `apply()` 后对象可复用，但 r48 不是每个成员都重置
-
-Java 文档明确说明 apply 会清空已积累状态，并允许继续向同一个 Transaction 对象加入下一批命令。
-
-更精确地看 native r48 实现，apply 会移走/清空 Layer、Display、listener、input commands，并复位 sync/animation/early-wakeup flags；但它没有在 `apply()` 末尾把 `mDesiredPresentTime` 重置为 `-1`。只有 `clear()` 会重置该字段。
-
-因此复用对象时：
+Java 侧另有两个辅助映射：
 
 ```text
-上一批Layer字段       不会再次发送
-上一批显示效果         不会因为收集器清空而撤销
-desiredPresentTime     可能继续沿用，除非调用方重新设置或clear
+mResizedSurfaces      更新 Java SurfaceControl 的宽高缓存
+mReparentedSurfaces   通知本地 reparent listener
 ```
 
-这是 r48 源码行为，不应只按 Java 文档中的“clearing its state”推断所有 native 成员都回到默认值。
+`apply(boolean)` 先处理这两个 Java 映射，再调用 native apply：
 
-### 4.3 `close()` 不会偷偷 apply
+```java
+applyResizedSurfaces();
+notifyReparentedSurfaces();
+nativeApplyTransaction(mNativeObject, sync);
+```
 
-`close()` 释放 native Transaction，对尚未 apply 的变更直接放弃。它不是 try-with-resources 结束时自动提交的事务。
+因此 Java 对象宽高已更新、reparent listener 已回调，也不能证明 SF 已 commit。
+
+`close()` 只释放 native 收集器，未 apply 的变更被放弃；它不会自动提交。
 
 ---
 
-## 5. `layer_state_t.what`：真正的增量协议
+## 5. `what` 位图才是增量协议
 
-`layer_state_t` 内有很多字段，但只有 `what` 指定的字段才属于本次变更：
+`layer_state_t` 看起来像完整 Layer 状态：
 
 ```cpp
 uint64_t what;
@@ -198,10 +191,9 @@ Rect frame;
 sp<GraphicBuffer> buffer;
 sp<Fence> acquireFence;
 ui::Dataspace dataspace;
-...
 ```
 
-对应位包括：
+但字段是否属于本次修改，由 `what` 决定：
 
 ```text
 ePositionChanged
@@ -220,20 +212,18 @@ eHasListenerCallbacksChanged
 ...
 ```
 
-### 5.1 为什么不能只看字段值
-
-未设置 `what` 位时，结构中的默认值或旧内存值不是“把属性重置为默认”，而是“这个字段不参与本次事务”。
+例如：
 
 ```text
-alpha = 0 且 eAlphaChanged存在     本次确实设置透明
-alpha = 0 但 eAlphaChanged不存在  alpha字段应被忽略
+alpha == 0 且 eAlphaChanged 已置位    本次要把 alpha 设为 0
+alpha == 0 但 eAlphaChanged 未置位    该字段不参与本次事务
 ```
 
-这是一种典型的 patch/update 协议，而不是整对象替换协议。
+所以它是 patch 协议，不是整对象替换协议。
 
-### 5.2 flags 还有 mask
+### 5.1 flags 还要结合 mask
 
-Layer flags 更新不是简单覆盖：
+flags 只改 mask 指定的 bit：
 
 ```cpp
 flags &= ~other.mask;
@@ -241,35 +231,25 @@ flags |= (other.flags & other.mask);
 mask |= other.mask;
 ```
 
-只有 mask 指定的 bit 被本次更新，其余 flag 保留。
+这让一笔事务可以只打开或关闭某些 Layer flag，而不覆盖其余位。
+
+### 5.2 SF 也只按 `what` 消费
+
+`setClientStateLocked()` 读取 `what` 后才调用相应 setter：
+
+```text
+ePositionChanged      → layer->setPosition(...)
+eCropChanged          → layer->setCrop(...)
+eFrameChanged         → layer->setFrame(...)
+eAcquireFenceChanged  → layer->setAcquireFence(...)
+eBufferChanged/cache  → 解析后 layer->setBuffer(...)
+```
+
+没有置位的成员即使随 Parcel 出现，也不应改变 Layer。
 
 ---
 
-## 6. 一个 Transaction 如何容纳多个 Layer
-
-native Transaction 保存：
-
-```cpp
-std::unordered_map<sp<IBinder>, ComposerState, IBinderHash> mComposerStates;
-```
-
-key 是 SurfaceControl 的 Binder handle，value 的核心是 `layer_state_t`。
-
-```mermaid
-flowchart TD
-    T["一个Transaction"] --> A["Layer A handle<br/>position + alpha"]
-    T --> B["Layer B handle<br/>buffer + acquire fence + crop"]
-    T --> C["Layer C handle<br/>reparent + z"]
-    T --> D["DisplayState<br/>projection/size/surface"]
-    T --> I["InputWindowCommands"]
-    T --> P["事务级flags/time/callback"]
-```
-
-同一个 Layer 多次 setter 不会产生多份 ComposerState，而是在相同 handle 对应的状态上累积。
-
----
-
-## 7. `merge()`：按字段合并，后者覆盖冲突
+## 6. `merge()`：Layer 字段能合，并非所有事务语义都能合
 
 Java：
 
@@ -277,313 +257,283 @@ Java：
 nativeMergeTransaction(mNativeObject, other.mNativeObject);
 ```
 
-native：
+JNI 最终调用：
 
 ```cpp
 transaction->merge(std::move(*otherTransaction));
 ```
 
-### 7.1 同一 Layer 的冲突
-
-`layer_state_t::merge(other)` 按 `other.what` 覆盖对应字段：
+对同一 Layer，`layer_state_t::merge(other)` 按 `other.what` 覆盖冲突字段：
 
 ```text
-this先设置alpha=0.5
-other设置alpha=0.8
-this.merge(other)
-结果alpha=0.8
+this:  alpha = 0.5
+other: alpha = 0.8
+this.merge(other) → 0.8
 ```
 
-绝对 z 与相对 z 是互斥语义：合并相对 layer 时会清掉 `eLayerChanged`；合并绝对 layer 时会清掉 `eRelativeLayerChanged`。
+有些字段有专门规则：
 
-metadata 是 key 级 merge，flags 按 mask 合并，callback 集合也会迁移。
+- 绝对 Z 与相对 Z 互斥，后合入者清掉另一种 `what` 位；
+- flags 按 mask 合并；
+- metadata 按 key 合并；
+- callback id 与关联 SurfaceControl 会迁移到接收者。
 
-### 7.2 other 被清空
+合并完成后 `other.clear()`，所以 `other` 对象仍存在，但已不再保存那批变更。
 
-Java 文档说明另一个 Transaction 会像已经 apply 一样被清空。它的 native 对象还存在，但不再保留被移走的变更。
+### 6.1 r48 的事务级缺口
 
-### 7.3 r48 的事务级字段有重要边界
-
-本版本 `merge()` 明确合并了：
+r48 `Transaction::merge()` 明确迁移：
 
 ```text
 ComposerState / DisplayState
 listener callbacks
 InputWindowCommands
 mContainsBuffer
-early-wakeup相关布尔值
+early-wakeup 三个布尔值
 ```
 
-但代码没有把 `other` 的：
+却没有把以下字段从 `other` 合到 `this`：
 
 ```text
 mDesiredPresentTime
 mForceSynchronous
 mAnimation
+mTransactionNestCount
+mStatus
 ```
 
-合并到接收者，然后 `other.clear()` 会重置它们。
-
-所以不能笼统说“merge 会保留另一个事务的所有语义”。这是 Android 11 r48 的实现边界；使用者应在最终 Transaction 上设置所需的事务级选项。
+随后 `other.clear()` 会重置其中一部分。因此不能说 merge 会保留 `other` 的全部事务级语义；需要这些选项时，应在最终接收 Transaction 上重新设置。
 
 ---
 
-## 8. `apply()`：先清本地快照，再跨 Binder
+## 7. `apply()` 的清空、复用与 Binder 边界
 
-Java：
+native `Transaction::apply()` 的关键步骤是：
 
-```java
-public void apply(boolean sync) {
-    applyResizedSurfaces();
-    notifyReparentedSurfaces();
-    nativeApplyTransaction(mNativeObject, sync);
-}
-```
-
-JNI：
-
-```cpp
-transaction->apply(sync);
-```
-
-native `apply()`：
-
-1. 整理 listener callback；
-2. 对 GraphicBuffer 做跨事务 cache；
-3. 把 map 转成 `Vector<ComposerState>`；
-4. 复制 DisplayState；
-5. 计算 synchronous/animation/early-wakeup flags；
-6. 清空客户端已提交的 Layer/Display/callback 状态并复位若干 flags；
-7. 调用 `ISurfaceComposer::setTransactionState()`。
+1. 把 callback 注册信息挂到相应 Layer state；
+2. 执行 GraphicBuffer cache 处理；
+3. 将 map 转成 `Vector<ComposerState>`，复制 DisplayState；
+4. 计算 synchronous、animation、early-wakeup flags；
+5. 清掉已提交的 Layer、Display、listener 等本地集合；
+6. 调用 `ISurfaceComposer::setTransactionState()`。
 
 ```cpp
 sf->setTransactionState(composerStates, displayStates, flags,
         applyToken, mInputWindowCommands, mDesiredPresentTime,
-        ..., hasListenerCallbacks, listenerCallbacks);
+        {}, hasListenerCallbacks, listenerCallbacks);
 ```
 
-注意上节的 r48 边界：发送后 `mDesiredPresentTime` 没有在 `apply()` 中重置，复用同一对象可能沿用旧值。
+### 7.1 apply 后可以复用，但不是完整 `clear()`
 
-### 8.1 Binder 是同步调用，不等于显示语义同步
+Java 文档允许复用 Transaction。确实，已发送的 Layer/Display patch 不会再发；但 r48 的 `apply()` 并未调用 `clear()`：
 
-普通 Binder transact 会等待服务端 `setTransactionState()` 返回；但服务端通常只更新 current state、设置 transaction flags，然后返回。
+| 成员 | `apply()` 后 |
+|---|---|
+| ComposerState / DisplayState | 清空 |
+| listener callbacks / input commands | 清空 |
+| sync / animation / early-wakeup flags | 复位 |
+| `mDesiredPresentTime` | **保留旧值** |
+| `mContainsBuffer` | **没有复位**，之后可能多做一次空扫描 |
 
-因此：
+只有 `clear()` 明确把 `mDesiredPresentTime` 设为 `-1`、把 `mContainsBuffer` 设为 false。
+
+这带来一个实际阅读结论：
 
 ```text
-Binder调用返回       服务端已接收/处理到API边界
-SF commit             current推进到drawing
-Layer latch           buffer成为本帧活动内容
-present               合成结果交给显示管线
+复用同一 Transaction 时，旧 Layer 字段不会重发；
+但旧 desiredPresentTime 可能继续影响下一次 apply。
 ```
 
-四者不能合并成一个“apply完成”。
+### 7.2 Binder 同步不等于显示同步
+
+`BpSurfaceComposer::setTransactionState()` 用普通 `transact`，所以调用线程会经历同步 Binder 往返；但普通事务在 SF 写 current state、设置调度 flag 后即可返回。
+
+```text
+Binder 返回       SF 已处理到 setTransactionState API 边界
+transaction commit current 推进为 drawing
+buffer latch       drawing buffer 成为 active buffer
+present fence      描述显示管线的完成条件
+```
+
+不能把这四层压缩为一句“apply 已完成显示”。
 
 ---
 
-## 9. Parcel：完整字段传输，`what` 决定消费
+## 8. Parcel 与三套 buffer cache 不要混淆
 
-`ComposerState::write()` 调用 `layer_state_t::write()`，顺序写入：
-
-```text
-surface handle
-what
-position/z/size/alpha/flags/matrix
-crop/reparent/defer信息
-transform/frame
-GraphicBuffer
-acquire Fence
-dataspace/HDR/damage/API
-color transform/input info/metadata
-listeners/frame-rate/fixed transform hint
-```
-
-接收端严格按同一顺序 read。
-
-即使很多字段本次未改变，结构仍按协议读写；SF 后续只按 `what` 分支调用 Layer setter。
-
-### 9.1 GraphicBuffer 与 fence 怎样跨进程
-
-第 162 章已经说明：
-
-- GraphicBuffer flatten 会传元数据、handle fd/ints；
-- Binder 复制 fd 引用，接收端导入；
-- Fence 自身也通过 fd 传递同一硬件时间线条件；
-- 指针值和 fd 数字不会作为跨进程身份。
-
----
-
-## 10. Buffer cache：避免同一 GraphicBuffer 反复传输
-
-客户端 `cacheBuffers()` 会为 buffer 分配 `token + cache id`：
+`BpSurfaceComposer` 写入：
 
 ```text
-首次：发送buffer + cache id
-命中：去掉完整buffer，只发送cache id
-淘汰：单独发送uncache transaction
-```
-
-SF 的 `ClientCache` 以 client cache id 找回 GraphicBuffer，并通过 token 的 Binder death 清理进程缓存。
-
-它类似第 162 章 BufferQueue slot cache 的目标——减少稳定复用时的 Binder 数据——但不是同一张表：
-
-```text
-BufferQueue slot cache    producer/consumer队列协议
-Surface transaction cache SurfaceComposerClient与SF之间的buffer传输优化
-HWC buffer cache          SF与composer HAL之间的slot缓存
-```
-
-三者不能用同一个 slot/id 概念代替。
-
----
-
-## 11. SF Binder 入口：从 Parcel 恢复 Transaction
-
-`ISurfaceComposer.cpp` 的 `SET_TRANSACTION_STATE` 分支依次读取：
-
-```text
-ComposerState数量和每项状态
-DisplayState数量和每项状态
-state flags
+ComposerState 数组
+DisplayState 数组
+transaction flags
 applyToken
 InputWindowCommands
 desiredPresentTime
 uncacheBuffer
-hasListenerCallbacks
-listener callback列表
+listener callback 信息
 ```
 
-然后进入：
+服务端 `BnSurfaceComposer::onTransact()` 按相同顺序恢复，再调用 SF。
 
-```cpp
-SurfaceFlinger::setTransactionState(...)
+每个 `layer_state_t` 的 Parcel 还包含完整协议布局：handle、`what`、几何、buffer、fence、dataspace、damage、metadata、listener 等。字段是否生效仍由 `what` 控制。
+
+GraphicBuffer 与 fence 跨进程的关键点仍是第 162 章的结论：
+
+- GraphicBuffer flatten 传元数据与 native handle 内容；
+- Binder 复制 fd 引用，接收端导入；
+- Fence 通过 fd 表达同一同步条件；
+- 指针值和本地 fd 数字都不是跨进程身份。
+
+### 8.1 transaction buffer cache
+
+`cacheBuffers()` 为 GraphicBuffer 建立 `token + cache id`：
+
+```text
+cache miss  → 同时发送完整 buffer 与 cache id
+cache hit   → 清 eBufferChanged，只发 eCachedBufferChanged + cache id
+淘汰       → 另发 uncache transaction
 ```
 
-此时发生第二个重要线程边界：调用通常进入 SF Binder 线程，而最终 traversal/commit/composition 由 SF 主线程推进。
+SF `ClientCache` 命中后恢复 buffer；若 cache id 无法解析，`setClientStateLocked()` 不调用 `setBuffer()`，但同一 Layer 的其他合法字段仍可能被应用。这再次说明它不是“任一项失败就全回滚”。
+
+不要混淆三套复用机制：
+
+| cache | 边界 |
+|---|---|
+| BufferQueue slot cache | producer ↔ consumer 队列协议 |
+| Surface transaction cache | SurfaceComposerClient ↔ SF |
+| HWC buffer cache | SF ↔ Composer HAL |
+
+它们可能描述同一底层分配，却没有共同的 slot/id 命名空间。
 
 ---
 
-## 12. apply token：为来源建立有序队列
+## 9. applyToken、就绪检查与 pending FIFO
 
-客户端取：
+标准 native 客户端取进程内 `TransactionCompletedListener` 的 Binder 作为 apply token：
 
 ```cpp
 sp<IBinder> applyToken =
         IInterface::asBinder(TransactionCompletedListener::getIInstance());
 ```
 
-SF 以它作为 `mTransactionQueues` 的 key。
+SF 用它作为 `mTransactionQueues` 的 key。标准实现中，同一进程的事务通常共享这个 token。
 
-如果同一 apply token 已有 pending transaction，那么后来事务也必须排到后面，即便后来事务自身已经满足时间/fence条件。
+若 token 对应的队列已经非空，新事务即使自己 ready，也必须追加到队尾：
 
 ```mermaid
 flowchart LR
-    T1["T1：fence未signal"] --> Q1["applyToken A队首"]
-    T2["T2：已经ready"] --> Q2["applyToken A队尾"]
-    Q1 -->|"T1 ready后"| APPLY1["应用T1"]
-    APPLY1 --> APPLY2["再应用T2"]
-
-    U1["U1：applyToken B"] --> QB["独立队列"]
+    T1["T1 fence未signal"] --> Q1["token A 队首"]
+    T2["T2 已ready"] --> Q2["token A 队尾"]
+    Q1 -->|T1 ready| A1["应用T1"]
+    A1 --> A2["再应用T2"]
+    U1["token B 的事务"] --> B1["另一条队列独立判断"]
 ```
-
-源码注释明确：同一进程的事务按 apply 顺序 present，desired present time 不改变这个顺序。
-
-但不同 token 的事务没有“自动成为一个全局原子事务”的承诺。需要一起生效的变更，应在客户端先 merge 到同一个 Transaction。
-
----
-
-## 13. 事务何时进入 pending queue
 
 `transactionIsReadyToBeApplied()` 检查两类条件。
 
-### 13.1 desired present time
+### 9.1 desired present time
 
 ```cpp
 if (desiredPresentTime >= 0 &&
     desiredPresentTime >= expectedPresentTime &&
-    desiredPresentTime < expectedPresentTime + 1s) {
+    desiredPresentTime < expectedPresentTime + s2ns(1)) {
     return false;
 }
 ```
 
-含义：
+因此：
 
-- 已经过期：尽快应用；
-- 位于未来 1 秒以内：先排队等合适周期；
-- 超过未来 1 秒：为稳定性忽略过远时间，不让事务长期卡住。
+- 时间已过：可以尽快应用；
+- 在未来 1 秒内：暂缓；
+- 比预期时间远 1 秒以上：为稳定性忽略这个过远时间，不长期阻塞。
 
-desired time 是期望，不是 exact alarm，也不保证正好在该纳秒 present。
+它是期望时间，不是保证精确触发的闹钟。
 
-### 13.2 acquire fence
+### 9.2 acquire fence
 
-若事务包含 `eAcquireFenceChanged` 且 fence 仍 unsignaled，整个 Transaction 暂不应用。
+只要任一 `ComposerState` 带 `eAcquireFenceChanged`，且 fence 状态仍为 `Unsignaled`，整个 Layer/Display transaction payload 暂不进入 setter 阶段。
 
-这很重要：
+```text
+同一事务：buffer + crop + frame + position
+其中 acquire fence 未完成
+结果：这批 Layer/Display patch 一起等待
+```
 
-> 为保持事务原子性，不能先应用几何，再等 buffer fence；包含它们的整个提交单元一起等待。
-
-`flushTransactionQueues()` 由 SF 主循环重新检查，队首未 ready 时保留队列并设置 flush-needed flag。
+`flushTransactionQueues()` 在 SF 主循环中从各 token 队首重试。队首不 ready，就保留它并设置 `eTransactionFlushNeeded`；不会跳过队首去应用同 token 的后项。
 
 ---
 
-## 14. `applyTransactionState()`：把 patch 写进 current state
+## 10. SF 如何把 patch 写入 current state
 
-SF 持有 `mStateLock`，先应用 DisplayState，再遍历 ComposerState：
+直接应用或从队列 flush 后，都会进入 `applyTransactionState()`。调用期间持有 `mStateLock`：
 
 ```cpp
+for (const DisplayState& display : displays) {
+    transactionFlags |= setDisplayStateLocked(display);
+}
+
 for (const ComposerState& state : states) {
     clientStateFlags |= setClientStateLocked(state, ...);
 }
 ```
 
-`setClientStateLocked()` 根据 `what` 调用：
+`setClientStateLocked()` 按 `what` 更新各 Layer 的 `mCurrentState`，并汇总 SF transaction flags。
 
-```text
-setPosition / setLayer / setRelativeLayer
-setSize / setAlpha / setMatrix / setCrop
-reparent / detach / metadata / input info
-setBuffer / setAcquireFence / setDataspace
-setTransactionCompletedListeners
-```
+### 10.1 原子提交不代表统一校验回滚
 
-这些 setter 主要更新 Layer 的 `mCurrentState`，标记 `modified`，并设置 Layer 自己的 transaction flags。
+几种局部失败都不会触发整笔事务回滚：
 
-### 14.1 权限不是 Transaction 一次性全有或全无
+- handle 为 null 或 Layer 已消失：该 Layer 的状态跳过，callback 登记为 unpresented；
+- 无 `ACCESS_SURFACE_FLINGER`：input info、frame-rate priority 或特定变换被拒绝；
+- Layer 层级条件不满足：例如对子 Layer 设置 layer stack，只记录错误；
+- buffer cache id 无法解析：buffer 不更新，其他字段仍可更新。
 
-部分字段需要 `ACCESS_SURFACE_FLINGER` 等特权，例如 input info、某些 early wakeup 或 frame-rate priority。SF 会按字段检查，未授权字段可被拒绝/忽略并记录错误。
+权限也是按字段判断，不是“持有 SurfaceControl 就能改一切”。
 
-不要把“能拿到 SurfaceControl”扩大成“能改所有 privileged Layer 状态”。
+### 10.2 transaction flags 是工作请求
+
+常见返回位：
+
+| flag | 含义 |
+|---|---|
+| `eTransactionNeeded` | 有 current/pending 状态需要推进 |
+| `eTraversalNeeded` | Layer 树几何、Z、可见区、输入等需要重新遍历 |
+| `eDisplayTransactionNeeded` | Display state 需要处理 |
+
+`mTransactionFlags.fetch_or()` 会合并多个请求，并在相应 flag 首次出现时唤醒主线程。它类似应用侧“合并下一次 traversal”的思想，但属于 SF 自己的调度循环。
 
 ---
 
-## 15. 两组 current/drawing state
+## 11. 两层 current/drawing 与 commit 顺序
 
-源码里至少有两层双缓冲状态。
+源码中有两套容易混淆的双状态。
 
-### 15.1 SurfaceFlinger 全局 State
+### 11.1 SurfaceFlinger 全局 State
 
 ```text
-mCurrentState   客户端事务不断写入的Layer树/Display集合
-mDrawingState   当前主循环用于遍历、合成的稳定快照
+mCurrentState   当前 Layer 树、Display 集合的编辑版本
+mDrawingState   本轮 traversal/composition 使用的稳定版本
 ```
 
-`commitTransactionLocked()`：
+`commitTransactionLocked()` 中有：
 
 ```cpp
 mDrawingState = mCurrentState;
 ```
 
-并提交 child list、offscreen layer、mirror info 等。
+并提交 child list、offscreen Layer 和 mirror 信息。
 
-### 15.2 每个 Layer 的 State
+### 11.2 每个 Layer 的 State
 
 ```text
-Layer::mCurrentState   setter写入的请求状态
-Layer::mPendingStates  defer/同步条件下等待的状态序列
-Layer::mDrawingState   Layer本轮可供可见性/合成读取的状态
+Layer::mCurrentState   setter 写入
+Layer::mPendingStates  legacy defer 等待队列
+Layer::mDrawingState   本轮可见性和合成读取
 ```
 
-`Layer::doTransaction()`：
+`handleTransactionLocked()` 遍历 Layer，调用 `Layer::doTransaction()`：
 
 ```text
 pushPendingState()
@@ -592,96 +542,90 @@ doTransactionResize(...)
 commitTransaction(candidate)
 ```
 
-最终：
+最后：
 
 ```cpp
 mDrawingState = stateToCommit;
 ```
 
-### 15.3 为什么需要双份
+随后 SF 才提交自己的全局 drawing tree。
 
-Binder 线程可以不断接收新状态；SF 主循环需要一个在本轮 traversal/composition 中保持一致的快照。current/drawing 分离避免遍历到一半结构被另一笔事务改写。
+Binder 线程也可能在下一次主循环 commit 前连续应用多笔事务；后写值会留在 current 中，主线程只提交最终快照。于是 apply 顺序可以得到保持，却不代表每笔事务都生成一帧可见画面，中间 current 状态可能从未进入 drawing。
 
----
+### 11.3 legacy defer 是显式例外
 
-## 16. `eTransactionNeeded` 与 `eTraversalNeeded`
-
-粗略区分：
-
-| flag | 作用 |
-|---|---|
-| `eTransactionNeeded` | 需要把 current/pending 状态推进并提交 |
-| `eTraversalNeeded` | Layer树几何、Z、可见区域、输入等需要重新遍历计算 |
-
-某些变更只需要 transaction；位置、Z、reparent、buffer、input 等常会要求 traversal。
-
-SF 用原子 `mTransactionFlags.fetch_or()` 合并请求，并在 flag 首次出现时唤醒主线程。它与 ViewRootImpl 的 `mTraversalScheduled` 类似，都是“把多次变更合并到一次循环”，但运行在完全不同的进程和调度器中。
-
----
-
-## 17. normal、synchronous 与 animation transaction
-
-### 17.1 普通 apply
-
-普通事务在 SF 写 current state、设置调度 flag 后即可从 Binder 返回。它不等待 commit，更不等待 present。
-
-### 17.2 `apply(true)`
-
-Java 注释直接称它为更卡顿的版本。对已经满足 desired-time/acquire-fence条件、可立即进入 `applyTransactionState()` 的事务，SF 设置 `mTransactionPending`，非 SF 主线程调用者等待 condition variable；`commitTransaction()` 后清掉 pending 并 broadcast。
-
-所以这条直接应用路径的同步边界是：
-
-> 等 SF 执行事务 commit，使 current 状态推进到 drawing 状态的主循环边界。
-
-但有一个容易漏读的例外：`setTransactionState()` 若发现同 apply token 已有 pending 事务，或本事务 desired time/fence 未 ready，会先放入 `mTransactionQueues` 然后直接 return。这个分支不会让原调用者继续等到未来 flush/commit，即使 flags 中带 `eSynchronous`。
-
-因此 r48 的准确表述是：
+`deferTransactionUntil_legacy` 会把 Layer state 绑到 barrier Layer 的 frame number。未满足同步点时，这个 Layer 的 pending state 不会 commit，SF 继续请求 traversal。
 
 ```text
-ready且直接应用的apply(true)       等本轮SF commit或5秒超时
-先进入TransactionQueue的apply(true) 提交入队后即可返回，未来由SF主线程flush
+入口 TransactionQueue  在调用 Layer setter 前，等待整批 Layer/Display payload
+Layer pending states    已写 current 后，按调用者显式设置的 legacy barrier 延迟单 Layer
 ```
 
-它仍不等于：
-
-```text
-buffer acquire fence之后的最终latch
-HWC present fence signal
-面板扫描完成
-```
-
-并且有 5 秒超时防止永久卡死。
-
-### 17.3 animation transaction
-
-同一 apply token 已有 pending transaction 时，animation transaction 会等待前序应用，最长同样有超时；SF 还用 `mAnimTransactionPending` 做 back-pressure 和本轮动画合成标记。
-
-early-wakeup flags 影响 VSync phase 调度，其中显式 start/end 仅允许 WindowManager 等特权调用者使用。
+因此谈原子性时必须把显式 defer 语义单列出来。BLAST 的方向是把 buffer 与几何直接 merge 到同一 Transaction，减少对此旧机制的依赖。
 
 ---
 
-## 18. legacy defer transaction 与新队列条件
+## 12. 普通、synchronous、animation 事务的真实等待点
 
-Layer 仍支持 legacy：让某个 Layer 状态等另一个 barrier Layer 到达指定 frame number。
+### 12.1 普通 apply
 
-`pushPendingState()` 会创建 SyncPoint，挂到 barrier Layer；`applyPendingStates()` 只有在 `frameIsAvailable()` 后才 pop 并 commit，否则保留 pending state 并继续请求 traversal。
+SF 直接路径会在 Binder 线程中写 current state、设置 transaction flag，然后返回。它不等待主循环 commit，更不等待 present。
 
-这与事务入口的 desired-time/acquire-fence queue 是两层机制：
+### 12.2 `apply(true)` 只有直接路径会等待 commit
+
+若事务已经 ready 且可以直接进入 `applyTransactionState()`：
 
 ```text
-SF TransactionQueue   整个setTransactionState在进入Layer setter前等待
-Layer pending states  已写入Layer current后，按legacy frame barrier延迟drawing提交
+设置 mTransactionPending = true
+非 SF 主线程调用者等待 condition variable
+commitTransaction() 清 false 并 broadcast
 ```
 
-Android 11 r48 正处在 BLAST 迁移中，代码注释也建议很多新场景直接把 buffer transaction 与几何 transaction merge，而不是继续依赖 legacy defer。
+等待上限为 5 秒。因此直接路径的同步边界大致是“SF 执行一次 transaction commit”，仍不是 buffer release 或 present fence signal。
 
----
-
-## 19. BufferStateLayer：buffer 是 Layer state 的一个字段
-
-BLAST 构造的 native Transaction 包含：
+但 r48 有一个关键分支：
 
 ```cpp
+if (pendingTransactions || !transactionIsReadyToBeApplied(...)) {
+    mTransactionQueues[applyToken].emplace(...);
+    setTransactionFlags(eTransactionFlushNeeded);
+    return;
+}
+```
+
+它发生在 `applyTransactionState()` 之前。所以：
+
+```text
+ready、直接应用的 apply(true)   等 commit 或 5 秒超时
+先进入 pending queue 的 apply(true) 入队后就从 Binder 返回
+```
+
+队列未来由 SF 主线程 flush；主线程调用 `applyTransactionState(..., isMainThread=true)` 时也不会在内部阻塞自己。
+
+### 12.3 animation transaction
+
+同 token 已有 pending 事务时，animation transaction 会先等队列消失，最长 5 秒；直接应用阶段还用 `mAnimTransactionPending` 对前一动画事务做 back-pressure。early-wakeup flags 则影响 VSync phase，显式 start/end 只允许特权调用者使用。
+
+### 12.4 r48 queued payload 的 InputWindowCommands 缺口
+
+`setTransactionState()` 收到了 `InputWindowCommands`，但 r48 的 `TransactionState` 队列结构只保存：
+
+```text
+states / displays / flags / desiredPresentTime
+uncacheBuffer / postTime / privileged / callbacks
+```
+
+它没有 `InputWindowCommands` 成员。flush 时传入的是 SF 的全局 `mPendingInputWindowCommands`，不是原事务携带的那份命令。
+
+所以“未 ready 时整笔事务原样入队”只适合描述 Layer/Display 主载荷；不能据此承诺 input commands 在该分支也按相同对象保存。这是 r48 的具体实现边界。
+
+---
+
+## 13. BufferStateLayer：setBuffer、drawing 与 active buffer
+
+BLAST 常提交：
+
+```text
 setBuffer(surfaceControl, buffer)
 setAcquireFence(surfaceControl, fence)
 setFrame(...)
@@ -690,14 +634,14 @@ setTransform(...)
 setDesiredPresentTime(...)
 ```
 
-SF 解析 cache 后调用：
+SF 解析直接 buffer 或 cache id 后调用：
 
 ```cpp
 layer->setBuffer(buffer, s.acquireFence,
                  postTime, desiredPresentTime, s.cachedBuffer);
 ```
 
-`BufferStateLayer::setBuffer()`：
+`BufferStateLayer::setBuffer()` 只更新 current state：
 
 ```cpp
 if (mCurrentState.buffer) {
@@ -710,46 +654,19 @@ mCurrentState.modified = true;
 setTransactionFlags(eTransactionNeeded);
 ```
 
-这里仍只是写 current state。`mBufferInfo.mBuffer` 代表当前实际 active buffer，要等后续 latch 的 `updateActiveBuffer()` 才替换。
+它还记录 post time、desired present time 和 frame event。此时真正参与合成的仍是 `mBufferInfo.mBuffer`。
 
----
-
-## 20. 为什么 BufferStateLayer 的 acquire fence 看起来已 signal
-
-`setAcquireFence()` 有注释：
-
-```cpp
-// The acquire fences of BufferStateLayers have already signaled before they are set
-```
-
-原因不是 producer 提交时 fence 天生已完成，而是 r48 的 SF TransactionQueue 在调用 `setClientStateLocked()` 前已经用 `transactionIsReadyToBeApplied()` 拦住 unsignaled acquire fence。
-
-所以要按两段读：
+Layer state commit 后，共同的 `BufferLayer::latchBuffer()` 依次检查：
 
 ```text
-客户端Transaction中的acquire fence   可以pending
-进入BufferStateLayer current state时  正常应已经signal
-```
-
-传统 BufferQueueLayer 不走这套 Transaction buffer入口，它在 `latchBuffer()` 前检查队首 BufferItem 的 acquire fence。
-
----
-
-## 21. BufferStateLayer 从 current 到 active buffer
-
-### 21.1 transaction 阶段
-
-`Layer::doTransaction()` 将满足条件的状态复制到 Layer drawing state。BufferStateLayer 额外记住：本次 drawing 候选是否来自 modified current state。
-
-### 21.2 latch 阶段
-
-共同 `BufferLayer::latchBuffer()` 检查 ready、refresh pending、fence、同步点，然后调用：
-
-```text
-updateTexImage()
-updateActiveBuffer()
-updateFrameNumber()
-gatherBufferInfo()
+hasReadyFrame
+mRefreshPending
+fenceHasSignaled
+legacy sync point
+updateTexImage
+updateActiveBuffer
+updateFrameNumber
+gatherBufferInfo
 ```
 
 `BufferStateLayer::updateActiveBuffer()` 才执行：
@@ -760,454 +677,223 @@ mBufferInfo.mBuffer = mDrawingState.buffer;
 mBufferInfo.mFence = mDrawingState.acquireFence;
 ```
 
-因此“setBuffer 已执行”与“Layer 当前用于合成的 buffer 已替换”是两个完成点。
+因此必须区分：
 
-```mermaid
-sequenceDiagram
-    participant C as "BLAST/客户端"
-    participant B as "SF Binder线程"
-    participant L as "BufferStateLayer"
-    participant S as "SF主线程"
-    participant H as "Composition/HWC"
-
-    C->>B: "Transaction(buffer + fence + geometry)"
-    B->>B: "ready检查 / 必要时排队"
-    B->>L: "写mCurrentState"
-    S->>L: "doTransaction → mDrawingState"
-    S->>L: "latchBuffer"
-    L->>L: "updateActiveBuffer / frameNumber"
-    S->>H: "合成与present"
+```text
+setBuffer 成功       buffer 进入 Layer current state
+doTransaction 成功   buffer 进入 Layer drawing state
+latchBuffer 成功     buffer 成为 active buffer
 ```
+
+### 13.1 为什么 `setAcquireFence()` 说 fence 已 signal
+
+它的注释写着 BufferStateLayer 的 acquire fence 在设置前已经 signal。原因不是 producer 交来的 fence 天生完成，而是 SF 入口的 `transactionIsReadyToBeApplied()` 已经拦住 unsignaled fence。
+
+```text
+客户端 Transaction 中的 acquire fence   可以未完成并导致排队
+进入 BufferStateLayer setter 时          正常已完成
+```
+
+共同 latch 路径仍会调用 `fenceHasSignaled()` 做检查。传统 BufferQueueLayer 则不经 Transaction buffer 入口，而是在消费队首 BufferItem 时检查 fence。
+
+### 13.2 几何与 buffer 配对的价值
+
+把 `buffer + frame + crop + transform + fence` 放在同一 Transaction 中，可以避免 resize 时先把新几何套到旧 buffer 上。
+
+但它只保证状态配对，不保证 GPU 一定赶上目标 VSync，也不保证 HWC 不会错过刷新周期。
 
 ---
 
-## 22. buffer 尺寸与几何为什么要一起 latch
+## 14. callback、present fence 与 previous release fence
 
-legacy BufferQueueLayer 在 resize 时会避免把新几何立即套在旧 buffer 上，直到正确尺寸 buffer 到达；否则可能短暂拉伸、裁剪错误或露出背景。
-
-BufferStateLayer/BLAST 的目标正是让：
+注册 transaction-completed callback 后，SF 为相关 SurfaceControl 建立 `CallbackHandle`，可携带：
 
 ```text
-buffer
-frame/crop
-transform
-position/relative state
-acquire fence
+latchTime / frameNumber / acquireTime
+previousReleaseFence / transformHint
+gpuCompositionDoneFence / refreshStartTime
+dequeueReadyTime / compositorTiming
 ```
 
-以一个 Transaction 到达 SF，降低几何和内容错拍。
+### 14.1 pending 与 unpresented
 
-但“同事务”只解决状态配对；buffer仍需满足 fence、时间和 Layer latch 条件。
+`BufferStateLayer::setTransactionCompletedListeners()` 先判断本次状态是否会 present：
 
----
+- 会重新 latch/present：登记 pending handle，并存进 Layer current state；
+- 不需要 present 或 Layer 已无效：登记 unpresented handle。
 
-## 23. 一帧内连续提交多个 buffer
+同一 listener 的 callback 保持事务顺序：前一笔仍有 pending handle 时，后一笔不会越过。
 
-`BufferStateLayer::onLayerDisplayed()` 的长注释给出重要语义。
+### 14.2 callback 不等待 present fence signal
 
-假设同一显示帧中有三笔事务：
+`postComposition()` 附近的顺序是：
 
 ```text
-T1：只改alpha，不换buffer
-T2：buffer A → buffer B
-T3：buffer B → buffer C
+Layer::releasePendingBuffer
+  → finalizePendingCallbackHandles
+SF 取得本轮 present fence
+  → TransactionCompletedThread::addPresentFence
+  → sendCallbacks
 ```
 
-最终显示的是 C：
-
-- T1 不释放 A，因为该时刻 Layer 仍需要 A；
-- 第一笔真正替换旧显示 buffer 的 T2 callback 需要得到 A 的 previous release fence；
-- B 在本帧内又被 C 覆盖，B没有真正显示，可更早释放；
-- T3 不应再次声称自己释放了同一个 A。
-
-代码遍历 drawing callback handles，只给第一个 `releasePreviousBuffer` 的 handle 填 previous release fence，然后 break。
-
-这说明 release fence 是“某次替换所释放的上一张实际显示 buffer”的完成条件，不是每笔 `setBuffer()` 都机械产生一个独立显示 release fence。
-
----
-
-## 24. Transaction completed callback 状态机
-
-客户端注册 callback 后，SF 为每个相关 SurfaceControl 创建 `CallbackHandle`。
-
-Handle 可携带：
+回调线程把 fence 对象装入 stats 后直接 Binder 回调，没有先 `waitForever()`。
 
 ```text
-latchTime
-frameNumber
-acquireTime
-previousReleaseFence
-transformHint
-gpuCompositionDoneFence
-refreshStartTime
-dequeueReadyTime
-compositorTiming
+callback 到达         SF 已凑齐该事务的相应统计和 fence 对象
+present fence signal  显示管线到达该 fence 定义的完成点
 ```
 
-### 24.1 pending 与 unpresented
+如果调用者需要硬完成条件，必须检查或等待 fence，不能只看 callback 已执行。
 
-若 Layer 的当前 transaction 需要重新 latch/present：
+### 14.3 同一显示帧内多次换 buffer
+
+假设当前显示 A，本轮连续收到：
 
 ```text
-registerPendingCallbackHandle()
-handle暂存在Layer current/drawing state
+T1：只改 alpha
+T2：A → B
+T3：B → C
 ```
 
-若变更不需要重新 present，或者 Layer 无效：
+最终显示 C。`BufferStateLayer::onLayerDisplayed()` 只把 A 的实际 release fence 交给第一个标记了 `releasePreviousBuffer` 的 callback handle，然后停止遍历：
 
-```text
-registerUnpresentedCallbackHandle()
-```
+- T1 没换 buffer，不应释放 A；
+- T2 是本帧第一个替换旧 active buffer A 的事务，应拿 A 的 fence；
+- B 被 C 在真正显示前覆盖，不需要再伪造一个“从屏幕移除 B”的硬件 fence；
+- T3 也不能再次声称释放了 A。
 
-回调线程还会保持同一 listener 的 transaction callback 顺序；前一笔 pending 未完成时，后一笔不会越过。
+### 14.4 BLAST 为什么能释放本地 BufferQueue
 
-### 24.2 何时 finalize
+BLAST callback 的做法带一项延迟：
 
-SF `postComposition()` 先让本轮 queued layers 执行 `releasePendingBuffer()`，把 callback handles 移入 TransactionCompletedThread；随后取得本轮 HWC present fence，调用：
-
-```cpp
-mTransactionCompletedThread.addPresentFence(...);
-mTransactionCompletedThread.sendCallbacks();
-```
-
-### 24.3 callback 到达不等于 present fence 已 signal
-
-回调携带 `presentFence` 对象。回调线程并没有先 `waitForever()` 等 fence signal 再调用客户端。
-
-所以：
-
-```text
-callback到达        SF已完成本轮相应提交/统计组装
-presentFence signal 合成结果到达该fence定义的显示完成点
-```
-
-需要硬完成时间的调用者应检查/等待 fence 或使用 frame timeline 数据，不能只看 callback 被调用。
-
----
-
-## 25. BLAST 如何用 callback 释放本地 BufferQueue
-
-第 163 章看到 BLAST：
-
-1. 从客户端本地 BufferQueue acquire BufferItem；
-2. 把 GraphicBuffer 与 acquire fence 写进 SF Transaction；
-3. 注册 transaction-completed callback；
-4. callback 获得 `previousReleaseFence`；
-5. 用该 fence release 上一项本地 BufferItemConsumer buffer；
-6. 继续处理下一张 buffer。
+1. 若已有 `mPendingReleaseItem`，用本次 stats 的 `previousReleaseFence` release 它；
+2. 再把 `mSubmitted.front()` 移成新的 pending release item；
+3. 继续处理下一张 buffer。
 
 ```mermaid
 flowchart LR
-    Q["HWUI queue到BLAST本地BQ"] --> A["BLAST acquire BufferItem"]
-    A --> T["Transaction setBuffer + acquireFence"]
+    Q["应用queue到BLAST本地BQ"] --> A["BLAST acquire BufferItem"]
+    A --> T["Transaction: buffer + acquire fence"]
     T --> SF["SF latch / present"]
-    SF --> CB["completed callback<br/>previousReleaseFence"]
-    CB --> R["BLAST release上一BufferItem"]
-    R --> FREE["producer以后可再次dequeue"]
+    SF --> C["callback: previousReleaseFence"]
+    C --> R["BLAST release上一项"]
+    R --> D["producer以后可重新dequeue"]
 ```
 
-这条链保持了第 162 章的原则：逻辑 release 可以先发生，真正安全复用由 release fence 约束。
+逻辑 release 可以发生在 callback 中；底层分配何时真的安全复用，仍由 release fence 约束。
 
 ---
 
-## 26. Transaction callback、frame commit callback 与 present listener
+## 15. 故障定位与只读练习
 
-几个名字相似但层级不同：
+### 15.1 先按完成点定位
 
-| 回调/完成点 | 所在层 | 主要语义 |
-|---|---|---|
-| HWUI FrameCompleteCallback | 应用 RenderThread | draw/swap或空帧完成边界，不是SF present |
-| SurfaceControl transaction completed callback | SF事务 | 可返回latch/present/release统计与fence |
-| BLAST transaction callback | 客户端BLAST | 消费SF返回stats，释放本地BufferItem |
-| present fence signal | HWC/display时间线 | 描述实际present完成条件 |
-
-不要只看到单词 commit/completed 就认为它们等价。
-
----
-
-## 27. 一个窗口 resize 的完整例子
-
-假设窗口从 600×800 变为 800×600，并产生新 buffer。
-
-### 27.1 容易出错的非原子顺序
-
-```text
-事务1：Layer frame先变800×600
-屏幕刷新：旧600×800 buffer被套进新几何
-事务2：新buffer到达
-```
-
-中间一帧可能错误缩放或裁剪。
-
-### 27.2 BLAST 合并后的顺序
-
-```text
-WMS/ViewRoot准备一份同步Transaction
-BLAST收到新800×600 buffer
-把buffer/fence/frame/crop/transform写进该Transaction
-apply给SF
-SF等acquire fence与目标时间满足
-current→drawing一起推进
-Layer latch新buffer并使用匹配几何
-```
-
-### 27.3 仍不能保证什么
-
-- GPU 一定按目标周期完成；
-- HWC 不会因系统负载错过目标刷新；
-- apply 返回时用户已看到横屏；
-- 其他独立 Surface 的事务自动与它同步。
-
----
-
-## 28. 事务丢失、覆盖与顺序思维
-
-### 28.1 同一 Transaction 内重复 setter
-
-后一次覆盖同一字段；不同字段共同保留。
-
-### 28.2 merge
-
-other 对冲突字段覆盖 this；other 随后清空。事务级选项在 r48 不一定被完整迁移。
-
-### 28.3 同一 apply token 的多次 apply
-
-若前一笔 pending，后一笔排队，不能越过。
-
-### 28.4 不同 apply token
-
-各自可独立进入 SF。若业务需要 A、B 两个 Layer 同时变化，最稳妥的表达是把它们放进同一个 Transaction，而不是依赖两个线程“差不多同时 apply”。
-
-### 28.5 current 中间值会不会显示
-
-Binder 线程可能连续把多个事务写入 current；只有主线程 commit/latch 的 drawing snapshot 才参与该轮显示。中间 current 状态可能被后续事务覆盖而从未成为可见帧。
-
-这不是数据丢失 bug，而是显示系统允许合并中间状态以追赶最新画面的结果。
-
----
-
-## 29. 卡顿与故障定位
-
-| 现象 | 优先查看 |
+| 现象 | 优先检查 |
 |---|---|
-| apply普通调用偶尔慢 | Binder线程、mStateLock竞争、Parcel/GraphicBuffer传输 |
-| apply(true)很慢 | 直接应用路径等SF commit、mStateLock/主循环拥堵、5秒timeout；先入TransactionQueue则另查异步flush |
-| 事务长期pending | desired time、acquire fence、applyToken队首 |
-| 几何更新但buffer没换 | 是否同一Transaction、buffer cache解析、latch条件 |
-| buffer到达但callback不来 | pending handle是否finalize、Layer是否removed/detached、present周期 |
-| callback来了但buffer仍不可复用 | previousReleaseFence尚未signal |
-| 不同Layer出现错拍 | 是否由不同Transaction/applyToken提交 |
-| SF频繁重新算可见区 | Z/reparent/position/crop/input等持续触发traversal |
+| 普通 apply 偶尔慢 | Binder、`mStateLock` 竞争、Parcel/buffer 传输 |
+| 直接路径 `apply(true)` 慢 | SF commit、主循环拥堵、5 秒超时 |
+| `apply(true)` 很快但效果晚 | 是否先进入 pending queue |
+| transaction 长期 pending | desired time、任一 acquire fence、同 token 队首 |
+| 几何更新但 buffer 没换 | cache id 解析、Layer setBuffer、drawing/latch 条件 |
+| callback 不来 | pending handle 是否 finalize、Layer 是否 detached/removed |
+| callback 来了仍不能复用 | `previousReleaseFence` 是否 signal |
+| 多 Layer 错拍 | 是否真在同一 Transaction；是否使用 legacy defer |
 
-### 29.1 三条 trace 轴
+建议同时看三条 trace 轴：
 
 ```text
-客户端：Transaction build / apply / Binder wait
-SurfaceFlinger：transaction queue / commit / latch / composition
+客户端：build / merge / apply / Binder wait
+SF：queue / current / transaction commit / latch / composition
 硬件：acquire / GPU done / present / release fence
 ```
 
-只看某一条线程难以证明“原子状态何时真正可见”。
-
----
-
-## 30. macOS 只读练习
-
-### 练习 1：验证 Java apply/merge/close
+### 15.2 练习：读客户端收集器
 
 ```bash
-sed -n '2270,2370p' \
+sed -n '2260,2385p' \
   frameworks/base/core/java/android/view/SurfaceControl.java
-sed -n '3025,3070p' \
-  frameworks/base/core/java/android/view/SurfaceControl.java
+sed -n '500,725p' \
+  frameworks/native/libs/gui/SurfaceComposerClient.cpp
 ```
 
-目标：说明 apply 后可复用、merge 会清 other、close 不提交，并核对 desired present time 是否随 apply 重置。
+回答：Java `close()` 是否 apply？native apply 哪些成员清空、哪些保留？
 
-### 练习 2：识别 `what` 位
+### 15.3 练习：手算 patch merge
 
 ```bash
 sed -n '70,230p' \
   frameworks/native/libs/gui/include/gui/LayerState.h
-```
-
-目标：从 buffer、fence、crop、frame、reparent 各找一个 changed bit。
-
-### 练习 3：手算 merge
-
-```bash
-sed -n '270,365p' \
+sed -n '272,430p' \
   frameworks/native/libs/gui/LayerState.cpp
 ```
 
-目标：解释绝对Z/相对Z互斥、flags mask以及后值覆盖。
+回答：为什么绝对 Z 与相对 Z 互斥？flags 为什么需要 mask？
 
-### 练习 4：检查 r48 事务级 merge 边界
-
-```bash
-sed -n '510,575p' \
-  frameworks/native/libs/gui/SurfaceComposerClient.cpp
-```
-
-目标：列出 merge 了与没有 merge 的成员。
-
-### 练习 5：追 apply Binder 参数
+### 15.4 练习：追 Binder 与 pending queue
 
 ```bash
-sed -n '630,725p' \
-  frameworks/native/libs/gui/SurfaceComposerClient.cpp
 sed -n '65,115p' \
   frameworks/native/libs/gui/ISurfaceComposer.cpp
-```
-
-目标：画出 composer/display/input/time/callback 五组数据。
-
-### 练习 6：验证 pending queue
-
-```bash
-sed -n '3250,3410p' \
+sed -n '1230,1305p' \
+  frameworks/native/libs/gui/ISurfaceComposer.cpp
+sed -n '3260,3530p' \
   frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
 ```
 
-目标：解释 desired time、acquire fence、applyToken FIFO。
+回答：ready 检查有哪些条件？同 token 后项为何不能越过？queued `apply(true)` 为何不等未来 commit？
 
-### 练习 7：区分普通与同步事务
-
-```bash
-sed -n '3470,3535p' \
-  frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
-sed -n '3005,3025p' \
-  frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
-```
-
-目标：找到 `mTransactionPending` 在哪里置位和清除，再找 pending queue 的提前 return，说明同步语义的两个分支且都不等 present。
-
-### 练习 8：追 Layer current→drawing
+### 15.5 练习：追 current → drawing → active
 
 ```bash
-sed -n '770,1020p' \
+sed -n '820,1025p' \
   frameworks/native/services/surfaceflinger/Layer.cpp
+sed -n '150,430p' \
+  frameworks/native/services/surfaceflinger/BufferStateLayer.cpp
+sed -n '392,475p' \
+  frameworks/native/services/surfaceflinger/BufferLayer.cpp
 ```
 
-目标：标出 push、apply pending、commit 四步。
+回答：`mCurrentState.buffer`、`mDrawingState.buffer`、`mBufferInfo.mBuffer` 分别代表什么？
 
-### 练习 9：追 BufferStateLayer set 与 latch
-
-```bash
-sed -n '250,325p' \
-  frameworks/native/services/surfaceflinger/BufferStateLayer.cpp
-sed -n '580,620p' \
-  frameworks/native/services/surfaceflinger/BufferStateLayer.cpp
-```
-
-目标：区分 `mCurrentState.buffer` 与 `mBufferInfo.mBuffer`。
-
-### 练习 10：追 previous release fence
+### 15.6 练习：证明 callback 不等 fence signal
 
 ```bash
 sed -n '70,125p' \
   frameworks/native/services/surfaceflinger/BufferStateLayer.cpp
-```
-
-目标：用三事务例子解释为什么只有第一个替换者拿旧显示buffer的release fence。
-
-### 练习 11：验证 callback 不等待 fence signal
-
-```bash
-sed -n '220,335p' \
+sed -n '180,335p' \
   frameworks/native/services/surfaceflinger/TransactionCompletedThread.cpp
-sed -n '2240,2275p' \
-  frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
+sed -n '140,185p' \
+  frameworks/native/libs/gui/BLASTBufferQueue.cpp
 ```
 
-目标：找到 present fence 被装入 stats 后直接 Binder callback 的路径。
+回答：present fence 在哪里被装入 stats？BLAST 用哪一个 fence release 上一项？
 
 ---
 
-## 31. 复读后补强的易懂版本
+## 16. 核心结论与自测
 
-### 31.1 Transaction 像一张“修改清单”
+核心结论：
 
-它不是 Layer 的完整副本。`what` 像每一行前的勾选框：只有勾选的属性才更新。没勾选的字段即使内存里有零值，也不应覆盖旧状态。
+1. `Transaction` 是 patch 收集器；`what` 位而非字段默认值决定本次修改。
+2. 一个 Transaction 可以容纳多 Layer/Display 状态，但局部无效或无权限字段不会触发数据库式全量回滚。
+3. `merge()` 对 Layer 字段是后者覆盖冲突；r48 不迁移 `other` 的 desired time、sync、animation 等全部事务级语义。
+4. r48 `apply()` 可复用对象，却保留 `mDesiredPresentTime`，也不复位 `mContainsBuffer`。
+5. 普通 Binder 往返不等于 commit、latch 或 present。
+6. SF 用 desired time、acquire fence 和 apply-token FIFO 决定整批 Layer/Display patch 何时应用。
+7. queued `apply(true)` 会立即返回；只有 ready 的直接路径才等待 SF commit 或超时。
+8. r48 queued `TransactionState` 不保存 `InputWindowCommands`，不能把主载荷的排队语义无条件扩展到它。
+9. Layer 的 current、drawing 与 active buffer 是三个不同阶段。
+10. transaction callback 可携带未 signal 的 present fence；BLAST 用 previous release fence 延后一项释放本地 BufferItem。
 
-### 31.2 current 与 drawing 像编辑稿和发布稿
+自测：
 
-Binder 线程在 current 上继续编辑；SF 主循环只用 drawing 做本轮排版和合成。commit 是把满足条件的编辑稿发布成一致快照，不是把它显示到面板的最后一步。
+1. `what` 未设置时，为什么字段中的零值不能理解为“重置”？
+2. `this.merge(other)` 后，冲突字段和 `other` 分别怎样变化？
+3. 复用已 apply 的 r48 Transaction，哪个时间字段可能泄漏到下一笔？
+4. 为什么一个 Layer 的 acquire fence 能让同 Transaction 的其他 Layer patch 一起等待？
+5. 同 token 的 T2 已 ready，为什么仍不能越过未 ready 的 T1？
+6. queued `apply(true)` 与直接路径的等待语义有何不同？
+7. setBuffer、drawing commit、active buffer 替换各发生在哪里？
+8. callback 已到但 present fence 未 signal，能否断言画面已经显示完成？
 
-### 31.3 acquire 与 release fence 像交接条件
-
-acquire fence 说明“新作品何时写完可读”；previous release fence 说明“旧作品何时不再被显示系统使用可复用”。事务把作品与交接条件一起传递。
-
-### 31.4 callback 为什么带 fence 而不是等完再通知
-
-异步图形系统希望 CPU 不因硬件执行时间停住。回调先把 fence 交给客户端，客户端可继续管理队列；真正要复用 buffer 时再按 fence 等待。
-
-### 31.5 原子不等于零延迟
-
-原子保证一组状态不被拆开显示，不保证它立刻显示。它可以因为时间、fence、前序事务、VSync或合成负载等待。
-
-### 31.6 merge 不等于万能拼接
-
-Layer字段能按 what 合并，但 r48 的 desired present time、sync/animation等事务级语义不会全部从 other 迁移。最终发送者必须重新确认事务级配置。
-
-### 31.7 apply 后可复用不等于所有配置都自动归零
-
-r48 的 Layer patch 会被取走，sync/animation flags会复位，但 desired present time会保留。长生命周期复用 Transaction 时，必须把这个“粘性事务级字段”纳入审查。
-
----
-
-## 32. 本章核心结论
-
-1. SurfaceControl Transaction 是按 Layer handle 聚合的增量修改清单。
-2. `layer_state_t.what` 决定字段是否有效；未置位字段不会覆盖旧状态。
-3. 同一 Transaction 可包含多 Layer、Display、输入命令、时间与 callback。
-4. 同一字段 merge 时 other 覆盖 this，other 随后清空。
-5. r48 merge 不完整迁移 desired time、sync、animation等事务级语义。
-6. apply 才跨 JNI/Binder；普通 apply 返回不代表 commit、latch或present；r48 apply后desired present time还可能保留。
-7. GraphicBuffer可用client cache id减少重复Binder传输，它不同于BQ/HWC slot cache。
-8. SF 按 apply token 保持 pending transaction 的FIFO顺序。
-9. 未来1秒内desired time或unsignaled acquire fence会让整个事务等待。
-10. SF和每个Layer都维护current/drawing状态，隔离异步写入与稳定合成快照。
-11. `eTransactionNeeded`要求推进状态，`eTraversalNeeded`要求重算Layer树相关结果。
-12. ready并直接应用的`apply(true)`最多等SF commit边界并有5秒兜底；先入TransactionQueue的同步事务会先返回、以后异步flush；两者都不等待显示present。
-13. BufferStateLayer `setBuffer`只写current，latch时才更新active `mBufferInfo`。
-14. 一帧多次换buffer时，只有第一笔真正替换旧显示buffer的handle需要旧buffer release fence。
-15. transaction callback可携带present/release fence，但callback到达不表示fence已signal。
-16. BLAST依靠previous release fence把SF的显示完成条件接回本地BufferQueue所有权环。
-
----
-
-## 33. 自测题
-
-1. 为什么不能只看 `layer_state_t.alpha` 判断本次是否改了透明度？
-2. 一个 Transaction 怎样区分多个 SurfaceControl？
-3. 同一 Layer 两次 setPosition 后保留哪个值？
-4. merge 后 other 还能保留原变更吗？
-5. r48 merge 会丢掉 other 的哪些事务级语义？
-6. 普通 Binder transact 返回为什么仍是显示异步语义？复用Transaction时哪个时间字段可能保留？
-7. GraphicBuffer transaction cache 与 BufferQueue slot cache有何区别？
-8. apply token 解决什么顺序问题？
-9. desired present time超过未来1秒为什么可能被忽略？
-10. acquire fence未signal时，为什么等待整个事务而不是只等buffer？
-11. SF global current/drawing与Layer current/drawing各自做什么？
-12. `eTransactionNeeded` 与 `eTraversalNeeded` 有何不同？
-13. `apply(true)` 的ready直达与pending queue两条路径分别等待到哪里，返回能否证明HWC present完成？
-14. legacy defer与TransactionQueue pending有何区别？
-15. BufferStateLayer的current buffer何时变成active buffer？
-16. 为什么一帧连续换三张buffer不会得到三份同等含义的release fence？
-17. callback到达与present fence signal有何区别？
-18. BLAST为什么必须保存submitted BufferItem直到SF callback？
-19. 两个线程分别apply两个Transaction能否自动成为一个原子提交？
-20. current中的中间状态没有显示，是否必然是事务丢失？
-
-能独立回答这 20 题，就能正确阅读 WMS、Shell transition、BLAST、SurfaceView 和 SurfaceFlinger 中的大部分 Transaction 代码。
-
----
-
-## 34. 下一章预告
-
-第 165 章继续深入 SurfaceFlinger 的时间轴：
-
-> Android Scheduler、VSyncModulator、EventThread 与 App/SF 双 VSync 相位。
-
-重点解释硬件 VSync 如何进入 DispSync/Scheduler，App 与 SF 为何使用不同 phase offset，事务 early-wakeup 怎样改变调度，以及一张已经 ready 的 buffer 为什么仍可能错过目标刷新周期。
+下一章将进入 Scheduler、VSyncModulator 与 EventThread，解释同一套硬件 VSync 样本如何派生 App/SF 两路软件节拍。

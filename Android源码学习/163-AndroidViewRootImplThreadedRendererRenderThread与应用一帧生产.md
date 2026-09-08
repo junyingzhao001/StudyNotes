@@ -1,88 +1,63 @@
 # 163 Android ViewRootImpl、ThreadedRenderer、RenderThread 与应用一帧生产
 
 > 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
-> 学习方式：macOS 只读源码，不要求编译、不要求连接设备  
-> 前置章节：第 11、12、21、160、161、162 章
+> 学习方式：macOS 静态阅读，不编译、不连接设备  
+> 前置章节：第 11、12、21、160—162 章
 
 ---
 
-## 1. 本章要解决什么
+## 1. “一帧完成”至少有五种含义
 
-第 162 章讲清了 `GraphicBuffer`、BufferQueue 和 fence，但还没有回答一个最贴近应用开发的问题：
+`View.invalidate()` 之后，应用的一帧不会从 Java 调用直接跳到屏幕。先建立五个完成点：
 
-> `View.invalidate()` 之后，应用的一帧究竟怎样变成一张进入 Surface 的 buffer？
+| 完成点 | 已经发生 | 还不能推出 |
+|---|---|---|
+| UI record | View 绘制命令已写入 RenderNode | GPU 已执行 |
+| RenderThread sync | staging 状态已同步到 RT 使用的树 | draw/swap 已结束 |
+| producer queue | buffer 与 producer-done fence 已提交 | fence 已 signal、SF 已采用 |
+| SurfaceFlinger latch | 某个合成周期选中了新 buffer | HWC 已 present |
+| present | 合成结果进入显示管线，由 present fence/时间戳描述 | 人眼在同一纳秒感知 |
 
-这条链上有几个名字很容易造成误解：
+本章主链：
 
 ```text
-View.draw()              不一定是在GPU里画
-DisplayList             不是屏幕截图，也不是像素buffer
-syncAndDrawFrame()       并不保证等到屏幕显示
-FrameCompleteCallback   通常不是“用户已经看到”回调
-eglSwapBuffers()         不是SurfaceFlinger已经latch
-BLAST                    不是另一个GPU渲染器
+invalidate / requestLayout
+  → scheduleTraversals
+  → Choreographer traversal
+  → measure/layout（按需）
+  → UI 线程录制 RenderNode
+  → syncAndDrawFrame
+  → RenderThread prepare/draw
+  → Surface dequeue/queue
+  → BufferQueue 或 BLAST Transaction
+  → SurfaceFlinger 选帧/latch
+  → 合成/present
 ```
 
-本章解决：
+六个名字尤其容易误导：
 
-1. `invalidate()`、`requestLayout()` 如何合并到下一次 traversal？
-2. Choreographer 为什么按 input、animation、insets、traversal、commit 排序？
-3. 同步屏障挡住什么，为什么 traversal 仍能执行？
-4. measure、layout、draw 是否每帧都完整执行？
-5. `View.draw()` 在硬件加速路径上主要产出什么？
-6. 哪些 View 会重录 DisplayList，哪些能直接复用 RenderNode？
-7. UI 线程在哪里把帧交给 RenderThread？
-8. `syncAndDrawFrame()` 到底同步到哪一步？
-9. RenderThread 什么时候可以先放行 UI 线程？
-10. SkiaGL 与 SkiaVulkan 在本章哪些部分相同，哪里分叉？
-11. `swapBuffers()` 怎样落到 Surface/BufferQueue 的 queue？
-12. BLAST 在 Android 11 中为什么把 buffer 包进 SurfaceControl Transaction？
-13. SurfaceFlinger 的 `onFrameAvailable`、`latchBuffer` 与应用提交有何时间差？
-14. “已录制、已提交、已入队、已 latch、已 present”如何严格区分？
+```text
+View.draw()             硬件路径主要在 UI 线程录命令
+DisplayList             不是 bitmap，也不是 GraphicBuffer
+syncAndDrawFrame()      默认不等屏幕显示
+FrameCompleteCallback  不等于 present callback
+eglSwapBuffers()        不等于 SF 已 latch
+BLAST                   不是另一种 GPU renderer
+```
 
-一句话总览：
+本章的判断原则是：
 
-> UI 线程在 Choreographer traversal 中更新 View 树并录制需要变化的 RenderNode；`syncAndDrawFrame()` 把 staging 状态同步给 RenderThread，正常情况下很快放行 UI 线程；RenderThread 通过 SkiaGL 或 SkiaVulkan 执行绘制并把 buffer queue 到 Surface；BLAST 可把这个 buffer 转成携带 fence、crop、transform 的 SurfaceControl Transaction；SurfaceFlinger 之后才在自己的合成周期选择并 latch，最终 present 到显示设备。
+> 每看到一个“完成、提交、帧、fence”，先确认它属于 UI、RenderThread、producer、SurfaceFlinger 还是显示设备。
 
 ---
 
-## 2. 先建立五个完成点
+## 2. 源码、进程与线程地图
 
-读图形源码前，先禁止自己说模糊的“这一帧完成了”。至少要区分：
-
-| 完成点 | 含义 | 还不能推出什么 |
-|---|---|---|
-| UI 录制完成 | View 的绘制命令已经写入 RenderNode DisplayList | GPU 已执行、buffer 已产生 |
-| RenderThread 同步完成 | staging 属性/DisplayList 已同步到 RT 可用状态 | RT 已画完、UI 一定不阻塞 |
-| producer queue 完成 | buffer 和 acquire fence 已提交到 BufferQueue/BLAST | fence 已 signal、SF 已采用 |
-| SurfaceFlinger latch 完成 | SF 在一个合成周期选中并获取该 buffer | HWC 已 present、面板已扫描 |
-| present 完成 | 合成结果提交到显示管线，并由相应 present fence/时间戳描述 | 用户眼睛在同一纳秒感知 |
-
-最容易错的是把前三项都叫“绘制完成”。
-
-```mermaid
-flowchart LR
-    A["UI线程：录制RenderNode"] --> B["RenderThread：同步树状态"]
-    B --> C["Skia/GPU：执行绘制"]
-    C --> D["Surface：queueBuffer"]
-    D --> E{"窗口Surface路径"}
-    E -->|"BLAST"| TX["SurfaceControl Transaction"]
-    E -->|"传统BufferQueueLayer"| F["SurfaceFlinger：latch"]
-    TX --> F
-    F --> G["合成与HWC present"]
-    G --> H["显示设备扫描输出"]
-```
-
-箭头表示先后依赖，不表示所有步骤都在同一线程，也不表示前一步返回时后一步已完成。
-
----
-
-## 3. 源码地图
+主线文件：
 
 ```text
 frameworks/base/core/java/android/view/
 ├── View.java
-├── ViewGroup.java
 ├── ViewRootImpl.java
 ├── Choreographer.java
 └── ThreadedRenderer.java
@@ -99,9 +74,9 @@ frameworks/base/libs/hwui/
 │   ├── RenderProxy.cpp
 │   ├── DrawFrameTask.cpp
 │   ├── CanvasContext.cpp
-│   ├── RenderThread.cpp
 │   ├── ReliableSurface.cpp
-│   └── EglManager.cpp
+│   ├── EglManager.cpp
+│   └── VulkanManager.cpp
 └── pipeline/skia/
     ├── SkiaOpenGLPipeline.cpp
     └── SkiaVulkanPipeline.cpp
@@ -114,98 +89,71 @@ frameworks/native/libs/gui/
 frameworks/native/services/surfaceflinger/
 ├── SurfaceFlinger.cpp
 ├── BufferLayer.cpp
-└── BufferQueueLayer.cpp
+├── BufferQueueLayer.cpp
+└── BufferStateLayer.cpp
 ```
 
-按进程和线程重新分组：
+线程边界：
 
-| 阶段 | 典型进程 | 典型线程 |
+| 阶段 | 典型进程 | 典型执行上下文 |
 |---|---|---|
-| Choreographer、traversal、View 录制 | 应用进程 | main/UI thread |
-| RenderNode 同步、Skia 绘制、swap | 应用进程 | RenderThread |
-| Surface/BLAST producer 操作 | 应用进程 | 多数由 RenderThread 触发；BLAST callback 另有 Binder/callback 上下文 |
-| Transaction 接收、Layer latch、合成 | `surfaceflinger` | SF 主线程及其工作线程 |
-| GPU/HWC 执行 | 驱动、GPU、composer HAL | 异步硬件时间线 |
+| traversal、View record | 窗口客户端 | main/UI thread |
+| RenderNode sync、Skia、swap | 同一客户端进程 | RenderThread |
+| BLAST 本地消费 | 同一客户端进程 | queue/callback 上下文 |
+| Transaction、latch、composition | `surfaceflinger` | SF 主线程及工作线程 |
+| GPU/HWC/scanout | driver、composer、硬件 | 异步时间线 |
+
+`RenderProxy` 不是远端 Binder 服务，只是 UI 线程操作应用进程内 RenderThread/`CanvasContext` 的 native 代理。Java→JNI 和 UI→RT 是两个边界；直到 Surface/Transaction 进入 SF，才跨到显示服务进程。
 
 ---
 
-## 4. 从 `invalidate()` 到 `scheduleTraversals()`
+## 3. scheduleTraversals：合并请求并让 traversal 越过屏障
 
-### 4.1 invalidate 与 requestLayout 不是一回事
-
-粗略区分：
+`invalidate()` 与 `requestLayout()` 不是同一个请求：
 
 ```text
-invalidate()     内容或视觉属性脏了，通常请求draw
-requestLayout()  尺寸/位置可能变化，请求measure/layout，并最终可能draw
+invalidate()      内容或视觉属性脏，通常需要 draw
+requestLayout()   尺寸/位置可能变化，需要 measure/layout，随后可能 draw
 ```
 
-两者最终都可能让 `ViewRootImpl` 安排 traversal，但不能据此认为每帧都会 measure、layout、draw 三件套全走。
-
-`ViewRootImpl.scheduleTraversals()`：
+它们都可能走到：
 
 ```java
 void scheduleTraversals() {
     if (!mTraversalScheduled) {
         mTraversalScheduled = true;
-        mTraversalBarrier = mHandler.getLooper().getQueue().postSyncBarrier();
+        mTraversalBarrier =
+                mHandler.getLooper().getQueue().postSyncBarrier();
         mChoreographer.postCallback(
-                Choreographer.CALLBACK_TRAVERSAL, mTraversalRunnable, null);
+                CALLBACK_TRAVERSAL, mTraversalRunnable, null);
         notifyRendererOfFramePending();
         pokeDrawLockIfNeeded();
     }
 }
 ```
 
-这里有三个关键点。
+这里同时解决三件事：
 
-第一，`mTraversalScheduled` 做帧内合并。十个 View 连续 invalidate，不等于马上执行十次 traversal。
+1. `mTraversalScheduled` 把同一轮内的多次请求合并；
+2. traversal 对齐 Choreographer 的下一次 frame pulse；
+3. sync barrier 暂时挡住屏障后的普通同步 Message，给异步帧消息优先机会。
 
-第二，真正工作不是直接调用 `performTraversals()`，而是向 Choreographer 登记 `CALLBACK_TRAVERSAL`，等待一次 frame pulse。
-
-第三，通知 ThreadedRenderer 有帧将到来，RenderThread 可调整离线动画任务的调度。
-
-### 4.2 同步屏障不是“主线程冻结”
-
-`postSyncBarrier()` 会让屏障之后的普通同步 Message 暂时不能越过，但异步 Message 可以通过。
-
-Choreographer 安排帧的 Message 会标记：
-
-```java
-Message msg = mHandler.obtainMessage(MSG_DO_FRAME);
-msg.setAsynchronous(true);
-```
-
-所以更准确的理解是：
+Choreographer 安排 `MSG_DO_FRAME` 时调用 `setAsynchronous(true)`，所以能越过 barrier。屏障不是“冻结主线程”：
 
 ```text
-屏障前消息                正常处理
-屏障后同步消息            暂时等
-屏障后异步帧消息          可越过屏障
-Choreographer traversal   借帧消息获得优先执行机会
+屏障前消息       仍可执行
+屏障后同步消息   暂缓
+屏障后异步消息   可通过
+native/GPU 工作  不由这个 Java MessageQueue 屏障控制
 ```
 
-它不是实时调度保证，也不代表所有输入、Binder 回调或 native 工作都停止。
-
-### 4.3 traversal 开始时先移除屏障
-
-```java
-void doTraversal() {
-    if (mTraversalScheduled) {
-        mTraversalScheduled = false;
-        mHandler.getLooper().getQueue().removeSyncBarrier(mTraversalBarrier);
-        performTraversals();
-    }
-}
-```
-
-这也解释了为什么屏障必须成对维护。若错误遗留，同步消息会长时间得不到执行。
+`doTraversal()` 先清标志、移除 barrier，再调用 `performTraversals()`。若 barrier 遗留，受影响的是后续同步消息，不只是 UI 绘制。
 
 ---
 
-## 5. Choreographer：一帧内的回调顺序
+## 4. Choreographer 定节拍，performTraversals 按状态选工作
 
-Android 11 r48 的顺序是：
+Android 11 r48 一次 `doFrame()` 的顺序是：
 
 ```java
 doCallbacks(CALLBACK_INPUT, frameTimeNanos);
@@ -215,249 +163,150 @@ doCallbacks(CALLBACK_TRAVERSAL, frameTimeNanos);
 doCallbacks(CALLBACK_COMMIT, frameTimeNanos);
 ```
 
-```mermaid
-sequenceDiagram
-    participant V as "DisplayEventReceiver / VSync"
-    participant C as "Choreographer(UI线程)"
-    participant I as "Input"
-    participant A as "Animation"
-    participant T as "ViewRootImpl traversal"
-    participant M as "Commit callbacks"
+直觉是先吸收输入，再推进动画与 Insets，然后用最新状态 traversal，最后执行 commit callbacks。
 
-    V->>C: "doFrame(frameTimeNanos)"
-    C->>I: "CALLBACK_INPUT"
-    C->>A: "CALLBACK_ANIMATION"
-    C->>A: "CALLBACK_INSETS_ANIMATION"
-    C->>T: "CALLBACK_TRAVERSAL"
-    C->>M: "CALLBACK_COMMIT"
-```
-
-这个顺序的直觉是：先消费输入，再推进动画/Insets，随后用最新状态 measure、layout、draw，最后做提交后的帧内工作。
-
-### 5.1 晚到一帧时 frame time 怎么处理
-
-`doFrame()` 会计算：
+如果 UI 真正开始时间比 VSync 时间晚超过一个刷新周期，`doFrame()` 用：
 
 ```text
-jitter = UI线程真正开始执行的时间 - VSync给出的frameTime
+jitter = startNanos - intended frameTime
+skippedFrames = jitter / frameInterval
+new frameTime = startNanos - jitter % frameInterval
 ```
 
-如果 jitter 超过一个刷新周期，它会估算跳过的帧数，并把本帧逻辑时间调整到最近一个有效周期，而不是简单把所有动画时间都设成当前墙钟。
+把逻辑帧时间移到最近的有效周期。“Skipped N frames”是时间差估算，不表示系统保存了 N 张图片。
 
-因此：
+r48 还有第二次时间修正：到 `CALLBACK_COMMIT` 时若已迟到至少两个周期，只给 commit 阶段重新计算 frame time，并更新 `mLastFrameTimeNanos`。所以不能假设一帧所有阶段在极端迟到时观察到的时间处理完全相同。
 
-- `frameTimeNanos` 是动画和帧逻辑的统一时间基准；
-- `System.nanoTime()` 更接近当前实际执行时刻；
-- 两者差值可体现主线程迟到；
-- “Skipped N frames”是基于时间间隔的估算，不等于系统保存了 N 张待显示图片。
+`performTraversals()` 不是固定三连：
+
+```text
+layout requested / 窗口尺寸或参数变化
+  → 可能 measure + layout
+
+内容脏 / 动画 / accessibility focus 变化
+  → 可能 draw
+
+Surface 无效、显示关闭、View 不可见
+  → draw 可跳过
+
+OnPreDrawListener 返回取消
+  → 本轮不 draw；可见时重新 scheduleTraversals
+```
+
+因此，在 `OnPreDrawListener` 中持续取消仍会反复产生 traversal 成本，并非免费的“暂停绘制”。
 
 ---
 
-## 6. `performTraversals()` 不是每帧机械三连
+## 5. ViewRootImpl.draw：先确认 Surface 和渲染分支
 
-`performTraversals()` 很大，因为它不仅负责 View 树，还要协调：
-
-- 首次 attach；
-- Window relayout；
-- Surface 创建、替换、尺寸变化；
-- Insets、可见性、焦点；
-- measure/layout；
-- `OnPreDrawListener`；
-- draw 与首次绘制上报。
-
-正确的简化不是“每帧 measure→layout→draw”，而是：
+`performDraw()` 会处理首次绘制上报、frame commit callback 和 BLAST 同步事务，再调用 `draw(fullRedrawNeeded)`。真正进入硬件 renderer 还要满足：
 
 ```text
-若layout requested或窗口尺寸/参数变化：可能measure/layout
-若内容脏、动画、可访问焦点变化等：可能draw
-若pre-draw取消：本轮可以不draw，再约下一轮
-若Surface无效/窗口不可画：draw可跳过
+Surface 有效
+且 dirty 非空 / 正在动画 / accessibility focus 改变
+且 ThreadedRenderer 存在并已 enabled
 ```
 
-### 6.1 `OnPreDrawListener` 可以取消本轮绘制
-
-如果 `dispatchOnPreDraw()` 返回取消，或者视图尚不可见，`ViewRootImpl` 可以重新 `scheduleTraversals()`，而不是强行提交当前帧。
-
-所以在 pre-draw 中持续返回 false 可能造成反复 traversal；它不是“等某个条件时完全没有成本”。
-
----
-
-## 7. `performDraw()`：先明确谁拥有 Surface
-
-`performDraw()` 会决定是否需要完整重绘、是否设置 frame-complete 回调、是否参与 BLAST 同步事务，随后调用 `draw(fullRedrawNeeded)`。
-
-### 7.1 `SurfaceHolder` 分支
-
-`ViewRootImpl.draw()` 有明确判断：
-
-```java
-if (mSurfaceHolder != null) {
-    // The app owns the surface, we won't draw.
-    dirty.setEmpty();
-    ...
-    return false;
-}
-```
-
-这个分支特指根 View 通过内部 `RootViewSurfaceTaker` 协议接管窗口 Surface 的情况，不应直接等同于普通布局里放了一个 `SurfaceView`。普通 `SurfaceView` 确实拥有独立子 Surface，其业务像素不在根 View DisplayList 中；但 ViewRootImpl 仍可绘制窗口其余 View 内容。两件事要分开。
-
-### 7.2 硬件加速入口
-
-当 dirty、动画或 accessibility focus 需要更新，且 ThreadedRenderer 可用：
+随后：
 
 ```java
 mThreadedRenderer.draw(mView, mAttachInfo, this);
 ```
 
-软件回退路径则会锁 Surface 的 Canvas，在 UI 线程执行栅格化；本章重点讨论默认的硬件加速窗口路径。
+但有三条不能混用的分支。
+
+### RootViewSurfaceTaker 接管
+
+若 `mSurfaceHolder != null`，`ViewRootImpl.draw()` 直接清 dirty 并返回，因为根 View 通过内部 `RootViewSurfaceTaker` 协议接管了窗口 Surface。
+
+这不等于“布局里有普通 `SurfaceView` 就不画根窗口”。`SurfaceView` 通常有独立子 Surface，其业务像素不进根 DisplayList，但 ViewRootImpl 仍可绘制窗口里的其他 View。
+
+### 软件渲染
+
+没有可用硬件 renderer 时，软件路径在 UI 线程 `lockCanvas(dirty)`、执行 View 绘制，再 `unlockCanvasAndPost()`。如果 renderer 是“已请求但暂时 disabled”，r48 会先尝试重新初始化；失败路径不会贸然锁软件 Canvas，以免妨碍硬件 Surface 恢复。
+
+所以“View.draw 只录命令”必须限定在硬件加速窗口路径。
+
+### r48 的 dirty offset 不对称
+
+`ViewRootImpl.draw()` 先计算：
+
+```java
+xOffset -= surfaceInsets.left;
+yOffset -= surfaceInsets.top;
+```
+
+但移动 dirty rect 时写的是：
+
+```java
+dirty.offset(surfaceInsets.left, surfaceInsets.right);
+```
+
+纵向使用 `right` 而不是前面对应的 `top`。从本文件能确认的是这两处参数不一致；在非对称 surface insets 下可能改变脏区位置。静态审计应保留这个 r48 实现事实，不能擅自把源码抄成更“合理”的 top。
 
 ---
 
-## 8. UI 线程画的主要是“命令”，不是最终像素
+## 6. UI 线程产出 RenderNode 命令图
 
-### 8.1 `ThreadedRenderer.draw()` 的两段工作
+`ThreadedRenderer.draw()` 先：
 
 ```java
-void draw(View view, AttachInfo attachInfo, DrawCallbacks callbacks) {
-    choreographer.mFrameInfo.markDrawStart();
-    updateRootDisplayList(view, callbacks);
-    ...
-    int syncResult = syncAndDrawFrame(choreographer.mFrameInfo);
-    ...
-}
+updateRootDisplayList(view, callbacks);
 ```
 
-两段边界：
+再：
 
-```text
-updateRootDisplayList()  UI线程：更新/录制RenderNode命令
-syncAndDrawFrame()       UI线程发起，native RenderThread同步并绘制
+```java
+syncAndDrawFrame(choreographer.mFrameInfo);
 ```
 
-### 8.2 DisplayList 是什么
-
-它更像可回放的绘制指令：
+第一步仍在 UI 线程。`RecordingCanvas` 记录的是：
 
 ```text
-drawRect
-drawText
-drawBitmap
-clipPath
-concat matrix
+drawRect / drawText / drawBitmap
+clip / matrix / alpha
 draw child RenderNode
 ```
 
-不是：
+DisplayList 不是 bitmap、BufferQueue slot 或已栅格化 GraphicBuffer。
+
+### 一个 View 有三种更新结果
+
+`View.updateDisplayListIfDirty()` 的核心分支：
+
+1. 当前节点需重录：`beginRecording → draw/dispatchDraw → endRecording`；
+2. 当前节点 DisplayList 可复用，但调用 `dispatchGetDisplayList()` 让子节点恢复或更新；
+3. 当前节点与子树均无需工作，直接保留已有 RenderNode。
+
+`ThreadedRenderer.updateViewTreeDisplayList()` 先把根 View 的 invalidated 状态折叠到 `mRecreateDisplayList`，更新子树后，只有 `mRootNodeNeedsUpdate` 或 root 尚无 DisplayList 时才重录 renderer 自己的根节点：
 
 ```text
-一张已栅格化Bitmap
-一块BufferQueue slot
-一张已经进入Surface的GraphicBuffer
+ThreadedRenderer root
+  → onPreDraw commands
+  → DecorView RenderNode
+      → child RenderNodes
+  → onPostDraw commands
 ```
 
-### 8.3 不是整棵 View 树每帧都重录
+父 DisplayList 可以引用子 RenderNode；子内容变化不要求每个祖先都重录完整内容。
 
-`View.updateDisplayListIfDirty()` 先判断：
+### 属性动画为何常不重跑 onDraw
 
-```java
-if (drawingCacheInvalid || !renderNode.hasDisplayList() || mRecreateDisplayList) {
-    if (renderNode.hasDisplayList() && !mRecreateDisplayList) {
-        dispatchGetDisplayList();
-        return renderNode;
-    }
-    RecordingCanvas canvas = renderNode.beginRecording(width, height);
-    ...
-    draw(canvas);
-    ...
-    renderNode.endRecording();
-} else {
-    // 直接保留已有display list
-}
-```
-
-这段包含三个层次：
-
-1. 当前 View 真正需要重录：`beginRecording()` → `draw()` → `endRecording()`；
-2. 父节点本身不用重录，但会让子节点恢复/更新自己的 DisplayList；
-3. 节点和子树都可复用，直接返回现有 RenderNode。
-
-### 8.4 属性动画为什么可能不重跑 `onDraw()`
-
-平移、缩放、旋转、alpha 等很多属性存在于 RenderNode 属性中。内容命令没变时，可以复用原 DisplayList，仅同步属性。
-
-例如：
+translation、scale、rotation、alpha 等属性可存在 RenderNode 属性中。内容命令不变时只需同步属性；文字或自定义内容变化通常要 invalidate 并重录。
 
 ```text
-文字内容改变       往往需要重录相关View
-自定义onDraw变化    需要invalidate并重录
-translationX变化   常可只更新RenderNode属性
-RT动画             甚至可由RenderThread继续推进
+translationX 改变   常只改 RenderNode 属性
+TextView 文本改变   可能 requestLayout + 重录内容
+自定义 onDraw 改变  需要正确 invalidate
 ```
 
-“硬件加速后 `onDraw()` 在 RenderThread 运行”是错误说法。普通 View 的 `draw()/onDraw()` 录制阶段仍在 UI 线程；RenderThread 回放命令、组织 Skia/GPU 工作。
+因此，“硬件加速后 `onDraw()` 在 RenderThread 执行”是错误模型：普通 View 的 `draw/onDraw` 录制在 UI 线程，RT 回放命令并组织 Skia/GPU 工作。
 
 ---
 
-## 9. Root RenderNode 如何引用 View 树
+## 7. syncAndDrawFrame：UI 等的是状态交接
 
-`updateRootDisplayList()` 先更新 View 树，再在需要时录制根节点：
-
-```java
-RecordingCanvas canvas = mRootNode.beginRecording(mSurfaceWidth, mSurfaceHeight);
-canvas.translate(mInsetLeft, mInsetTop);
-callbacks.onPreDraw(canvas);
-canvas.enableZ();
-canvas.drawRenderNode(view.updateDisplayListIfDirty());
-canvas.disableZ();
-callbacks.onPostDraw(canvas);
-mRootNode.endRecording();
-```
-
-可以把它理解为一棵命令图：
-
-```mermaid
-flowchart TD
-    R["ThreadedRenderer Root RenderNode"] --> PRE["ViewRootImpl onPreDraw命令"]
-    R --> V0["DecorView RenderNode"]
-    V0 --> V1["ViewGroup RenderNode"]
-    V1 --> V2["TextView RenderNode"]
-    V1 --> V3["ImageView RenderNode"]
-    R --> POST["ViewRootImpl onPostDraw命令"]
-```
-
-父节点的 DisplayList 可以引用子 RenderNode。子内容变化时，不必必然重录所有祖先的完整内容。
-
----
-
-## 10. Java 到 native：`HardwareRenderer` 与 `RenderProxy`
-
-`HardwareRenderer.syncAndDrawFrame()` 进入 JNI，JNI 把 Java 的 FrameInfo 数组复制到 native 侧，再调用：
-
-```cpp
-return proxy->syncAndDrawFrame();
-```
-
-`RenderProxy` 本身不是另一个进程服务。它是应用进程中 UI 线程访问 RenderThread/CanvasContext 的代理。
-
-```text
-Java ThreadedRenderer
-        ↓ JNI
-native RenderProxy
-        ↓ DrawFrameTask + RenderThread queue
-CanvasContext
-        ↓
-SkiaGL / SkiaVulkan pipeline
-```
-
-这一步发生 Java/native 边界和线程边界，但还没有发生进程边界。
-
----
-
-## 11. `syncAndDrawFrame()` 到底同步什么
-
-### 11.1 UI 线程确实会等待一次条件变量
-
-`DrawFrameTask::drawFrame()`：
+Java 经 JNI 调到 `RenderProxy`，再使用 `DrawFrameTask`：
 
 ```cpp
 int DrawFrameTask::drawFrame() {
@@ -466,151 +315,74 @@ int DrawFrameTask::drawFrame() {
     postAndWait();
     return mSyncResult;
 }
-
-void DrawFrameTask::postAndWait() {
-    AutoMutex _lock(mLock);
-    mRenderThread->queue().post([this]() { run(); });
-    mSignal.wait(mLock);
-}
 ```
 
-所以它不是完全异步的 fire-and-forget：UI 线程会把任务放进 RenderThread 队列并等待 RenderThread 发信号。
+`postAndWait()` 在持有 `mLock` 时把任务放到 RenderThread 队列，然后等待 `mSignal`。它不是 fire-and-forget。
 
-### 11.2 但正常路径可在真正 draw 前放行 UI
-
-RenderThread 执行：
+RT 执行顺序：
 
 ```cpp
 canUnblockUiThread = syncFrameState(info);
 canDrawThisFrame = info.out.canDrawThisFrame;
 
-if (canUnblockUiThread) {
-    unblockUiThread();
-}
+if (canUnblockUiThread) unblockUiThread();
 
-if (canDrawThisFrame) {
-    context->draw();
-} else {
-    context->waitOnFences();
-}
+if (canDrawThisFrame) context->draw();
+else context->waitOnFences();
 
-if (!canUnblockUiThread) {
-    unblockUiThread();
-}
+if (!canUnblockUiThread) unblockUiThread();
 ```
 
-因此准确结论是：
+所以 UI 至少等到本帧状态同步完成；正常时可在 RT 真正 draw/swap 前返回。
 
-> UI 线程至少等 RenderThread 完成帧状态同步；当同步阶段确认可以安全放行时，UI 线程会在 RenderThread 真正绘制和 swap 之前返回。特殊情况下，放行会推迟到 draw/等待工作结束之后。
+### 提前放行条件不是笼统的“RT ready”
 
-不能把方法名解释成：
-
-```text
-等待GPU完成
-等待queueBuffer被SF消费
-等待SurfaceFlinger合成
-等待屏幕present
-```
-
-### 11.3 同步阶段做什么
-
-`syncFrameState()` 主要包括：
-
-- 把 UI 帧的 VSync 交给 RenderThread 时间基准；
-- `makeCurrent()`；
-- 应用待更新 layer；
-- 设置内容边界；
-- `CanvasContext.prepareTree()`；
-- 同步 RenderNode staging 属性与 DisplayList；
-- 运行/准备 RT 动画；
-- 计算 damage；
-- 判断 Surface 是否存在、是否 stopped、这一帧能不能画；
-- 必要时向 UI 返回“Surface 丢失”或“请求重绘”。
-
----
-
-## 12. UI 与 RenderThread 的真实流水线
-
-```mermaid
-sequenceDiagram
-    participant UI as "UI线程"
-    participant Q as "RenderThread队列"
-    participant RT as "RenderThread"
-    participant GPU as "Skia/GPU"
-    participant S as "Surface/BufferQueue"
-    participant SF as "SurfaceFlinger"
-
-    UI->>UI: "updateRootDisplayList()"
-    UI->>Q: "post DrawFrameTask"
-    UI->>UI: "等待mSignal"
-    Q->>RT: "run()"
-    RT->>RT: "syncFrameState / prepareTree"
-    RT-->>UI: "正常路径先unblock"
-    RT->>GPU: "draw() / submit commands"
-    GPU->>S: "swap / queue buffer + fence"
-    S-->>SF: "frame available / transaction"
-    SF->>SF: "以后某个合成周期latch"
-```
-
-图中 UI 被 unblock 后，它可以处理后续消息，甚至准备下一帧；但 BufferQueue 容量、fence、RenderThread 队列和调度仍会形成背压，不能无限超前。
-
-### 12.1 `waitOnFences()` 这个名字也会误导
-
-`CanvasContext::waitOnFences()` 在这里等待的是 `CommonPool::async()` 返回的 future：
+`syncFrameState()` 的返回值就是：
 
 ```cpp
-for (auto& fence : mFrameFences) {
-    fence.get();
-}
+return info.prepareTextures;
 ```
 
-它不是第 162 章所讲的 `android::Fence` / sync fence fd。源码命名相同，不代表抽象相同。
+`prepareTextures` 在 full traversal 初始为 true；若为 mutable images 预固定 GPU cache 失败，会设 false 并 unpin 已固定图片。此时 UI 要继续阻塞到本次 draw 或 `waitOnFences()` 结束，避免 UI 与 RT 对可变资源的使用重叠。
+
+因此：
+
+- `canDrawThisFrame == false` 不必然阻止 UI 提前放行；
+- 真正决定早放行的是 `prepareTextures`；
+- 方法返回不表示 GPU、queue、latch 或 present 完成。
+
+`syncFrameState()` 同时会更新时间基准、`makeCurrent()`、应用 pending layers、设置 content bounds、`prepareTree()`，并生成 LostSurface、ContextStopped、UIRedrawRequired、FrameDropped 等结果位。Java 据此请求 relayout 或 invalidate。
 
 ---
 
-## 13. RenderThread 可以独立驱动动画
+## 8. prepareTree 决定能否画，RT-only 动画可独立推进
 
-`CanvasContext::doFrame()` 会以 `MODE_RT_ONLY` 准备树并绘制：
-
-```cpp
-TreeInfo info(TreeInfo::MODE_RT_ONLY, *this);
-prepareTree(info, frameInfo, ..., node);
-if (info.out.canDrawThisFrame) {
-    draw();
-}
-```
-
-这使某些 RenderNodeAnimator 能在 UI 线程一时忙碌时继续推进。
-
-但不要扩张成“所有动画都不怕主线程卡”：
-
-- 需要业务计算、layout、重新录制内容的动画仍依赖 UI；
-- RT 动画若发现需要 UI 重绘，会设置相应结果；
-- Surface、GPU、BufferQueue 或 SF 拥堵仍可卡住后段；
-- 输入响应和应用逻辑仍运行在主线程。
-
----
-
-## 14. `CanvasContext::prepareTree()`：画之前先决定能否画
-
-这里会遍历 RenderNode 树、同步属性、更新动画、累计 damage，并判断 Surface 状态。
-
-几个常见跳帧条件：
+`CanvasContext::prepareTree()` 本身会：
 
 ```text
-没有Surface或context stopped
-同一VSync附近RT动画已经画过，UI请求可能被判定为过近
-特定多RenderNode/backdrop条件不能安全绘制
-buffer/Synchronize条件不满足
+导入 UI FrameInfo
+  → 启动动画上下文
+  → 遍历 RenderNodes
+  → 同步 staging 属性/DisplayList
+  → 累计 damage
+  → pin mutable images
+  → 判断 Surface 与本周期能否 draw
+  → 安排后续 RT frame callback
 ```
 
-不能看到 `syncAndDrawFrame()` 被调用就断定一定产生了新 buffer。
+它自身可因下列条件把 `canDrawThisFrame` 设为 false：
 
-### 14.1 r48 的 `reserveNext()` 是一个版本陷阱
+- 没有 Surface；
+- 同一 VSync 附近 RT 动画已画过，UI 请求迟到不到 2 ms；
+- 多 RenderNode/backdrop 组合中的指定节点还不可 render。
 
-`prepareTree()` 会调用 `mNativeSurface->reserveNext()`，从名字和注释看像是提前 dequeue buffer。
+在外围 `syncFrameState()` 中，`makeCurrent()` 发现 context stopped 或 Surface 失败也会禁止绘制。
 
-但 Android 11 r48 的 `ReliableSurface.cpp` 写着：
+被跳过时 `syncResult` 可带 `FrameDropped`，但 RenderThread 仍会等待本帧登记的异步 futures，避免工作跨到下一帧。
+
+### reserveNext 在 r48 实际不预取
+
+`prepareTree()` 调用 `mNativeSurface->reserveNext()`，名称像提前 dequeue；但 r48：
 
 ```cpp
 constexpr bool DISABLE_BUFFER_PREFETCH = true;
@@ -623,379 +395,352 @@ int ReliableSurface::reserveNext() {
 }
 ```
 
-因此在本版本，这个调用直接返回 OK，不真正预取 buffer。真正 dequeue 通常仍由 EGL/Vulkan 的取帧路径经 ANativeWindow 触发。
+所以该版本的调用总是直接成功，真正 dequeue 仍由 GL/Vulkan 取帧路径触发。调用点的意图不能替代被编译进版本的实际分支。
 
-这是典型的源码阅读规则：
+### MODE_RT_ONLY 的能力边界
 
-> 不要只读调用点和函数名，必须进入本版本实现，看编译期常量和 feature gate。
+RenderThread 自己收到 frame callback 时可用 `MODE_RT_ONLY` 更新动画并 draw，使部分 RenderNodeAnimator 在 UI 忙时继续推进。
+
+这不覆盖：
+
+- 需要业务代码或 layout 的动画；
+- 需要重录 View 内容的变化；
+- 输入与应用逻辑；
+- Surface、GPU、BufferQueue 或 SF 的后段拥堵。
+
+“可由 RT 驱动”与“整个应用完全不受主线程影响”不是同一结论。
 
 ---
 
-## 15. `CanvasContext::draw()`：从 damage 到 swap
+## 9. CanvasContext::draw：damage、future 与 swap
 
-主要结构：
+RT 真正绘制的骨架：
 
 ```cpp
+mDamageAccumulator.finish(&dirty);
 Frame frame = mRenderPipeline->getFrame();
 setPresentTime();
 SkRect windowDirty = computeDirtyRect(frame, &dirty);
-
 bool drew = mRenderPipeline->draw(...);
 int64_t frameCompleteNr = getFrameNumber();
 waitOnFences();
 bool didSwap = mRenderPipeline->swapBuffers(...);
 ```
 
-### 15.1 damage 与 buffer age
-
-窗口通常不是每次都必须完整重画。pipeline 会结合：
-
-- 本帧 View/RenderNode damage；
-- Surface 是否新建或尺寸变化；
-- buffer age；
-- swap history；
-- preserve/buffer-age 策略；
-
-计算真正需要恢复的区域。
-
-如果取到的旧 buffer 已很久没用，本帧就必须把它缺失的历史 damage 合并进来；这与第 162 章 async drop 合并 damage 的目标相同：局部更新不能漏内容。
-
-### 15.2 空 damage 可以完全不 swap
-
-当：
+`computeDirtyRect()` 结合：
 
 ```text
-dirty为空
-skipEmptyFrames开启
-Surface不要求重画
+本帧 RenderNode damage
+新 Surface / 尺寸变化
+buffer age
+历史 swap damage
+preserve / buffer-age 策略
 ```
 
-`CanvasContext::draw()` 会标记 SkippedFrame，调用等待中的 frame-complete callbacks，然后直接返回。
+若取到的旧 back buffer 已错过若干局部更新，就把对应历史 damage 并入本帧。它与 BufferQueue drop 时合并 damage 解决的是同一类问题：局部更新不能因 buffer 轮换而丢失。
 
-所以 frame-complete callback 被调用，也不严格证明新 buffer 已提交。源码是为了避免调用方无限等待而主动完成回调。
+### waitOnFences 不是 sync_file fence
+
+`CanvasContext::mFrameFences` 的类型是：
+
+```cpp
+std::vector<std::future<void>>
+```
+
+`enqueueFrameWork()` 用 `CommonPool::async()` 加入工作，`waitOnFences()` 对每个 future 调 `get()`。来源包括 frame callback 和部分 RenderNode functor 工作。
+
+它不是 `android::Fence`，没有 sync-file fd，也不是第 162 章的 buffer acquire/release fence。这里只是同名。
+
+### 空 damage 路径比普通完成更早返回
+
+若：
+
+```text
+dirty 为空
+Properties::skipEmptyFrames 为 true
+Surface 不要求重画
+```
+
+`draw()` 会标记 `SkippedFrame`，调用并清空 frame-complete callbacks，然后直接 return：
+
+- 不 `getFrame()`；
+- 不画；
+- 不 `waitOnFences()`；
+- 不 swap；
+- 还没走到后面的 `markFrameCompleted()` 与常规 jank finish。
+
+回调仍被调用是为了避免上层无限等待，不是证明新 buffer 已提交；本帧已排入 CommonPool 的异步 work 也可能到后续路径才被等待。若 GL 的 damage/preserve 策略要求 swap，`surfaceRequiresRedraw()` 会阻止这个空帧早退。
+
+普通路径也不是“draw 返回 true就必有成功新帧”：pipeline 的 `requireSwap`、swap 错误和 ReliableSurface 保存的错误还会改变结果。
 
 ---
 
-## 16. SkiaGL 与 SkiaVulkan：公共骨架、不同后端
+## 10. SkiaGL、SkiaVulkan 与 ReliableSurface
 
-Android 11 r48 根据 renderer 属性选择：
-
-```cpp
-if (rendererProperty == "skiavk") {
-    return RenderPipelineType::SkiaVulkan;
-}
-return RenderPipelineType::SkiaGL;
-```
-
-共同骨架是：
+`CanvasContext::create()` 根据 `Properties::getRenderPipelineType()` 选择：
 
 ```text
-RenderNode树
-  → Skia组织绘制
-  → 获得ANativeWindow-backed frame
-  → 绘制/提交
-  → swap/present到Surface producer
+SkiaOpenGLPipeline
+或
+SkiaVulkanPipeline
+```
+
+`debug.hwui.renderer=skiavk` 选 Vulkan；否则走 SkiaGL，默认值还会参考 build-time `use_vulkan()`。选择一旦锁定，运行中试图改成另一种会 fatal。
+
+公共骨架是：
+
+```text
+RenderNode tree
+  → Skia renderFrame
+  → ANativeWindow-backed frame
+  → GPU submit
+  → queue/present current buffer
 ```
 
 分叉点：
 
-| 后端 | 典型对象/动作 |
+| SkiaGL | SkiaVulkan |
 |---|---|
-| SkiaGL | EGLSurface、FBO 0、`eglSwapBuffersWithDamageKHR()` |
-| SkiaVulkan | Vulkan swapchain、Skia Vulkan backend、相应 present |
+| EGLSurface、FBO 0 | VulkanSurface、swapchain image |
+| `eglSwapBuffersWithDamageKHR()` | `presentCurrentBuffer(dirty, fenceFd)` |
+| `damageRequiresSwap()` 可要求空 damage 也 swap | `requireSwap = drew` |
+| EGL sync/driver 路径 | semaphore 导入/导出 sync fd |
 
-本章用 SkiaGL 代码说明 `swap`，但结论不能写成“Android 硬件加速永远由 OpenGL 渲染”。
+因此本章用 GL 函数名说明主线时，不能推出 Android 硬件加速只有 OpenGL 后端。
 
-### 16.1 SkiaGL 的 getFrame/draw/swap
+### ReliableSurface 的兜底不是成功显示
 
-```cpp
-Frame SkiaOpenGLPipeline::getFrame() {
-    return mEglManager.beginFrame(mEglSurface);
-}
-
-bool SkiaOpenGLPipeline::swapBuffers(...) {
-    *requireSwap = drew || mEglManager.damageRequiresSwap();
-    if (*requireSwap && !mEglManager.swapBuffers(frame, screenDirty)) {
-        return false;
-    }
-    return *requireSwap;
-}
-```
-
-`EglManager::swapBuffers()` 最终调用：
+HWUI 用 `ReliableSurface` 包装 ANativeWindow 并安装 dequeue/queue/cancel/perform/query interceptors。真实 dequeue 失败时：
 
 ```cpp
-eglSwapBuffersWithDamageKHR(...);
-```
-
-EGL native window bridge 会走到 `Surface`/ANativeWindow 的 dequeue、queue 协议。驱动内部细节可能是 vendor 实现，不应把 AOSP Framework 调用栈虚构成固定实现。
-
----
-
-## 17. `ReliableSurface`：让 buffer 失败可恢复
-
-HWUI 用 `ReliableSurface` 包装 ANativeWindow，并安装 dequeue/queue/cancel interceptor。
-
-若真实 dequeue 失败：
-
-```cpp
-*buffer = rs->acquireFallbackBuffer(result);
+*buffer = acquireFallbackBuffer(result);
 *fenceFd = -1;
 return *buffer ? OK : INVALID_OPERATION;
 ```
 
-fallback 是一张 1×1 scratch AHardwareBuffer。目的不是把错误画面显示给用户，而是让渲染栈能在一个本地兜底目标上收尾，再由 `CanvasContext` 读取保存的错误并重试或放弃 Surface。
+fallback 是本地 `1 × 1` scratch AHardwareBuffer。后续对 scratch 的 queue/cancel 在 wrapper 内被吞掉；真实 BufferQueue 错误保存在 `mBufferQueueState`。
 
-流程：
+`CanvasContext` swap 后调用 `getAndClearError()`：
 
 ```text
-真实dequeue失败
-  → 保存BufferQueue错误
-  → 给pipeline一张1×1 scratch buffer
-  → scratch queue/cancel在wrapper内吞掉
-  → CanvasContext swap后读取真实错误
-  → TIMED_OUT则请求后续帧重试
-  → 其他错误则setSurface(nullptr)，等待上层relayout恢复
+TIMED_OUT
+  → post 后续 RT frame callback 重试
+
+其他错误或 didSwap=false
+  → setSurface(nullptr)
+  → 上层通过 lost-surface/relayout 恢复
 ```
 
-这说明“EGL 调用返回成功”也可能只是 wrapper 成功兜底，必须继续看上层错误状态。
+所以底层 EGL/Vulkan 一段看似成功，可能只是兜底目标让渲染栈完成收尾。
+
+r48 还有一个 fd 边界：scratch 的 cancel/queue 仅在 `fenceFd > 0` 时 close；合法 fd 0 不会被关闭。通常图形进程不会把标准 fd 槽位空出来，但源码条件确实不是 `>= 0`，应把它记录为罕见泄漏窗口，而非假装不存在。
 
 ---
 
-## 18. `swapBuffers()` 只到 producer 提交边界
+## 11. swap 只走到 producer 提交边界
 
-对于普通 BufferQueue，稳定概念链是：
-
-```text
-RenderThread获得可写buffer
-  → 等待dequeue fence后写入/提交GPU命令
-  → queueBuffer(buffer, producer done fence)
-  → BufferQueue将其变为QUEUED
-  → consumer以后acquire并等待acquire fence
-```
-
-`eglSwapBuffers()` 返回不能直接推出：
-
-- GPU 所有指令已经物理完成；
-- acquire fence 已 signal；
-- SurfaceFlinger 已 latch；
-- HWC 已 present；
-- 屏幕扫描到了该 buffer。
-
-它主要表示 producer 侧 swap/提交动作已完成到 API 所定义的边界。
-
----
-
-## 19. BLAST：buffer 与 Layer 状态一起交给 SurfaceFlinger
-
-### 19.1 Java 入口
-
-`ViewRootImpl.getOrCreateBLASTSurface()`：
-
-```java
-if (mBlastBufferQueue == null) {
-    mBlastBufferQueue = new BLASTBufferQueue(
-            mBlastSurfaceControl, width, height, mEnableTripleBuffering);
-    ret = mBlastBufferQueue.getSurface();
-} else {
-    mBlastBufferQueue.update(mBlastSurfaceControl, width, height);
-}
-```
-
-renderer 得到的仍是 `Surface`，所以 View/ThreadedRenderer 不需要直接理解 SurfaceControl 的所有事务细节。
-
-### 19.2 BLAST 的 BufferQueue consumer 在客户端进程
-
-native `BLASTBufferQueue` 自己创建一对 producer/consumer：
+SkiaGL：
 
 ```cpp
-BufferQueue::createBufferQueue(&mProducer, &mConsumer);
-mBufferItemConsumer = new BLASTBufferItemConsumer(...);
-mBufferItemConsumer->setFrameAvailableListener(this);
-```
-
-renderer 经 Surface 向 producer queue；BLAST 收到 `onFrameAvailable()` 后 acquire buffer，再构建 SurfaceControl Transaction：
-
-```cpp
-t->setBuffer(mSurfaceControl, buffer);
-t->setAcquireFence(mSurfaceControl, ...);
-t->setFrame(mSurfaceControl, {0, 0, mWidth, mHeight});
-t->setCrop(mSurfaceControl, computeCrop(bufferItem));
-t->setTransform(mSurfaceControl, bufferItem.mTransform);
-t->setDesiredPresentTime(bufferItem.mTimestamp);
-t->apply();
-```
-
-它把：
-
-```text
-buffer
-acquire fence
-frame/crop
-transform
-desired present time
-```
-
-作为同一 Transaction 的 Layer 状态交给 SurfaceFlinger。
-
-### 19.3 `setNextTransaction()` 的意义
-
-窗口几何变化、首次绘制等场景需要“buffer 与一组 SurfaceControl 状态原子同行”。`ViewRootImpl` 可先：
-
-```java
-mBlastBufferQueue.setNextTransaction(mRtBLASTSyncTransaction);
-```
-
-下一张 buffer 到达时，BLAST 把 buffer 操作写进这份指定 Transaction，而不是立刻应用自己的局部 Transaction。
-
-这减少了：
-
-```text
-Layer尺寸/位置先变
-buffer下一拍才到
-两者短暂不一致
-```
-
-但 BLAST 不是跳过 BufferQueue，也不是让应用直接调用 HWC。
-
-### 19.4 为什么 BLAST 要等 Transaction callback 才 release
-
-BLAST 保存已提交的 BufferItem，并注册 transaction-completed callback。回调带回 previous release fence 后，才把上一项 release 给其本地 BufferItemConsumer。
-
-这仍是第 162 章的所有权与 fence 接力，只是 consumer 先把 buffer 作为 SurfaceControl Transaction 交给 SF。
-
----
-
-## 20. 普通 BufferQueue 与 BLAST 路径不要混画
-
-```mermaid
-flowchart TD
-    RT["RenderThread / ANativeWindow producer"] --> CHOICE{"Surface类型"}
-    CHOICE -->|"普通BufferQueueLayer"| BQP["BufferQueue producer queue"]
-    BQP --> BQL["SurfaceFlinger BufferQueueLayer consumer"]
-    CHOICE -->|"BLAST Surface"| BBP["BLAST本地BufferQueue producer"]
-    BBP --> BBC["客户端BLAST consumer acquire"]
-    BBC --> TX["SurfaceControl Transaction<br/>buffer + fence + geometry"]
-    TX --> BL["SurfaceFlinger BufferStateLayer"]
-    BQL --> LATCH["SF latch/compose"]
-    BL --> LATCH
-```
-
-Android 11 正处在 BLAST 引入期，具体窗口走哪条路径还受窗口类型、feature gate 和版本实现影响。读某个问题时先确认实际 Layer/Surface 类型，不要把两条 consumer 模型硬拼成一条。
-
----
-
-## 21. SurfaceFlinger：frame available 只是唤醒，不是 latch
-
-以传统 `BufferQueueLayer` 为例，`onFrameAvailable()`：
-
-```cpp
-mQueueItems.push_back(item);
-mQueuedFrames++;
-...
-mFlinger->signalLayerUpdate();
-mConsumer->onBufferAvailable(item);
-```
-
-这表示 SF 知道有新 buffer，并请求一次 Layer update。
-
-它没有在 producer queue 回调里直接完成最终合成，这样可以让多个 Layer 在统一的显示节奏上被选择、latch 和合成。
-
-### 21.1 `handlePageFlip()` 才选择本周期可 latch 的 Layer
-
-SF 遍历 drawing state：
-
-```cpp
-if (layer->hasReadyFrame()) {
-    if (layer->shouldPresentNow(expectedPresentTime)) {
-        mLayersWithQueuedFrames.push_back(layer);
-    }
-}
-```
-
-随后才调用：
-
-```cpp
-layer->latchBuffer(visibleRegions, latchTime, expectedPresentTime);
-```
-
-### 21.2 latch 前还要过 fence 和 transaction 条件
-
-`BufferLayer::latchBuffer()` 会检查：
-
-```text
-是否真有ready frame
-上一轮refresh是否仍pending
-head buffer acquire fence是否signal
-相关transaction/sync point是否满足
-desired present time是否适合当前周期
-```
-
-如果 acquire fence 未 signal：
-
-```cpp
-if (!fenceHasSignaled()) {
-    mFlinger->signalLayerUpdate();
+*requireSwap = drew || mEglManager.damageRequiresSwap();
+if (*requireSwap &&
+        !mEglManager.swapBuffers(frame, screenDirty)) {
     return false;
 }
 ```
 
-也就是 buffer 已 queue 到 SF 侧，但本周期仍可能不 latch。
+`EglManager::swapBuffers()` 最终调用 `eglSwapBuffersWithDamageKHR()`。EGL 的 native-window bridge 再走 Surface/BufferQueue 的 dequeue、queue 与 fence 协议。
 
----
+SkiaVulkan 则 dequeue native buffer，把 dequeue fence 导入 Vulkan semaphore；无法 dup 时会同步 `sync_wait`。提交后尝试导出 semaphore fd，并把它交给 `presentCurrentBuffer()`。
 
-## 22. 一帧完整时序：把线程、队列和 fence 放在一起
-
-```mermaid
-sequenceDiagram
-    participant V as "VSync"
-    participant UI as "App UI线程"
-    participant RT as "App RenderThread"
-    participant BQ as "Surface / BufferQueue或BLAST"
-    participant SF as "SurfaceFlinger"
-    participant H as "GPU/HWC/Display"
-
-    V->>UI: "Choreographer doFrame"
-    UI->>UI: "input → animation → traversal"
-    UI->>UI: "measure/layout按需执行"
-    UI->>UI: "录制脏RenderNode DisplayList"
-    UI->>RT: "syncAndDrawFrame"
-    RT->>RT: "同步staging属性、准备树、damage"
-    RT-->>UI: "正常路径提前放行"
-    RT->>BQ: "dequeue可写buffer + release/dequeue fence"
-    RT->>H: "Skia提交GPU绘制"
-    RT->>BQ: "queue buffer + producer-done fence"
-    BQ-->>SF: "frame available / buffer transaction"
-    SF->>SF: "按expectedPresentTime选择"
-    SF->>SF: "acquire fence可用后latch"
-    SF->>H: "client/device合成并present"
-    H-->>SF: "present/release fences与时间戳"
-    SF-->>BQ: "buffer release条件"
-```
-
-注意 RT 的 dequeue 与 GPU submit 的具体内部交错由 GL/Vulkan 驱动决定；图表达所有权和依赖关系，不声称 vendor 驱动只有这一种固定函数栈。
-
----
-
-## 23. 三种“fence”别再混淆
-
-### 23.1 Graphic buffer sync fence
-
-第 162 章的 fence fd：
+抽象上两者都完成：
 
 ```text
-dequeue/release fence  producer写前等待consumer上次读完
-queue/acquire fence    consumer读前等待producer本次写完
-present/release fence  显示/合成完成后帮助归还buffer
+取得可写 buffer + 等待 consumer-done 条件
+  → 提交 GPU 工作
+  → queue buffer + producer-done 条件
 ```
 
-### 23.2 `CanvasContext::waitOnFences()`
+但 swap 返回不能推出：
 
-这里是等待 CommonPool future 完成，保证本帧异步 CPU 工作不跨到下一帧；不是 sync fence fd。
+- GPU 命令已经物理完成；
+- producer-done fence 已 signal；
+- SurfaceFlinger 已获取或 latch；
+- HWC 已 present；
+- 屏幕已经 scanout。
 
-### 23.3 `HardwareRenderer.fence()`
+GL 的 `EGL_BAD_SURFACE/EGL_BAD_NATIVE_WINDOW` 会返回 false 供上层丢弃 Surface；其他 EGL 错误在 r48 直接 fatal。Vulkan 的 semaphore create/export/submit 也有各自日志或等待恢复路径，不能只看统一的 `didSwap` 布尔值猜底层原因。
 
-Android 11 r48 最终是：
+---
+
+## 12. BLAST：本地消费后把 buffer 填进 Transaction
+
+`ViewRootImpl.setView()` 给窗口参数加 `PRIVATE_FLAG_USE_BLAST`，但最终只有 WMS 返回 `ADD_FLAG_USE_BLAST` 才置 `mUseBLASTAdapter=true`；`mForceDisableBLAST` 还能覆盖它。因此不能把 Android 11 的每个窗口都默认画成 BLAST。
+
+启用时，`getOrCreateBLASTSurface()` 创建：
+
+```java
+new BLASTBufferQueue(
+        mBlastSurfaceControl,
+        width,
+        height,
+        mEnableTripleBuffering);
+```
+
+renderer 仍拿到普通 `Surface`。native BLAST 在窗口客户端进程内创建自己的 producer/consumer：
+
+```cpp
+BufferQueue::createBufferQueue(&mProducer, &mConsumer);
+mProducer->setDequeueTimeout(INT64_MAX);
+if (enableTripleBuffering) {
+    mProducer->setMaxDequeuedBufferCount(2);
+}
+```
+
+巨大正 timeout 让本地 adapter 的 producer 走阻塞式 dequeue；triple buffering 把 `mMaxDequeuedBufferCount` 配成 2。第 162 章所述“首次 queue 前不执行 max-dequeued 检查”的兼容例外仍然存在，不能把配置值误当成所有时刻都由同一分支硬限制。
+
+`onFrameAvailable()` 增加 shadow 计数并调用 `processNextBufferLocked()`。后者最多持有 `MAX_ACQUIRED_BUFFERS + 1 == 2` 张，从本地 BufferQueue acquire 后写 Transaction：
+
+```cpp
+t->setBuffer(surfaceControl, buffer);
+t->setAcquireFence(surfaceControl, dup(bufferItem.mFence));
+t->setFrame(surfaceControl, ...);
+t->setCrop(surfaceControl, ...);
+t->setTransform(surfaceControl, ...);
+t->setDesiredPresentTime(bufferItem.mTimestamp);
+t->addTransactionCompletedCallback(...);
+```
+
+于是 buffer、acquire fence、几何和 desired-present time 作为同一 Layer 状态进入 SurfaceFlinger。BLAST 没有删除 BufferQueue，也没有绕过 SF 直接调用 HWC。
+
+### setNextTransaction 与 release 为什么都要延后
+
+首次绘制或窗口几何同步时，ViewRoot 可先：
+
+```java
+mBlastBufferQueue.setNextTransaction(
+        mRtBLASTSyncTransaction);
+```
+
+下一张 buffer 到来后，BLAST 把操作写入指定 Transaction，不立即 `apply()` 自己的 local Transaction。这样 buffer 可与 WMS/ViewRoot 已准备的其他 SurfaceControl 状态原子同行。
+
+BLAST 自己是本地 BufferQueue consumer，不能在交给 SF 后立刻 release。transaction callback 的处理是“落后一张”：
+
+```text
+callback(Tn)
+  → 用 Tn stats.previousReleaseFence
+     release 先前 pending item
+  → 把 Tn 对应 submitted item
+     变成新的 pending release
+```
+
+当前显示 buffer 要等后续 Transaction 带回它的 previous-release fence 才能归还；若没有下一帧，它仍可能是 SF 当前使用的 buffer，继续持有是正确的。
+
+---
+
+## 13. SurfaceFlinger 的两条接收路径不能混画
+
+传统路径：
+
+```text
+App Surface producer
+  → SurfaceFlinger 内的 BufferQueueLayer consumer
+  → SF shadow queue
+  → handlePageFlip / latchBuffer
+```
+
+BLAST 路径：
+
+```text
+App Surface producer
+  → 客户端 BLAST consumer
+  → SurfaceControl Transaction
+  → SF BufferStateLayer state
+  → transaction apply / latchBuffer
+```
+
+两者最后都进入 Layer 合成，但“时间戳和 acquire fence 在哪里拦住帧”并不相同。
+
+### 传统 BufferQueueLayer
+
+`onFrameAvailable()` 先把 `BufferItem` 放进 SF 的 shadow queue、增加 `mQueuedFrames`，再 `signalLayerUpdate()`。它不会在 producer callback 中直接合成。
+
+为保持 callback 顺序，r48 会等期望的连续 frame number；但每次最多等 500 ms，超时只记录并继续 push。这是“尽量保序并有超时退出”，不是绝对永不乱序的证明。
+
+`handlePageFlip()` 遍历 drawing state：
+
+```cpp
+if (layer->hasReadyFrame() &&
+        layer->shouldPresentNow(expectedPresentTime)) {
+    mLayersWithQueuedFrames.push_back(layer);
+}
+```
+
+`BufferQueueLayer::shouldPresentNow()` 对普通头帧使用严格 `timestamp < expectedPresentTime`；超过 expected 但不到未来 1 秒会推迟，更远的异常时间戳反而被视为 implausible 并允许继续。
+
+之后 `BufferLayer::latchBuffer()` 还要检查 refresh pending、fence、local sync points，再执行 `updateTexImage()`。
+
+### “fence 未 signal 就绝不 latch”在 r48 不成立
+
+`BufferQueueLayer::fenceHasSignaled()` 有两个绕过条件：
+
+```cpp
+if (latchUnsignaledBuffers()) return true;
+if (mQueueItems[0].mIsDroppable) return true;
+```
+
+`debug.sf.latch_unsignaled` 默认 0，但首次读取后静态缓存；而 droppable 头帧即使 fence pending 也会被允许 acquire/latch，目的是避免它不断被新帧替换而永远无法 latch。后续纹理/合成仍携带 acquire fence，并非假装 GPU 工作已完成。
+
+当头帧已 signal、后面候选未 signal 时，`BufferQueueLayer::updateTexImage()` 会计算从队头开始连续已 signal 的最后 frame number，并作为 `maxFrameNumber` 传给 consumer，避免通用 `BufferQueueConsumer` 的时间戳 drop 跳到未 ready 的后帧。这是第 162 章 generic TODO 在 SF 调用层上的补充保护。
+
+### BLAST / BufferStateLayer
+
+BLAST Transaction 到 SF 时，`transactionIsReadyToBeApplied()` 已检查：
+
+```text
+desiredPresentTime 尚未到且不超过未来 1 秒
+  → Transaction 留在 apply-token 队列
+
+Transaction 中 changed acquire fence 为 Unsignaled
+  → Transaction 留队
+```
+
+等 Transaction 真正应用后，`BufferStateLayer::shouldPresentNow()` 在 r48 只返回 sideband/auto-refresh/`hasFrameUpdate()`，不再比较 `expectedPresentTime`。也就是说 BLAST 的 desired-present 和初始 fence gate 主要前移到了 Transaction apply 阶段。
+
+这正是不能把传统 BufferQueueLayer 的 queue/latch 判断原样套到 BufferStateLayer 的原因。下一章会继续展开 Transaction current/drawing state 与同步点。
+
+---
+
+## 14. 三种 callback 与 HardwareRenderer.fence 的边界
+
+`ViewRootImpl.performDraw()` 在以下情况设置 frame-complete callback：
+
+```text
+BLAST sync transaction
+存在 ViewTreeObserver frame commit callbacks
+WMS 要求 report-next-draw
+```
+
+`CanvasContext` 在 `didSwap == true` 后调用这些 callbacks；空 damage 早退也主动调用。普通 swap 后紧接着还有：
+
+```cpp
+// TODO: Use a fence for real completion?
+mCurrentFrameInfo->markFrameCompleted();
+```
+
+所以三者要分开：
+
+| 名称 | r48 能证明什么 |
+|---|---|
+| frame-complete callback | 本次 HWUI 路径已 swap，或空帧被有意完成 |
+| FrameInfo `FrameCompleted` | RT 在该代码点完成 CPU 侧帧记账，源码自己提示缺真实 fence |
+| SF present fence/time | 合成提交/显示时间线的后段证据 |
+
+`ViewTreeObserver.registerFrameCommitCallback()` 的文档也明确说“已提交 swap chain，但可能尚不可见”。空帧特例又说明实现为避免死等，会比这段日常描述更宽。
+
+### HardwareRenderer.fence 只清 RenderThread 队列
+
+r48 实现：
 
 ```cpp
 void RenderProxy::fence() {
@@ -1003,341 +748,129 @@ void RenderProxy::fence() {
 }
 ```
 
-它等待 RenderThread 队列跑到这个空任务，相当于一个队列排空边界；不会直接等待 SurfaceFlinger present。
+它等待队列运行到这个空任务，因此能等到此前 `DrawFrameTask::run()` 返回，通常覆盖 draw/swap API 调用；它不直接等待 GPU fence、SF latch 或 HWC present。
 
-不要因为同名就套用 `EglManager::fence()`。后者创建 EGL sync 并等 GPU；`RenderProxy::fence()` 没有调用它。
+`FrameRenderRequest.setWaitForPresent(true)` 的注释使用了“presented”字样，但同一段又把返回保证收窄为“submitted to Surface”，实际只调用上述 `fence()`。应以实现边界理解为提交/RT 队列完成，不把它升级成屏幕 present fence。
 
----
+### finishDrawing 是窗口协议回执
 
-## 24. FrameCompleteCallback 也不是 present callback
-
-`ViewRootImpl.performDraw()` 会在首次绘制上报、BLAST sync 或用户注册 frame commit callback 时设置 frame-complete callback。
-
-RenderThread 在 `didSwap` 后调用它；但有两个重要边界：
-
-1. `didSwap` 表示 producer/pipeline swap 边界，不等于 SF present；
-2. 空 damage 跳帧路径也会主动调用 callback，避免上层永远等待。
-
-源码中 `CanvasContext` 在记录 FrameCompleted 前还有：
-
-```cpp
-// TODO: Use a fence for real completion?
-mCurrentFrameInfo->markFrameCompleted();
-```
-
-这条 TODO 直接提醒读者：这里不是“GPU/显示真实完成”的绝对时刻。
-
-`ViewTreeObserver.registerFrameCommitCallback()` 的 Java 文档把它描述为内容已渲染并提交给 swap chain，也不能扩张为用户已看到。
-
----
-
-## 25. `reportDrawFinished()` 是窗口协议完成，不是视觉证明
-
-首次显示或 WMS 要求 redraw 时，`ViewRootImpl` 最终调用：
+首次显示或 WMS 请求 redraw 时，ViewRoot 最终调用：
 
 ```java
-mWindowSession.finishDrawing(mWindow, mSurfaceChangedTransaction);
+mWindowSession.finishDrawing(
+        mWindow, mSurfaceChangedTransaction);
 ```
 
-这告诉 WindowManager“客户端已完成所要求的绘制/提交阶段”，用于窗口显示、转场和 Surface 状态协调。
+它让 WindowManager 推进窗口展示、转场和 Surface 状态；不是面板扫描完成证明。远端异常还被捕获忽略，因此本地流程结束也不保证服务端一定成功收到。
 
-它不是：
+---
+
+## 15. 用一帧时序和诊断问题闭环
+
+普通硬件加速窗口的一帧可按以下顺序推演：
 
 ```text
-面板光子已经变化的硬件回执
-应用所有子Surface都已显示的通用证明
-用户可感知完成时间
+App UI thread
+  1. invalidate/requestLayout 合并
+  2. Choreographer input→animation→traversal
+  3. measure/layout 按需执行
+  4. 脏 View 录制 DisplayList
+  5. post DrawFrameTask，并等待 RT sync
+
+App RenderThread
+  6. sync staging tree、pin images、计算 damage
+  7. 条件允许时先 unblock UI
+  8. GL/Vulkan dequeue buffer
+  9. 回放 RenderNodes、提交 GPU 命令
+ 10. swap/queue buffer + acquire fence
+
+Buffer transport
+ 11a. 传统：直接进入 SF BufferQueueLayer
+ 11b. BLAST：客户端先 acquire，再写 SurfaceControl Transaction
+
+SurfaceFlinger
+ 12. Transaction apply 或 frame-available 唤醒
+ 13. 本周期选择并 latch
+ 14. client/device composition
+ 15. HWC present，随后借 release/present fence 闭合复用
 ```
 
-协议完成点必须按调用方需求理解，不能按方法名的日常语言理解。
+诊断时不要先问“谁掉帧”，而要逐段找证据：
 
----
-
-## 26. 卡顿应该按哪一段定位
-
-| 症状/trace | 更可能先查 |
+| 现象 | 优先核对 |
 |---|---|
-| UI thread 的 traversal 很长 | measure/layout、`onDraw()`录制、业务回调、锁、GC |
-| UI 等 `DrawFrameTask` 很久 | RenderThread 队列拥堵、prepareTree、纹理准备、特殊不提前放行路径 |
-| RenderThread draw 很长 | Skia复杂度、shader、纹理上传、过度绘制、GPU压力 |
-| dequeue 很长 | BufferQueue无空闲buffer、consumer慢、release fence未就绪 |
-| queue/swap 很长 | producer背压、驱动、queue限制、Surface异常 |
-| 已queue但SF晚latch | acquire fence、desired present time、SF调度/事务依赖 |
-| SF合成长 | Layer数量、client composition、HWC validate/present、GPU合成 |
-| present延迟 | HWC/display pipeline、刷新周期、fence时间线 |
+| UI traversal 长 | measure/layout、业务 callback、View record、锁、GC |
+| UI 等 DrawFrameTask 长 | RT 队列、prepareTree、mutable image pin 失败、特殊延迟放行 |
+| RT draw 长 | RenderNode/Skia 复杂度、纹理上传、shader、GPU 压力 |
+| dequeue 长 | 无 free buffer、consumer 慢、release fence |
+| swap/queue 长 | producer 背压、driver、Surface 错误 |
+| queue 后迟迟无新状态 | BLAST 本地 acquire、Transaction desired time/acquire fence |
+| SF 有帧但未 latch | shouldPresent、refresh pending、sync point、fence |
+| latch 后 present 慢 | client composition、HWC validate/present、显示管线 |
 
-### 26.1 一条常见误诊
+几个静态审计问题尤其有效：
 
-看到主线程 `syncAndDrawFrame` 时间长，就直接说“GPU 渲染慢”并不可靠。
+```text
+1. 当前是软件 Canvas，还是 RecordingCanvas？
+2. 此次 traversal 真执行了哪些 measure/layout/draw 分支？
+3. 哪些 RenderNode 重录，哪些只同步属性？
+4. UI 在 syncFrameState 后早放行，还是等到 draw 后？
+5. prepareTextures 为什么为 false？
+6. 本帧空 damage 早退、didSwap，还是 Surface error？
+7. 后端是 SkiaGL 还是 SkiaVulkan？
+8. ReliableSurface 是否已切到 scratch fallback？
+9. 窗口由 WMS 真正启用了 BLAST 吗？
+10. 帧卡在 BQ shadow queue、Transaction queue、latch 还是 present？
+```
 
-可能性包括：
-
-- RenderThread 前面已有任务；
-- 本帧 prepareTree 慢；
-- 纹理/资源准备使 UI 不能提前放行；
-- Surface 丢失或状态切换；
-- 前一帧的 frame work/future 未完成；
-- 真正 draw/swap 只是在特殊路径上被包含进等待区间。
-
-必须结合 UI、RenderThread、GPU、SurfaceFlinger 多轨 trace。
-
----
-
-## 27. 一个具体例子：TextView 平移并改文字
-
-假设同一帧执行：
+### 一个例子：平移并修改 TextView 文本
 
 ```java
 textView.setTranslationX(20f);
 textView.setText("new");
 ```
 
-不要简单说“View 重画一次”。更细的推演：
+合理推演是：
 
-1. `translationX` 更新 RenderNode 的变换属性；
-2. `setText` 会使 TextView 内容/布局状态变化，可能触发 requestLayout 和 invalidate；
-3. 多次请求由 `mTraversalScheduled` 合并；
-4. 下一次 Choreographer traversal 中，按需 measure/layout；
-5. TextView 的内容 DisplayList 需要重录；
-6. 不相关子树可复用已有 RenderNode；
-7. Root RenderNode 仍引用整棵子节点图；
-8. RenderThread 同步新的属性和 DisplayList；
-9. Skia 只重建必要命令/资源，最终 damage 仍需结合 buffer age；
-10. buffer queue 后由 SF 决定哪次刷新 latch。
+1. translation 更新 RenderNode 变换属性；
+2. 文本变化可能触发 requestLayout 与 invalidate；
+3. 多次请求被 `mTraversalScheduled` 合并；
+4. 下一 traversal 按需 measure/layout；
+5. TextView 内容 DisplayList 重录，不相关子树继续复用；
+6. RT 同步新属性和命令，结合 buffer age 扩大最终 damage；
+7. buffer queue 后仍由 BLAST/SF/HWC 的后半段决定能否赶上目标刷新。
 
-这比“invalidate 后 GPU 重新画整屏”准确得多。
+这比“invalidate 让 GPU 重新画整屏”更接近真实代码。
 
 ---
 
-## 28. 源码阅读中的十二个高频误区
+## 16. 结论：record、draw、queue、latch、present 分层
 
-### 28.1 “draw 在 RenderThread”
+本章最需要记住的十二条边界：
 
-要拆成：View `draw/onDraw` 录制通常在 UI；RenderNode 回放与 Skia/GPU 提交通常在 RenderThread。
+1. `scheduleTraversals()` 用标志合并请求，以 Choreographer 对齐帧节拍。
+2. sync barrier 只拦屏障后的同步 Message；异步帧消息可以通过。
+3. `performTraversals()` 按状态选择 measure/layout/draw，pre-draw 还可取消本轮。
+4. 硬件路径的 View `draw/onDraw` 主要在 UI 线程向 RecordingCanvas 录命令。
+5. DisplayList 是 RenderNode 命令图，不是 bitmap 或 GraphicBuffer。
+6. `syncAndDrawFrame()` 确实让 UI 等 RT；是否提前放行由 `prepareTextures` 决定。
+7. `CanvasContext::waitOnFences()` 等的是 CommonPool futures，不是 sync-file fd。
+8. r48 的 `ReliableSurface::reserveNext()` 因常量开关不真正预取。
+9. 空 damage 可不产生 buffer 却仍调用 frame-complete callback。
+10. swap 只到 producer 提交边界；`HardwareRenderer.fence()` 也不是 present fence。
+11. BLAST 在客户端消费本地 BufferQueue，再把 buffer/fence/几何作为 Transaction 交给 SF。
+12. 传统 BufferQueueLayer 与 BufferStateLayer 的时间/fence gate 位置不同；可丢帧还可有意 latch 未 signal 的 fence。
 
-### 28.2 “DisplayList 是 bitmap cache”
+最终主链：
 
-DisplayList 是命令记录，可引用其他 RenderNode；硬件 layer 或纹理 cache 是另一层机制。
-
-### 28.3 “每个 View 每帧都会 onDraw”
-
-有效 RenderNode 可复用；只更新变换属性时常无需重录内容。
-
-### 28.4 “每帧必定 measure/layout/draw”
-
-performTraversals 按状态选择工作，甚至 draw 也可跳过。
-
-### 28.5 “同步屏障阻塞所有主线程消息”
-
-它阻塞屏障后的同步 Message；异步 Message 能通过。
-
-### 28.6 “syncAndDrawFrame 等 GPU”
-
-正常路径只等到 RenderThread 完成同步并允许 UI 放行。
-
-### 28.7 “waitOnFences 等 sync fence”
-
-CanvasContext 这里等的是 CommonPool future。
-
-### 28.8 “HardwareRenderer.fence 等 present”
-
-r48 的 RenderProxy fence 只是 RenderThread 队列 runSync 空任务。
-
-### 28.9 “frame complete 一定产生新 buffer”
-
-空 damage skip path 也会调用回调。
-
-### 28.10 “eglSwapBuffers 后屏幕已显示”
-
-后面还有 BufferQueue、fence、SF latch、composition、HWC present。
-
-### 28.11 “BLAST 删除了 BufferQueue”
-
-BLAST 本身创建本地 BufferQueue，再把 acquire 到的 buffer 放入 SurfaceControl Transaction。
-
-### 28.12 “SurfaceFlinger 收到 onFrameAvailable 就立即使用”
-
-它只登记并 signal update；合成周期还要判断 present time、fence 和 transaction 条件。
-
----
-
-## 29. macOS 只读练习
-
-### 练习 1：验证 traversal 合并和屏障
-
-```bash
-sed -n '1910,1955p' \
-  frameworks/base/core/java/android/view/ViewRootImpl.java
+```text
+UI 录命令
+  → RT 同步并回放
+  → GPU 产出 buffer
+  → Surface queue
+  → BufferQueue 或 BLAST Transaction
+  → SF 选择/latch
+  → HWC present
 ```
 
-目标：解释 `mTraversalScheduled`、sync barrier、Choreographer callback 各自解决什么问题。
-
-### 练习 2：验证回调顺序
-
-```bash
-sed -n '650,750p' \
-  frameworks/base/core/java/android/view/Choreographer.java
-```
-
-目标：写出五类 callback 顺序，并解释 frameTime 与实际开始时间为何不同。
-
-### 练习 3：找到 DisplayList 复用分支
-
-```bash
-sed -n '21155,21255p' \
-  frameworks/base/core/java/android/view/View.java
-```
-
-目标：标出“重录当前节点”“只恢复子节点”“完全复用”三个分支。
-
-### 练习 4：区分 UI record 与 native draw
-
-```bash
-sed -n '550,680p' \
-  frameworks/base/core/java/android/view/ThreadedRenderer.java
-```
-
-目标：在 `updateRootDisplayList` 与 `syncAndDrawFrame` 中间画出线程边界。
-
-### 练习 5：证明 UI 可提前放行
-
-```bash
-sed -n '45,135p' \
-  frameworks/base/libs/hwui/renderthread/DrawFrameTask.cpp
-```
-
-目标：指出 `unblockUiThread()` 在 `context->draw()` 前后的两个位置及条件。
-
-### 练习 6：查空帧与 FrameCompleted
-
-```bash
-sed -n '450,565p' \
-  frameworks/base/libs/hwui/renderthread/CanvasContext.cpp
-```
-
-目标：解释为何 callback 被调用不保证新 buffer swap。
-
-### 练习 7：验证 r48 没有真正预取
-
-```bash
-sed -n '25,115p' \
-  frameworks/base/libs/hwui/renderthread/ReliableSurface.cpp
-```
-
-目标：找到 `DISABLE_BUFFER_PREFETCH`，说明调用点意图和本版本行为的差异。
-
-### 练习 8：比较 GL/Vulkan 选择
-
-```bash
-sed -n '170,200p' frameworks/base/libs/hwui/Properties.cpp
-sed -n '55,90p' frameworks/base/libs/hwui/renderthread/CanvasContext.cpp
-```
-
-目标：不要再把 SkiaGL 当成唯一后端。
-
-### 练习 9：追 BLAST buffer transaction
-
-```bash
-sed -n '190,290p' \
-  frameworks/native/libs/gui/BLASTBufferQueue.cpp
-```
-
-目标：找出 buffer、acquire fence、crop、transform、timestamp 如何写入同一 Transaction。
-
-### 练习 10：验证 SF 不会在 callback 中直接 latch
-
-```bash
-sed -n '390,445p' \
-  frameworks/native/services/surfaceflinger/BufferQueueLayer.cpp
-sed -n '3090,3145p' \
-  frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
-```
-
-目标：区分 `signalLayerUpdate()` 与 `latchBuffer()`。
-
----
-
-## 30. 复读后补强的易懂版本
-
-### 30.1 为什么 UI 线程“画了”又说没画像素
-
-日常 API 把 `Canvas.drawRect()` 叫画图；但 RecordingCanvas 只记录命令。就像 UI 线程写了一份施工单，RenderThread 才拿施工单组织实际 GPU 工作。
-
-软件 Canvas 路径例外：它可能在调用线程直接对锁住的 Surface buffer 做 CPU 栅格化。所以一定先确认 Canvas 类型和硬件加速状态。
-
-### 30.2 为什么 `syncAndDrawFrame()` 必须等待一小段
-
-UI 线程下一轮可能继续修改 RenderNode staging 状态。RenderThread 必须先把本帧需要的状态同步到自己可安全使用的版本，才能让 UI 继续。同步完成后，RT 可持有本帧所需数据独立画图。
-
-### 30.3 为什么 buffer queue 了还不能 latch
-
-queue 同时交付一张“完成凭证”——acquire fence。SF 得到 buffer 不代表 GPU 已写完；fence 未 signal 时不能读。除此之外，desired present time 和相关事务也可能要求等后续周期。
-
-### 30.4 为什么 swap 与 present 必须分开
-
-swap 是 producer 把作品交到队列；present 是显示系统把选中的多层作品合成并送到显示管线。中间还有消费者选择、同步和合成。
-
-### 30.5 为什么 BLAST 不直接把 buffer 给 HWC
-
-HWC 面对的是 SF 组织好的 Layer 合成计划。BLAST 只是把客户端 buffer 和 Layer 几何状态以 Transaction 形式原子交给 SF，合成裁决仍在 SF/HWC 链路。
-
-### 30.6 为什么“应用掉帧”不能只看主线程
-
-一帧可能在 UI、RenderThread、GPU、BufferQueue、SF 或 HWC 任一段错过目标刷新。主线程很快只证明前半段快，不证明 buffer 按时 present。
-
----
-
-## 31. 本章核心结论
-
-1. `scheduleTraversals()` 用标志合并请求，以 Choreographer traversal 对齐下一帧。
-2. sync barrier 只拦屏障后的同步 Message；异步帧 Message 可以通过。
-3. Choreographer 顺序是 input→animation→insets animation→traversal→commit。
-4. `performTraversals()` 按状态选择 measure/layout/draw，不是每帧固定三连。
-5. 硬件加速时，View `draw/onDraw` 主要在 UI 线程向 RecordingCanvas 录制命令。
-6. DisplayList 属于 RenderNode 命令图，不是 bitmap，也不是 GraphicBuffer。
-7. 脏节点按需重录，未变节点和很多属性动画可复用 RenderNode。
-8. `syncAndDrawFrame()` 至少同步 UI 与 RT 状态；正常路径可在真正 draw/swap 前放行 UI。
-9. `CanvasContext::waitOnFences()` 等 CommonPool future，不是图形 sync fence fd。
-10. r48 的 `RenderProxy::fence()` 只等待 RenderThread 队列边界，不等待 SF present。
-11. HWUI 可选 SkiaGL 或 SkiaVulkan；GL 的 swap 经 EGL/ANativeWindow 进入 Surface producer。
-12. r48 `ReliableSurface::reserveNext()` 因常量开关实际不预取 buffer。
-13. BLAST 用本地 BufferQueue 接收 renderer buffer，再把 buffer、fence 与几何写入 SurfaceControl Transaction。
-14. SF 的 frame-available 只表示有新数据并请求调度；之后才按时间、fence 和事务条件 latch。
-15. UI record、RT sync、queue、latch、present 是五个不同完成点。
-
----
-
-## 32. 自测题
-
-1. 为什么十次 invalidate 通常不会立刻执行十次 traversal？
-2. 同步屏障为什么没有挡住 Choreographer 的帧 Message？
-3. Choreographer 五类 callback 的顺序是什么？
-4. `performTraversals()` 为什么不等于每帧完整 measure/layout/draw？
-5. RecordingCanvas 与普通软件 Canvas 的核心差异是什么？
-6. DisplayList 与 GraphicBuffer 有何区别？
-7. 哪些变化可能只更新 RenderNode 属性而不重跑 `onDraw()`？
-8. `syncAndDrawFrame()` 的 UI 线程等待在哪里发生？
-9. RenderThread 为什么可以在 draw 前先放行 UI？
-10. `CanvasContext::waitOnFences()` 等的是什么？
-11. `HardwareRenderer.fence()` 在 r48 为什么不是 present fence？
-12. 空 damage 为什么仍可能调用 frame-complete callback？
-13. r48 的 `reserveNext()` 为什么名字和实际行为不同？
-14. SkiaGL 与 SkiaVulkan 的公共骨架是什么？
-15. `eglSwapBuffers()` 返回后还剩哪些阶段？
-16. BLAST 的 consumer 位于哪里，它 acquire 后做什么？
-17. `setNextTransaction()` 解决哪类 buffer/几何不同步？
-18. SF 收到 `onFrameAvailable()` 后为什么不立即使用 buffer？
-19. acquire fence 未 signal 时 `latchBuffer()` 怎样处理？
-20. 如何区分 record、sync、queue、latch、present？
-
-能独立讲清这 20 题，就能在 Perfetto 中更准确地把应用一帧拆到 UI、RT、GPU、BufferQueue 和 SF 五段。
-
----
-
-## 33. 下一章预告
-
-第 164 章继续站到 SurfaceFlinger 侧：
-
-> Android SurfaceControl Transaction、Layer 状态提交、BufferStateLayer latch 与事务原子性。
-
-重点追应用/WindowManager 的 Transaction 怎样进入 SF，current state 与 drawing state 怎样切换，buffer transaction、desired present time、sync point、callback 和 release fence 怎样共同决定某一帧何时可见。
+下一章进入 `SurfaceControl.Transaction`、current/drawing state、`BufferStateLayer` buffer latch、desired-present、同步点、callback 与 release fence，继续解释多个 Layer 状态怎样原子收敛到同一合成周期。

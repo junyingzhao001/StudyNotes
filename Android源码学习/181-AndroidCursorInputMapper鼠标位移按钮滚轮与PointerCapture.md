@@ -1,14 +1,14 @@
 # 181 Android CursorInputMapper：鼠标位移、按钮、滚轮与 Pointer Capture
 
-> 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
-> 学习方式：macOS 只读源码，不要求编译、不要求连接 Android 设备  
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`，`frameworks/base` 提交 `1d9b9ab57d`  
+> 学习方式：macOS 静态只读，不要求编译、不要求连接设备  
 > 前置章节：第 20、173、174、179、180 章
 
 ---
 
-## 1. 本章目标：同一组 REL/BTN 为什么会成为三种坐标语义
+## 1. 先抓住真实问题：同一包 REL/BTN 为何会变成三套语义
 
-Linux 鼠标通常只报告相对量：
+Linux 鼠标常把一次硬件报告写成相对位移、按钮和同步边界：
 
 ```text
 EV_REL / REL_X / +10
@@ -17,66 +17,31 @@ EV_KEY / BTN_LEFT / 1
 EV_SYN / SYN_REPORT / 0
 ```
 
-但 Android 可以把它解释成：
+Android 11 却可把它解释为普通鼠标、Pointer Capture 相对鼠标或 navigation/trackball。三者不只 `source` 不同，连 X/Y、display、目标窗口和 App 入口也不同。调试时常见的误判正来自把这些层混在一起：
 
-- 普通鼠标：移动系统光标，向App报告屏幕绝对 X/Y；
-- pointer capture：隐藏/冻结光标，向焦点窗口报告本批相对 X/Y；
-- navigation/trackball：不使用系统光标，以归一化相对量按焦点路由。
+- 普通鼠标在 InputReader 产出显示逻辑坐标，App 的 `getX()/getY()` 通常已被 Dispatcher 变成窗口局部坐标；
+- Capture 下 `getX()/getY()` 本身就是相对量，系统光标不由这个 Mapper 移动；
+- 一枚侧键可同时形成 Motion button 与 KeyEvent，但两条事件走不同选窗规则；
+- `NotifyDeviceReset` 不一定真的调用 Mapper 的 `reset()`，Capture 切换就是关键反例。
 
-本章从 accumulator、`sync()`、PointerController、VelocityControl 一直追到 Dispatcher 和 ViewRoot，解释这三种模式的坐标、按钮、事件顺序与目标窗口为何不同。
+本章只追 r48 的 `CursorInputMapper` 主链：
 
----
+```text
+evdev packet
+  → accumulator
+  → CursorInputMapper::sync()
+  → NotifyMotionArgs / NotifyKeyArgs
+  → InputDispatcher 选窗与坐标变换
+  → ViewRootImpl 的 mouse / trackball / captured-pointer 入口
+```
 
-## 2. 先记住十四条结论
-
-1. CursorInputMapper 等到 `SYN_REPORT` 才把本包位移、滚轮和按钮状态一起提交。
-2. r48 的 motion/scroll accumulator 对同一轴是赋值，不是累加；同包重复 REL_X/REL_WHEEL 时后值覆盖前值。
-3. pointer mode 使用共享 PointerController 移动并裁剪光标，MotionEvent X/Y 是移动后的屏幕位置。
-4. pointer mode 同时填写 RELATIVE_X/Y；绝对位置与本包增量可同时存在。
-5. pointer capture 切到 `SOURCE_MOUSE_RELATIVE`，不移动 PointerController；X/Y 本身就是相对增量。
-6. navigation mode 使用 `SOURCE_TRACKBALL`，X/Y 是按阈值 6 缩放的相对量，也没有绝对光标。
-7. 位移先按显示方向旋转，再进入速度缩放/加速；滚轮使用独立的 X、Y VelocityControl。
-8. primary/secondary/tertiary 中任一按下就算 pointer down；BACK/FORWARD 不改变 down/pressure。
-9. 一次按钮变化可产生主 DOWN/UP/MOVE/HOVER、BUTTON_PRESS/RELEASE，甚至额外 BACK/FORWARD KeyEvent。
-10. r48 的顺序是：BACK/FORWARD Key DOWN → button release → 主motion → button press → UP后的hover → scroll → BACK/FORWARD Key UP。
-11. 纯滚轮包也先产生主 HOVER_MOVE（mouse）或 MOVE（relative/navigation），再产生 SCROLL。
-12. pointer capture 只允许焦点窗口请求；焦点丢失会释放，并用 device reset 隔开 source/坐标语义。
-13. 普通 mouse 是 pointer-class，Dispatcher按触点命中窗口；relative mouse/trackball 是 navigation-class，按焦点窗口路由。
-14. PointerController 在 InputReader 中由多个需要它的输入设备共享，不是每个物理鼠标一只独立系统光标。
+读完应能仅凭一个 raw packet，推导事件条数、顺序、source、坐标、buttonState、displayId 和大致路由；也能解释 Capture 开关附近的断流、孤立 UP、旧按钮状态与回调竞态。
 
 ---
 
-## 3. 本章要回答的二十五个问题
+## 2. 源码地图与三个不能混用的坐标层
 
-1. 哪种 capability 会创建 CursorInputMapper？
-2. pointer、pointer-relative、navigation 三种 mode 如何选择？
-3. 为什么首次配置不能直接从 relative mode 启动？
-4. accumulator 为什么等 SYN_REPORT 才提交？
-5. 同一包两次 REL_X 是相加还是覆盖？
-6. 原始 delta 在哪里旋转？
-7. pointer speed 怎样改变 delta？
-8. 500ms 停顿为何清速度历史？
-9. 普通 mouse 的 X/Y 与 RELATIVE_X/Y 分别是什么？
-10. capture 后为什么光标位置保持不变？
-11. capture 事件为什么用 getX/getY 读相对量？
-12. trackball 的阈值 6 表示什么？
-13. 哪些按钮决定 ACTION_DOWN/UP？
-14. BUTTON_PRESS/RELEASE 与 DOWN/UP 为什么同时存在？
-15. 多按钮同包改变时事件顺序如何？
-16. BACK/SIDE、FORWARD/EXTRA 为什么两两合并？
-17. 鼠标侧键为什么还合成 KeyEvent？
-18. BTN_TASK 最终去了哪里？
-19. 纯滚轮为何不只发 ACTION_SCROLL？
-20. scroll range 标为[-1,1]为何不等于运行值硬裁剪？
-21. 外接鼠标哪些动作会带 WAKE？
-22. 全局键盘meta如何进入鼠标MotionEvent？
-23. pointer display 如何选择？
-24. capture 开关为什么 bump generation并notify reset？
-25. reset 后若硬件按钮仍按住会怎样重建状态？
-
----
-
-## 4. 源码地图
+本章核心文件：
 
 ```text
 frameworks/native/services/inputflinger/reader/mapper/
@@ -88,115 +53,120 @@ frameworks/native/services/inputflinger/reader/mapper/
     └── CursorScrollAccumulator.cpp
 
 frameworks/native/services/inputflinger/reader/
-├── InputReader.cpp
-└── InputDevice.cpp
+├── InputDevice.cpp
+└── InputReader.cpp
 
-frameworks/native/services/inputflinger/include/
-├── PointerControllerInterface.h
-└── InputReaderBase.h
-
-frameworks/native/libs/input/
-└── VelocityControl.cpp
-
-frameworks/native/services/inputflinger/dispatcher/
-├── InputDispatcher.cpp
-└── InputState.cpp
+frameworks/native/libs/input/VelocityControl.cpp
+frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
 
 frameworks/base/core/java/android/view/
 ├── View.java
-└── ViewRootImpl.java
+├── ViewGroup.java
+├── ViewRootImpl.java
+└── IWindow.aidl
 
 frameworks/base/services/core/java/com/android/server/
 ├── input/InputManagerService.java
 └── wm/InputManagerCallback.java
 ```
 
----
+先固定三层词义：
 
-## 5. 运行位置与边界
+| 层 | 普通鼠标 X/Y | Capture / trackball X/Y |
+|---|---|---|
+| evdev | 没有绝对位置，只有 `REL_X/Y` | 同左 |
+| InputReader 输出 | PointerController 移动后的显示逻辑坐标 | 本包经缩放、旋转和速度控制后的 delta |
+| App `MotionEvent.getX/Y()` | 通常经窗口 transform，成为窗口局部坐标 | 仍作为相对导航量读取 |
 
-CursorInputMapper 在 system_server 的 InputReader 线程处理 raw event。它负责：
+因此“普通鼠标向 App 报屏幕绝对坐标”并不严谨。绝对显示坐标是 Mapper/Dispatcher 入口处的事实，最终 App 坐标还要经过目标窗口变换。`AXIS_RELATIVE_X/Y` 则不应被套用普通 X/Y 的窗口平移。
 
-- 累积一个 evdev packet；
-- 选择 source/mode；
-- 计算坐标、按钮、滚轮和 meta；
-- 操作 PointerController；
-- 产生 NotifyMotion/NotifyKey。
+责任边界也要分开：
 
-它不负责：
-
-- 决定目标窗口；
-- 实现 App 的 click/context menu；
-- 确认应用是否处理；
-- 绘制应用自己的鼠标UI。
-
-目标由 InputDispatcher根据 source class、焦点和窗口几何决定；App侧再由 ViewRoot/View 分发。
+- Mapper 解释设备、维护本地状态并生成通知；
+- PointerController 保存并裁剪系统光标位置；
+- Dispatcher 依据 source class、焦点、触摸区域和已有按压状态选窗；
+- ViewRoot/View 决定应用回调及是否消费；
+- 本章不把“已生成通知”写成“目标 App 一定收到并处理”。
 
 ---
 
-## 6. 为什么会创建 CursorInputMapper
+## 3. Mapper 从何而来，以及三种 mode 的契约
 
-第179章看到 EventHub 依据 capability 分类。子设备包含 `INPUT_DEVICE_CLASS_CURSOR` 时，`InputDevice::addEventHubDevice()` 创建：
+EventHub 只有在节点同时具备 `BTN_MOUSE` 基准、`REL_X` 和 `REL_Y` 能力时，才赋予 `INPUT_DEVICE_CLASS_CURSOR`。`InputDevice::addEventHubDevice()` 再据此创建 `CursorInputMapper`。复合设备还可同时拥有 KeyboardInputMapper；InputDevice 会让相关 Mapper 按 raw event 顺序交错处理，不能假设“一个节点只对应一个 Mapper”。
 
-```cpp
-if (classes & INPUT_DEVICE_CLASS_CURSOR) {
-    mappers.push_back(std::make_unique<CursorInputMapper>(*contextPtr));
-}
-```
+三种运行模式可先记成一张表：
 
-一个复合鼠标也可能同时有 KeyboardInputMapper，例如额外媒体键由keyboard class处理，BTN_LEFT等由cursor class处理。同一 raw event 会按 Mapper 顺序交错解释。
+| mode | native source | X/Y | PointerController | event display | Dispatcher 主路由 |
+|---|---|---|---|---|---|
+| `MODE_POINTER` | `AINPUT_SOURCE_MOUSE` | 光标移动后的绝对显示坐标 | 获取、移动、同步按钮 | controller 的 displayId | pointer class，初始按位置命中 |
+| `MODE_POINTER_RELATIVE` | `AINPUT_SOURCE_MOUSE_RELATIVE` | 本包 delta | 保留但本 Mapper 不移动 | `ADISPLAY_ID_NONE` | navigation class，按焦点 |
+| `MODE_NAVIGATION` | `AINPUT_SOURCE_TRACKBALL` | `delta / 6` 后的相对量 | 不获取 | `ADISPLAY_ID_NONE` | navigation class，按焦点 |
 
----
-
-## 7. 三种 mode 总表
-
-| mode | source | X/Y语义 | PointerController | Dispatcher路由 |
-|---|---|---|---|---|
-| POINTER | `SOURCE_MOUSE` | 光标移动后的绝对屏幕坐标 | 移动、显示、保存按钮 | pointer-class按位置命中 |
-| POINTER_RELATIVE | `SOURCE_MOUSE_RELATIVE` | 本包相对delta | 保留位置但不移动，立即隐藏 | navigation-class按焦点 |
-| NAVIGATION | `SOURCE_TRACKBALL` | delta/6的相对导航量 | 不获取 | navigation-class按焦点 |
-
-relative mode 不是 IDC 可直接指定的持久模式，而是 pointer capture 期间由 POINTER 动态切换。
-
----
-
-## 8. IDC 怎样选择初始 mode
-
-`configureParameters()` 读取：
+`cursor.mode` 的 IDC 值只有：
 
 ```text
-cursor.mode = pointer | navigation | default
-cursor.orientationAware = 0 | 1
+pointer | default | navigation
 ```
 
-默认是 POINTER。`navigation` 才选择 trackball模式；非法值记录警告并保留默认。
+默认和 `pointer` 都进入普通鼠标；`navigation` 进入 trackball。IDC 不能把设备直接配置成 relative，relative 只由全局 Pointer Capture 从已建立的 pointer 模式动态切入。首次配置若意外看到 `MODE_POINTER_RELATIVE`，代码会记录错误并退回 `MODE_POINTER`，以保证先取得 PointerController。
 
-首次 `configure()` 若意外已是 POINTER_RELATIVE，源码记录错误并强制回 POINTER，因为 relative 必须由已建立普通 PointerController 的 capture 状态过渡而来。
+Java 的 `SOURCE_MOUSE_RELATIVE` 带的是 `SOURCE_CLASS_TRACKBALL`/navigation class，而不是 pointer class。这不是命名细节：相对 X/Y 不能作为屏幕命中坐标，所以必须按焦点分发。
 
 ---
 
-## 9. hasAssociatedDisplay 不是简单等于“鼠标”
+## 4. 首次配置：source、显示关联和速度参数各自何时确定
 
-源码设置：
+`configureParameters()` 先读取：
+
+```text
+cursor.mode
+cursor.orientationAware
+```
+
+然后计算：
 
 ```cpp
-mParameters.hasAssociatedDisplay =
-        mode == MODE_POINTER || orientationAware;
+hasAssociatedDisplay = mode == MODE_POINTER || orientationAware;
 ```
 
-所以：
+这意味着普通 pointer 总声明显示关联；默认 navigation 不关联；orientation-aware navigation 虽声明有关联语义，`getAssociatedDisplayId()` 却返回 `ADISPLAY_ID_NONE`，表示可向任意显示的焦点派发，而不是绑定一个具体屏幕。
 
-- pointer mouse 总关联系统pointer display；
-- 普通navigation设备默认无关联显示；
-- orientation-aware navigation会声明有关联显示语义，但其事件 displayId 返回 NONE，表示可按非特定显示的焦点语义处理。
+首次配置再建立各模式常量：
 
-这个字段用于输入设备信息与显示配置，不等于每笔事件一定携带具体 displayId。
+```text
+POINTER:
+  source = MOUSE
+  x/y scale = 1
+  x/y precision = 1
+  obtain shared PointerController
+
+NAVIGATION:
+  source = TRACKBALL
+  x/y scale = 1/6
+  x/y precision = 6
+  no PointerController
+```
+
+若系统此时已经开启 Capture，后面的 Capture 分支会把新建 pointer Mapper 立刻切为 relative。该首次分支会 `bumpGeneration()`，但 Mapper 只在增量变化 `changes != 0` 时显式发送 `NotifyDeviceReset`；新设备本身另有 add/config/reset 生命周期，不能把两条路径合成一句“首次 Capture 必发 reset”。
+
+另外两类变化独立处理：
+
+- `CHANGE_POINTER_SPEED` 会给 pointer、横轮、纵轮三个 VelocityControl 调 `setParameters()`；该调用也清各自历史；
+- `CHANGE_DISPLAY_INFO` 会从 **internal viewport** 读取方向，随后无条件 bump Mapper generation。
+
+系统 pointer speed 的基础比例由 policy 计算为：
+
+```cpp
+scale = exp2f(pointerSpeed * 0.25f);
+```
+
+滚轮拿的是自己的参数；只是一次 pointer-speed 配置刷新会重新设置三只控制器，所以滚轮历史也会被清掉，并不表示滚轮使用 pointer 的比例公式。
 
 ---
 
-## 10. 一个 packet 有三个 accumulator
+## 5. accumulator：SYN_REPORT 才提交，但“累积”不等于求和
 
-每笔 RawEvent 依次交给：
+每笔 RawEvent 先依次交给三只 accumulator：
 
 ```cpp
 mCursorButtonAccumulator.process(rawEvent);
@@ -204,52 +174,22 @@ mCursorMotionAccumulator.process(rawEvent);
 mCursorScrollAccumulator.process(rawEvent);
 ```
 
-直到：
+只有遇到：
 
 ```text
 EV_SYN / SYN_REPORT
 ```
 
-才调用 `sync(when)` 统一计算输出。这样同一硬件报告里的X、Y、按钮、滚轮变化拥有相同提交时间和一致状态快照。
+才调用 `sync(when)`。提交后 motion 和 scroll 的瞬时轴清零，按钮状态跨包保留。
 
----
-
-## 11. SYN_REPORT 是提交边界
-
-```mermaid
-flowchart LR
-    A["REL_X / REL_Y"] --> P["本包accumulator"]
-    B["BTN_*状态"] --> P
-    C["REL_WHEEL / REL_HWHEEL"] --> P
-    P --> S{"SYN_REPORT?"}
-    S -->|"否"| P
-    S -->|"是"| Y["sync: 快照、变换、发NotifyArgs"]
-    Y --> Z["清relative与scroll轴；按钮状态保留"]
-```
-
-按钮是跨包持久状态；相对位移和滚轮是本包瞬时量，`finishSync()` 后清零。
-
----
-
-## 12. r48 accumulator 是覆盖，不是累加
-
-`CursorMotionAccumulator::process()`：
+r48 的相对轴是覆盖赋值：
 
 ```cpp
-case REL_X:
-    mRelX = rawEvent->value;
-    break;
+case REL_X:     mRelX = rawEvent->value; break;
+case REL_WHEEL: mRelWheel = rawEvent->value; break;
 ```
 
-scroll 同样：
-
-```cpp
-case REL_WHEEL:
-    mRelWheel = rawEvent->value;
-    break;
-```
-
-因此一包若是：
+所以同一包：
 
 ```text
 REL_X +3
@@ -257,113 +197,93 @@ REL_X +4
 SYN_REPORT
 ```
 
-r48最终取 +4，不是 +7。常见evdev设备每轴每包只报一次，所以日常不明显；但这不是 accumulator 这个名字所暗示的“自动求和”。
+只留下 `+4`，不是 `+7`。按钮也只保存最终布尔值：若前态未按，同包 `BTN_LEFT 1 → 0 → SYN_REPORT`，最终状态仍为 0，于是没有 DOWN、UP、WAKE 或 downTime 变化。
+
+按钮的跨包语义与相对轴不同。`CursorButtonAccumulator::reset()` 不把所有按钮机械清零，而是用 `isKeyPressed()` 重新查询 kernel 的 LEFT、RIGHT、MIDDLE、BACK、SIDE、FORWARD、EXTRA、TASK 状态。这个快照只说明 reset 时硬件当前状态；何时能重新发成 Framework 事件，还取决于后续是否有一个真正交给 Mapper 的 `SYN_REPORT`。
+
+### SYN_DROPPED 的精确恢复边界
+
+InputDevice 收到 `SYN_DROPPED` 时会当场 `reset(when)` 并进入丢弃态。之后的 raw event 一直被丢到第一枚 `SYN_REPORT`；这枚“解除丢弃”的同步事件本身也不会传给 Mapper。
+
+```text
+SYN_DROPPED
+  → InputDevice::reset()，button accumulator 查询 kernel
+  → 丢弃中间事件
+  → 第一枚 SYN_REPORT：只清 drop gate，仍被吞掉
+  → 再有一个交给 Mapper 的 packet + SYN_REPORT：才可能提交按钮快照
+```
+
+所以旧稿常说的“下一枚 SYN_REPORT 重建 DOWN”少了一层。这个 InputDevice reset 也不 bump generation；“状态重新建账”不等于“设备进入新 generation”。
 
 ---
 
-## 13. 按钮 accumulator 会查询 kernel 状态
+## 6. `sync()` 先冻结状态快照，再决定是否输出
 
-reset 时 `CursorButtonAccumulator` 不只是清0，而是调用 `isKeyPressed()` 查询 BTN_LEFT/RIGHT/MIDDLE/BACK/SIDE/FORWARD/EXTRA/TASK 当前状态。
+`sync(when)` 开头先计算：
 
-原因是 reset 可能发生在按钮仍物理按住时。保留驱动状态后，下一次 SYN_REPORT 可让 Mapper从新的逻辑 `mButtonState=0` 重新产生DOWN序列。
+```text
+lastButtonState
+currentButtonState
+wasDown / down / downChanged
+buttonsPressed / buttonsReleased
+deltaX / deltaY / moved
+vscroll / hscroll / scrolled
+```
 
-这也是 InputDevice disable 前为何要先reset：查询必须在fd仍可用时完成。不过整个 device reset 通知还会先让Dispatcher取消旧代际状态，避免新旧序列粘连。
-
----
-
-## 14. Linux按钮到Android buttonState
-
-| Linux code | Android Motion button |
-|---|---|
-| BTN_LEFT | PRIMARY |
-| BTN_RIGHT | SECONDARY |
-| BTN_MIDDLE | TERTIARY |
-| BTN_BACK 或 BTN_SIDE | BACK |
-| BTN_FORWARD 或 BTN_EXTRA | FORWARD |
-
-BACK/SIDE、FORWARD/EXTRA 是“任一个为真就置同一bit”。若两者同时按下，释放其中一个不会让Android bit释放；必须两者都释放。
-
----
-
-## 15. BTN_TASK 的 r48 实现缺口
-
-`CursorButtonAccumulator`：
-
-- 构造和reset都维护 `mBtnTask`；
-- process也接收 `BTN_TASK`；
-- 但 `getButtonState()` 没有把 `mBtnTask` 映射到任何 Android button bit。
-
-所以仅 BTN_TASK 的变化不会造成 `currentButtonState` 改变，也不会由本 Mapper产生 Motion/Key输出。这是当前源码的真实缺口，不要看到“已accumulate”就断言App能收到。
-
----
-
-## 16. 哪些button算pointer down
-
-公共函数只检查：
+其中 `isPointerDown()` 只看：
 
 ```text
 PRIMARY | SECONDARY | TERTIARY
 ```
 
-BACK/FORWARD 不算 down。因此：
+BACK/FORWARD 不让 pointer 进入 down，pressure 仍为 0。右键或中键单独按下却足以产生主 `ACTION_DOWN`，并把 pressure 设为 1。
 
-- 左/右/中任一从全未按→有按键：主 action DOWN；
-- 只要三者仍有任一个按住：pressure=1，主 action通常MOVE；
-- 最后一个释放：主 action UP；
-- 侧键单独按下：仍处于hover，pressure=0。
-
-右键也能开启pointer-down序列，不是只有左键才有DOWN/UP。
-
----
-
-## 17. downTime 是整组主按钮共享的
-
-只有 `wasDown=false && down=true` 时：
+一次同步只有在以下任一条件成立时才进入 Motion 输出块：
 
 ```cpp
-mDownTime = when;
+downChanged || moved || scrolled || buttonsChanged
 ```
 
-它表示 primary/secondary/tertiary 这组从“全未按”进入“至少一个按下”的时刻。按住左键后再按右键不会重置；释放左键但右键仍在也不结束；最后一个主按钮释放才UP。
+因此纯 `SYN_REPORT` 不产生 Motion，也不会仅为刷新光标而 unfade。注意 `moved` 在旋转和 VelocityControl 之前，由基础 scale 后的 delta 判断；`scrolled` 也在 wheel VelocityControl 之前判断。
 
-BACK/FORWARD不参与这份downTime，但其合成 KeyEvent把各自变化时刻直接作为downTime，KEY UP也用UP时刻，因而不具备普通键盘DOWN/UP共享downTime的语义。
-
----
-
-## 18. 位移的处理顺序
-
-原始相对量依次经过：
+主 action 的选择是：
 
 ```text
-raw REL_X/Y
-  → mode基础scale（mouse=1；navigation=1/6）
-  → orientationAware旋转
-  → VelocityControl缩放/加速
-  → PointerController移动或直接写X/Y
+无主按钮 → 有主按钮      DOWN
+有主按钮 → 无主按钮      UP
+状态不跨边界且当前 down   MOVE
+状态不跨边界且非 MOUSE    MOVE
+其余普通 MOUSE            HOVER_MOVE
 ```
 
-旋转在加速之前；VelocityControl看到的是旋转后的向量，但二维速度大小在纯旋转下不变。
+所以纯滚轮也不是“只发 SCROLL”：它先触发一笔普通鼠标 `HOVER_MOVE`（按住主按钮则为 `MOVE`），relative/navigation 则先发 `MOVE`，之后才有 `ACTION_SCROLL`。
 
 ---
 
-## 19. orientation rotation 的精确方向
+## 7. 位移变换链：基础 scale、方向、速度控制不能调换
 
-`rotateDelta()`：
+X/Y 的实际顺序是：
 
-| orientation | 输出 |
+```text
+本包最后一个 REL_X/Y
+  → mode 基础 scale（pointer=1；navigation=1/6）
+  → 若 orientationAware，按 internal viewport 旋转
+  → pointer VelocityControl
+  → 移动 PointerController，或直接写入 X/Y
+```
+
+`rotateDelta()` 的映射为：
+
+| display orientation | `(x, y)` 变成 |
 |---|---|
-| 0° | `(x,y)` |
-| 90° | `(y,-x)` |
-| 180° | `(-x,-y)` |
-| 270° | `(-y,x)` |
+| 0° | `(x, y)` |
+| 90° | `(y, -x)` |
+| 180° | `(-x, -y)` |
+| 270° | `(-y, x)` |
 
-只有 `cursor.orientationAware=true` 且 hasAssociatedDisplay 时执行。r48取的是 INTERNAL viewport orientation，而不是 PointerController当前default pointer display的orientation；多显示时这两者可能不是同一个显示，是需要注意的实现边界。
+方向来自 internal viewport，不一定等于共享 PointerController 当前所在 display 的方向；多显示场景不能凭 event displayId 反推这里使用的 viewport。
 
----
-
-## 20. navigation mode 为什么除以6
-
-常量：
+navigation 的常量是：
 
 ```cpp
 TRACKBALL_MOVEMENT_THRESHOLD = 6;
@@ -371,602 +291,430 @@ mXScale = mYScale = 1.0f / 6;
 mXPrecision = mYPrecision = 6;
 ```
 
-因此原始 REL_X=3 输出 X=0.5。它不是在 Mapper里凑满6后才离散发一个方向键，而是把相对MotionEvent归一化；后续 ViewRoot SyntheticTrackballHandler 才可能依据移动合成DPAD键。
+raw `REL_X=3` 因而先成为 `0.5`。它不是 Mapper 等累计满 6 才离散成方向键；若之后出现 DPAD 合成，那是 ViewRoot `SyntheticTrackballHandler` 的另一段逻辑。
+
+VelocityControl 维护的是“控制器输入位置”及 VelocityTracker。navigation 在进入它以前已经除以 6，不能称为累计 raw position。停止至少 500 ms 后的下一次非零移动会先清速度历史，再按基础 scale、阈值和 acceleration 计算输出，避免把很久以前的速度接续到新一笔。
+
+pointer 是一只二维控制器，横滚和纵滚各有一只一维控制器，三者速度历史互不串扰。
 
 ---
 
-## 21. VelocityControl 不是简单乘固定倍数
+## 8. 普通鼠标：共享 PointerController、显示坐标与粘住的按压流
 
-每条控制器维护累计 raw position 和 VelocityTracker：
-
-1. 本次非零delta加入累计位置；
-2. 根据事件时间估算速度；
-3. 先应用基础 `scale`；
-4. 低阈值以下不加速；
-5. 低/高阈值间线性插值；
-6. 高阈值以上使用完整 acceleration。
-
-500ms没有移动后，下次输入先reset历史，避免长停顿后的第一笔被旧速度污染。
-
----
-
-## 22. pointer speed 如何进入native参数
-
-NativeInputManager读取整数pointer speed后设置：
-
-```cpp
-scale = exp2f(pointerSpeed * POINTER_SPEED_EXPONENT);
-```
-
-再发 `CHANGE_POINTER_SPEED`。CursorInputMapper给pointer与两个wheel VelocityControl更新参数；`setParameters()`同时reset速度历史。
-
-因此改系统鼠标速度不会重建EventHub设备，也不需要销毁Mapper，但下一笔不会沿用旧速度估计。
-
----
-
-## 23. 三条VelocityControl为什么分开
-
-Mapper有：
-
-- pointer X/Y 共用一个二维控制器；
-- horizontal wheel 单独一个控制器；
-- vertical wheel 单独一个控制器。
-
-若横竖滚轮共用二维速度，快速竖滚可能抬高紧随其后的横滚加速。r48明确将它们解耦。
-
-配置中pointer默认阈值/acceleration与wheel默认值也不同；不能用鼠标指针速度公式直接推断滚轮量。
-
----
-
-## 24. 普通 pointer mode 的坐标
-
-若本包 moved：
-
-```cpp
-mPointerController->move(deltaX, deltaY);
-```
-
-PointerController负责限制在显示bounds、保存位置与显示光标。随后 Mapper读取位置：
+普通 `SOURCE_MOUSE` 分支在 moved、scrolled 或 buttonsChanged 时依次：
 
 ```text
-AXIS_X / AXIS_Y             = 移动后的绝对光标坐标
-AXIS_RELATIVE_X / RELATIVE_Y = 本批加速后的delta
-xCursorPosition/yCursorPosition = 同一绝对光标位置
-displayId                  = PointerController displayId
+setPresentation(POINTER)
+若 moved：move(deltaX, deltaY)
+若 buttonsChanged：setButtonState(currentButtonState)
+unfade(IMMEDIATE)
 ```
 
-若在屏幕边缘，绝对X/Y可能不再变化，但RELATIVE_X仍可保留用户继续移动的意图。
-
----
-
-## 25. PointerController 是共享系统光标状态
-
-InputReader只保留一份弱引用：
-
-```cpp
-wp<PointerControllerInterface> mPointerController;
-```
-
-第一台需要它的设备通过policy创建，后续鼠标/触摸板指针模式复用。结果是：
-
-- 两只鼠标移动同一系统光标；
-- defaultPointerDisplayId统一决定光标当前显示；
-- Mapper成员各持sp，但底层对象可相同；
-- controller初次创建时传入某个deviceId，不表示以后只属于该设备。
-
----
-
-## 26. pointer display 怎样更新
-
-InputReader读取 `config.defaultPointerDisplayId`，查对应 viewport：
-
-1. 找到则 `controller->setDisplayViewport(viewport)`；
-2. 找不到则回退默认显示；
-3. 默认显示也没有则记录错误并跳过更新。
-
-普通 mouse每笔事件的displayId从PointerController取得。也就是说事件显示归属随系统pointer display配置走，不是依据每只鼠标的物理连接端口单独选择。
-
----
-
-## 27. 活动时如何显示光标
-
-当 moved/scrolled/buttonsChanged 任一为真，普通mouse：
-
-1. presentation设为 POINTER；
-2. moved时移动位置；
-3. buttonsChanged时同步button state；
-4. immediate unfade。
-
-纯 SYN_REPORT没有变化不会反复唤出光标。滚轮即使位置不变，也会让系统光标立即显示。
-
----
-
-## 28. pointer capture 请求链
-
-```mermaid
-sequenceDiagram
-    participant V as "Focused View"
-    participant R as "ViewRootImpl"
-    participant I as "InputManagerService"
-    participant W as "WMS InputManagerCallback"
-    participant N as "NativeInputManager"
-    participant C as "CursorInputMapper"
-
-    V->>R: "requestPointerCapture()"
-    R->>I: "windowToken, enabled=true"
-    I->>W: "verify focused window"
-    W-->>R: "dispatchPointerCaptureChanged(true)"
-    W-->>I: "configuration refresh needed"
-    I->>N: "nativeSetPointerCapture(true)"
-    N->>C: "CHANGE_POINTER_CAPTURE"
-    C->>C: "MOUSE→MOUSE_RELATIVE; hide pointer; bump generation"
-    C-->>I: "NotifyDeviceReset"
-```
-
-请求不是调用返回就立刻等于已capture；ViewRoot以 `dispatchPointerCaptureChanged` 更新 `mPointerCapture` 并通知View。
-
----
-
-## 29. 为什么只有焦点窗口能capture
-
-WMS保存当前focused window token。请求时：
+随后读取 controller 的位置和显示：
 
 ```text
-focusedWindow == null 或 token不匹配 → 拒绝，不刷新native配置
+AXIS_X / AXIS_Y                 = 裁剪后的显示逻辑位置
+AXIS_RELATIVE_X / RELATIVE_Y   = 本包变换后的 delta
+xCursorPosition / yCursorPosition = 同一显示位置
+displayId                      = controller displayId
 ```
 
-焦点切走时，旧窗口capture状态被释放。这样 relative motion不会继续流向后台窗口。
+在屏幕边界继续移动时，X/Y 可因裁剪保持不变，RELATIVE_X/Y 仍保留移动意图。反过来，`populateDeviceInfo()` 会声明普通鼠标的 X/Y range，却没有为它声明 RELATIVE_X/Y range；运行时存在轴值不等于 `InputDeviceInfo` 一定为该轴给出 range。
 
-Android 11的native reader配置是单个全局 `pointerCapture` bool，不是每display、每device一份；授权在窗口层做，mode切换则影响所有POINTER CursorInputMapper。
+InputReader 只保存一份 PointerController 弱引用；需要 controller 的多个 cursor/touch Mapper 可持有同一个强引用。两只鼠标因此移动同一系统光标。`getPointerControllerLocked(deviceId)` 虽把 deviceId 传给 policy，但 r48 的 `NativeInputManager::obtainPointerController(int32_t /* deviceId */)` 明确忽略该参数，不能把 controller 归属于最先创建它的设备。
+
+显示选择来自 `defaultPointerDisplayId`：找不到指定 viewport 时回退默认显示，默认也不存在才记录错误并跳过更新。
+
+Dispatcher 对 pointer-class 的 hover、scroll 和新 DOWN 按坐标命中窗口；DOWN 一旦建立，后续按压序列粘在既有目标，不是每一笔 MOVE 都重新 hit-test。再经目标窗口 transform 后，App `getX()/getY()` 通常成为窗口局部坐标。
 
 ---
 
-## 30. capture 时为什么保留PointerController
+## 9. relative 与 navigation：X/Y 就是 delta，按焦点进入 ViewRoot
 
-切入 capture：
-
-```cpp
-mParameters.mode = MODE_POINTER_RELATIVE;
-mSource = AINPUT_SOURCE_MOUSE_RELATIVE;
-mPointerController->fade(TRANSITION_IMMEDIATE);
-```
-
-Mapper没有清掉 controller，也不改其位置。capture期间 raw delta不调用 `move()`；退出后source恢复MOUSE，下一笔普通移动从进入capture前保存的位置继续。
-
-这实现了“光标消失且不改变位置”，而不是把光标强制搬到屏幕中心。
-
----
-
-## 31. relative mode 的坐标与cursor position
-
-非普通mouse分支：
+非普通鼠标分支直接写：
 
 ```cpp
-AXIS_X = deltaX;
-AXIS_Y = deltaY;
+pointerCoords.setAxisValue(AXIS_X, deltaX);
+pointerCoords.setAxisValue(AXIS_Y, deltaY);
 displayId = ADISPLAY_ID_NONE;
 ```
 
-并保持：
+同时保留：
 
 ```text
 xCursorPosition = INVALID
 yCursorPosition = INVALID
 ```
 
-r48没有在relative分支填写 AXIS_RELATIVE_X/Y；公开API文档也明确要求从 `MotionEvent.getX()/getY()` 读取相对变化。不要照普通mouse习惯只读 `AXIS_RELATIVE_X`。
+r48 不在这里设置 `AXIS_RELATIVE_X/Y`。因此 Capture API 应从 `MotionEvent.getX()/getY()` 读取 delta，不能照普通 mouse 只查 `AXIS_RELATIVE_X/Y`。
 
----
+`ADISPLAY_ID_NONE` 进入 Dispatcher 后由当前 focused display 的窗口焦点承接；它只在选目标时用 focused display，交给 App 的 MotionEvent `displayId` 仍是 `NONE`。navigation-class 事件不拿 delta 去碰 touchable region，也不对 relative X/Y 套普通 pointer 的窗口 offset/scale。普通 mouse 的侧键 Motion 仍属于 pointer 路由，两者不能混写成“所有鼠标都发给焦点窗口”。
 
-## 32. capture 为什么用navigation-class source
-
-`SOURCE_MOUSE_RELATIVE = ... | SOURCE_CLASS_NAVIGATION`，不是pointer class。
-
-InputDispatcher因此走 `findFocusedWindowTargetsLocked()`，而非按X/Y命中触摸窗口。这很合理：relative X/Y不是屏幕坐标，无法拿来判断落在哪个touchable region。
-
-ViewRoot在trackball阶段识别SOURCE_MOUSE_RELATIVE，真实条件是：
+ViewRoot 的 trackball 阶段对 relative mouse 有一层门：
 
 ```java
-if (!hasPointerCapture() || mView.dispatchCapturedPointerEvent(event)) {
+if (event.isFromSource(SOURCE_MOUSE_RELATIVE)) {
+    if (!hasPointerCapture() || mView.dispatchCapturedPointerEvent(event)) {
+        return FINISH_HANDLED;
+    }
+}
+if (mView.dispatchTrackballEvent(event)) {
     return FINISH_HANDLED;
 }
+return FORWARD;
 ```
 
-所以客户端还没确认capture时会直接结束这笔relative事件；已capture且View处理成功也结束；只有“已capture但captured回调返回false”才继续尝试 `dispatchTrackballEvent()`。这段保护可避免Reader mode已经切换、客户端capture回调尚未同步完成的短窗口把relative量误当普通trackball。
+结果分三种：
+
+- Reader 已切 relative，但客户端 `hasPointerCapture()` 尚未变 true：事件静默结束；
+- 客户端已 capture，`dispatchCapturedPointerEvent()` 返回 true：正常消费；
+- 客户端已 capture但回调返回 false：继续尝试 `dispatchTrackballEvent()`，之后还可能进入 `SyntheticTrackballHandler`。
+
+把第一条理解为避免相对量误落到普通 trackball 的保护效果是合理推论，但源码没有跨进程握手来保证“客户端先确认，Reader 后切 mode”。
 
 ---
 
-## 33. capture切换为什么要device reset
+## 10. 按钮状态：别名、BTN_TASK 缺口与共享 downTime
 
-POINTER与POINTER_RELATIVE之间：
+Linux 按钮到 Android Motion button 的映射为：
 
-- source class改变；
-- X/Y从绝对坐标变相对量；
-- displayId从具体值变NONE；
-- hover/路由方式改变。
+| Linux code | Android bit |
+|---|---|
+| `BTN_LEFT` | `BUTTON_PRIMARY` |
+| `BTN_RIGHT` | `BUTTON_SECONDARY` |
+| `BTN_MIDDLE` | `BUTTON_TERTIARY` |
+| `BTN_BACK` 或 `BTN_SIDE` | `BUTTON_BACK` |
+| `BTN_FORWARD` 或 `BTN_EXTRA` | `BUTTON_FORWARD` |
 
-若一个按钮在切换时正按住，让旧DOWN直接接新source的UP会破坏InputState。于是 Mapper bump generation，并在增量capture change时发送 NotifyDeviceReset，让Dispatcher先取消旧source/device在各connection上的在途状态。
+BACK/SIDE 是 OR 到同一个 bit，FORWARD/EXTRA 也是。两个别名同时按住时，第二次按下不会再改变 Framework state；释放其中一个也不会释放该 bit，直到另一枚也释放。
 
----
+`BTN_TASK` 是一个明显的 r48 边界：accumulator 会构造、reset、process 它，却没有在 `getButtonState()` 中映射到任何 Android bit。因此只变 `BTN_TASK` 不会让本 Mapper 输出 Motion/Key，也不会凭它触发外接设备 WAKE。不过 `getScanCodeState()` 接受 `[BTN_MOUSE, BTN_JOYSTICK)`，直接查询 scan state 时仍可能看见 BTN_TASK。
 
-## 34. 首次配置已capture的特殊路径
+`mDownTime` 属于 PRIMARY/SECONDARY/TERTIARY 这一整组：
 
-条件是：
+- 从“全未按”到“至少一枚主按钮按下”时写为当前 `when`；
+- 组内再按或释放一枚不会改；
+- 最后一枚释放时不会清零；
+- reset 才清为 0，下一轮 DOWN 会覆盖。
 
-```cpp
-(!changes && config->pointerCapture) ||
-(changes & CHANGE_POINTER_CAPTURE)
-```
-
-即Mapper首次建立时如果全局capture已开，也会立即切relative。代码无论 `changes` 是否为0都会 bump generation；只有 `changes!=0` 的动态切换才在该分支显式notify device reset。
-
-不过整个InputDevice首次加入本来就有自己的add/config/reset生命周期，不需要把这条分支的显式reset机械套用到首次创建。
-
----
-
-## 35. 主 Motion action 怎样选
-
-```mermaid
-flowchart TD
-    A{"down状态变化?"} -->|"false→true"| D["ACTION_DOWN"]
-    A -->|"true→false"| U["ACTION_UP"]
-    A -->|"没有"| B{"当前down或source不是普通MOUSE?"}
-    B -->|"是"| M["ACTION_MOVE"]
-    B -->|"否"| H["ACTION_HOVER_MOVE"]
-```
-
-所以：
-
-- 普通mouse未按键移动/滚轮/侧键变化：HOVER_MOVE；
-- 普通mouse按住主按钮移动：MOVE；
-- relative/navigation即使未按也用MOVE；
-- 最后一枚主按钮释放：UP。
+因此 UP、UP 后额外 HOVER，以及随后纯 hover/scroll 都可能继续携带上一轮按压的旧 downTime。这不表示它们仍在 down；应同时看 action、pressure 和 buttonState。
 
 ---
 
-## 36. BUTTON_PRESS/RELEASE 不等于主DOWN/UP
+## 11. 一个 SYN_REPORT 可输出很多事件，且按钮按较大 mask 先处理
 
-DOWN/UP描述 pointer接触式序列是否从“无主按钮”进入“有主按钮”。BUTTON_PRESS/RELEASE描述具体哪一个button bit变化，`actionButton` 指明该bit。
-
-例如左键已按，再按右键：
+`sync()` 的固定输出顺序是：
 
 ```text
-主action = MOVE（pointer本来就down）
-随后 ACTION_BUTTON_PRESS(actionButton=SECONDARY)
+1. 新按下 BACK/FORWARD 对应的 Key DOWN
+2. 每个 ACTION_BUTTON_RELEASE
+3. 一笔主 DOWN / UP / MOVE / HOVER_MOVE
+4. 每个 ACTION_BUTTON_PRESS
+5. 普通 mouse 主 UP 后额外一笔 HOVER_MOVE
+6. 若滚轮非零，再发 ACTION_SCROLL
+7. 新释放 BACK/FORWARD 对应的 Key UP
+8. 清本包 motion / scroll accumulator
 ```
 
-若把BUTTON_PRESS当成DOWN的别名，就无法表达多按钮组合。
+release 在主事件前，press 在主事件后。主事件总携带最终 `currentButtonState`；BUTTON_RELEASE/PRESS 则用局部 state 一步步减少或增加。
 
----
+多按钮循环是：
 
-## 37. 同一 SYN_REPORT 的精确输出顺序
+```cpp
+BitSet32 bits(changedButtons);
+actionButton = BitSet32::valueForBit(bits.clearFirstMarkedBit());
+```
 
-`sync()` 顺序为：
+`BitSet32` 的 bit index 0 对应 `0x80000000`，`clearFirstMarkedBit()` 从最高有效数值位开始；Android button mask 又位于低位。所以实际顺序是**较大的 Android button mask 先**，不是“最低数值 bit 先”。同时按 SECONDARY=`0x2` 与 TERTIARY=`0x4` 时：
 
-1. 对刚按下的BACK/FORWARD合成 Key DOWN；
-2. 对每个released bit发 BUTTON_RELEASE；
-3. 发一笔主 DOWN/UP/MOVE/HOVER_MOVE；
-4. 对每个pressed bit发 BUTTON_PRESS；
-5. 若主action是普通mouse UP，再发 HOVER_MOVE；
-6. 若有滚轮，再发 SCROLL；
-7. 对刚释放的BACK/FORWARD合成 Key UP；
-8. 清本包relative/scroll accumulator。
+```text
+主 DOWN：buttonState = SECONDARY | TERTIARY
+BUTTON_PRESS：actionButton = TERTIARY，state = TERTIARY
+BUTTON_PRESS：actionButton = SECONDARY，state = TERTIARY | SECONDARY
+```
 
-这个顺序决定App观察buttonState的中间值，不应按直觉重新排序。
+同时“释放旧键、按下新键”的一包更能看清两种口径：release 事件从旧 state 逐步清；主 MOVE/UP/DOWN 已携最终 state；press 事件再从清完后的中间 state 逐步加。
 
----
-
-## 38. 多button同包时buttonState如何递进
-
-假设上一包无按钮，本包同时按RIGHT与MIDDLE：
-
-- 主DOWN携带最终完整状态 SECONDARY|TERTIARY；
-- 进入pressed循环时局部 `buttonState` 从旧状态0开始；
-- 先发哪个取决于 BitSet最低bit顺序；
-- 第一笔BUTTON_PRESS携带加入第一bit后的中间状态；
-- 第二笔携带最终状态。
-
-这解释了源码测试中“主DOWN已经有两个bit，但第一笔BUTTON_PRESS只有其中一个”并非矛盾。
-
----
-
-## 39. release 为什么发生在主action之前
-
-`buttonsReleased` 循环先从lastButtonState逐bit清除，再发 BUTTON_RELEASE。随后主action携带完整currentButtonState。
-
-若释放最后一个主按钮：
+最后一枚普通主按钮释放的典型序列是：
 
 ```text
 BUTTON_RELEASE → ACTION_UP → ACTION_HOVER_MOVE
 ```
 
-若还有另一主按钮按住：
-
-```text
-BUTTON_RELEASE → ACTION_MOVE
-```
-
-UP后的额外HOVER_MOVE告诉窗口：touch-like按压序列结束，但鼠标仍停在此位置进入hover状态。
+若仍有另一枚主按钮按着，则是 `BUTTON_RELEASE → ACTION_MOVE`，没有 UP 后 hover。
 
 ---
 
-## 40. BACK/FORWARD 为什么同时有Motion与Key
+## 12. 侧键、滚轮、meta、WAKE 和查询接口的交叉边界
 
-侧键变化先进入 Motion buttonState，因此App可看到：
+BACK/FORWARD 先作为 Motion button 参加前述状态机，公共 helper 又分别合成 `KEYCODE_BACK` / `KEYCODE_FORWARD`：
 
 ```text
-ACTION_HOVER_MOVE / MOVE
-ACTION_BUTTON_PRESS / RELEASE
-buttonState = BUTTON_BACK / BUTTON_FORWARD
+Key DOWN → Motion 主/按键事件 …… Motion 释放事件 → Key UP
 ```
 
-公共 helper 又合成：
+两类事件不保证到同一窗口：KeyEvent 走 focused-key target，普通 mouse Motion 走光标位置/已有流的目标；policy 还可能消费 Key，只留下 Motion。应用若恰好收到两路，也要避免把它们再次互相合成造成双触发。
+
+侧键 helper 构造的 Key 有几个特殊点：
 
 ```text
-BUTTON_BACK    → KEYCODE_BACK
-BUTTON_FORWARD → KEYCODE_FORWARD
-```
-
-这是为键语义兼容。Key DOWN 在motion之前，Key UP 在motion之后。应用可能从KeyEvent或MotionEvent处理侧键，应避免自己把两条路径再次重复转换。
-
----
-
-## 41. 侧键合成KeyEvent的downTime边界
-
-helper构造NotifyKey时，DOWN和UP均传：
-
-```text
+scanCode = 0
+flags = 0
 eventTime = when
-downTime  = when
+downTime = when（DOWN、UP 各自都用本次 when）
+source / displayId / policyFlags 沿用 cursor 包
 ```
 
-因此合成BACK键UP的downTime不是对应DOWN的时间。这与第180章KeyboardInputMapper的常规单键序列不同。
+UP 的 downTime 因而不是原 DOWN 时间。它也没有 `DISABLE_KEY_REPEAT`：如果 Key DOWN 被 policy 放行并一直没有对应 UP，Dispatcher 的普通重复机制可能生成 repeat/long-press；这和 Motion button 事件是两套状态账。
 
-同时 scanCode=0，flags=0；source沿用MOUSE/MOUSE_RELATIVE/TRACKBALL，policyFlags沿用本包WAKE等标志。
+能力查询也并不对称：Cursor mapper 实现 scan-code state，却没有像 KeyboardInputMapper 那样实现 key-code state 或 supported-key 标记。运行时能合成 BACK/FORWARD，不代表“支持哪些 keyCode”的查询一定报告它们。
 
----
+滚轮只读取 `REL_WHEEL` / `REL_HWHEEL`，r48 不处理 high-resolution wheel code。`mVWheelScale`、`mHWheelScale` 被设为 1 并出现在 dump，却没有在 `sync()` 数据路径中消费；真实变换来自两只 wheel VelocityControl。
 
-## 42. 纯滚轮为什么会有两笔 MotionEvent
+`populateDeviceInfo()` 为 VSCROLL/HSCROLL 以及 relative/navigation X/Y 声明 nominal `[-1, 1]`，但 `sync()` 没有 clamp。它只能证明声明范围，不能单独证明运行值一定落在范围内，更不能由此推导全部 API 语义。
 
-scroll变化令 `scrolled=true`，因此先进入主motion分支：
-
-- 普通mouse无主按钮：HOVER_MOVE；
-- 主按钮按住：MOVE；
-- relative/navigation：MOVE。
-
-之后才把 VSCROLL/HSCROLL 写入coords并发 ACTION_SCROLL。
-
-第一笔主motion中scroll轴还未写入；第二笔SCROLL才包含滚轮值。应用要以 action 区分，不能假定同一packet只对应一个Java MotionEvent。
-
----
-
-## 43. wheel scale字段与真实处理
-
-初次配置把：
-
-```cpp
-mVWheelScale = 1.0f;
-mHWheelScale = 1.0f;
-```
-
-并在dump中打印，但 r48 `sync()` 读取wheel后没有乘这两个成员，只调用各自 VelocityControl。这两个字段在当前实现对输出没有实际作用。
-
-这是典型的“成员存在不代表数据路径使用”。读源码应从赋值继续追到消费点。
-
----
-
-## 44. MotionRange [-1,1] 不是硬裁剪
-
-设备信息给VSCROLL/HSCROLL声明 nominal range `[-1,1]`。但 `sync()` 没有 clamp：
+每次 Motion 输出从 InputReaderContext 读取全局 meta，所以按住外接键盘 Ctrl 再滚轮，SCROLL 可带 Ctrl。外接 cursor 只有在：
 
 ```text
-raw wheel value → VelocityControl → axis value
+buttonsPressed || moved || scrolled
 ```
 
-高分辨率/快速滚动或加速后可能超出1。MotionRange在这里主要描述典型单位与能力，不能当成运行时保证。
-
-同理navigation X/Y range也标[-1,1]，但较大raw delta除以6后仍可能超界。
+时添加 `POLICY_FLAG_WAKE`。纯 release 不自动 WAKE；内部 cursor 不走这条自动唤醒；BTN_TASK 因不形成 buttonState 变化也不贡献这里的 `buttonsPressed`。
 
 ---
 
-## 45. metaState 与 WAKE
+## 13. Pointer Capture 控制面：焦点授权、回调与 native 刷新不是一次原子提交
 
-每次输出motion时读取：
+请求链是：
 
-```cpp
-metaState = getContext()->getGlobalMetaState();
+```text
+View.requestPointerCapture()
+  → ViewRootImpl.requestPointerCapture(true)
+  → InputManagerService.requestPointerCapture(token, true)
+  → WMS InputManagerCallback 校验当前 focused IWindow
+  → IWindow.dispatchPointerCaptureChanged(true)
+  → NativeInputManager::setPointerCapture(true)
+  → InputReader 请求 CHANGE_POINTER_CAPTURE
 ```
 
-所以外接键盘按住Ctrl再滚轮，SCROLL可带Ctrl meta。
+ViewRoot 只用本地 `mPointerCapture` 做“是否无需请求”的快速判断；真正授权在 WMS callback：请求 token 必须与**全局 focused display 上的 focused window** Binder 相同。这里校验的是窗口 token，不是发起请求的子 View 是否持有 View focus；同一 ViewRoot 中任一已附着 View 都可发请求，Capture 状态属于整个窗口。窗口焦点或全局 focused display 切换会先向旧窗口派发 `false`，并请求 native 关闭 Capture；子 View 间焦点移动本身不会释放。
 
-外接cursor设备在以下任一发生时添加 `POLICY_FLAG_WAKE`：
+WMS 的 `dispatchPointerCaptureChanged()` 先更新 `mFocusedWindowHasCapture`，再调用 oneway `IWindow` 回调；`RemoteException` 被忽略，方法仍返回需要刷新配置。于是即使客户端回调发送失败，WMS 仍可认为已 capture，IMS 仍会调用 native。
 
-- buttonsPressed；
-- moved；
-- scrolled。
+客户端 Binder stub 收到回调后还要向 ViewRoot 主 Handler 投递 `MSG_POINTER_CAPTURE_CHANGED`，才更新 `mPointerCapture` 并通知 View。`ViewGroup` 会把状态变化广播给孩子，而 captured event 沿当前 focused child 的输入路径下发，两者范围也不相同。另一边 native 只是更新全局 bool，再异步请求 InputReader 刷新配置。
 
-纯按钮释放不自动WAKE；内部设备不自动WAKE。注意buttonsPressed包含BACK/FORWARD，而BTN_TASK因最终buttonState不变也不会触发。
+因此这两条异步支路没有握手：
 
----
+```text
+窗口回调支路：WMS → oneway IWindow → ViewRoot Handler
+Reader 支路：   IMS → native bool → requestRefreshConfiguration
+```
 
-## 46. reset、SYN_DROPPED 与状态恢复
+观察时可能先看到客户端 capture=true，也可能先看到 relative source；请求方法返回更不是“下一笔输入已完成切换”的确认点。
 
-reset清：
-
-- Mapper `mButtonState=0`、`mDownTime=0`；
-- 三个VelocityControl历史；
-- relative与scroll瞬时值；
-- button accumulator则重新查询kernel当前状态。
-
-InputDevice还发NotifyDeviceReset，使Dispatcher取消旧状态。EventHub/InputDevice在SYN_DROPPED后reset并丢弃到下一SYN_REPORT；恢复后的按钮快照可作为新代际重新建立，不把丢失区间猜成一串精确变化。
+r48 的 native `pointerCapture` 是全局 bool，不按 display、window 或 device 保存。窗口层只允许焦点窗口请求，但 Reader 配置变化会广播给所有 CursorInputMapper。
 
 ---
 
-## 47. macOS 只读源码练习
+## 14. Pointer Capture 数据面：切 mode 不等于 reset Mapper
 
-### 练习一：标出sync输出顺序
+进入 Capture 时，当前 pointer Mapper 做：
+
+```text
+MODE_POINTER → MODE_POINTER_RELATIVE
+SOURCE_MOUSE → SOURCE_MOUSE_RELATIVE
+fade(IMMEDIATE)
+保留 PointerController 引用和其中的位置
+```
+
+Capture 期间此 CursorInputMapper 不调用 controller `move()`。退出时只把 mode/source 切回普通 mouse，**没有**在配置分支中 `unfade()`；要等之后 moved、scrolled 或 buttonsChanged，普通 mouse 数据路径才 immediate unfade。TouchInputMapper 不读取这个全局 Capture 开关，仍可能移动或显示共享 controller，所以“Capture 冻结所有指针设备”也不成立。
+
+“退出后回到原位置”只能作条件性描述：本 Mapper 在 relative 期间不改共享 controller，因而通常从保留位置继续；但其他共享它的鼠标/触控板路径或显示配置仍可能改变 controller。
+
+动态 Capture 分支无论成功切换还是因当前 mode 不合适而只记错误，都会继续：
+
+```text
+bumpGeneration()
+NotifyDeviceReset（changes != 0）
+```
+
+对 `MODE_NAVIGATION` 设备也是如此：source/mode 没变，仍会 bump 并发 reset 通知。
+
+最容易误读的是 `NotifyDeviceReset`。这里直接构造通知交给 listener，**没有调用** `CursorInputMapper::reset()`，所以以下状态都会保留：
+
+- `mButtonState` 与 `mDownTime`；
+- 三只 VelocityControl 的历史；
+- accumulator 中尚未被 `finishSync()` 清掉的位移/滚轮；
+- button accumulator 的当前布尔状态。
+
+Dispatcher 会据 reset 通知按逻辑 deviceId 对各 connection 做 `CANCEL_ALL_EVENTS`，复合设备同一 id 下的键盘等其他 source 也会受影响；Reader 自己却不会重新建 DOWN。若主按钮跨切换一直按着，切换后的下一包可能直接成为新 source 的 MOVE；随后释放可出现 BUTTON_RELEASE → UP，却没有同 source 的新 DOWN，并继续使用旧 downTime。第一笔 relative delta 也可能继承 Capture 前的速度历史。这是通知隔离下游状态的效果，不是两端原子重置。
+
+共享 PointerController 还有一个可见边界：relative 分支不会 `setButtonState()`。Capture 期间发生的按/放不会更新 controller；退出后若第一包没有新的 `buttonsChanged`，controller 内部按钮图可能继续是旧值，虽然 Mapper 发出的 Motion 使用自己的当前 `mButtonState`。
+
+真正的 `CursorInputMapper::reset()` 才会清本地 button/downTime、三只速度历史、相对与滚轮瞬时值，并让 button accumulator 查询 kernel。它与 Capture 配置分支的同名“device reset 通知”必须分开阅读。
+
+---
+
+## 15. 九个 macOS 只读练习：把结论变成可复查证据
+
+所有命令都从 AOSP 工作树 `/Users/ninebot/androidSource` 执行，不修改源码。
+
+### 练习一：定位创建条件与 Mapper 装配
 
 ```bash
-sed -n '260,455p' \
+rg -n "INPUT_DEVICE_CLASS_CURSOR|BTN_MOUSE|REL_X|REL_Y" \
+  frameworks/native/services/inputflinger/reader/EventHub.cpp \
+  frameworks/native/services/inputflinger/reader/InputDevice.cpp
+```
+
+回答：capability 判类和 Mapper 构造分别在哪一层？
+
+### 练习二：对照三种 mode
+
+```bash
+sed -n '112,238p' \
   frameworks/native/services/inputflinger/reader/mapper/CursorInputMapper.cpp
 ```
 
-在纸上写出侧键DOWN、release、主motion、press、hover、scroll、侧键UP的顺序。
+分别圈出 source、scale、PointerController、Capture 切换和 generation。
 
-### 练习二：验证覆盖而非累加
+### 练习三：验证覆盖而非求和
 
 ```bash
+sed -n '20,62p' \
+  frameworks/native/services/inputflinger/reader/mapper/CursorInputMapper.cpp
 sed -n '20,75p' \
   frameworks/native/services/inputflinger/reader/mapper/accumulator/CursorScrollAccumulator.cpp
-sed -n '25,65p' \
+```
+
+找出 `=`，手算同包 `REL_X 3 → REL_X 4`。
+
+### 练习四：逐行标出 `sync()` 输出顺序
+
+```bash
+sed -n '265,450p' \
   frameworks/native/services/inputflinger/reader/mapper/CursorInputMapper.cpp
 ```
 
-找出 `=`，并手算同包两次REL_X的结果。
+写出 Key DOWN、release、主 Motion、press、hover、scroll、Key UP 的次序。
 
-### 练习三：追capture完整链
+### 练习五：证明多按钮从较大 mask 开始
 
 ```bash
-rg -n "requestPointerCapture|CHANGE_POINTER_CAPTURE|MODE_POINTER_RELATIVE" \
+sed -n '35,105p' system/core/libutils/include/utils/BitSet.h
+sed -n '3405,3465p' \
+  frameworks/native/services/inputflinger/tests/InputReader_test.cpp
+```
+
+用 SECONDARY=`0x2`、TERTIARY=`0x4` 验证哪一个先发。
+
+### 练习六：找出 BTN_TASK 与查询接口的不对称
+
+```bash
+sed -n '20,115p' \
+  frameworks/native/services/inputflinger/reader/mapper/accumulator/CursorButtonAccumulator.cpp
+sed -n '445,470p' \
+  frameworks/native/services/inputflinger/reader/mapper/CursorInputMapper.cpp
+```
+
+比较 `process()`、`getButtonState()` 与 `getScanCodeState()`。
+
+### 练习七：核对 SYN_DROPPED 的两枚同步边界
+
+```bash
+sed -n '320,370p' \
+  frameworks/native/services/inputflinger/reader/InputDevice.cpp
+```
+
+确认解除 drop gate 的那枚 SYN_REPORT 是否传给 Mapper。
+
+### 练习八：追完 Capture 的两条异步支路
+
+```bash
+rg -n "requestPointerCapture|dispatchPointerCaptureChanged|nativeSetPointerCapture|CHANGE_POINTER_CAPTURE" \
   frameworks/base/core/java/android/view \
-  frameworks/base/services/core/java/com/android/server \
+  frameworks/base/services/core/java/com/android/server/input \
+  frameworks/base/services/core/java/com/android/server/wm \
   frameworks/base/services/core/jni \
   frameworks/native/services/inputflinger
 ```
 
-回答请求、授权、客户端回调、Reader切mode分别发生在哪里。
+分别标出授权点、客户端状态更新点、native bool 和 Reader 配置点。
 
-### 练习四：核对按钮映射缺口
-
-```bash
-sed -n '20,110p' \
-  frameworks/native/services/inputflinger/reader/mapper/accumulator/CursorButtonAccumulator.cpp
-```
-
-比较 `process()` 接受的code与 `getButtonState()` 真正输出的bit。
-
-### 练习五：读官方单元测试作为时序证据
+### 练习九：验证 ViewRoot 的 relative fallback
 
 ```bash
-sed -n '3200,3815p' \
-  frameworks/native/services/inputflinger/tests/InputReader_test.cpp
+sed -n '6048,6070p' frameworks/base/core/java/android/view/ViewRootImpl.java
+rg -n "SOURCE_MOUSE_RELATIVE|SyntheticTrackballHandler" \
+  frameworks/base/core/java/android/view/ViewRootImpl.java
 ```
 
-重点看多按钮中间state、UP后hover、侧键KeyEvent、pointer capture位置保持和displayId。
+回答 capture=false、captured callback=true、callback=false 三种结果。
 
 ---
 
-## 48. 手算三个事件包
+## 16. 三个手算包、复读清单与下一章
 
-### 包一：普通mouse纯移动
+### 包一：普通 mouse 在边界继续右移
 
-初始光标(100,200)，raw(+10,+20)，无按钮：
+假设光标已在显示最右边，忽略 acceleration，本包 `REL_X=+10`：
 
 ```text
-PointerController → (110,220)
-主action          → HOVER_MOVE
-X/Y               → 110/220
-RELATIVE_X/Y      → +10/+20（忽略加速时）
+主 action         = HOVER_MOVE（无主按钮）
+Mapper AXIS_X     = 仍是边界位置
+AXIS_RELATIVE_X   = +10
+cursorPosition    = 边界位置
+App getX          = 再经目标窗口 transform，通常是局部坐标
 ```
+
+这同时证明“绝对位置未变”不等于“设备没有移动意图”。
 
 ### 包二：同时按右键与中键
 
-从全未按进入两键按下：
+前态无按钮，本包最终为 SECONDARY|TERTIARY：
 
 ```text
-主DOWN(final state=SECONDARY|TERTIARY)
-BUTTON_PRESS(第一个bit的中间state)
-BUTTON_PRESS(final state)
+ACTION_DOWN(final state = SECONDARY | TERTIARY)
+ACTION_BUTTON_PRESS(actionButton = TERTIARY, state = TERTIARY)
+ACTION_BUTTON_PRESS(actionButton = SECONDARY, state = 两者)
 ```
 
-### 包三：capture纯滚轮
+若下一包释放两者，则较大 mask 的 TERTIARY release 也先出现，最后才是主 UP 和额外 HOVER。
+
+### 包三：按钮按住时切入 Capture
 
 ```text
-主MOVE(X=0,Y=0, source=MOUSE_RELATIVE, displayId=NONE)
-SCROLL(VSCROLL=加速后值, cursorPosition=INVALID)
-PointerController位置不变
+普通 MOUSE 已有 DOWN，mDownTime=t0
+CHANGE_POINTER_CAPTURE：切 source、bump、通知 Dispatcher reset；Mapper 状态不清
+下一包 relative delta：ACTION_MOVE，buttonState 仍按下，downTime=t0
+随后释放：BUTTON_RELEASE → ACTION_UP，仍可能带 t0
 ```
 
----
+新 source 没有由 Mapper 补一笔 DOWN；这正是“通知下游 reset”与“执行 Mapper reset”不同的可观察后果。
 
-## 49. 复读审计：十二个易错边界
+### 十四条复读清单
 
-### 边界一：同包relative轴不累计
-
-motion与scroll accumulator最后值覆盖前值，设备协议通常避免重复上报，但源码未求和。
-
-### 边界二：moved在加速前判断
-
-`moved`由基础scale后的delta是否非0确定，之后才VelocityControl；正常正scale不会改变真假，但阅读顺序要准确。
-
-### 边界三：orientation取internal viewport
-
-orientation-aware cursor不一定按当前pointer display旋转，多显示配置可能出现来源差异。
-
-### 边界四：PointerController跨设备共享
-
-不能按Mapper成员表面形态推断每只鼠标各有独立cursor position。
-
-### 边界五：relative X/Y不是绝对坐标
-
-capture下getX/getY直接承载delta，cursorPosition无效，RELATIVE_X/Y反而未填写。
-
-### 边界六：capture native状态是全局bool
-
-窗口请求需焦点授权，但Reader mode切换不是per-window/per-device配置。
-
-### 边界七：capture动态切换用device reset分隔语义
-
-generation变化只表示InputDevice描述更新；reset用于取消旧source状态，两者职责不同。
-
-### 边界八：BTN_TASK被读取但未输出
-
-不能把“accumulator支持”写成“Framework支持”。
-
-### 边界九：侧键Key UP downTime等于UP时刻
-
-公共helper没有保存侧键DOWN时间，也没有普通KeyboardMapper的配对表。
-
-### 边界十：wheel scale成员未消费
-
-实际滚轮变换来自VelocityControl，不来自mV/HWheelScale。
-
-### 边界十一：range不是clamp
-
-声明[-1,1]不禁止实际axis超界。
-
-### 边界十二：scroll是一包多事件
-
-先主hover/move，再scroll；BUTTON和侧键还可让同包输出更多NotifyArgs。
-
----
-
-## 50. 最终模型、检查题与下一章
+1. accumulator 等 SYN_REPORT，但 r48 的同轴值与按钮布尔值只保留包内最后状态。
+2. SYN_DROPPED 后用于解除 drop 的首枚 SYN_REPORT 被吞，最早要后续同步才提交 kernel 按钮快照。
+3. pointer 的 Mapper X/Y 是显示逻辑坐标；App X/Y 通常已变成窗口局部坐标。
+4. relative/navigation 的 X/Y 是 delta，cursorPosition 无效，r48 不填 RELATIVE_X/Y。
+5. navigation 在进入 VelocityControl 前已除以 6。
+6. orientation 使用 internal viewport，不必等于 pointer 当前 display。
+7. PointerController 被多个 Mapper 共享，native policy 还忽略传入的 deviceId。
+8. pointer 的初始目标按位置命中；已建立的 DOWN 流不会逐笔重新命中。
+9. PRIMARY/SECONDARY/TERTIARY 任一都建立 down；BACK/FORWARD 不建立。
+10. 多 button 的 release/press 按较大 Android mask 先处理。
+11. 侧键 Motion 与合成 Key 路由不同，接收者和消费结果可能不同。
+12. 纯滚轮先有主 HOVER/MOVE，再有 SCROLL；nominal range 不是 clamp 证据。
+13. Capture 的窗口回调与 Reader 切 mode 是无握手的异步支路。
+14. Capture 的 `NotifyDeviceReset` 不调用 Mapper reset，退出分支也不会主动 unfade。
 
 ### 一句话模型
 
 ```text
-CursorInputMapper以SYN_REPORT为提交边界，把最后一组REL_X/Y、wheel值与持久按钮快照统一变换：
-普通mouse经方向和速度控制移动共享PointerController并同时报告绝对/相对轴，capture与trackball则把X/Y当相对导航量按焦点路由；
-随后严格按侧键Key DOWN、button release、主motion、button press、UP后hover、scroll、侧键Key UP的顺序输出，
-capture切换再以generation和device reset隔开两套source/坐标语义。
+CursorInputMapper 以真正交给它的 SYN_REPORT 为提交边界，把包内最后一组相对轴和持久按钮快照依次做 mode scale、方向与速度变换；普通 mouse 借共享 PointerController 形成显示坐标并按位置建立目标，relative/trackball 则把 X/Y 当 delta 按焦点路由；一个包再严格按侧键 Key DOWN、button release、主 Motion、button press、UP 后 hover、scroll、侧键 Key UP 输出，而 Capture 只异步切 source/mode、bump generation 并通知下游 reset，并不会清 Mapper 自己的状态。
 ```
-
-### 检查题
-
-1. pointer、relative、navigation三种mode的X/Y分别是什么？
-2. 同一包REL_X=3再REL_X=4为何输出4？
-3. 普通mouse为什么同时有X和RELATIVE_X？
-4. capture为何不能按屏幕坐标命中窗口？
-5. 右键能否单独产生ACTION_DOWN？
-6. BACK按钮为何pressure仍为0，却可产生Motion和Key两条路径？
-7. 最后一枚主按钮释放时三笔motion的顺序是什么？
-8. 纯滚轮为何先有HOVER_MOVE？
-9. BTN_TASK在r48为何不会到App？
-10. capture退出后光标为何回到原位置继续移动？
-11. pointer speed改变为何会清速度历史？
-12. MotionRange[-1,1]为何不能作为clamp证据？
 
 ### 下一章
 
-第 182 章进入 TouchInputMapper 的设备配置与 raw/cooked state：先建立单点、多点、触控板、direct/indirect模式及坐标校准框架，再为后续多点slot和手势状态机打基础。
+第 182 章进入 `TouchInputMapper` 的设备配置与 raw/cooked state：先建立 single-touch、multi-touch、touchpad、direct/indirect 模式与坐标校准框架，再为 slot 跟踪和手势状态机打基础。

@@ -1,76 +1,95 @@
 # 170 Android SurfaceFlinger dump、Layer Proto 与显示故障现场
 
 > 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
-> 学习方式：macOS 只读源码，不要求编译、不要求连接设备  
+> 学习方式：macOS 静态只读源码，不要求编译或连接设备  
 > 前置章节：第 160—169 章
 
 ---
 
-## 1. 本章目标：把一份dump变成证据，不是字段词典
+## 1. 一份 SurfaceFlinger dump 能证明什么
 
-遇到黑屏、旧帧、闪烁、局部不刷新或触摸错位时，很多人的第一反应是：
+黑屏、旧帧、闪烁、局部不刷新或触摸错位时，常见入口是：
 
 ```bash
 adb shell dumpsys SurfaceFlinger
 ```
 
-然后在数千行文本中搜窗口名。这只是定位起点，还不是诊断。
-
-本章要建立的思维是：
+它不是面板硬件在某个原子时刻的回读，而是 SurfaceFlinger 依次拼接的多组软件状态。正确用法不是搜索窗口名后立即定因，而是先问：
 
 ```text
-现象
-→ 问题发生在哪个完成点之前/之后
-→ 选对dump/trace/timestamp
-→ 核对Layer身份、树、几何、buffer、合成和显示
-→ 与WMS、Input、FrameEventHistory交叉验证
-→ 得出有边界的结论
+现象发生在哪个边界？
+→ WMS 是否仍认为窗口可见
+→ SF current/drawing tree 是否存在 Layer
+→ 目标 Display 是否生成 OutputLayer
+→ buffer 是否 latch、合成是否推进
+→ HWC/present 是否有动态证据
+→ InputDispatcher 是否使用同一套几何
 ```
 
-最重要的一句话：
+静态 dump 最擅长回答“采样时软件对象处于什么状态”；它不能单独证明：
 
-> `dumpsys SurfaceFlinger`是采集过程中拼出的若干状态片段，不是面板在某个原子时刻的硬件回读。
+- 某字段与另一段输出来自同一 VSync；
+- 当前 active buffer 的像素内容正确；
+- present fence 已 signal；
+- 面板正在扫描这块 buffer；
+- 瞬时闪烁由哪个状态切换造成。
+
+本章的主线是：先识别每段数据的生产者和时间边界，再把 Layer 树、每显示输出、buffer 与时序证据拼成可证伪的诊断链。
 
 ---
 
-## 2. 本章先回答的十个问题
+## 2. 四层状态不能混成一张“当前画面”
 
-1. `dumpsys SurfaceFlinger`如何经Binder进入SF？
-2. 文本dump、`--proto`、`--list`、HWC mini dump分别是什么？
-3. dump里的Layer是current state还是drawing state？
-4. 为什么“Visible layers”不等于肉眼真正可见？
-5. parent、relative-Z、layer stack和Z如何一起决定层级？
-6. active buffer、queued frames、refresh pending能证明什么？
-7. visible region、covered region、damage region有什么区别？
-8. CLIENT/DEVICE composition与HWC状态怎样交叉阅读？
-9. 静态dump为什么无法单独证明闪烁或掉帧因果？
-10. 如何把黑屏、旧帧、局部不刷新、触摸错位转成稳定证据链？
+SF dump 会同时暴露四个层次：
+
+| 层次 | 代表什么 | 典型入口 |
+|---|---|---|
+| current | 客户端事务已进入 SF 的当前状态 | `--list`、`--frame-events`、部分 mini dump 遍历 |
+| drawing | 已提交给 Layer 树计算与合成遍历的状态 | Layer Proto |
+| composition/output | 某个 Display 上次构建出的 OutputLayer、遮挡、几何与合成分工 | CompositionEngine、HWC layer mini dump |
+| physical completion | HWC present、fence signal、面板扫描的动态结果 | 时间戳、trace、vendor/driver 证据 |
+
+大致关系是：
+
+```mermaid
+flowchart LR
+    A["SurfaceControl transaction"] --> B["current state"]
+    B --> C["commit"]
+    C --> D["drawing state"]
+    D --> E["per-Display OutputLayer"]
+    E --> F["CLIENT target / DEVICE layers"]
+    F --> G["HWC present fence"]
+    G --> H["physical display"]
+```
+
+`commitTransactionLocked()` 会把 SF 全局的 `mCurrentState` 赋给 `mDrawingState`；各 Layer 也管理自己的 current、pending 与 drawing state。随后几何计算会生成 `mEffectiveTransform`、`mBounds`、`mScreenBounds` 等有效值，CompositionEngine 再按 Display 计算输出状态。
+
+因此，同名字段也可能不在同一层次：
+
+- requested transform 是 Layer drawing state 中的局部请求；
+- Proto 的 transform 来自 `getTransform()`，是已计算并包含父变换的 effective transform；
+- HWC displayFrame/sourceCrop 是目标 Display 的输出几何。
+
+requested 与 effective 不同不必然代表“事务卡住”，也可能只是父层变换、裁剪或 buffer 缩放正常生效。
 
 ---
 
-## 3. 本章源码地图
+## 3. 源码地图
 
-### 3.1 SurfaceFlinger dump入口
+dump 入口与拼接：
 
 ```text
-frameworks/native/services/surfaceflinger/
-├── main_surfaceflinger.cpp
-├── SurfaceFlinger.h
-└── SurfaceFlinger.cpp
+frameworks/native/services/
+├── utils/
+│   ├── PriorityDumper.cpp
+│   └── include/serviceutils/PriorityDumper.h
+└── surfaceflinger/
+    ├── main_surfaceflinger.cpp
+    ├── SurfaceFlinger.h
+    └── SurfaceFlinger.cpp
 ```
 
-核心方法：
-
-```cpp
-SurfaceFlinger::doDump(...)
-SurfaceFlinger::dumpCritical(...)
-SurfaceFlinger::dumpAllLocked(...)
-SurfaceFlinger::dumpDrawingStateProto(...)
-SurfaceFlinger::dumpProtoFromMainThread(...)
-SurfaceFlinger::dumpOffscreenLayers(...)
-```
-
-### 3.2 Layer与Proto
+Layer Proto 与文本转换：
 
 ```text
 frameworks/native/services/surfaceflinger/
@@ -82,20 +101,21 @@ frameworks/native/services/surfaceflinger/
     └── include/layerproto/LayerProtoParser.h
 ```
 
-### 3.3 每显示输出与HWC
+每显示输出：
 
 ```text
 frameworks/native/services/surfaceflinger/
 ├── DisplayDevice.cpp
+├── BufferLayer.cpp
+├── BufferQueueLayer.cpp
+├── BufferStateLayer.cpp
 ├── CompositionEngine/src/Output.cpp
 ├── CompositionEngine/src/OutputLayer.cpp
-├── CompositionEngine/src/OutputCompositionState.cpp
-├── CompositionEngine/src/OutputLayerCompositionState.cpp
 ├── CompositionEngine/src/RenderSurface.cpp
 └── DisplayHardware/HWComposer.cpp
 ```
 
-### 3.4 交叉证据
+交叉证据：
 
 ```text
 frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
@@ -106,791 +126,472 @@ frameworks/native/libs/gui/FrameTimestamps.cpp
 
 ---
 
-## 4. dump从shell到SurfaceFlinger的边界
+## 4. dump 入口有权限、参数、锁和输出四道边界
 
-SurfaceFlinger向ServiceManager注册时声明：
+SurfaceFlinger 注册服务时声明：
 
 ```cpp
-sm->addService(String16("SurfaceFlinger"), flinger, false,
-        DUMP_FLAG_PRIORITY_CRITICAL | DUMP_FLAG_PROTO);
+DUMP_FLAG_PRIORITY_CRITICAL | DUMP_FLAG_PROTO
 ```
 
-shell执行`dumpsys SurfaceFlinger`后，dumpsys通过Binder dump调用进入SF的Binder线程。`PriorityDumper`会剥离：
+Binder dump 先经过 `PriorityDumper`，它从参数中剥离 `--dump-priority` 与 `--proto`，再调用对应虚函数。SF 重写了 `dumpCritical()` 和 `dumpAll()`，没有重写 HIGH/NORMAL。
+
+### 4.1 priority 行为有一个反直觉点
+
+未指定 priority 时，SF 自己的 `dumpAll()` 直接进入 `doDump()`，原有子命令仍可分流。显式指定：
 
 ```text
---dump-priority CRITICAL/HIGH/NORMAL
---proto
+--dump-priority CRITICAL
 ```
 
-然后调用对应优先级方法。SF在r48实际只重写：
+则进入 `dumpCritical()`。r48 的实现忽略传入的剩余参数，以空参数调用 `doDump()`；HIGH/NORMAL 则落到基类空实现。因此 priority 名字不能推导出“同一完整 dump 被稳定切成三个区块”。
 
-```text
-dumpCritical()
-dumpAll()
-```
+若 critical proto dump 发生时 SurfaceTracing 已开启，`dumpCritical()` 还会先调用 `writeToFileAsync()`。这是异步写 trace 文件的副作用，不能把所有 dump 入口都视为严格无状态读取。
 
-HIGH和NORMAL没有独立内容。
+### 4.2 权限失败仍返回 NO_ERROR
 
-另一个容易忽略的副作用：若调用的是`dumpCritical(..., asProto=true)`且SurfaceTracing正在开启，SF会先调`writeToFileAsync()`请求把环形trace异步写入`layers_trace.pb`。所以bugreport的critical proto dump不是完全无副作用的观察。
-
-```mermaid
-flowchart LR
-    A["adb shell dumpsys SurfaceFlinger"] --> B["dumpsys process"]
-    B --> C["Binder dump transaction"]
-    C --> D["SF Binder thread"]
-    D --> E["PriorityDumper strips priority/proto args"]
-    E --> F["SurfaceFlinger::doDump"]
-    F --> G["mStateLock sections"]
-    F --> H["schedule to SF main thread"]
-    F --> I["vendor composer dump"]
-    G --> J["one assembled result string"]
-    H --> J
-    I --> J
-    J --> K["single write(fd, result, size)"]
-```
-
-这张图首先帮我们看清：dump不是全部在Binder线程就地读取，它会等SF主线程任务。
-
----
-
-## 5. 权限门：shell或DUMP权限
-
-`doDump()`先读calling pid/uid：
+`doDump()` 只允许 shell UID 或持有 `android.permission.DUMP` 的调用者。拒绝时，它把 Permission Denial 文本写入结果，最后仍走统一的：
 
 ```cpp
-if (uid != AID_SHELL &&
-        !PermissionCache::checkPermission(sDump, pid, uid)) {
-    result = "Permission Denial ...";
-}
+write(fd, result.c_str(), result.size());
+return NO_ERROR;
 ```
 
-所以：
+所以命令退出成功不等于拿到了 Layer 现场；必须检查内容。
 
-- adb shell通常可读；
-- 普通App不能随意窃取全局Layer现场；
-- 权限拒绝时仍会向fd写一段文本，方法最后仍返回`NO_ERROR`。
+### 4.3 mStateLock 只等一秒，但超时不终止读取
 
-不要只看dumpsys命令退出码来判断是否真正拿到数据，还要看输出内容。
-
----
-
-## 6. r48的子命令分流
-
-`doDump()`建立了一张字符串到dumper的表：
-
-| 参数 | 主要输出 |
-|---|---|
-| `--display-id` | display ID、HWC ID、port、EDID名称 |
-| `--edid <hwcId>` | 原始识别数据，是二进制 |
-| `--dispsync` | Primary DispSync状态 |
-| `--vsync` | Scheduler、刷新率、phase、policy等 |
-| `--frame-events` | 所有current Layer的FrameEventHistory |
-| `--latency [name]` | 全局动画或精确Layer名的legacy FrameTracker |
-| `--latency-clear [name]` | 清空legacy frame stats |
-| `--list` | current state的Layer debug name |
-| `--static-screen` | 静态屏幕分桶 |
-| `--timestats ...` | TimeStats参数解析与输出 |
-| `--wide-color` | wide color能力和当前mode |
-
-没命中专用参数时，文本路径走完整dump；Proto路径则输出Layer Proto。
-
----
-
-## 7. 完整文本dump实际由三段拼出
-
-简化`doDump()`：
-
-```cpp
-TimedLock lock(mStateLock, 1s);
-dumpAllLocked(args, result);
-
-LayersProto p = dumpProtoFromMainThread();
-result += LayerProtoParser::layerTreeToString(generateLayerTree(p));
-result += schedule(dumpOffscreen).get();
-```
-
-所以一份普通文本dump至少混合：
-
-1. Binder线程尝试持`mStateLock`读取的全局/current/组合状态；
-2. SF主线程之后生成的drawing-state Layer Proto，再转文本；
-3. 另一个SF主线程任务生成的offscreen Layer pid/uid列表。
-
-三段之间系统可能继续提交与合成。不能默认任意两个字段是同一VSync的原子快照。
-
----
-
-## 8. mStateLock最多等1秒，超时后仍继续dump
-
-r48使用：
+核心结构是：
 
 ```cpp
 TimedLock lock(mStateLock, s2ns(1), __FUNCTION__);
 if (!lock.locked()) {
-    result += "Dumping without lock after timeout ...";
+    // append warning
 }
+// 仍继续调用子 dumper 或 dumpAllLocked()
 ```
 
-关键不是“最多等1秒后放弃dump”，而是：
+出现 `Dumping without lock after timeout` 后，后续容器可能被并发修改。这是为了卡死时尽量留下应急信息，不是一个“无锁也自洽”的保证。
 
-> 锁超时之后，代码仍然进入对应dumper或`dumpAllLocked()`。
+### 4.4 最后一次 write 也不是可靠交付协议
 
-这样在SF卡锁时至少有机会导出部分现场，但代价是：
-
-- 输出可能内部不一致；
-- 容器正在变化时存在竞态风险；
-- 看到`Dumping without lock after timeout`必须将整份文本降为“应急现场”，不能当成自洽快照。
+结果最终只调用一次 `write()`，既不循环处理 partial write/EINTR，也不检查返回值，随后固定返回 `NO_ERROR`。极大输出被截断或 fd 写失败时，Binder status 不能可靠反映问题。
 
 ---
 
-## 9. 主线程schedule会让dump暴露SF主线程卡死
+## 5. 普通文本 dump 是三个阶段的拼接
 
-Layer Proto通过：
+未命中特殊子命令时，普通文本路径大致为：
 
 ```cpp
-return schedule([=] { return dumpDrawingStateProto(traceFlags); }).get();
+{
+    TimedLock lock(mStateLock, 1s);
+    dumpAllLocked(args, result);
+} // 这里释放 state lock
+
+LayersProto p = dumpProtoFromMainThread();
+result += LayerProtoParser::layerTreeToString(generateLayerTree(p));
+result += dumpOffscreenLayersOnMainThread();
 ```
 
-这意味着Binder dump线程要等SF主线程执行任务。
+三个阶段分别是：
 
-如果SF主线程卡在：
+1. Binder 线程持有或尝试持有 `mStateLock`，输出全局、Display、CompositionEngine、HWC 等状态；
+2. 通过 `schedule(...).get()` 等待 SF 主线程生成 drawing-state Layer Proto，再在调用线程转成文本；
+3. 再次等待主线程遍历 offscreen layers。
 
-```text
-HWC validate/present
-RenderEngine
-fence wait
-长事务
-锁依赖
-```
+两次主线程任务之间，树仍可能 reparent、移除或销毁。主线程若卡在事务、RenderEngine、HWC 或锁依赖上，`get()` 没有这里可见的超时，dumpsys 也可能迟迟不返回。
 
-dumpsys可能也长时间不返回。“拿不到SF dump”本身就是证据，但不能单凭它区分是哪一个等待点，还需要Perfetto、native stacks、binder/HWC日志。
+### 5.1 dumpAllLocked 的大区块
 
----
-
-## 10. 完整dump的大区块
-
-`dumpAllLocked()`依次组装：
+第一阶段依次包含：
 
 ```text
-Build / UI / GUI configuration
-Display identification
-Wide color
-Sync configuration
-Scheduler / VSync / refresh-rate policy
-Static screen stats
-missed-frame counters
+build/UI/GUI configuration
+display identification / wide color
+scheduler / VSync / refresh-rate policy
+static-screen 与 missed-frame 累计
 buffering stats
 Composition layers
-DisplayDevice state
-CompositionEngine / Output / OutputLayer / RenderSurface
-SurfaceFlinger global state
-RenderEngine / EGL image tracker
-Tracing state
+DisplayDevice 与 CompositionEngine
+SurfaceFlinger / RenderEngine / tracing state
 per-display HWC layer mini dump
 vendor HWComposer dump
-gralloc allocator dump
-TimeStats mini dump
+gralloc 与 TimeStats mini dump
 ```
 
-然后`doDump()`再追加Layer tree和offscreen列表。
+随后才追加 Layer tree 和 offscreen 名单。读者应给每段加上“current、drawing、output、vendor”标签，不能把前后同名 Layer 行当成同一时刻的重复打印。
 
-阅读时应先判断当前行属于哪个观察对象，不要把同名Layer在“Layer tree”与“Output Layer”中的字段当成重复无用信息。
+### 5.2 r48 的混合实例
+
+| 输出 | 实际遍历/数据 |
+|---|---|
+| `--list` | `mCurrentState.traverseInZOrder()` |
+| `--frame-events` | `mCurrentState.layersSortedByZ` |
+| Composition layers | `mDrawingState` + Layer composition snapshot |
+| Layer Proto | 主线程上的 `mDrawingState` |
+| HWC mini dump | current tree 遍历 + 已有 per-Display OutputLayer |
+
+最后一项尤其容易误读：刚进入 current tree、尚未产生 OutputLayer 的 Layer 会被 `miniDump()` 直接跳过；反过来，已不在 current 遍历中的对象也不会出现在该表，即使其他段仍能看到更早的 output 状态。
 
 ---
 
-## 11. current state、drawing state和composition state三层
+## 6. 子命令回答的是不同问题
 
-### current state
+`doDump()` 的 r48 分发表包括：
 
-客户端事务已被SF接收、写入当前状态，但不一定已commit给合成遍历。
+| 参数 | 主要用途 | 关键边界 |
+|---|---|---|
+| `--display-id` | physical/HWC id、port、EDID 名称 | 无/未知/无效 EDID 会打印对应状态 |
+| `--edid <hwcId>` | 原始识别数据 | 输出可能是二进制 |
+| `--dispsync` | primary DispSync | 不是 Layer 数据 |
+| `--vsync` | Scheduler、phase、policy、refresh rate | 是调度状态快照 |
+| `--frame-events` | current Layer 的 FrameEventHistory | 近帧时序，不是树几何 |
+| `--latency [exactName]` | animation 或精确名称 Layer 的 FrameTracker | 名字可重复，只有 127 个历史槽输出 |
+| `--latency-clear [exactName]` | 清 FrameTracker | 会破坏统计现场 |
+| `--list` | current tree 的 debug name | 名称不是唯一身份 |
+| `--static-screen` | 静态屏幕累计分桶 | 不是当前帧 |
+| `--timestats ...` | TimeStats 参数解析/输出 | 可能有自身控制参数 |
+| `--wide-color` | 色彩能力与当前 mode | 不证明像素已显示 |
 
-### drawing state
+只取证时尤其要避开 `--latency-clear`。它会清匹配 Layer 的 FrameTracker，并总是清 animation tracker；“先清、复现场景、再读”只适合受控实验。
 
-`commitTransactionLocked()`执行：
+---
+
+## 7. Layer Proto 是 drawing tree 的结构化快照
+
+默认 `dumpProtoFromMainThread()` 使用 `TRACE_ALL`。主线程取得默认 Display 后，`dumpDrawingStateProto()` 遍历 `mDrawingState.layersSortedByZ`，每个根 Layer 再递归 `mDrawingChildren`。
+
+`Layer::writeToProto()` 按 flag 分组写入：
+
+| flag | 主要字段 |
+|---|---|
+| `TRACE_CRITICAL` | id/name/type、树关系、buffer、frame、几何、颜色、damage、barrier |
+| `TRACE_INPUT` | InputWindowInfo |
+| `TRACE_COMPOSITION` | visible region、HWC composition type |
+| `TRACE_EXTRA` | metadata |
+
+### 7.1 三种 Layer 标识各有用途
+
+- `id/sequence`：对象生命周期内的内部身份，parent、child、relative-Z、barrier 都用它关联；SF 重启或新建对象后不能假定跨现场稳定。
+- `name`：适合人工搜索，但可以重复，也可能带 ViewRoot、SurfaceView 或 BLAST 包装名。
+- `type`：说明 BufferQueueLayer、BufferStateLayer、ColorLayer、ContainerLayer 等行为预期，不能替代身份。
+
+实际分析应“用 name 找候选、用 id 和树关系确认对象、用 type 判断字段是否应存在”。
+
+### 7.2 parent 与 relative-Z 是两张关系网
+
+`parent/children` 决定组织、生命周期和变换/隐藏继承；`z_order_relative_of/relatives` 让 z 相对另一 Layer 解释。只比较整数 z 无法重建全局顺序。
+
+文本转换器会把 relative layers 与非 relative children 合并排序，先打印负 z，再打印本层，再打印非负 z。它输出的是重建后的树序，不是 Proto 数组的原始顺序。
+
+### 7.3 Proto 的 composition type 只有默认 Display 视角
+
+writer 在 `TRACE_COMPOSITION` 下调用：
 
 ```cpp
-mDrawingState = mCurrentState;
+getCompositionType(*defaultDisplay)
 ```
 
-然后Layer也把可提交pending state推进到`mDrawingState`。这是合成流程主要遍历的稳定状态。
-
-### composition/output state
-
-CompositionEngine按某一个Display的layer stack、bounds、viewport、遮挡与合成结果，为Layer生成`OutputLayerCompositionState`。
-
-```mermaid
-flowchart LR
-    A["client SurfaceControl.Transaction"] --> B["Layer current state"]
-    B --> C["transaction commit"]
-    C --> D["Layer drawing state"]
-    D --> E["CompositionEngine per Display"]
-    E --> F["OutputLayer state"]
-    F --> G["HWC layer or client target"]
-    G --> H["present fence / panel scanout"]
-
-    I["--list and some mini-dump traversal"] -. "may read current" .-> B
-    J["Layer Proto"] -. "reads drawing" .-> D
-    K["Composition layers / Output dumps"] -. "reads composition state" .-> E
-```
+找不到该 Display 的 OutputLayer 时返回 INVALID；存在 HWC state 时取对应 type，否则按 CLIENT。多显示场景不能拿这一个字段代表所有输出，应分别读取每个 Display 的 mini dump/OutputLayer。
 
 ---
 
-## 12. 一份dump里确实会混用不同状态
+## 8. Proto schema、writer 和文本 parser 是三个不同口径
 
-r48中：
+不要看到 `layers.proto` 有字段就假定普通文本一定能看到。需要依次确认：
 
-- `--list`：`mCurrentState.traverseInZOrder()`；
-- `--frame-events`：`mCurrentState.layersSortedByZ`；
-- 文本dump中Composition layers：`mDrawingState.traverseInZOrder()`；
-- Layer Proto：`mDrawingState.layersSortedByZ`；
-- per-display HWC mini dump：遍历`mCurrentState`，但查找Display已有OutputLayer state。
+```text
+schema 声明
+→ r48 writer 是否写入
+→ LayerProtoParser 是否读取
+→ Layer::to_string() 是否打印
+```
 
-最后一项甚至是current Layer遍历与composition output状态的混合。
+### 8.1 id 被 parser 保留，但没有打印
 
-因此诊断口诀是：
+`generateLayer()` 确实读取 `layerProto.id()`，并用它修复 child、parent 与 relative 指针，也作为排序兜底。普通 Layer tree 文本不打印 id。
 
-> 先标注数据属于current、drawing还是output，再做相等性比较。
+因此准确说法是“文本输出丢失可见 id”，不是“parser 完全丢弃 id”。
+
+### 8.2 一批字段根本没有进入文本模型
+
+writer 实际写入但 `generateLayer()` 不读取的关键字段包括：
+
+```text
+curr_frame
+hwc_composition_type
+source_bounds / bounds / screen_bounds
+input_window_info
+effective_scaling_mode
+color_transform
+barrier_layer
+```
+
+requested position/color/transform 则被 parser 保存，却没有在 `to_string()` 打印。另一方面，schema 中的 `hwc_frame`、`hwc_crop`、`hwc_transform`、`effective_transform` 在当前 Layer writer 没有对应写入点。
+
+这解释了为什么“schema 有”“Proto 实际带有”“普通文本看得见”不能画等号。
+
+### 8.3 Region 的 this 值是 r48 的未初始化残留
+
+`RegionProto` 的旧 field 1 已 reserved，只剩 rect 列表；但文本 parser 的 `Region` 类仍有未默认初始化的 `uint64_t id`。`generateRegion()` 只填 rects，`to_string()` 却把 id 打成：
+
+```text
+Region VisibleRegion (this=... count=N)
+```
+
+这个 `this` 不是 Layer id、稳定 Region id 或可信指针。应忽略它，只使用 count 和后续矩形。
+
+### 8.4 --proto 不含 offscreen tree
+
+普通无子命令的 proto 路径只序列化 `dumpDrawingStateProto()`。虽然代码另有 `dumpOffscreenLayersProto()`，这里没有调用。文本模式会追加 offscreen Layer 的 name/type/pid/uid，但不是完整几何 Proto。
+
+若目标是 Layer 泄漏或 reparent 竞态，应同时保留文本 offscreen 名单与时序 trace，不能只存一个 `--proto` 文件。
 
 ---
 
-## 13. “Visible layers count”是一个误导性标题
+## 9. Layer 在树里，不代表它属于目标 Display
 
-dump打印：
+CompositionEngine 先调用 `belongsInOutput()`。r48 的条件是：
+
+```cpp
+layerStackId 有值
+&& layerStackId == output.layerStackId
+&& (!internalOnly || output.layerStackInternal)
+```
+
+所以多显示诊断的第一组等式是：
+
+```text
+Layer.layerStack
+==
+目标 Composition Output.layerStackId
+```
+
+不匹配时，该 Layer 不会在目标输出上形成 OutputLayer；继续讨论该 Display 的 CLIENT/DEVICE 已没有意义。
+
+### 9.1 基本可见门和输出可见门
+
+对 BufferLayer，`isVisible()` 的基本条件是：
+
+```cpp
+!isHiddenByPolicy()
+&& getAlpha() > 0
+&& (active buffer != nullptr || sideband stream != nullptr)
+```
+
+`isHiddenByPolicy()` 还会沿 drawing parent 递归；使用 relative-Z 时，也检查 relative target 是否 hidden。
+
+通过基本门后，`Output::ensureOutputLayerIfVisible()` 还要：
+
+1. 确认 output membership 与 composition snapshot；
+2. 计算 effective transform 后的几何足迹；
+3. 扣除上方 opaque region；
+4. 处理 transparent hint 与 shadow；
+5. 经 output transform 与 bounds 检查非透明绘制区是否为空。
+
+任一步失败都可能没有 OutputLayer。因此：
+
+```text
+drawing tree 无 Layer
+→ 事务、reparent、移除或生命周期
+
+tree 有 Layer，但目标 Display 无 OutputLayer
+→ layerStack、hidden/alpha/buffer、几何、裁剪或遮挡
+
+OutputLayer 存在，画面仍异常
+→ buffer 内容、CLIENT/DEVICE 合成、HWC、present 或显示设备
+```
+
+### 9.2 “Visible layers count”并不计可见层
+
+完整 dump 的：
 
 ```text
 Visible layers (count = N)
 ```
 
-但N实际来自`mNumLayers`：
+实际打印 `mNumLayers`。它在 `onLayerFirstRef()` 增加、`onLayerDestroyed()` 减少，计数的是活着的 Layer 对象。hidden、alpha=0、无 buffer、offscreen、错误 layerStack 或完全被遮挡的对象仍可能计入。
 
-```cpp
-onLayerFirstRef()  { mNumLayers++; }
-onLayerDestroyed() { mNumLayers--; }
-```
-
-它计数的是活着的Layer对象，不是“最终肉眼可见且正在合成”的Layer数。以下Layer也可能在计数里：
-
-- hidden；
-- alpha为0；
-- 没有buffer；
-- 不属于当前display layer stack；
-- 被上方opaque Layer完全遮挡；
-- offscreen但尚有强引用。
-
-诊断Layer泄漏时N很有价值；诊断屏幕上有几层时，不能直接用N。
+这个数字适合观察 Layer 数量异常增长，不适合回答屏幕最终合成了几层。
 
 ---
 
-## 14. Layer Proto是整棵drawing-state树的结构化数据
+## 10. buffer 字段记录“SF 拿到了什么”，不是“面板显示了什么”
 
-`dumpDrawingStateProto()`遍历：
-
-```cpp
-for (const sp<Layer>& layer : mDrawingState.layersSortedByZ) {
-    layer->writeToProto(layersProto, traceFlags, display);
-}
-```
-
-`Layer::writeToProto()`会递归`mDrawingChildren`。`layers.proto`的主要字段包括：
+Proto 的 `active_buffer` 只包含：
 
 ```text
-id / name / type
-children / relatives / parent / z_order_relative_of
-layer_stack / z
-position / size / crop / transform
-active_buffer / queued_frames / refresh_pending / curr_frame
-visible_region / damage_region
-dataspace / pixel_format / color / flags
-hwc_composition_type
-source_bounds / bounds / screen_bounds
-input_window_info
-metadata / corner / shadow / color transform
+width / height / stride / format
 ```
 
-这些字段是理解Layer树和几何的主数据集，但后面会看到：普通文本dump不会把它们全部打印出来。
+它能证明 writer 采样时 Layer 的 `getBuffer()` 非空，以及 buffer 的基础几何/格式。它不能证明：
+
+- 像素不是黑色、旧内容或错误内容；
+- acquire fence 已 signal；
+- 本轮 Output 使用了这块 buffer；
+- HWC present 已完成；
+- 面板正在扫描它。
+
+这里还要区分原始 Proto 的 message presence 与普通文本：writer 只在 buffer 非空时创建 `active_buffer` 子消息；文本 parser 对缺失子消息也会生成一组默认零值并照常打印。因此只有原始 Proto 能可靠区分“消息不存在”和“字段全为 0”。
+
+ColorLayer/ContainerLayer 等本来就不应按“必须有 active buffer”的标准判断，所以始终要先核对 `type`。
+
+### 10.1 queued_frames 主要是传统 BufferQueueLayer 信号
+
+Proto 调用虚函数 `getQueuedFrameCount()`。基类返回 0，r48 只有 `BufferQueueLayer` 覆盖它并返回 `mQueuedFrames`。因此：
+
+- BufferQueueLayer 上大于 0：consumer 侧还有排队帧；
+- 等于 0：只说明这个实现此刻没有暴露排队计数；
+- BufferStateLayer/BLAST 上的 0：不能证明事务侧不存在等待中的 buffer。
+
+即使传统队列大于 0，下一帧也可能因 desired present time、acquire fence 或同步条件而不能立即 latch。
+
+### 10.2 refresh_pending 是 latch 到 pre-composition 之间的瞬态
+
+writer 把 `isBufferLatched()` 写入 `refresh_pending`。BufferLayer 在成功 latch 后把 `mRefreshPending` 置 true，`onPreComposition()` 写入 first refresh 信息后又清 false。
+
+它表示“有新 buffer 已 latch，尚待这一轮 pre-composition 处理”的窄窗口，不等于：
+
+- 队列非空；
+- present fence pending；
+- 显示请求永远卡住。
+
+静态 dump 恰好看到 false 很正常；必须靠连续快照或 trace 判断它是否长期不推进。
+
+### 10.3 curr_frame 是旧帧问题的重要 Proto 字段
+
+writer 把 `mCurrentFrameNumber` 写入 `curr_frame`，但文本 parser 不读取它。要判断：
+
+```text
+应用持续 queue
+但 SF 是否一直持有旧 frame
+```
+
+应保留原始 Proto，或改用 FrameEventHistory/trace。单次 frame number 也只是一张快照；“卡住”至少需要两个时间点或一段时序证据。
 
 ---
 
-## 15. Layer id、name、type的作用不同
+## 11. 几何和 Region 要按坐标系与生成阶段阅读
 
-### id / sequence
-
-SF内部Layer唯一身份，parent/child/relative-Z/barrier等关系都引用它。
-
-### name
-
-主要面向人类和trace，可能重复，也可能因ViewRoot、SurfaceView、BLAST包装出现前后缀。
-
-### type
-
-例如Buffer Layer、Color Layer、Container Layer等，提示这层是否应当有active buffer。
-
-所以：
+一帧内容大致经过：
 
 ```text
-人眼搜索用name
-稳定关联用id
-预期字段用type
-```
-
-不要用“名字相同”代替“是同一Layer对象”。
-
----
-
-## 16. parent树与relative-Z树不是一回事
-
-Layer可同时有：
-
-```text
-parent
-zOrderRelativeOf
-z
-```
-
-parent决定组织、继承变换/隐藏与生命周期关系。relative-Z则让它的Z相对另一Layer解释，不要只拿整数Z做全局排序。
-
-`LayerProtoParser::layerToString()`会把relatives和non-relative children合并排序，先递归负Z，再打印本层，最后打印非负Z。
-
-文本顺序是解析器重建后的结果，不是Proto原始数组顺序的原样照抄。
-
----
-
-## 17. layerStack决定Layer属于哪个显示输出
-
-CompositionEngine先判断：
-
-```cpp
-if (!belongsInOutput(layerFE)) return;
-```
-
-核心是Layer的`layerStack`必须与Output的`layerStackId`匹配，同时还要考虑internal-only等属性。
-
-因此，找到Layer不代表它会去当前内屏。多显示诊断的第一步应是：
-
-```text
-Layer.layerStack
-==
-target Display Composition Output.layerStack
-```
-
-如果不等，后续再看该Display的HWC composition type没有意义，因为该Layer根本不属于该Output。
-
----
-
-## 18. position、size、crop、transform要按坐标系阅读
-
-Layer Proto同时有：
-
-```text
-requested position / requested transform
-actual position / transform
-size / crop
-source bounds / bounds / screen bounds
-buffer transform
-```
-
-一个简单理解是：
-
-```text
-buffer像素坐标
-→ buffer transform
-→ Layer自身crop/bounds
-→ Layer/父节点几何transform
+buffer 像素
+→ buffer transform / source crop
+→ Layer 本地 bounds 与 crop
+→ parent + Layer effective transform
 → screen bounds
-→ Display viewport/frame/transform
-→ HWC sourceCrop/displayFrame
+→ Output viewport/transform
+→ HWC sourceCrop + displayFrame
 ```
 
-但每个字段并非都在文本Layer tree中保留。诊断旋转、缩放、letterbox或触摸错位时，应优先保留Proto原始数据，而不只保留转换后文本。
+Proto 同时有 requested position/transform、effective position/transform、source/bounds/screen bounds；HWC mini dump又有 per-Display sourceCrop/displayFrame。诊断旋转、缩放、letterbox 或触摸偏移时，不能拿不同坐标系的四个整数直接相减。
+
+### 11.1 requested 与 effective 不同不等于 pending
+
+writer 的 requested transform 来自 drawing state 的本地 `active_legacy.transform`；实际 transform 来自 `mEffectiveTransform`，它由 parent transform 与本层 active transform 相乘。actual color 的 alpha 也会乘 parent alpha。
+
+所以 requested/actual 差异首先提示“存在继承或有效化计算”，而不是自动证明 barrier、resize 或事务未提交。要判断不收敛，应再看：
+
+- parent 链；
+- bounds/screen bounds；
+- pending barrier；
+- 前后快照；
+- transaction trace。
+
+### 11.2 visible、covered 与 opaque 回答不同问题
+
+CompositionEngine 从前向后维护覆盖：
+
+| Region | 含义 |
+|---|---|
+| visible | 本层足迹扣掉上方 opaque 区；上方半透明层不会把它完全扣除 |
+| covered | 本层足迹与所有上方可见区相交，半透明覆盖也计入 |
+| opaque | 该层可安全视为完全不透明、可遮掉下层的部分 |
+
+因此 `covered != invisible`。下层可同时仍在 visibleRegion 中，又有一部分 covered。
+
+### 11.3 damage 是合成输入，不是面板局部刷新回读
+
+Layer 的 surface damage 还要和以下因素合并：
+
+- `contentDirty`；
+- 新旧 visible/covered region；
+- 新暴露区域；
+- 上方 opaque 扣除；
+- Output dirty region 与 viewport；
+- CLIENT/DEVICE 分工；
+- HWC/driver 的更新策略。
+
+当 `contentDirty` 为 true，Output 把新旧 visible region 都并入 dirty；否则根据 exposed/covered 的几何变化计算。因此“应用没有画新像素，但窗口移动后需要重绘”是正常路径。
+
+Proto 中的 `damage_region` 只是中间证据。它为空不能单独把局部不刷新归因给 App，它非空也不能证明面板收到等价的 partial-update 区域。
 
 ---
 
-## 19. Layer为什么可能没有OutputLayer
+## 12. Display、OutputLayer 与 HWC 描述最后的软件合成输入
 
-`Output::ensureOutputLayerIfVisible()`会在以下情况直接返回：
+`DisplayDevice::dump()` 先给出 powerMode、activeConfig，再委托 Composition Output 输出 enabled/secure、layerStack、transform、bounds/viewport、颜色配置、RenderSurface 与 OutputLayer。
 
-```text
-不属于该Output
-LayerFE composition state不存在
-isVisible=false
-变换后几何区域为空
-被上方opaque region完全扣除
-经Output transform/viewport裁剪后为空
-```
-
-所以Layer tree里有一层，但Composition Output不存在对应Output Layer，并不一定是bug。
-
-相反，这正是黑屏诊断的关键分叉：
+黑屏时先检查出口，再检查单层：
 
 ```text
-Layer不在drawing tree
-→ 事务/生命周期问题
-
-Layer在tree但没OutputLayer
-→ 隐藏/透明/几何/遮挡/layerStack问题
-
-OutputLayer存在但屏幕错
-→ buffer/合成/HWC/present/面板方向
+Display 是否存在、是否目标 physical display
+→ powerMode 是否符合 ON/DOZE 预期
+→ Output 是否 enabled
+→ layerStack/viewport/bounds 是否合理
+→ 目标 Layer 是否有 OutputLayer
+→ composition type、sourceCrop/displayFrame 是否合理
 ```
 
----
+### 12.1 HWC mini dump 是 per-Display 几何摘要
 
-## 20. hidden、alpha、buffer和遮挡是四道不同的可见门
-
-BufferLayer的基本`isVisible()`需要：
-
-```cpp
-!isHiddenByPolicy()
-&& alpha > 0
-&& (buffer != nullptr || sidebandStream != nullptr)
-```
-
-`isHiddenByPolicy()`还会递归检查parent，使用relative-Z时也会检查relative target是否隐藏。
-
-通过这道门后，CompositionEngine还要：
-
-- 按上方opaque layer扣除visible region；
-- 与Output bounds/viewport求交；
-- 处理transparent hint、shadow和rounded crop。
-
-所以“flags没hidden”不等于“屏幕上可见”。
-
----
-
-## 21. activeBuffer能证明SF当前拿着一块buffer
-
-Layer Proto的`active_buffer`只保存：
+`Layer::miniDump()` 在目标 Display 上找不到 OutputLayer 就不打印。成功时主要给出：
 
 ```text
-width
-height
-stride
-format
-```
-
-它能回答：
-
-- Buffer Layer是否有当前active buffer；
-- buffer几何是否与预期大小一致；
-- format是否可能带alpha/YUV/HDR特性。
-
-它不能直接证明：
-
-```text
-这块buffer的像素是正确内容
-它已在当前物理屏scanout
-acquire/present fence已signal
-这是App最近刚绘制的那一帧
-```
-
-画面全黑也可以是一块合法active buffer。
-
----
-
-## 22. queuedFrames与refreshPending的语义
-
-Proto写：
-
-```cpp
-queued_frames = getQueuedFrameCount();
-refresh_pending = isBufferLatched();
-```
-
-`queuedFrames > 0`说明consumer侧还有可能待处理的新帧，但不保证下一帧一定能立即latch：
-
-```text
-desired present time在未来
-acquire fence未就绪
-队列时序导致drop/reject
-事务条件未满足
-```
-
-`refreshPending`/文本`mRefreshPending`表示Layer当前有新buffer已latch、需要走后续refresh处理的状态，不是present fence已signal的同义词。
-
----
-
-## 23. curr_frame对旧帧问题很重要，但文本dump丢了它
-
-Proto明确写：
-
-```cpp
-layerInfo->set_curr_frame(mCurrentFrameNumber);
-```
-
-但r48 `LayerProtoParser::Layer`没有`currFrame`字段，`generateLayer()`也不读`curr_frame`，文本`to_string()`自然不会打印。
-
-因此：
-
-> 普通`dumpsys SurfaceFlinger`的Layer tree不能用来对比两次快照的current frame number；`--proto`原始数据才保留该字段。
-
-这是诊断“App在更新，但SF是否一直显示旧帧”时最容易被文本转换掩盖的信息之一。
-
----
-
-## 24. requested字段与actual字段可反映事务是否收敛
-
-Proto包含一些成对值：
-
-```text
-requested_position vs position
-requested_transform vs transform
-requested_color vs color
-requested size/crop语义 vs active几何
-```
-
-当requested与actual不同时，可能是：
-
-- legacy resize要等buffer尺寸；
-- 事务还在pending state；
-- barrier/defer未满足；
-- 父子transform与有效几何尚未同步到该快照。
-
-但dump只是一次采样，必须结合pending barrier、事务trace与前后快照判断这是正常瞬态还是长时间不收敛。
-
----
-
-## 25. visibleRegion、coveredRegion和opaqueRegion
-
-CompositionEngine从上到下计算遮挡：
-
-```text
-visibleRegion
-= Layer几何足迹
-- 上方opaque layers完全不透明区
-```
-
-```text
-coveredRegion
-= 该Layer足迹中被所有上方visible layers覆盖的部分
-```
-
-注意：半透明层会让下层区域成为covered，但不会从下层visibleRegion中完全扣掉；只有opaque region会完全遮挡下层。
-
-这是为什么：
-
-```text
-covered != invisible
-```
-
-不能看到“covered有值”就认定该Layer完全被挡住。
-
----
-
-## 26. damageRegion不是“屏幕最终刷新区域”
-
-BufferLayer在有待呈现数据时使用buffer携带的surface damage；没有ready frame或还不到present time时，可调`useEmptyDamage()`清空当轮Layer damage。
-
-CompositionEngine还会结合：
-
-```text
-contentDirty
-新旧visibleRegion
-新旧coveredRegion
-新暴露区域
-上层opaque扣除
-Display dirty region
-HWC/client target策略
-```
-
-所以Layer Proto的`damage_region`是一个输入/中间证据，不是面板最终部分刷新命令的硬件回读。
-
-局部不刷新时不应只说“damage是空，所以App错了”，必须继续检查SF的dirty region、client/device composition、HWC与前后帧trace。
-
----
-
-## 27. contentDirty会把整个新旧可见区域标脏
-
-`ensureOutputLayerIfVisible()`在`contentDirty`时：
-
-```cpp
-dirty = visibleRegion;
-dirty.orSelf(oldVisibleRegion);
-```
-
-否则主要根据新旧exposed/covered变化计算。
-
-这说明两类刷新原因要分开：
-
-```text
-内容变了
-→ content/surface damage
-
-内容没变，但遮挡/位置/尺寸变了
-→ exposed/covered geometry damage
-```
-
-如果只看App提交的surface damage，会漏掉后一类。
-
----
-
-## 28. HWC mini dump是每个Display的最终几何摘要
-
-`Layer::miniDump()`先在目标Display中查对应OutputLayer；没有就不打印。每行主要包含：
-
-```text
-Layer name
-Z / relative Z
+name / z
 window type
 composition type
 buffer transform
 display frame
 source crop
-explicit frame rate + compatibility
-focused marker
+explicit frame rate / focused
 ```
 
-其中：
+`sourceCrop` 表示从 Layer/buffer 哪块取样，`displayFrame` 表示放到该显示的哪块。它们比 Layer 本地 position/size 更接近 HWC 输入，但仍不是面板回读。
 
-```text
-sourceCrop = 从源buffer/Layer哪一块取样
-displayFrame = 在目标Display上放到哪一块
-```
+### 12.2 CLIENT 与 DEVICE 是职责，不是成功/快慢标签
 
-对视频拉伸、旋转、多屏投射和半屏黑区，这一行往往比Layer自身position/size更接近最终合成输入。
-
----
-
-## 29. CLIENT、DEVICE、SOLID_COLOR、CURSOR和SIDEBAND
-
-HWC composition type的主要值：
-
-| 类型 | 含义 |
+| type | 含义 |
 |---|---|
-| CLIENT | SF/RenderEngine把该层画进client target |
-| DEVICE | HWC/display以overlay等硬件路径合成 |
-| SOLID_COLOR | HWC使用颜色层 |
-| CURSOR | 设备cursor plane类路径 |
+| CLIENT | RenderEngine 先把该层画进 client target |
+| DEVICE | HWC 用 overlay 等设备路径合成 |
+| SOLID_COLOR | 设备颜色层 |
+| CURSOR | 可异步定位的 cursor 类路径 |
 | SIDEBAND | sideband stream |
 
-不要做两个错误等式：
+多个 CLIENT Layer 通常合成到同一 client target，再与 DEVICE Layer 一起交给 HWC。不能把 DEVICE 等同“整屏不用 GPU”，也不能把 CLIENT 等同“每层有独立 GPU target”。
 
-```text
-DEVICE = 不用GPU的整个屏幕
-CLIENT = 这个Layer单独占一块client target
-```
+### 12.3 vendor HWC dump 没有稳定文本 schema
 
-实际上多个CLIENT Layer会先被RenderEngine合成一块client target，再把这块target与DEVICE Layer一起交给HWC。
+`HWComposer::dump()` 追加 Composer HAL 返回的 debug string。不同厂商、SoC 和 OTA 的字段与完整度都可能不同，脚本不应依赖固定行号。它适合作为 vendor-specific 旁证，不是 AOSP 统一协议。
 
----
+### 12.4 flips 与 missed counters 都是提示，不是完成证明
 
-## 30. Proto里的HWC composition type只按默认显示写
+RenderSurface 的 `mPageFlipCount` 在 SF 输出流程的 `flip()` 中增加，不是面板硬件 scanout 计数。Total/HWC/GPU missed frame count 又是进程生命周期内累计，缺少 Layer 身份和发生时间。
 
-`dumpDrawingStateProto()`获取default display，`Layer::writeToProto()`在`TRACE_COMPOSITION`打开时写：
-
-```cpp
-getCompositionType(*display)
-```
-
-所以Proto中每层的`hwc_composition_type`是主/默认Display视角，不能用一个字段同时表示该Layer在多个Display上的结果。
-
-多显示时应读每个Display的HWC mini dump/Output Layer状态，并带上Display ID。
+两次现场中 flips 不变可能提示输出未推进；missed 快速增长可能提示合成压力。但 flips 变化不能证明像素正确，missed 增长也不能单独给当前黑屏定因。
 
 ---
 
-## 31. vendor HWC dump是不稳定的厂商文本接口
+## 13. 静态树必须和近帧时间证据配合
 
-SF的：
+Layer tree 回答“对象与几何是什么”，不能回答“刚才是否连续推进”。r48 还提供三类相邻证据。
 
-```cpp
-void HWComposer::dump(std::string& result) const {
-    result.append(mComposer->dumpDebugInfo());
-}
-```
+### 13.1 --latency 是 legacy FrameTracker
 
-只是把Composer HAL返回的debug string追加进结果。
-
-这意味着：
-
-- 不同SoC/厂商字段名可以完全不同；
-- AOSP不保证其文末格式稳定；
-- 有的实现很详细，有的只有少量状态；
-- 脚本若依赖固定行号/字段容易跨OTA失效。
-
-它很有价值，但应当作“vendor-specific证据”，不是AOSP统一schema。
-
----
-
-## 32. DisplayDevice先看powerMode、activeConfig和Output投影
-
-`DisplayDevice::dump()`先打印：
-
-```text
-physical/virtual
-internal/external
-primary
-display name
-powerMode
-activeConfig
-```
-
-然后Composition Output打印：
-
-```text
-isEnabled / isSecure
-usesClientComposition / usesDeviceComposition
-layerStack
-transform
-bounds / frame / viewport / sourceClip / destinationClip
-needsFiltering
-colorMode / renderIntent / dataspace / target dataspace
-```
-
-黑屏时最先检查：
-
-```text
-Display是否存在
-powerMode是否ON/DOZE预期
-Output isEnabled是否true
-layerStack是否与目标Layer一致
-viewport/frame/bounds是否为空或异常
-```
-
-先确认显示出口，再钻进单个Layer。
-
----
-
-## 33. RenderSurface的flip count也不是面板硬件帧计数器
-
-RenderSurface dump包含：
-
-```text
-size
-ANativeWindow pointer/format
-flips
-DisplaySurface dump
-```
-
-`flip()`在SF输出流程推进`mPageFlipCount`。它是SF RenderSurface路径的计数，不是从面板硬件回读的“已scanout帧数”。
-
-连续两次dump看flips不变，可以提示SF输出未推进；但变化了也不能单独证明面板内容正确。
-
----
-
-## 34. missed-frame counters是累计摘要，不是当前故障帧
-
-完整dump打印：
-
-```text
-Total missed frame count
-HWC missed frame count
-GPU missed frame count
-```
-
-第167章已说明，r48主要根据previous present fence和expected present判断miss，HWC/GPU计数反映上一轮composition path。
-
-这些值：
-
-- 没有自动附Layer身份；
-- 没有自动附发生时间；
-- 是进程生命周期内累计；
-- 不能证明用户刚看到的这次黑屏由某一计数造成。
-
-它适合告诉你“系统合成近期是否有压力”，不适合独立定因。
-
----
-
-## 35. `--latency`输出三列legacy FrameTracker时间
-
-`FrameTracker::dumpStats()`按环形历史打印127条：
+输出第一行是当前 HWC VSync period，之后每行三列：
 
 ```text
 desiredPresentTime
@@ -898,497 +599,250 @@ actualPresentTime
 frameReadyTime
 ```
 
-SF的`--latency`:
+无 Layer 名时读取 animation tracker；带名字时在 current tree 做 `getName() == name` 精确匹配。名字并不唯一，多个同名 Layer 会依次追加数据，不能把参数形式误认为唯一选择器。
 
-- 无Layer名：打印Window animation tracker；
-- 带Layer名：在current tree中做`getName() == name`的精确匹配；
-- 第一行先打印当前HWC VSync period。
+FrameTracker ring 有 128 槽，但 `dumpStats()` 从当前 offset 的下一项循环 127 次；值可能为 0 或 `INT64_MAX`。它们是空/未完成 sentinel，不应参与普通纳秒差值。
 
-三列里可能出现`INT64_MAX`或0类占位/无数据值，应结合`FrameTracker.cpp`读，不要直接当成真实时间戳计算。
+### 13.2 --frame-events 会先刷新 fence 状态
 
----
-
-## 36. `--latency-clear`会改变系统统计状态
-
-```bash
-adb shell dumpsys SurfaceFlinger --latency-clear
-```
-
-会清理Layer FrameTracker和animation tracker的环形记录/统计。它不是纯读命令。
-
-正确的实验语义是：
-
-```text
-清理历史
-→ 执行可重复场景
-→ 再读latency
-```
-
-取证时如果还没保存原现场，不要先运行clear，否则会破坏历史证据。
-
----
-
-## 37. `--frame-events`与Layer tree的目的不同
-
-`--frame-events`遍历current Layer，每层：
+该子命令遍历 current Layer，对每层持 history mutex，调用：
 
 ```cpp
 checkFencesForCompletion();
 FrameEventHistory::dump();
 ```
 
-它打印第169章的：
+它把第 169 章的 posted/requested、acquire、latch、refresh、GPU composite、display present、dequeue ready 与 release 放到近帧时间线上。它仍受短 ring、current tree 选择与 fence 完成时机约束。
+
+结合方式是：
 
 ```text
-posted / requested present
-latch
-first / last refresh
-acquire
-GPU composite done
-display present
-dequeue ready
-release
+Layer tree：对象、层级、几何和 active buffer
+Frame events：buffer 经过哪些异步节点
+FrameTracer/SurfaceTracing：状态如何随时间变化
+TimeStats/missed：一段时间内的聚合倾向
 ```
 
-Layer tree回答“这层现在是什么几何/结构状态”；Frame Events回答“近几帧经过哪些异步节点”。
+### 13.3 闪烁优先使用 trace
 
-两者结合才能区分：
+闪烁通常是状态交替：
 
 ```text
-Layer状态没提交
-vs
-Layer存在但buffer没latch
-vs
-buffer已latch但present还没完成
+Layer A/B 出现与消失
+alpha 1/0
+parent/z/crop 中间态
+buffer 空/非空
+CLIENT/DEVICE 切换
+连续 present 中的新旧帧交替
 ```
+
+一份 dump 只会随机命中某一态。两次人工快照能证明“有变化”，但难以确定变化顺序；SurfaceTracing、FrameTracer 和 Perfetto 才适合建立时序。
 
 ---
 
-## 38. Proto比文本Layer tree保留更多字段
+## 14. 四类故障怎样组合证据
 
-`--proto`时SF直接：
-
-```cpp
-result.append(layersProto.SerializeAsString());
-```
-
-普通文本则先用`LayerProtoParser::generateLayerTree()`转成一个精简C++模型，再`to_string()`。
-
-r48文本解析器不保留/不打印的Proto字段包括：
-
-```text
-id
-curr_frame
-hwc_composition_type
-hwc_frame / hwc_crop / hwc_transform
-source_bounds / bounds / screen_bounds
-input_window_info
-effective_transform
-effective_scaling_mode
-color_transform
-barrier details
-```
-
-其中部分字段在r48 writer也未必实际填充，但核心结论不变：
-
-> “Proto schema里有”、“writer实际写了”、“文本parser保留了”是三个不同问题。
-
----
-
-## 39. r48文本Region的`this=`值不可信
-
-`layers.proto`已将`RegionProto` field 1标记为reserved，只保留rect数组。
-
-但`LayerProtoParser::Region`仍有：
-
-```cpp
-uint64_t id;
-```
-
-`generateRegion()`创建局部`Region region;`后只填rects，没有初始化id；`to_string()`却打印：
-
-```text
-Region VisibleRegion (this=... count=N)
-```
-
-所以r48这个`this=`不是Layer ID、Region ID或指针的稳定证据，它来自未初始化字段，应忽略。有意义的是`count`和后续rect。
-
----
-
-## 40. `--proto`不包含offscreen Layer树
-
-`doDump()`在asProto时只序列化`dumpDrawingStateProto()`的结果。`dumpOffscreenLayersProto()`是SurfaceTracing在打开EXTRA等路径中可用的方法，但普通`dumpsys SurfaceFlinger --proto`这里没有调它。
-
-文本dump会在末尾追加：
-
-```text
-Offscreen Layers:
-Layer <name> (<type>) pid:<pid> uid:<uid>
-```
-
-但也只有名称/类型/pid/uid，不是完整offscreen几何树。
-
-所以排查Layer泄漏时，单独保存`--proto`可能漏offscreen对象。
-
----
-
-## 41. on-screen与offscreen也不是一次原子采集
-
-文本dump先在主线程导drawing tree Proto，再另起一个`schedule(...).get()`遍历`mOffscreenLayers`。
-
-两次主线程任务之间，Layer可能：
-
-```text
-被reparent回屏幕树
-从屏幕树移除
-销毁
-子节点归属变化
-```
-
-因此极端竞态下，一份文本可能出现短暂重复或缺口。需要精确重建层树迁移时，应使用第168章SurfaceTracing时序，而不是强迫一份静态dump回答动态问题。
-
----
-
-## 42. WMS dump与SF dump是两个层级
-
-### WMS主要回答
-
-```text
-Window/Activity/DisplayContent组织
-Window token和lifecycle
-focus / IME / policy visibility
-layout frame / insets / rotation
-WindowStateAnimator / SurfaceController意图
-```
-
-### SF主要回答
-
-```text
-SurfaceControl Layer drawing tree
-active buffer与合成几何
-per-display OutputLayer
-CLIENT/DEVICE composition
-HWC/RenderSurface/present附近状态
-```
-
-```mermaid
-flowchart LR
-    A["WMS WindowState / DisplayContent"] --> B["SurfaceControl transaction intent"]
-    B --> C["SF current state"]
-    C --> D["SF drawing Layer tree"]
-    D --> E["Composition OutputLayer"]
-    E --> F["HWC / client target"]
-    F --> G["physical display"]
-
-    H["dumpsys window"] -. "policy, focus, layout" .-> A
-    I["dumpsys SurfaceFlinger"] -. "layer, buffer, composition" .-> D
-    J["Perfetto / timestamps"] -. "time and completion" .-> E
-```
-
-如果WMS里窗口已visible，但SF没有对应Layer，问题更像在SurfaceControl事务/生命周期交界；WMS自己就认为隐藏时，先不要怀疑HWC。
-
----
-
-## 43. 触摸错位要加上InputDispatcher的真正路由现场
-
-Layer Proto在`TRACE_INPUT`中可保存：
-
-```text
-input frame
-touchable region
-visible / canReceiveKeys / hasFocus
-global scale / window scale
-crop layer
-replaceTouchableRegionWithCrop
-```
-
-但普通Layer文本parser丢弃`input_window_info`。`dumpsys input`的InputDispatcher状态会直接打印它实际使用的：
-
-```text
-FocusedDisplay / FocusedWindow
-per-display windows order
-frame
-globalScale / windowScale
-touchableRegion
-flags / type
-ownerPid / ownerUid
-current TouchState targets
-```
-
-还有一个容易误解的r48语义：有InputInfo的Layer为了兼容，在尚未提交buffer时也可先`canReceiveInput()`；输入visible不总是与buffer真实可见绑死。
-
----
-
-## 44. 黑屏的分层诊断树
+### 14.1 黑屏：从显示出口向 Layer 逐层收缩
 
 ```mermaid
 flowchart TD
-    A["黑屏/局部黑"] --> B{"Display存在且power/output enabled?"}
-    B -- "否" --> B1["DMS/PMS/power mode/hotplug/config"]
-    B -- "是" --> C{"WMS目标Window已visible且layout正常?"}
-    C -- "否" --> C1["Window lifecycle/policy/focus/insets"]
-    C -- "是" --> D{"SF drawing tree有对应Layer?"}
-    D -- "否" --> D1["SurfaceControl transaction/reparent/removal"]
-    D -- "是" --> E{"hidden alpha buffer layerStack geometry通过?"}
-    E -- "否" --> E1["Layer state/buffer producer/geometry"]
-    E -- "是" --> F{"target Display有OutputLayer?"}
-    F -- "否" --> F1["occlusion/viewport/output membership"]
-    F -- "是" --> G{"CLIENT/DEVICE合成与present正常?"}
-    G -- "否" --> G1["RenderEngine/HWC/fence"]
-    G -- "是" --> H["panel/driver/color/protected-content与动态trace"]
+    A["黑屏"] --> B{"Display 存在且 power/output 正常?"}
+    B -- "否" --> B1["DMS/PMS、hotplug、power/config"]
+    B -- "是" --> C{"WMS 认为目标 Window 可见?"}
+    C -- "否" --> C1["Window 生命周期、policy、layout"]
+    C -- "是" --> D{"drawing tree 有同一 Layer id?"}
+    D -- "否" --> D1["SurfaceControl transaction、reparent、remove"]
+    D -- "是" --> E{"目标 Display 有 OutputLayer?"}
+    E -- "否" --> E1["layerStack、hidden/alpha/buffer、裁剪、遮挡"]
+    E -- "是" --> F{"frame/present 在推进?"}
+    F -- "否" --> F1["producer、acquire、latch、RenderEngine/HWC/fence"]
+    F -- "是" --> G["像素内容、secure/protected、颜色、driver/panel"]
 ```
 
-这棵树的价值是让每一层都有“应当查什么”，避免一看黑屏就跳到“GPU驱动错”。
+每个分叉都要写反证。例如“Display OFF”的支持证据是 powerMode；若 Output enabled 且 present timestamp 持续推进，就需要重新检查是否找错 Display 或证据时间不一致。
 
----
+### 14.2 旧帧/画面卡住：比较推进点
 
-## 45. 旧帧/画面卡住的证据链
+依次比较两个时间点：
 
-建议按顺序问：
+1. App/RenderThread 是否继续 queue；
+2. Proto `curr_frame` 是否增加；
+3. 对传统 BufferQueueLayer，`queued_frames` 是否堆积；
+4. acquire 是否长期 PENDING；
+5. latch/first refresh 是否增加；
+6. display present 是否增加；
+7. RenderSurface/HWC 是否继续推进。
 
-1. App/RenderThread是否还在queue新buffer？
-2. SF Layer Proto的`curr_frame`是否推进？
-3. `queued_frames`是否持续大于0？
-4. acquire fence是否长时间PENDING？
-5. latch/first refresh是否推进？
-6. display present fence/timestamp是否推进？
-7. RenderSurface flip/HWC present是否推进？
+`curr_frame` 增加但 present 不进，把范围缩到合成/HWC/fence；present 也进但肉眼仍旧，则要复核 Layer 身份、Display 路由、像素本身与驱动/面板。任何单点都不是完整因果。
 
-对应分层：
+### 14.3 局部不刷新：沿 damage 到 output
 
 ```text
-App不queue
-→ UI/RT/producer侧
-
-queue但curr_frame不进
-→ ready/acquire/present-time/latch侧
-
-curr_frame进但present不进
-→ composition/HWC/fence侧
-
-present证据进但肉眼旧
-→ 核对Layer身份、Display路由、面板/driver与内容本身
+View/RenderNode 是否产生目标区域更新
+→ buffer surface damage 是否合理
+→ SF 是否 latch 新 frame
+→ contentDirty、visible/covered 变化如何形成 Output dirty
+→ 该区域走 CLIENT 还是 DEVICE
+→ client target/HWC/present/driver 是否推进
 ```
 
-静态dump只能提供当前点，“是否推进”必须用两次快照或trace/timestamp时序判断。
+这条链能避免把 Layer 的一个空 damageRegion 直接判成 App 错误，也避免看到非空 damage 就假定面板一定执行了局部刷新。
 
----
+### 14.4 触摸错位：比较视觉几何和实际输入窗口
 
-## 46. 闪烁问题为什么优先trace而不是dump
-
-闪烁本质上是“状态在时间上交替”，例如：
-
-```text
-Layer A/B交替出现
-alpha 1/0交替
-Z/parent短暂变化
-buffer空/非空交替
-crop/transform中间态
-CLIENT/DEVICE路径切换
-新旧帧在连续present中交替
-```
-
-一份dump只随机命中其中一态，最好情况也只是“闪烁当时的一张照片”。
-
-第168章SurfaceTracing能比较Layer树在多个时刻的变化；FrameTracer/Perfetto能追buffer event。它们才是回答“什么在交替”的工具。
-
----
-
-## 47. 局部不刷新的读取模板
-
-### 第一层：App是否画了那块
-
-检查View invalidation、RenderNode damage与buffer surface damage。
-
-### 第二层：SF是否latch了新buffer
-
-核对frame number、acquire/latch与FrameEventHistory。
-
-### 第三层：Layer damage怎样进入Output dirty
-
-同时考虑contentDirty、新旧visible/covered、opaque遮挡和viewport clip。
-
-### 第四层：该区域走CLIENT还是DEVICE
-
-CLIENT查RenderEngine/client target；DEVICE查HWC layer与damage传递。
-
-### 第五层：present与面板
-
-核对present fence、HWC日志、driver/partial update能力。
-
-这个模板避免把一个中间`damageRegion`错当成全链路最终结论。
-
----
-
-## 48. 触摸错位的对照表
-
-| 层级 | 核对内容 |
+| 系统 | 核对内容 |
 |---|---|
-| WMS | Window frame、insets、rotation、surfaceInsets、globalScale |
-| SF Layer Proto | screen bounds、effective/requested transform、crop、parent transform |
-| SF Output | display transform、viewport、frame、sourceClip/destinationClip |
-| InputWindowInfo | input frame、touchable region、window/global scale、crop layer |
-| InputDispatcher | 实际窗口顺序、focused window、当前touch target |
+| WMS | Window frame、insets、rotation、surfaceInsets、compat scale |
+| Layer Proto | parent、requested/effective transform、screen bounds、crop |
+| Composition Output | display transform、viewport、sourceCrop/displayFrame |
+| InputWindowInfo | frame、touchable region、scale、crop layer |
+| InputDispatcher | focused display/window、窗口顺序、当前 touch target |
 
-典型错误是只比较视觉上的Layer position和WMS Window frame，却漏掉：
+普通 Layer tree 文本不打印 `input_window_info`；应保留 Proto，并读取 `dumpsys input` 中 InputDispatcher 真正使用的窗口列表。
+
+r48 还有一个兼容语义：有 InputInfo 的 Layer 用 `canReceiveInput()` 设置 input visible，它只检查 policy hidden，不要求已经提交 buffer。于是“可接收输入”和“已有像素可见”本来就可能短暂分离。
+
+### 14.5 WMS 与 SF 不是互相替代
+
+WMS 主要回答 Window/Activity、token、focus、policy visibility、layout/insets；SF 主要回答 SurfaceControl Layer、active buffer、per-Display OutputLayer 与合成。典型边界是：
 
 ```text
-父层transform
-display rotation
-surface inset
-compatibility scale
-touchableRegion crop
-portal/multi-display route
-```
+WMS 已 visible，SF drawing tree 无 Layer
+→ 优先查 SurfaceControl transaction / 生命周期交界
 
-最终要以InputDispatcher实际收到的InputWindowInfo为输入路由事实，再回查SF/WMS哪一步产生了不一致。
+WMS 自己认为 hidden
+→ 先查 Window policy/lifecycle，不先归因 HWC
+```
 
 ---
 
-## 49. macOS只读练习、复读审计与核心结论
+## 15. 静态源码练习与现场记录模板
 
-### 49.1 练习1：追dump线程与锁边界
+以下练习只读取 `android-11.0.0_r48` 工作树。
 
-```bash
-cd /Users/ninebot/androidSource
+1. 验证 priority 参数怎样剥离，以及 SF 哪些方法真正 override：
 
-sed -n '4304,4375p' \
-  frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
+   ```bash
+   sed -n '20,95p' frameworks/native/services/utils/PriorityDumper.cpp
+   sed -n '960,985p' frameworks/native/services/surfaceflinger/SurfaceFlinger.h
+   ```
 
-sed -n '185,225p' \
-  frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
-```
+2. 追 `doDump()` 的权限、子命令、TimedLock、主线程等待和单次 write：
 
-回答：
+   ```bash
+   sed -n '4290,4390p' frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
+   ```
 
-1. dump从哪个线程进来？
-2. `mStateLock`最多等多久？
-3. 超时后为什么输出可能不一致？
-4. 哪一段要等SF主线程？
+3. 对照完整 dump 与 on-screen/offscreen Proto 的拼接：
 
-### 49.2 练习2：列出Proto写了但文末parser丢弃的字段
+   ```bash
+   sed -n '4580,4815p' frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
+   ```
 
-```bash
-sed -n '30,135p' \
-  frameworks/native/services/surfaceflinger/layerproto/layers.proto
+4. 查看 trace flag 怎样控制 Layer writer：
 
-sed -n '77,120p' \
-  frameworks/native/services/surfaceflinger/layerproto/LayerProtoParser.cpp
+   ```bash
+   sed -n '2200,2365p' frameworks/native/services/surfaceflinger/Layer.cpp
+   ```
 
-sed -n '277,335p' \
-  frameworks/native/services/surfaceflinger/layerproto/LayerProtoParser.cpp
-```
+5. 比较 schema、parser model 与文本输出，确认 id 和 Region 边界：
 
-至少找到`curr_frame`、input、HWC composition、screen bounds的丢失。
+   ```bash
+   sed -n '1,160p' frameworks/native/services/surfaceflinger/layerproto/layers.proto
+   sed -n '55,155p' frameworks/native/services/surfaceflinger/layerproto/LayerProtoParser.cpp
+   sed -n '250,335p' frameworks/native/services/surfaceflinger/layerproto/LayerProtoParser.cpp
+   ```
 
-### 49.3 练习3：手算visible与covered
+6. 手算 Layer 是否能为目标 Display 生成 OutputLayer：
 
-设底层A是`[0,0,100,100]`，上方B是`[0,0,50,100]`：
+   ```bash
+   sed -n '255,285p' frameworks/native/services/surfaceflinger/CompositionEngine/src/Output.cpp
+   sed -n '340,565p' frameworks/native/services/surfaceflinger/CompositionEngine/src/Output.cpp
+   ```
 
-- B opaque：A visible只剩右半；
-- B translucent：A visible仍可是整块，但左半属于covered；
-- B alpha=0或hidden：B不应进入有效OutputLayer覆盖。
+   可用两个 100×100 Layer 验证：上层 opaque 覆盖左半时，下层 visible 只剩右半；上层半透明时，下层 visible 仍可为整块，但左半属于 covered。
 
-然后对照`Output.cpp::ensureOutputLayerIfVisible()`的计算顺序。
+7. 核对 buffer 可见门、refresh pending 与传统队列计数：
 
-### 49.4 练习4：建一张黑屏假设表
+   ```bash
+   sed -n '105,122p' frameworks/native/services/surfaceflinger/BufferLayer.cpp
+   sed -n '305,325p' frameworks/native/services/surfaceflinger/BufferLayer.cpp
+   sed -n '400,460p' frameworks/native/services/surfaceflinger/BufferLayer.cpp
+   sed -n '90,105p' frameworks/native/services/surfaceflinger/BufferQueueLayer.cpp
+   ```
 
-```text
-假设：Display OFF
-证据：DisplayDevice powerMode
-反证：Output enabled且present持续
+8. 阅读 HWC mini dump 与 RenderSurface flip 的实际字段：
 
-假设：Layer未提交
-证据：WMS有Window、SF drawing tree无Layer
-反证：Proto id稳定存在
+   ```bash
+   sed -n '1560,1645p' frameworks/native/services/surfaceflinger/Layer.cpp
+   sed -n '260,280p' frameworks/native/services/surfaceflinger/DisplayDevice.cpp
+   sed -n '220,245p' frameworks/native/services/surfaceflinger/CompositionEngine/src/RenderSurface.cpp
+   ```
 
-假设：buffer没latch
-证据：queue推进、curr_frame不进、acquire pending
-反证：latch/present都持续推进
-```
+9. 验证 FrameTracker 只输出 127 个历史槽及 sentinel：
 
-一个好的假设必须同时写出“支持证据”和“什么能推翻它”。
+   ```bash
+   sed -n '35,50p' frameworks/native/services/surfaceflinger/FrameTracker.h
+   sed -n '228,260p' frameworks/native/services/surfaceflinger/FrameTracker.cpp
+   ```
 
-### 49.5 复读审计：r48最容易误解的边界
+### 15.1 现场最少记录五列
 
-1. dump是Binder线程、SF主线程与vendor HWC结果的拼接，不是单时刻原子快照。
-2. `mStateLock`超时1秒后仍继续读，这时整份dump只能当应急现场。
-3. Layer Proto要schedule到SF主线程；主线程卡死会让dumpsys也挂住。
-4. `dumpCritical()`忽略原子参数，以空参数再走完整`doDump()`；CRITICAL在r48并不是极小mini dump。
-5. `Visible layers count`实际是活Layer对象计数，不是OutputLayer或肉眼可见数。
-6. `--list`与`--frame-events`读current state，Layer Proto读drawing state，HWC mini dump还混用current traversal和Output state。
-7. Layer在drawing tree不保证在目标Display上有OutputLayer。
-8. active buffer不证明像素正确、fence已signal或面板正在scanout它。
-9. damage region是中间输入，不是最终display partial-update命令回读。
-10. Proto中HWC composition type只按default display视角填写。
-11. r48文本Layer parser丢弃`curr_frame`、HWC type、input和screen bounds等重要字段。
-12. Proto schema有字段不代表r48 writer一定填它；writer填了也不代表文本parser会保留。
-13. 文本Region的`this=`来自未初始化id，不是稳定身份。
-14. 普通`--proto`不包含offscreen layer tree；文本offscreen也只打印name/type/pid/uid。
-15. on-screen Proto与offscreen列表是两次主线程任务，之间可能变化。
-16. `--latency-clear`是破坏性统计重置，不是纯读查询。
-17. vendor HWC dump没有跨厂商稳定文本schema。
-18. InputInfo的visible为兼容可在buffer出现前为true，不等于像素已可见。
-19. dump最后对大result只调一次`write()`，忽略返回值并总是返回`NO_ERROR`；极端大输出的截断/写失败不会通过status可靠反映。
-20. 闪烁、交替、掉帧和短暂中间态必须用trace/多快照，不能由一份静态dump单独定因。
+| 列 | 示例 |
+|---|---|
+| 采集时间/顺序 | T0 文本、T1 proto、T2 trace |
+| 数据层次 | current / drawing / output / physical |
+| 稳定身份 | display id、Layer id、type；name 只作标签 |
+| 支持结论 | “目标 Display 没有此 Layer 的 OutputLayer” |
+| 反证/缺口 | “采样非原子；下一次 trace 可能出现” |
 
-### 49.6 本章核心结论
-
-1. 先区分current、drawing、composition/output和physical present四层。
-2. 完整SF文本dump是多阶段拼接，不具有全局原子性。
-3. Layer身份优先用id，name只适合搜索，type用来判断字段预期。
-4. parent、relative-Z、layerStack和per-display OutputLayer要合在一起读。
-5. hidden/alpha/buffer只是基本可见门，之后还有遮挡、viewport与output membership。
-6. active buffer不是正确显示完成证明，queued/refresh pending也与present不等价。
-7. visible/covered/damage分别描述可见、覆盖和更新中间区域，不能混用。
-8. CLIENT/DEVICE是每Output的合成分工，不是快慢或成功失败标签。
-9. `--proto`保留的Layer字段比普通文本更多，但不包含完整offscreen树。
-10. WMS、SF、InputDispatcher、FrameEventHistory和Perfetto回答的是不同层级，只有交叉后才能稳定定位。
-11. 黑屏用分层决策树，旧帧用frame/timestamp推进链，局部不刷新用damage-to-output链，触摸错位用多坐标系对照。
-12. 证据的价值取决于它能回答什么，也取决于你明确记住它不能证明什么。
+还应原样保留 warning、命令参数与文件是否截断。若看到 lock timeout、尾部不完整或 vendor 文本突变，先降低证据等级。
 
 ---
 
-## 50. 自测题与下一章预告
+## 16. 结论：dump 是分层现场，不是最终真相
 
-### 50.1 自测题
+Android 11 r48 的 SurfaceFlinger dump 可以稳定建立以下模型：
 
-1. SF dump为什么不是原子快照？
-2. `mStateLock`超时后dump会怎样？
-3. Layer Proto为什么要等SF主线程？
-4. current、drawing、OutputLayer状态各代表什么？
-5. “Visible layers count”为什么不是真正可见层数？
-6. name和id在关联Layer时有什么差别？
-7. parent与relative-Z有什么差别？
-8. layerStack不匹配会发生什么？
-9. Layer在drawing tree里为什么可能没有OutputLayer？
-10. active buffer不能证明哪些事？
-11. queuedFrames和refreshPending与present是什么关系？
-12. visibleRegion和coveredRegion为什么不等价？
-13. damageRegion为什么不是面板最终刷新区？
-14. CLIENT composition如何与DEVICE layers共存？
-15. Proto HWC type在多显示场景有什么边界？
-16. `curr_frame`为什么在文本Layer tree中看不到？
-17. Region文本的`this=`为什么不可信？
-18. `--proto`是否包含offscreen Layer？
-19. `--latency-clear`为什么要谨慎使用？
-20. 闪烁为什么不能靠一份dump定因？
-21. WMS有Window而SF无Layer时，优先查哪一层？
-22. 触摸错位为什么还要查`dumpsys input`？
-23. present fence推进能否证明buffer像素内容正确？
-24. 如何为一个黑屏假设写出可推翻它的反证？
+1. Binder 入口先处理 priority/proto，权限拒绝也可能返回 NO_ERROR；
+2. state lock 最多等一秒，超时后仍继续读取；
+3. 完整文本由锁内大段、主线程 drawing Proto、另一主线程 offscreen 名单拼成；
+4. current、drawing、per-Display output 与 physical completion 是四层不同事实；
+5. Layer tree 存在不等于目标 Display 有 OutputLayer；
+6. active buffer、queued、refresh pending、curr frame 分别证明不同阶段；
+7. visible、covered、opaque、damage 不能互换；
+8. CLIENT/DEVICE 是合成职责，不代表成功、速度或面板完成；
+9. schema、writer、parser 与最终文本具有四次信息筛选；
+10. 黑屏、旧帧、闪烁、局部刷新和触摸错位都需要跨系统或跨时间证据。
 
-### 50.2 下一章预告
+### 16.1 最容易记错的 r48 边界
 
-第171章继续学习：
+- `Visible layers count` 实为所有活 Layer 对象数；
+- Proto parser 保留 id 用于连树和排序，但文本不打印；
+- requested/effective 差异可能只是父变换或继承，不自动表示 pending；
+- `queued_frames` 对 BufferStateLayer 走基类 0；
+- `refresh_pending` 是 latch 到 pre-composition 之间的短状态；
+- Proto HWC type 只取默认 Display；
+- `Region this=` 来自未初始化 id；
+- 普通 `--proto` 不含 offscreen tree；
+- `--latency-clear` 会改变历史；
+- 末尾单次 `write()` 的失败或 partial write 不会改变最终 NO_ERROR。
 
-> SurfaceFlinger ScreenCapture、captureDisplay/captureLayers、secure/protected content 与截屏完成边界。
+### 16.2 自测
 
-将回答：
+1. 为什么同一份文本中 current Layer 与 OutputLayer 可能不对应？
+2. lock timeout 后为什么仍可能拿到输出，又为什么必须降级使用？
+3. Proto writer 要等主线程，会怎样暴露 SF 主线程卡死？
+4. Layer id、name、type 分别适合什么关联？
+5. requested transform 与 effective transform 为什么可正常不同？
+6. drawing tree 有 Layer，却没有目标 Display OutputLayer，有哪些正常原因？
+7. 为什么 BufferStateLayer 的 queued_frames=0 不能排除等待中的 BLAST buffer？
+8. active buffer、curr frame 与 display present 各自能证明到哪里？
+9. coveredRegion 为什么不等于 invisible？
+10. 为什么闪烁优先 trace，而黑屏可先用分层静态现场？
 
-- Java `SurfaceControl.screenshot/captureLayers`如何进入SF；
-- display capture与layer subtree capture的树、crop、scale和transform差别；
-- secure Layer、protected buffer、uid权限和黑块策略；
-- RenderEngine如何把多层画入GraphicBuffer；
-- capture callback/fence返回与像素可读、屏幕present的差别；
-- 为什么“截图正常但屏幕异常”能帮助将问题分界到SF之后。
+能为每个字段写出“生产者、状态层、采样时刻、不能证明什么”，就能把 dump 从字段词典变成诊断证据。
+
+---
+
+下一篇将进入 **171-AndroidSurfaceFlingerScreenCapture与secureprotectedcontent**，继续拆解 captureDisplay/captureLayers、secure/protected 内容与截图完成边界。

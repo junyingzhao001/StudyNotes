@@ -1,197 +1,164 @@
 # 166 Android RefreshRateConfigs、LayerHistory 与动态刷新率选择
 
 > 源码版本：Android 11 / API 30 / `android-11.0.0_r48`  
-> 学习方式：macOS 只读源码，不要求编译、不要求连接设备  
+> 学习方式：macOS 静态阅读；不编译，不连接设备  
 > 前置章节：第 12、21、67、155、165 章
 
 ---
 
-## 1. 本章要解决什么
+## 1. 本章要回答的问题
 
-第 165 章讲清楚了：刷新率一旦确定，Scheduler 如何依据新的 period 建立 App/SF 两路软件 VSync。现在把视线往前移一步：
+第 165 章从硬件 VSync 样本出发，解释了 Scheduler 怎样派生 App 与 SurfaceFlinger（下文简称 SF）两路软件 VSync。本章向前追一层：
 
-> SurfaceFlinger 为什么选择某个刷新率？
+> SF 为什么选中某个刷新率，又凭什么认为这次切换已经走到下一阶段？
 
-常见回答是“看内容 fps”，但源码里的真实决策远不止这一项：
+“根据内容 fps 选刷新率”只说中了中间一环。r48 的完整输入至少包括：
 
 ```text
-硬件支持哪些display config
-+ DisplayManager允许哪些范围
-+ Layer是动画、低频、启发式，还是显式setFrameRate
-+ Layer面积与焦点权重
-+ 内容帧率能否整除显示刷新率
-+ touch boost
-+ idle降频
-+ display power恢复保护
-+ 刷新率切换是否尚在进行
-= 最终候选config
+HWC display configs
+        ↓ 尺寸、DPI、config group、Policy
+合法候选 config
+        ↑
+Layer 显式请求、更新节奏、动画、面积、焦点
+        ↑
+touch / idle / display-power
 ```
 
-本章回答：
+选出目标之后，还要依次经过 desired、upcoming、HAL 请求、present fence、SF active config 与 VSync period 模型。它们不是同一个状态，也没有一个返回值能一次证明全部完成。
 
-1. HWC config、config id、config group、fps、vsync period 有何区别？
-2. 为什么相同 fps 也可能对应多个 config？
-3. `primaryRange` 与 `appRequestRange` 为什么是两层政策边界？
-4. `LayerHistory` V1 与 V2 在 r48 如何选择？
-5. 内容检测关闭时，为何仍保留 LayerHistory？
-6. BufferStateLayer、BufferQueueLayer 和 animation transaction 在哪里写历史？
-7. desired present time 与 queue time 如何共同参与 fps 推断？
-8. 为什么刚出现的新 Layer 默认偏向 Max，而不是立刻猜低 fps？
-9. 动画、低频内容和稳定视频分别投什么票？
-10. `Surface.setFrameRate()` 的 Default 与 Fixed Source 如何映射到 vote？
-11. Layer 面积和焦点如何影响评分？
-12. 24 fps 为什么可能选择 60、72、120 Hz，而不是“必须 24 Hz”？
-13. touch 与 idle 谁优先？显式 vote 能否阻止 touch boost？
-14. DisplayPower 非正常状态为何强制性能档？
-15. 从“选中 config”到“HWC 真正切换”经过哪些阶段？
-16. config changed 事件为什么可能被 idle 切换抑制？
+本章重点回答：
 
-一句话总览：
+1. config id、fps、VSync period 与 config group 分别是什么；
+2. `primaryRange` 与 `appRequestRange` 怎样限制候选；
+3. LayerHistory V2 怎样从 buffer、动画和 `setFrameRate()` 形成 vote；
+4. unknown、infrequent、animating 与 stable content 为什么得到不同票；
+5. 六类 vote 怎样给候选打分，面积和焦点怎样参与；
+6. touch、idle、display-power 为什么可能绕过常规评分；
+7. 从 Scheduler 选中 config 到新 period 被模型确认，究竟有几个完成点。
 
-> `LayerHistory` 把可见 Layer 的显式意图、更新节奏和空间权重整理成 vote；`RefreshRateConfigs` 先用 policy/config group 筛出合法候选，再按整倍频匹配、权重、焦点及全局 touch/idle/display-power 信号选出 config；SurfaceFlinger 随后异步请求 HWC 切换，并在 present fence 与 VSync period 样本分别证明不同阶段后，更新内部 active config 和 VSync 模型。
+先记住本章结论：
+
+> `LayerHistoryV2` 负责把 Layer 事实压缩成需求，`RefreshRateConfigs` 负责在 Policy 允许的候选中决策，SF 负责把目标异步交给 HWC；present fence 与硬件 VSync 样本分别支撑“SF 更新 active config”和“预测模型确认 period”，二者不能互相代替。
 
 ---
 
-## 2. 全链路图
+## 2. 先建立四层状态与四个完成点
+
+动态刷新率最容易读错，是因为源码里同时存在四份“刷新率”：
+
+| 状态 | 含义 | 典型字段 |
+|---|---|---|
+| preferred | Scheduler 当前算法选出的目标 | `mFeatures.configId` |
+| desired/upcoming | SF 缓存的最新目标、已提交给 HWC 的这一代目标 | `mDesiredActiveConfig`、`mUpcomingActiveConfig` |
+| active config | SF 认为显示当前采用的 config | `DisplayDevice::getActiveConfig()`、`mCurrentRefreshRate` |
+| predictor period | 软件 VSync 模型当前使用的周期 | `VSyncReactor` / tracker period |
+
+一次切换也至少有四个不同完成点：
+
+```text
+① RefreshRateConfigs 选出目标 config
+② setActiveConfigWithConstraints() 返回：HWC 接受或拒绝请求
+③ 上一帧 present fence 不再 pending：SF 假定 HWC 已更新并改 active 账
+④ 新周期硬件 VSync 样本通过确认：VSync 模型改用新 period
+```
+
+其中：
+
+- ② 不等于像素已经显示；
+- ③ 是 SF 基于 present fence 的状态推进，不是面板寄存器同步读回；
+- ④ 只证明 period confirmation 逻辑通过，也不是某个 App buffer 已经 present。
+
+完整链路可以画成：
 
 ```mermaid
 flowchart LR
-    HWC["HWC Display Configs<br/>尺寸/DPI/group/period"] --> RRC["RefreshRateConfigs<br/>候选与Policy"]
-    DM["DisplayManager Policy<br/>primary/appRequest范围"] --> RRC
-    BUF["Layer buffer / desiredPresentTime"] --> LH["LayerHistory V2"]
-    TX["Animation transaction"] --> LH
-    API["Surface.setFrameRate"] --> LH
-    AREA["Layer可见面积/Display面积"] --> LH
-    FOCUS["WMS frameRateSelectionPriority"] --> LH
-    LH --> SUM["LayerRequirement Summary"]
-    TOUCH["Touch timer"] --> SELECT["Scheduler选择"]
-    IDLE["Idle timer"] --> SELECT
-    POWER["Display power timer"] --> SELECT
-    SUM --> SELECT
-    RRC --> SELECT
-    SELECT --> DESIRED["SurfaceFlinger desired config"]
-    DESIRED --> HAL["HWC setActiveConfigWithConstraints"]
-    HAL --> PRESENT["Present fence确认一次提交完成"]
-    PRESENT --> ACTIVE["SF更新active config"]
-    HAL --> VS["新period的硬件VSync样本"]
-    VS --> MODEL["VSync模型确认period"]
+    H["HWC configs"] --> P["Policy 过滤"]
+    B["Buffer/Animation/setFrameRate"] --> L["LayerHistoryV2"]
+    L --> R["LayerRequirement summary"]
+    T["Touch / Idle / DisplayPower"] --> S["RefreshRateConfigs 选择"]
+    P --> S
+    R --> S
+    S --> D["SF desired config"]
+    D --> C["HWC setActiveConfigWithConstraints"]
+    C --> F["非 pending present fence"]
+    F --> A["SF active config"]
+    C --> V["新周期 HWC VSync 样本"]
+    V --> M["VSync model period"]
 ```
 
-这张图有两个独立的“确认”：
-
-- present fence 解除 `mSetActiveConfigPending`，SF 据此更新 active config 账；
-- HWC VSync 样本让 Reactor/DispSync 确认新 period，VSyncModulator 才结束 refresh-rate-change early 状态。
-
-它们不能合并成一个“刷新率切换完成”布尔值。
+后文每读到“current”“changed”或“completed”，都要先问它属于哪一层。
 
 ---
 
-## 3. 源码地图
+## 3. 源码地图与建议阅读顺序
+
+主要 native 文件：
 
 ```text
 frameworks/native/services/surfaceflinger/
-├── SurfaceFlinger.cpp
-├── Layer.cpp / Layer.h
+├── SurfaceFlinger.cpp / .h
+├── SurfaceFlingerDefaultFactory.cpp
+├── Layer.cpp / .h
 ├── BufferStateLayer.cpp
 ├── BufferQueueLayer.cpp
+├── DisplayHardware/
+│   └── HWC2.cpp
 └── Scheduler/
-    ├── Scheduler.cpp / Scheduler.h
+    ├── Scheduler.cpp / .h
     ├── RefreshRateConfigs.cpp / .h
     ├── LayerHistory.cpp / .h
     ├── LayerHistoryV2.cpp
-    ├── LayerInfo.cpp / .h
     ├── LayerInfoV2.cpp / .h
-    └── PhaseOffsets.cpp / .h
-
-frameworks/base/core/java/android/view/
-├── Surface.java
-└── SurfaceControl.java
-
-frameworks/native/libs/gui/
-├── Surface.cpp
-└── SurfaceComposerClient.cpp
+    ├── VSyncReactor.cpp
+    └── VSyncModulator.cpp
 ```
 
-建议按三条线阅读：
+Java/API 入口可辅助理解：
 
 ```text
-候选线：HWC Config → RefreshRateConfigs → Policy过滤
-证据线：Layer更新 → LayerInfoV2 → LayerRequirement
-执行线：choose → setDesiredActiveConfig → HWC → active/model确认
+frameworks/base/core/java/android/view/Surface.java
+frameworks/base/core/java/android/view/SurfaceControl.java
+frameworks/native/libs/gui/Surface.cpp
+frameworks/native/libs/gui/SurfaceComposerClient.cpp
 ```
+
+建议按三条线分别追，不要一开始就在所有回调之间跳转：
+
+```text
+候选线：HWC Config → RefreshRateConfigs → Policy → 两个候选表
+证据线：Layer 更新 → LayerInfoV2 → LayerHistoryV2 → Summary
+执行线：choose → desired → HWC → present fence / period sample
+```
+
+V1 仍在源码中，但 r48 工厂默认选择 V2。本文以 V2 为主，只在会影响判断时对照 V1。
 
 ---
 
-## 4. 先分清 config id、fps、period 和 group
+## 4. RefreshRateConfigs：先筛出能选的 config
 
-`RefreshRateConfigs::RefreshRate` 保存：
+### 4.1 config id 不是 fps
+
+`RefreshRateConfigs::RefreshRate` 同时保存：
 
 ```cpp
 HwcConfigIndexType configId;
-shared_ptr<const HWC2::Display::Config> hwcConfig;
-string name;
+std::shared_ptr<const HWC2::Display::Config> hwcConfig;
+std::string name;
 float fps;
 ```
 
-### config id
+四者角色不同：
 
-是 HWC config 向量中的身份/位置。系统真正请求 HWC 切换时传的是 config id，不是直接传 float fps。
+- `configId` 是交给 HWC 的具体 mode 身份；
+- `hwcConfig` 还包含尺寸、DPI、group、period 等硬件属性；
+- `fps` 由 `1e9 / vsyncPeriod` 换算，便于策略比较；
+- `name` 只是日志友好的表现形式。
 
-### vsync period
+两个 config 完全可能同为 60 Hz，却属于不同分辨率或 config group。因此，排障不能只说“当前是 60”，必须同时核对 config id。
 
-来自 HWC config：
+`RefreshRate::operator==` 也不是只比较 fps，而是比较 config id 与 config 对象。
 
-```cpp
-nsecs_t getVsyncPeriod() const;
-```
-
-fps 由：
-
-```text
-fps = 1,000,000,000 / periodNs
-```
-
-换算。float fps 是便于策略比较的人类表达，period 才是时序模型的基础量。
-
-### config group
-
-Android 11 的 HWC config 可带 group。group 通常用来表示可在某类约束下切换的一组 mode；平台代码默认只在 default config 的同一 group 内选择。
-
-### 尺寸与 DPI
-
-候选过滤还要求 width、height、dpiX、dpiY 与 default config 完全相同。
-
-因此：
-
-> “设备声明支持 120 Hz”不代表当前 policy 下 120 Hz config 一定是合法候选；分辨率、DPI、group 和范围任一不匹配都可能被过滤。
-
----
-
-## 5. 为什么相同 fps 也不能只用 fps 当身份
-
-可能存在：
-
-```text
-config 0：1080×2400，60 Hz，group 0
-config 1：1080×2400，60 Hz，group 1
-config 2：1440×3200，60 Hz，group 2
-```
-
-三者 fps 一样，但硬件 mode 不同。
-
-`RefreshRate::operator==` 比较的是 config id 与 config 对象，不是只比 fps。`setCurrentConfigId()` 也保存指向具体 `RefreshRate` 的指针。
-
-所以日志里“60fps”只是名字：
-
-```cpp
-StringPrintf("%.0ffps", fps)
-```
-
-不能代替 config id 做故障定位。
-
----
-
-## 6. Policy：primaryRange 与 appRequestRange
+### 4.2 Policy 有两层范围
 
 ```cpp
 struct Policy {
@@ -202,905 +169,764 @@ struct Policy {
 };
 ```
 
-### primaryRange
-
-DisplayManager 的常规指导范围。没有明确 App 请求时，系统一般留在这个范围。
-
-### appRequestRange
-
-外层硬边界。显式 `setFrameRate()` 等条件可以让选择走出 primaryRange，但绝不能走出 appRequestRange。
-
-合法 policy 必须满足：
+可以把两层范围理解为：
 
 ```text
-defaultConfig存在
-defaultConfig fps落在primaryRange
-appRequestRange.min ≤ primaryRange.min
-appRequestRange.max ≥ primaryRange.max
+primaryRange    = 日常自动选择范围
+appRequestRange = 任何选择都不能越过的外层范围
 ```
 
-两层范围可以理解为：
+没有特殊的 App 明确信号时，评分通常只能影响 primary 范围；特定的 focused `ExplicitDefault` 可以给 primary 外的候选计分，但该候选仍必须位于 app-request 范围。
+
+合法 Policy 还要求：
 
 ```text
-appRequestRange = 绝对可用边界
-primaryRange    = 日常自动选择边界
+defaultConfig 存在并落在 primaryRange
+appRequestRange.min <= primaryRange.min
+appRequestRange.max >= primaryRange.max
 ```
 
-此外还有 display-manager policy 与 override policy 两份；override 主要供测试使用，存在时覆盖前者，清除后恢复 DisplayManager policy。
+代码分别保存 DisplayManager policy 与 override policy。override 存在时覆盖前者，清除后重新使用 DisplayManager policy。
 
----
+### 4.3 候选还受物理属性约束
 
-## 7. constructAvailableRefreshRates 如何筛候选
-
-每次 policy 改变，代码重建两个有序列表：
+`constructAvailableRefreshRates()` 分别构建：
 
 ```text
 mPrimaryRefreshRates
 mAppRequestRefreshRates
 ```
 
-过滤条件是：
+一个 config 要进入相应列表，必须满足：
 
 ```cpp
-same width
-&& same height
-&& same dpiX
-&& same dpiY
+same width && same height
+&& same dpiX && same dpiY
 && (allowGroupSwitching || same configGroup)
 && fps in requested range
 ```
 
-然后按 period 从大到小排序，也就是 fps 从低到高。period相同再按 config group 降序。
+这里的参照物是 Policy 的 `defaultConfig`。所以“面板支持 120 Hz”不等于“当前能选 120 Hz”：它可能被尺寸、DPI、group 或范围过滤掉。
 
-这使：
+列表按 VSync period 从大到小排序，也就是 fps 从低到高；period 相同再按 group 降序。因此：
 
 ```text
-front() = 该列表最低刷新率
-back()  = 该列表最高刷新率
+front() = 最低刷新率
+back()  = 最高刷新率
 ```
 
-源码里的 `getMinRefreshRateByPolicyLocked()` 和 `getMaxRefreshRateByPolicyLocked()` 正是取 primary 列表的 front/back。
+评分只遍历 `mAppRequestRefreshRates`，但普通 Layer 对 primary 外候选通常不给分。这是“外层候选池”和“谁有资格影响外层候选”两道不同的门。
 
 ---
 
-## 8. r48 默认选择 LayerHistory V2，但内容检测默认可关闭
+## 5. 功能开关、默认 vote 与三类历史输入
 
-Scheduler 工厂传入两个开关：
+### 5.1 V2 默认打开，不等于内容检测默认打开
+
+工厂创建 Scheduler 时传入：
 
 ```cpp
-useContentDetectionV2 =
-    property_get_bool("debug.sf.use_content_detection_v2", true);
-
-useContentDetection =
-    ro.surface_flinger.use_content_detection_for_refresh_rate
-    // helper调用的默认值为false
+property_get_bool("debug.sf.use_content_detection_v2", true)
+sysprop::use_content_detection_for_refresh_rate(false)
 ```
 
-因此这份代码的缺省倾向是：
+因此未被设备配置覆盖时：
 
 ```text
-LayerHistory实现：V2
-内容启发式检测：若设备未配置属性，则关闭
+LayerHistory 实现：V2
+普通内容 fps 启发式检测：关闭
 ```
 
-这并不矛盾。即使内容检测关闭，LayerHistory V2 仍用于：
+这并不矛盾。即使内容检测关闭，LayerHistory 仍要承接显式 frame-rate API、默认 Max vote、面积和焦点等信息。
 
-- 接收 `setFrameRate()` 显式 vote；
-- 为普通 Layer 默认产生 Max vote；
-- 计算面积、焦点等需求；
-- 参与 touch/idle 与 policy 选择。
+### 5.2 注册 Layer 时先给默认票
 
-不能因为 `use_content_detection=false` 就说“动态刷新率代码完全不用 LayerHistory”。
+`Scheduler::registerLayer()` 的 r48 分支如下：
 
----
-
-## 9. Layer 注册时的默认 vote
-
-`Scheduler::registerLayer()`：
-
-| Layer/配置 | 默认 vote |
+| 条件 | 默认 vote |
 |---|---|
-| Status Bar | NoVote |
-| 内容检测关闭的普通 Layer | Max |
-| V1 内容检测，普通 Layer | Heuristic |
-| V1 Wallpaper | Heuristic，但 highFps 被限制到 min |
-| V2 内容检测，Wallpaper | Min |
-| V2 内容检测，普通 Layer | Heuristic |
+| Status Bar | `NoVote` |
+| 内容检测关闭的普通 Layer | `Max` |
+| V1 普通 Layer | `Heuristic` |
+| V1 Wallpaper | `Heuristic`，但传入的 high fps 是设备最低档 |
+| V2 Wallpaper | `Min` |
+| V2 普通 Layer | `Heuristic` |
 
-状态栏不参与，是为了避免一个长期可见的系统装饰层无意主导内容刷新率。
+显式请求被清除后，Layer 会回到这里保存的 default vote，而不是继续沿用上一次显式 fps。
 
-V2 中 wallpaper 直接 Min；普通新内容在没有足够数据时会从 Heuristic 退化为 Max，优先保证动画启动流畅。
+### 5.3 BufferStateLayer 提供 desired present time
 
----
-
-## 10. 哪些事件会写 LayerHistory
-
-### BufferStateLayer
-
-设置 buffer 时：
+`BufferStateLayer::setBuffer()` 把非正的 desired time 规范为 0，然后记录：
 
 ```cpp
 mScheduler->recordLayerHistory(
         this, desiredPresentTime,
-        LayerUpdateType::Buffer);
+        LayerHistory::LayerUpdateType::Buffer);
 ```
 
-`desiredPresentTime <= 0` 会先规范成 0。
+### 5.4 BufferQueueLayer 区分自动时间戳
 
-### BufferQueueLayer
-
-`onFrameAvailable()`：
+`BufferQueueLayer::onFrameAvailable()`：
 
 ```cpp
 const nsecs_t presentTime =
         item.mIsAutoTimestamp ? 0 : item.mTimestamp;
-recordLayerHistory(this, presentTime, Buffer);
 ```
 
-### animation transaction
+自动 timestamp 不被当成客户端提供的 desired present time。
 
-带 `eAnimation` flag 的事务会对关联 Layer 记录：
+### 5.5 动画事务与 setFrameRate
 
-```cpp
-LayerUpdateType::AnimationTX
+带 `eAnimation` 的事务记录 `AnimationTX`。`Layer::setFrameRate()` 则在修改 current state 前记录 `SetFrameRate`，从而把 Layer 激活，让新请求有机会进入后续 summary。
+
+这三个输入不要混为“实际显示时间”：
+
+```text
+Buffer         → desired time 或 0，并同时记录实际 queue 时刻
+AnimationTX    → 最近是否发生动画事务
+SetFrameRate   → 激活 Layer，具体 vote 来自随后提交到 drawing state 的 FrameRate
 ```
 
-### setFrameRate
-
-`Layer::setFrameRate()` 在修改 Layer current state 前先记录：
-
-```cpp
-recordLayerHistory(this, systemTime(), SetFrameRate);
-```
-
-它的作用之一是把 Layer 激活，让新 vote 能进入下一次 summarize；不是说 API 调用时间就是内容帧率样本。
+present fence 仍是另一条完成证据。
 
 ---
 
-## 11. LayerInfoV2 记录的不是一个“fps字段”
+## 6. LayerInfoV2：从时间样本生成一张票
 
-每条 frame data：
+### 6.1 一条样本保存什么
+
+源码字段名是 `presetTime`，注释明确它表示 desired present time：
 
 ```cpp
 struct FrameTimeData {
-    nsecs_t presetTime; // 源码字段拼作preset，含义是desired present time
+    nsecs_t presetTime;
     nsecs_t queueTime;
     bool pendingConfigChange;
 };
 ```
 
-`setLastPresentTime()` 还记录：
+每次记录还会更新：
 
 ```text
-mLastUpdatedTime = max(presentTime, now)
-mLastAnimationTime（仅AnimationTX）
-最多90条frameTimes
+mLastUpdatedTime = max(lastPresentTime, now)
+mLastAnimationTime = max(lastPresentTime, now)  // 仅 AnimationTX
 ```
 
-为何取 max？
+取最大值是因为客户端可能提前 queue 一个目标在未来显示的 buffer。未来 desired time 会延长 Layer 的 active 时间，但仍不能证明它届时真的 present。
 
-> 客户端可能提交未来 desired present time。即使 buffer 现在就 queue，它仍应在目标时间附近保持 active，不能过早被 1.2 秒 active 窗口淘汰。
+`mFrameTimes` 最多保存 90 条。`onLayerInactive()` 不删除这些 frame time，而是推进 `mFrameTimeValidSince`、清 reported 状态和 rate 稳定历史；`clearHistory()` 才会进一步清空 frame times。
 
-但这也意味着异常遥远的未来时间会延长 Layer 活跃性；它不是“硬件已经 present”的证据。
+### 6.2 active、frequent、animating 是三道不同判断
 
----
-
-## 12. active、frequent、animating 是三种不同判断
-
-### active
-
-普通 Layer 必须：
+普通 Layer active 需要：
 
 ```text
-可见
-且 lastUpdatedTime >= now - 1.2s
+visible && lastUpdatedTime >= now - 1.2s
 ```
 
-显式 rate vote 的 Layer 在 V2 `isLayerActive()` 中始终保留 active，随后不可见时再把 vote 设成 NoVote。
+`getFrameRateForLayerTree().rate > 0` 的 Layer 会被一直保留为 active；但在 partition 时，如果它不可见，具体 vote 仍会被改成 `NoVote`。所以“保留 active”不等于隐藏 Layer 继续左右评分。
 
-### frequent
+frequent 的判断先找 1.2 秒 active window 内的 frame：
 
-至少看最近 3 帧；在 active window 内不足 3 帧就是不 frequent。达到窗口后按平均 queue rate 判断是否至少 10 fps。
+- 总历史少于 3 条时，代码先把未知 Layer 当作 frequent；
+- active window 内不足 3 条时，判为不频繁；
+- 否则用 queue time 的平均速率判断是否至少 10 fps。
 
-### animating
+animating 则只看最近 1.2 秒是否记录过 `AnimationTX`。
 
-最近 1.2 秒内发生过 animation transaction。
-
-三者作用：
-
-```text
-inactive       → 不进入当前active summary
-active但不频繁 → Min
-active且动画   → Max
-active稳定频繁 → 尝试Heuristic fps
-```
-
----
-
-## 13. 为什么新 Layer 或数据不足时投 Max
-
-`LayerInfoV2::getRefreshRate()`：
+### 6.3 `getRefreshRate()` 的优先级
 
 ```cpp
+if (explicit/default vote is not Heuristic) return it;
 if (isAnimating(now)) return Max;
 if (!isFrequent(now)) return Min;
-
-if (calculateRefreshRateIfPossible()) return Heuristic;
+if (heuristic can report fps) return Heuristic(fps);
 return Max;
 ```
 
-注意“数据不足”和“不频繁”不是一回事：
+这解释了新 Layer 为什么倾向 Max：少于 3 条历史时先被当作 frequent，但启发式计算又没有足够数据，最终落到 Max。系统先为可能刚启动的动画保留性能，观察到低频后才投 Min。
 
-- 少于 frequent window：`isFrequent()` 代码注释说未知内容可能正开始动画，因此直接认为 frequent；
-- 但历史不足 90 帧且不足 1 秒，heuristic 又算不出来；
-- 最终走 Max。
+若 Layer 刚从 animating 或 infrequent 回到 frequent，代码会先 `clearHistory(now)`，避免旧行为污染新阶段；本轮因样本清空，通常仍先回到 Max。
 
-这是保守启动策略：
+### 6.4 何时有足够数据
 
-> 不知道新内容速度时先给性能，观察到确实低频后才投 Min；获得足够且稳定的数据后才投具体 fps。
-
----
-
-## 14. heuristic 如何从时间序列算 fps
-
-先要求：
+启发式至少需要 2 帧，并同时满足：
 
 ```text
-至少2帧
-最旧帧不早于mFrameTimeValidSince
-并且：已积满90帧，或队列时间跨度达到1秒
+最旧样本不早于 mFrameTimeValidSince
+并且：样本已达到 90 条，或 queue-time 跨度达到 1 秒
 ```
 
-平均帧间隔优先使用 desired present time：
+“2 帧”只够形成 delta；“90 条或 1 秒”才是允许报告 heuristic 的数据量门。
+
+### 6.5 desired time 优先，queue time 只作有条件回退
+
+平均周期逐段计算，每段至少钳到设备最高刷新率的 period，防止零或极小 delta 推出超硬件上限的 fps。
+
+规则是：
+
+1. 所有相邻帧都有 desired time 时，用 desired-time delta；
+2. 任一段缺 desired time，且过去从未得到 reported fps，本轮返回 `nullopt`；
+3. 过去已有 reported fps 时，允许整轮改用 queue-time delta，检查节奏是否仍延续。
+
+这种回退主要照顾 render-ahead：生产者可能曾用 desired time 表达呈现节奏，后来不再携带它；此时 queue 节奏可以辅助验证，但不能在完全没有基线时直接代替呈现意图。
+
+### 6.6 稳定性与 known frame rate
+
+raw fps 为：
 
 ```text
-average = sum(max(presentDelta, highRefreshPeriod)) / deltaCount
+1e9 / averageFrameTime
 ```
 
-若某段缺 desired present time：
+它不会直接成为 display config。代码先用 `RefreshRateHistory` 判断近段计算值的最大最小差是否不超过 1 Hz，再映射到 closest known frame rate。
 
-- 过去从未可靠算出 reported fps：本轮不能计算；
-- 过去已有 reported fps：允许用 queue time delta 检查当前节奏是否仍匹配。
-
-每个 delta 至少钳到设备最高刷新率周期，防止零/极小时间差推导出超过硬件上限的 fps。
-
-然后：
+known 集合起始包含：
 
 ```text
-raw fps = 1e9 / averageFrameTime
-→ 送入稳定性历史
-→ 稳定后映射到closest known frame rate
+24, 30, 45, 60, 72
 ```
 
----
+再加入硬件所有 config 的 fps，以 0.01 fps 容差去重。稳定历史按 2 秒和 `HISTORY_SIZE=90` 淘汰；由于 `add()` 在 size `>= 90` 时就弹出首项，实现中稳定队列实际不会保留满 90 项。
 
-## 15. known frame rates 与稳定性过滤
+不稳定时继续使用上一次 reported 值。raw 变化不超过 1 Hz，或归一结果仍与上次 reported 相同，也不会更新输出。这些门共同抑制 mode 来回摆动。
 
-候选已知内容帧率初始包含：
+### 6.7 config change 样本为何让本轮放弃计算
 
-```text
-24、30、45、60、72
-```
-
-再加入硬件所有 config 的 fps，排序并以 0.01 fps 容差去重。
-
-`findClosestKnownFrameRate()` 不是选择 display config；它只是把推测的内容 fps 归一到已知 rate。
-
-此外 `RefreshRateHistory`：
-
-- 最多保留约 90 个计算值；
-- 时间窗口 2 秒；
-- max-min 不超过 1 Hz 才算 consistent；
-- 不稳定时继续返回上一次已报告值；
-- raw 变化与上次 calculated 相差需超过 1 Hz，并且归一后的 reported 也不同，才更新。
-
-这些防抖意味着内容从 24 切 60 不会靠单个 buffer 立刻改票。
-
----
-
-## 16. config change 期间为何放弃一次启发式计算
-
-SF 发起刷新率切换时：
+SF 发起切换时调用：
 
 ```cpp
 mScheduler->setConfigChangePending(true);
 ```
 
-切换流程收尾时再 false。
+该布尔值被复制进新 `FrameTimeData`。计算相邻 delta 时，只要两端任一个样本带 pending 标记，就直接返回 `nullopt`，避免把新旧 period 过渡误判为内容节奏。
 
-LayerInfoV2 把该标记复制进每个 FrameTimeData。计算相邻 delta 时，只要任一端处在 config change：
-
-```cpp
-if (a.pendingConfigChange || b.pendingConfigChange) {
-    return nullopt;
-}
-```
-
-原因：切换期间 queue/present 节拍可能被旧、新 period 和 HWC transition 混合污染。与其把过渡抖动误判为内容 fps，不如本轮不更新 heuristic，暂用之前值或 Max。
+它只影响 heuristic 帧间隔计算：不会冻结所有 vote，也不会阻止显式请求或全局信号参与选择。
 
 ---
 
-## 17. 显式 setFrameRate 如何变成两类 vote
+## 7. 显式 frame-rate vote、Layer tree 与焦点
 
-Java：
+### 7.1 Java compatibility 到 native vote
 
-```java
-surface.setFrameRate(frameRate, compatibility);
-```
+两种主要 compatibility 的映射是：
 
-两种 compatibility：
-
-| Java 常量 | Layer 内部 | RefreshRate vote |
+| Java 语义 | Layer 内部类型 | LayerHistory vote |
 |---|---|---|
-| DEFAULT | `FrameRateCompatibility::Default` | ExplicitDefault |
-| FIXED_SOURCE | `ExactOrMultiple` | ExplicitExactOrMultiple |
+| `DEFAULT` | `FrameRateCompatibility::Default` | `ExplicitDefault` |
+| `FIXED_SOURCE` | `ExactOrMultiple` | `ExplicitExactOrMultiple` |
 
-Default 适合 UI、游戏等可适应系统 rate 的内容；Fixed Source 适合视频等天然固定帧率内容。
+`frameRate == 0` 表示移除具体 rate。若 Layer tree 没有其他 vote，它会回到注册时的 default vote。
 
-`frameRate == 0` 用于清除具体 rate；Layer 会恢复 default vote，而不是永久保留上一显式 fps。
+### 7.2 tree vote 不等于父子复制相同 fps
 
-Layer tree 还会聚合父子中的 frame-rate vote；frame-rate-selection priority 若本 Layer 未设置，会沿 parent 向上查找。
+`updateTreeHasFrameRateVote()` 遍历父节点和整棵子树，统计 Default 或 NoVote 类型，并把“树中存在相关 vote”写到各节点。
 
----
+`getFrameRateForLayerTree()` 的行为是：
 
-## 18. 焦点怎样进入 native 评分
+```text
+本 Layer 有 rate 或明确 NoVote → 返回自身 FrameRate
+自身没 rate，但 treeHasFrameRateVote → 返回 rate=0 的 NoVote
+否则 → 返回自身默认空 FrameRate
+```
 
-WMS/特权事务可写 `frameRateSelectionPriority`。SF 只把两种特殊 priority 判断为 focused：
+因此，树标记主要防止同一父子树里没有明确请求的邻接 Layer 再用 heuristic/default 票干扰；它不是把某个子 Layer 的具体 fps 广播给所有亲属。
 
-```cpp
+源码注释还明确：`ExactOrMultiple` 不计入 `treeHasFrameRateVote` 的这组统计，与后续允许 touch boost 的策略相呼应。
+
+### 7.3 焦点来自 priority 继承
+
+如果本 Layer 的 drawing state 没设置 `frameRateSelectionPriority`，`getFrameRateSelectionPriority()` 会沿 parent 向上查找。只有：
+
+```text
 PRIORITY_FOCUSED_WITH_MODE
 PRIORITY_FOCUSED_WITHOUT_MODE
 ```
 
-LayerHistory summary 记录 boolean `focused`。
+被 `isLayerFocusedBasedOnPriority()` 视为 focused。
 
-在 `getBestRefreshRate()` 中，primaryRange 外的候选通常不评分；唯一例外是：
+焦点不会直接把某一票变成最高分。它唯一关键的越界能力是：
 
-```text
-focused && ExplicitDefault
-```
+> focused 的 `ExplicitDefault` 可以给 primaryRange 外、appRequestRange 内的候选计分。
 
-所以显式请求不等于都能越过 primaryRange：
+非焦点 `ExplicitDefault`、`ExplicitExactOrMultiple` 和 Heuristic 都没有这条例外。
 
-- ExactOrMultiple 即使显式，也没有这条例外；
-- 非焦点 ExplicitDefault 也没有；
-- 所有候选仍必须位于 appRequestRange。
-
-这是一条很容易被“显式请求优先”口号掩盖的精确边界。
+r48 的 `LayerHistoryV2` 构造函数读取 `debug.sf.use_frame_rate_priority` 到 `mUseFrameRatePriority`，但该成员在这份 `.cpp` 的后续逻辑中没有被使用。不能仅凭属性名声称把它设为 false 就会关闭焦点作用。
 
 ---
 
-## 19. V2 的面积权重
+## 8. LayerHistoryV2：把活跃 Layer 压成 Summary
 
-`LayerHistoryV2::summarize()`：
+`LayerHistoryV2::summarize()` 先 partition active/inactive/expired Layer，再为 active Layer 生成：
 
 ```cpp
-Rect bounds = strong->getBounds();
-Rect transformed = transform.transform(bounds, roundOutwards);
-
-float layerArea = transformed.width * transformed.height;
-float weight = mDisplayArea
-        ? layerArea / mDisplayArea
-        : 0.0f;
+LayerRequirement {
+    name,
+    vote,
+    desiredRefreshRate,
+    weight,
+    focused
+}
 ```
 
-主显示区域由 SF 在显示建立/尺寸变化时传给 Scheduler。
+`NoVote` 在这里直接跳过，不进入 summary。
 
-直觉是：全屏视频应比一个小浮窗更能左右显示 mode。
+### 8.1 可见性与显式 vote 的细边界
 
-但源码边界也要看清：
+有正 rate 的显式 Layer 即便很久不更新，也留在 active 分区；但不可见时被转换为 `NoVote`。普通 Layer 则必须可见且最近 1.2 秒有更新。
 
-- 使用 transformed bounds 的面积，不是精确可见 region 面积；
-- 没有在此处显式扣除遮挡；
-- 源码注释说 weight 范围 `[0,1]`，但这里没有显式 clamp；异常 transform/bounds 是否超过要依赖上游状态；
-- displayArea 为 0 时所有权重为 0；
-- V1 的 summary 固定 weight=1，不做面积加权。
-
----
-
-## 20. 六类 Layer vote
-
-| Vote | 含义 | 是否带 desired fps |
-|---|---|---|
-| NoVote | 不关心 | 否 |
-| Min | 希望最低 | 否 |
-| Max | 希望最高/流畅优先 | 否 |
-| Heuristic | 系统从历史推算 | 是 |
-| ExplicitDefault | App给定，可适应非整倍频 | 是 |
-| ExplicitExactOrMultiple | App固定源，希望精确或整数倍 | 是 |
-
-聚合不是简单“票数最多者胜”，而是对每个合法 display rate 累计浮点 score。
-
----
-
-## 21. getBestRefreshRate 的早返回优先级
-
-```mermaid
-flowchart TD
-    P["DisplayPower非正常或恢复grace?"] -->|"是"| PMAX["primary Max"]
-    P -->|"否"| T0{"touch且无任何Explicit票?"}
-    T0 -->|"是"| TMAX["primary Max"]
-    T0 -->|"否"| I{"idle且touch不活跃<br/>且不受单档+显式例外?"}
-    I -->|"是"| IMIN["primary Min"]
-    I -->|"否"| N{"无有效层或全NoVote?"}
-    N -->|"是"| NMAX["primary Max"]
-    N -->|"否"| M{"只有NoVote+Min?"}
-    M -->|"是"| MMIN["primary Min"]
-    M -->|"否"| SCORE["对appRequest候选逐层评分"]
-    SCORE --> TLATE{"touch且无ExplicitDefault<br/>且能提高结果?"}
-    TLATE -->|"是"| TMAX
-    TLATE -->|"否"| BEST["最高分候选"]
-```
-
-DisplayPower boost 位于 `Scheduler::calculateRefreshRateConfigIndexType()` 外层，比 Layer score 更早；图中为完整调用链优先级，而不只是 `RefreshRateConfigs` 单函数。
-
----
-
-## 22. Touch、idle 与显式 vote 的细节
-
-### touch + 无任何 Explicit
-
-直接 primary Max。
-
-### touch + 有 ExplicitExactOrMultiple，但无 ExplicitDefault
-
-先正常评分；若结果低于 primary Max，再执行 touch boost。
-
-### touch + 有 ExplicitDefault
-
-先正常评分，末尾不会用 touch 覆盖。这类内容被认为通常也是交互型，应尊重其明确请求。
-
-### idle
-
-只有 `touch=false` 才走 idle Min。
-
-有一个例外：primaryRange 被锁成单一 rate，且存在显式 vote 时，idle 不抢先返回，允许显式请求在 appRequestRange 中被评分。
-
-### `outSignalsConsidered`
-
-它记录 touch/idle 是否真正决定了结果，而不是简单复制当前 timer 状态。SF 用它决定 config changed event 是否要抑制。
-
----
-
-## 23. Max vote 的评分
-
-候选按 fps 从低到高，最高候选为 `scores.back()`。
-
-Max Layer 对候选的分数：
+因此排障时要分开看：
 
 ```text
-(candidateFps / maxCandidateFps)² × weight
+是否仍在 active 容器
+是否 visible
+最终 summary 是否真的包含它
 ```
 
-例如候选 60/90/120 Hz：
+### 8.2 V2 权重来自 transformed bounds
 
-| 候选 | 原始分数 |
+```cpp
+Rect bounds = Rect(layer->getBounds());
+Rect transformed = transform.transform(bounds, true);
+float weight = displayArea ? transformedArea / displayArea : 0;
+```
+
+它表达“大面积内容通常更应影响整块屏幕的 mode”，但不是精确可见面积：
+
+- 没有扣除被其他 Layer 遮挡的 region；
+- 使用外接矩形式 transformed bounds；
+- `displayArea == 0` 时权重为 0；
+- 接口注释称 weight 在 `[0,1]`，此处实现没有显式 clamp。
+
+所以不能把 0.3 weight 解读为“屏幕上恰有 30% 像素可见”。V1 更简单，summary 中权重固定为 1。
+
+### 8.3 Summary 相等会跳过内容重算
+
+`Scheduler::chooseRefreshRateForContent()` 每轮先 summarize。若结果与缓存完全相同，就立即返回。
+
+这只跳过“内容 summary 未变化”的路径。touch、idle 和 display-power timer 状态变化会经 `handleTimerStateChanged()` 独立重算；Policy 更新也会重新求 preferred config。不要误读成刷新率只能在 Layer 列表变化时改变。
+
+---
+
+## 9. 六类 vote 怎样给每个候选打分
+
+六类 vote 的职责是：
+
+| Vote | 含义 | desired fps |
+|---|---|---|
+| `NoVote` | 不关心 | 无 |
+| `Min` | 倾向最低档 | 无 |
+| `Max` | 倾向性能档 | 无 |
+| `Heuristic` | 平台从历史推算 | 有 |
+| `ExplicitDefault` | App 给定，但允许系统适配 | 有 |
+| `ExplicitExactOrMultiple` | 固定源，希望精确或整数倍 cadence | 有 |
+
+聚合不是“票数最多者胜”，而是对 app-request 候选逐层累计 `layerScore * weight`。
+
+### 9.1 `NoVote` 与 `Min` 不进入普通计分
+
+两者在 score 循环中直接跳过。但函数有早返回：
+
+```text
+summary 为空或全 NoVote → primary Max
+全体只有 NoVote + Min，且至少有 Min → primary Min
+```
+
+这就是为何 `Min` 不需要给每个低档候选计算连续分数。
+
+### 9.2 `Max` 使用相对最高档的平方分数
+
+```text
+score = (candidateFps / highestAppRequestFps)^2
+```
+
+再乘 Layer weight。例如候选为 60/90/120 Hz，原始分数约为：
+
+| 候选 | Max score |
 |---|---:|
 | 60 | 0.25 |
 | 90 | 0.5625 |
 | 120 | 1.0 |
 
-再乘 Layer 面积 weight 并累加。
+注意分母是 app-request 候选列表最高档；但该 Layer 是否能给 primary 外候选计分，还受前面的资格门限制。
 
-只要存在至少一个 Max vote，最终相同最高分的 tie 会偏向更高刷新率；否则 tie 偏向更低刷新率省功耗。
+### 9.3 `ExplicitDefault` 把请求周期当作最小生产时间
 
----
+它寻找一个整数 multiplier，使：
 
-## 24. ExplicitDefault 的评分不是严格整倍频
+```text
+actualLayerPeriod = displayPeriod * multiplier
+actualLayerPeriod + 800us >= layerPeriod
+```
 
-它把 Layer period 看成“生产一帧所需的最小时间”，计算显示 VSync 的整数个数，使累计显示时间至少覆盖 Layer period：
+然后：
+
+```text
+score = min(1, layerPeriod / actualLayerPeriod)
+```
+
+这不是严格的“只有整数倍才得分”。Default 表达内容能够适应系统选择的 rate，因此相近但不完美的组合也能得分。
+
+### 9.4 `Heuristic` 与 `ExactOrMultiple` 看 cadence
+
+这两类共用 `getDisplayFrames()`：把 layer period 除以 display period，并用 800 μs margin 把接近边界的 remainder 当成 0。
+
+- 精确整数倍：score = 1；
+- 内容 rate 高于显示 rate：给一个较低的比例分；
+- 内容 rate 低于显示 rate但不整除：模拟误差回绕，最多检查 10 帧，score 为 `1 / iter`。
+
+例如 24 fps 内容周期约 41.67 ms，120 Hz 显示周期约 8.33 ms，每 5 个显示周期呈现一帧，cadence 可以完整对齐。因此 24 fps 内容并不要求硬件必须存在 24 Hz。
+
+### 9.5 primary 外评分资格
+
+对每个候选，代码先判断：
 
 ```cpp
-actualLayerPeriod = displayPeriod * multiplier;
-score = min(1, layerPeriod / actualLayerPeriod);
+if ((primaryRangeIsSingleRate || !inPrimaryRange) &&
+    !(layer.focused && layer.vote == ExplicitDefault)) {
+    continue;
+}
 ```
 
-800 μs margin 用来容忍 period 计算误差。
+尤其要看到 `primaryRangeIsSingleRate`：当 primary 被锁成单档时，普通 Layer 连这一个 primary 候选也不走常规 score；只有 focused `ExplicitDefault` 能给 app-request 候选打分。若最终所有 score 都是 0，函数明确回到 primary 的唯一档，而不是随手选 app-request 列表的一项。
 
-这种 compatibility 表达的是：
+### 9.6 tie 的方向由 Max vote 决定
 
-> 内容可适应系统选出的 rate，即使不是完美整数倍，也可以获得接近程度分数。
-
-所以 UI 请求 60 并不意味着显示器只能选 60；更高刷新率可能同样获得高分，并与其他 Layer、touch、policy 综合。
-
----
-
-## 25. Heuristic 与 ExactOrMultiple 的 cadence 评分
-
-先算：
+存在至少一个 Max vote 时，从高到低遍历候选；否则从低到高。helper 只有在新 score 大于当前最大值的 `1.001` 倍时才替换，因此近似平局会保留先遇到的候选：
 
 ```text
-layerPeriod / displayPeriod
-→ quotient + remainder
+有 Max → 近似平局偏高
+无 Max → 近似平局偏低
 ```
 
-若 remainder 在 800 μs 容差内视为 0，表示精确整数倍，score=1。
+r48 还计算了 `maxExplicitWeight`，但该局部量在后续函数中没有使用。变量名不能作为“最大显式权重有额外特权”的证据。
 
-例如：
+---
+
+## 10. 全局信号：哪些情况会绕过或改写评分
+
+### 10.1 DisplayPower 是最外层可选 boost
+
+如果设备配置了 display-power timer，并且：
 
 ```text
-24 fps内容周期 ≈ 41.67ms
-120Hz显示周期 ≈ 8.33ms
-41.67 / 8.33 ≈ 5
+显示电源状态不是 normal
+或刚恢复 normal、grace timer 仍处于 Reset
 ```
 
-120 Hz 可每 5 个显示周期呈现一帧，cadence 完整，分数高。
+`Scheduler::calculateRefreshRateConfigIndexType()` 直接返回 primary Max，不进入 V2 的 Layer 评分。
 
-若不整除，算法继续模拟误差在多个帧中的回绕，最多检查 10 帧：
+SF 只把 `PowerMode::ON` 视为 normal。每次 display power 状态变化都会清 LayerHistory；清理动作本身不依赖 timer 是否存在。若 timer 没被设备配置，则特殊 boost 分支不存在。
+
+### 10.2 touch 有前后两次机会
+
+`getBestRefreshRate()` 的规则不是“touch 永远最高”：
 
 ```text
-越快在较少帧内重新对齐 → 分数越高
-到第iter次才接近对齐       → score = 1/iter
+touch + 没有任何 Explicit* → 立即 primary Max
+
+touch + 有 Explicit* → 先正常评分
+    若没有 ExplicitDefault，且 normal result 低于 primary Max
+        → 末尾再 boost 到 primary Max
+    只要存在 ExplicitDefault
+        → 不做末尾 boost
 ```
 
-因此动态刷新率目标不是简单“display fps 离 content fps 最近”，而是：
+因此 `ExplicitExactOrMultiple` 会阻止第一次早返回，却不会阻止末尾 boost；`ExplicitDefault` 才会阻止末尾 boost。这里统计的是是否存在该类 Layer，不要求它一定是面积最大者。
 
-> 哪个显示周期能让内容以更规则的 cadence 呈现。
+### 10.3 idle 只在 touch 不活跃时抢先降频
 
----
-
-## 26. 为什么 24 fps 不一定切 24 Hz
-
-可能原因：
-
-1. 硬件根本没有 24 Hz config；
-2. 24 Hz config 分辨率/DPI/group 不匹配；
-3. policy primary/appRequest range 不允许；
-4. 48、72、120 都是 24 的整数倍，cadence 同样规则；
-5. 其他大面积/焦点 Layer 投 Max 或别的 rate；
-6. touch 正处于 active；
-7. DisplayPower grace 强制 Max；
-8. 当前历史尚不稳定，Layer 暂时投 Max；
-9. 选择相同分时，是否存在 Max vote 决定高/低 tie 方向。
-
-因此“内容 fps = 显示 Hz”只是一种可能，不是算法的不变量。
-
----
-
-## 27. 多 Layer 如何竞争：一个示意
-
-假设 120 Hz 主显示：
+满足：
 
 ```text
-全屏24fps视频：ExactOrMultiple，weight 0.90，focused=true
-小面积动画角标：Max，weight 0.05
-状态栏：NoVote
+!touch && idle
 ```
 
-视频给整倍频候选高分，小角标偏向最高档但权重很小。最终可能选一个适合 24 cadence 的中/高档。
+通常直接选 primary Min。例外是 primaryRange 只有单档且存在显式 vote，此时允许继续评分，让 focused `ExplicitDefault` 有机会使用 app-request 范围。
 
-若角标扩成全屏动画，weight 显著增大，Max 分数会更能影响结果。
+### 10.4 `consideredSignals` 不是 timer 状态副本
 
-但这只是按算法方向的示意；真实结果还取决于实际候选列表和 policy，不能脱离设备 config 手算结论。
+输出中的 touch/idle 只在该信号真正决定返回结果时置位。Scheduler 用它判断是否清历史，以及是否抑制 config changed event。
 
----
+### 10.5 kernel idle timer 是另一套机制
 
-## 28. V1 与 V2 的关键差异
+Scheduler idle timer 是用户空间选择信号；kernel idle timer 面向显示/DPU 无活动时的硬件低功耗。r48 还用约 65 Hz 阈值决定 kernel timer callback 中是否重新采样或停硬件 VSync event。
 
-| 项目 | V1 | V2 |
-|---|---|---|
-| 默认属性分支 | `use_content_detection_v2=false`时 | r48工厂默认true |
-| 每层权重 | 固定1 | transformed bounds / displayArea |
-| 更新历史 | 直接相邻present delta，30个fps平均 | 90帧/1秒数据、present优先、queue fallback |
-| 稳定性 | 较简单 | 2秒/90次、1Hz一致性 |
-| 动画 | record类型被忽略 | 最近animation直接Max |
-| config change污染 | 不记录pending | 任一相邻样本pending则放弃本轮计算 |
-| 新层/少数据 | recentlyActive门后计算 | unknown→Max，低频→Min |
-| 默认vote | register type参数被V1忽略 | 保留default vote |
-
-阅读 r48 默认行为应以 V2 为主，但调试设备属性时要确认没有切回 V1。
+两者可能共享“idle”一词，却不是同一个布尔值，也不能用一个 dump 字段替代另一个。
 
 ---
 
-## 29. 内容检测关闭时的一个反直觉结果
+## 11. Scheduler 何时重算，以及 App 为何可能收不到 config 事件
 
-内容检测关闭时普通 Layer 注册为 Max。因此：
+### 11.1 主循环先更新 Layer，再选择
 
-```text
-可见普通Layer活跃
-→ Max vote
-→ score偏向高刷新率
-```
-
-但显式 `setFrameRate()` 可以覆盖 Layer vote；idle 也可能提前选 Min；DisplayManager policy 还能把范围锁住。
-
-所以“关闭内容检测”不是永远固定最高档，而是：
-
-> 不再根据普通 Layer 的历史自动推测具体内容 fps，默认把它们当成性能优先；其他显式意图和全局政策仍生效。
-
----
-
-## 30. Scheduler 何时重新选择
-
-SF 主循环先处理 transaction 和 invalidate、更新 Layer 状态，然后在持有 `mStateLock` 时调用：
+`onMessageInvalidate()` 的主线先处理 transaction/invalidate，让 drawing state、可见性与 buffer 历史推进，然后持有 `mStateLock` 调用：
 
 ```cpp
 mScheduler->chooseRefreshRateForContent();
 ```
 
-顺序很重要：必须先把本轮 Layer 更新推进，summary 才能看到最新可见性、priority、frame-rate vote 与 buffer history。
+这样本轮 summary 才能看到最新 Layer 事实。
 
-`chooseRefreshRateForContent()`：
+内容路径依次做：
 
 1. `summarize(systemTime())`；
-2. 若 summary 与上次完全相同，直接返回；
-3. 更新 content requirements；
-4. 结合 timer/global signals 算 config id；
-5. id 不变时可能只补发此前被抑制的 config event；
-6. id 改变则 callback 给 SF `changeRefreshRate()`。
+2. summary 未变则返回；
+3. 缓存新的 content requirements；
+4. 结合全局信号算新 config id；
+5. id 相同则视情况补发缓存 config event；
+6. id 改变则回调 SF `changeRefreshRate()`。
 
-这意味着 timer 状态改变会走自己的 `handleTimerStateChanged()` 重算；不依赖 Layer summary 恰好变化。
+### 11.2 timer 状态变化独立重算
 
----
+touch、idle 与 display-power timer callback 都通过 `handleTimerStateChanged()` 比较旧新状态并重新调用选择算法。它们不需要等待下一次 Layer summary 改变。
 
-## 31. Touch timer
+新 transaction 和 Layer update 会 reset idle timer。`notifyTouchEvent()` 只在 touch timer 存在时 reset 它；若同时支持 kernel timer 且存在 idle timer，也会 reset idle timer。
 
-`notifyPowerHint(INTERACTION)` 最终调用：
+touch callback 只有在这次选择真正 `considered touch` 时才清 LayerHistory，而不是每个原始触摸通知都无条件清。
 
-```cpp
-mScheduler->notifyTouchEvent();
-```
+### 11.3 idle 切换可以抑制 App config changed
 
-有配置 touch timer 时：
-
-- reset timer；
-- timer callback 把 touch state 设为 Active/Inactive；
-- 状态变化立即重算 config；
-- 若本次 touch 真正被算法 considered，会清 LayerHistory，之后重新学习内容 fps；
-- 支持 kernel timer 且有 idle timer 时，touch 也会 reset idle timer。
-
-“触摸事件来了”与“touch boost 真正改变选择”不是同义词；`consideredSignals.touch` 记录后者。
-
----
-
-## 32. Idle timer
-
-新事务、Layer update 会调用 `resetIdleTimer()`。超时后 Scheduler 标记 idle，再重算。
-
-V2 算法中，满足条件时 idle 选择 primary Min，并把 `consideredSignals.idle=true`。
-
-SF 随后请求切换时使用：
+当 idle 真正决定选择时，Scheduler 回调 SF 使用：
 
 ```cpp
 ConfigEvent::None
 ```
 
-而不是 Changed。原因是 idle 降频不希望把 config changed 事件频繁广播给 App，避免无内容变化时反而触发新的工作。
+这样无内容活动时的降频不必立刻唤醒 App 处理配置事件。离开 idle 后，即使算出的 config id 与缓存目标相同，`dispatchCachedReportedConfig()` 仍可能补发此前抑制的最新 config。
 
-离开 idle 后，即使最终 config id 没变，Scheduler 也可能通过 `dispatchCachedReportedConfig()` 补发先前抑制的最新配置。
-
-因此：
-
-> 硬件 active config 变化与 App 是否收到 config changed event 是两条相关但可分离的状态。
-
----
-
-## 33. DisplayPower timer
-
-主显示 power mode 改变时，SF 调用：
-
-```cpp
-setDisplayPowerState(mode == PowerMode::ON)
-```
-
-只把严格 `ON` 视为 normal；OFF、DOZE、DOZE_SUSPEND 等都属于非正常。
-
-若设备配置了 display-power timer：
+所以：
 
 ```text
-power非normal
-或刚回normal但timer仍Reset/grace
-→ 直接primary Max
+HWC/SF 的 active config 改变
+≠ App 一定在同一时刻收到 config changed
 ```
 
-每次 display power 状态变化都会清 LayerHistory，避免拿熄屏/Doze 前的旧节奏立即降频；这个清理不依赖 display-power timer 是否存在。
+### 11.4 Policy 更新是另一入口
 
-这条 boost 的优先级高于 touch、idle 和 Layer vote。
-
-若设备没有配置该 timer，这条特殊分支不存在；不能把它写成所有 Android 11 设备必然行为。
+Policy 改变后，RefreshRateConfigs 重建候选，SF 通知 Scheduler 当前 primary config 参数、调整 kernel idle timer，再通过 `getPreferredConfigId()` 重新计算目标。若 Scheduler 还没有目标，则退回 Policy 的 default config。
 
 ---
 
-## 34. Kernel idle timer 与 Scheduler idle timer 不是同一个对象
+## 12. 从 preferred config 到 HWC 请求
 
-源码还有 `support_kernel_idle_timer` 相关逻辑：
+### 12.1 `setDesiredActiveConfig()` 建立异步目标
 
-- Scheduler idle timer 是用户空间 OneShotTimer，影响 refresh-rate choice；
-- kernel idle timer 可让显示/DPU 在无帧时进入硬件低功耗行为；
-- policy min 高于设备 min 时要关闭 kernel timer，避免内核越过 policy；
-- policy 只有单档时也可能关闭或 NoChange；
-- `kernelIdleTimerCallback()` 还会依据约 65 Hz 阈值决定是否重同步/停硬件 VSync event。
+Scheduler 的 callback 最终进入 SF `changeRefreshRateLocked()`，再次检查 config 是否仍被 Policy 允许，然后调用 `setDesiredActiveConfig()`。
 
-同名“idle”不要混成一个状态机。
+第一次建立 pending change 时，SF 会：
 
----
-
-## 35. 从选中 config 到发给 HWC
-
-```mermaid
-sequenceDiagram
-    participant SC as Scheduler
-    participant SF as SurfaceFlinger
-    participant H as HWC
-    participant VM as VSyncModulator
-    participant LH as LayerHistoryV2
-
-    SC->>SF: changeRefreshRate(config,event)
-    SF->>SF: setDesiredActiveConfig
-    SF->>SC: resyncToHardwareVsync(targetPeriod)
-    SF->>VM: onRefreshRateChangeInitiated
-    SF->>VM: setPhaseOffsets(target fps)
-    SF->>LH: configChangePending=true
-    SF->>SF: 下一次主循环performSetActiveConfig
-    SF->>H: setActiveConfigWithConstraints
-    H-->>SF: VsyncPeriodChangeTimeline
-    SF->>SF: 等待一次非pending present fence
-    SF->>SF: setActiveConfigInternal
-    H-->>SC: 新period硬件VSync样本
-    SC-->>VM: period确认后onRefreshRateChangeCompleted
+```text
+mDesiredActiveConfigChanged = true
+保存 desired config/event
+repaintEverythingForHWC()
+按目标 period 开始 hardware-VSync resync
+VSyncModulator::onRefreshRateChangeInitiated()
+切到目标 fps 对应的 phase offsets
+LayerHistory configChangePending = true
 ```
 
-若已有 desired change pending，新的选择只覆盖缓存的目标 config，并把前后 `ConfigEvent` 做 OR，避免丢失需要通知的语义。
+若旧切换尚未收尾，新请求不会并行创建第二条 HWC 状态机，而是覆盖 `mDesiredActiveConfig`；新旧 `ConfigEvent` 做按位 OR，以免丢掉需要通知的语义。
 
----
+`getActiveConfig()` 对主显示还有一个容易误导诊断的细节：若存在 desired config，它返回 desired id，而非 DisplayDevice 当前 active id。因此这个 Binder/API 结果也不能独立证明 HWC 已切完。
 
-## 36. setActiveConfigWithConstraints 的 timeline
+### 12.2 真正调用 HAL 在后续主循环
 
-SF 构造：
+SF 更新完 Layer 并完成选择后，主线程调用：
+
+```cpp
+performSetActiveConfig();
+```
+
+它重新检查：
+
+- 当前是否仍有 desired change；
+- display 是否存在；
+- desired 是否已经等于 active；
+- config 在执行时是否仍被 Policy 允许。
+
+通过后复制为 `mUpcomingActiveConfig`，构造：
 
 ```cpp
 constraints.desiredTimeNanos = systemTime();
 constraints.seamlessRequired = false;
 ```
 
-r48 此处 TODO 明确还未充分使用 constraints；它请求尽快切换且不强求 seamless。
+再调用 `setActiveConfigWithConstraints()`。r48 的 TODO 说明此处还没有充分利用 constraints；语义是请求尽快切换，不要求 seamless。
 
-HWC 返回 timeline：
+### 12.3 HAL 返回 timeline，不返回“像素已完成”
 
-- 是否需要额外 refresh；
-- refresh 应在何时发生；
-- 新 VSync period 预计何时应用。
+支持 HWC 2.4 period switch 时，Composer 返回：
 
-Scheduler 会缓存 timeline；若 `refreshRequired`，反复安排空刷新直到越过 refreshTime。过远的 new-vsync-applied time 还会被平台上限钳制。
+```text
+newVsyncAppliedTimeNanos
+refreshRequired
+refreshTimeNanos
+```
 
-r48 这里的平台上限是“当前时间 + 200 ms”；这是防止异常 timeline 把内部等待推得过远，并不是硬件必须在 200 ms 内完成切换的通用 HAL 保证。
+legacy fallback 则调用旧 `setActiveConfig()`，在 framework 侧合成一份 timeline，并把 `refreshRequired` 设为 true。
 
-所以“调用 HAL 返回成功”只表示切换请求被接受，不表示新 mode 此刻已经生效。
+HAL 调用失败时，r48 只记录 warning 并返回；它没有在这里清掉 desired-change 状态。后续主循环仍可能重试同一个 desired 目标。
 
----
-
-## 37. SF 怎样更新 active config 账
-
-`performSetActiveConfig()` 成功调用 HWC 后：
+HAL 调用成功后：
 
 ```cpp
+mScheduler->onNewVsyncPeriodChangeTimeline(outTimeline);
 mSetActiveConfigPending = true;
 ```
 
-后续 SF 帧开始时，如果上一 present fence 仍 pending：
+此刻 SF 还没有更新自己的 active config。
+
+---
+
+## 13. Timeline、present fence 与 period confirmation 各证明什么
+
+### 13.1 timeline 的 `refreshRequired` 驱动空刷新
+
+Scheduler 收到 timeline 后，若 `refreshRequired` 为 true，就请求 repaint。每次显示 present 前记录一个 `systemTime()`，present 调用返回后把这个时间传给 `onDisplayRefreshed()`：
 
 ```text
-再request invalidate
-然后return
+若 refreshTimeNanos < 本轮 present 调用前的时间
+    → 清 refreshRequired
+否则
+    → 再请求一次 repaint
 ```
 
-直到 fence 不再 pending，SF 假定 HWC 已成功更新 config，调用：
+这个比较用的不是 present fence signal time，而是调用 composition engine 前取得的时刻。
 
-```cpp
-setActiveConfigInternal();
+### 13.2 r48 只缓存并钳制 `newVsyncAppliedTimeNanos`
+
+Scheduler 把过远的 `newVsyncAppliedTimeNanos` 钳到 `now + 200ms`。但在这份 r48 SurfaceFlinger/Scheduler 源码中，该字段之后没有被读取来阻塞 active config 更新、等待 deadline 或确认 period；真正重复 repaint 的分支只看 `refreshRequired/refreshTimeNanos`。
+
+所以 200 ms 不是“HWC 必须在 200 ms 内完成”的保证，甚至不能描述为这里真的等待了 200 ms。它只是被保存 timeline 字段的上界处理。
+
+HWC 后续还可通过 `onVsyncPeriodTimingChangedReceived()` 提交更新后的 timeline，Scheduler 会覆盖缓存并重复同样处理。
+
+### 13.3 present fence 推进 SF active config
+
+下一次 invalidate 开始时，SF 检查上一帧 present fence：
+
+```text
+mSetActiveConfigPending && previous frame still pending
+    → 再 invalidate，提前返回
+
+mSetActiveConfigPending && previous frame no longer pending
+    → 清 mSetActiveConfigPending
+    → setActiveConfigInternal()
 ```
 
-内部才更新：
+源码注释很谨慎：SF 是“assume” HWC 已成功更新 config。随后内部才更新：
 
-- `RefreshRateConfigs::mCurrentRefreshRate`；
+- RefreshRateConfigs current config；
 - RefreshRateStats mode；
 - DisplayDevice active config；
-- 切换统计；
-- PhaseConfiguration/Modulator offsets；
-- 必要时向 App EventThread发送 config changed。
+- refresh-rate switch 计数；
+- PhaseConfiguration 与 VSyncModulator offsets；
+- 非 `None` event 对应的 App config changed。
 
-这仍是 Framework 根据 present fence 作出的确认，不是面板寄存器的同步读回。
+present fence 支撑的是这次 Framework 状态推进，不等于屏幕像素扫描完成回执。
 
----
+### 13.4 desired pending 在同轮后段正常收尾
 
-## 38. desiredActiveConfigChangeDone 的边界
+`setActiveConfigInternal()` 自身没有调用 `desiredActiveConfigChangeDone()`。但这次 invalidate 并不会在更新 active 后立即结束；后面仍会走到 `performSetActiveConfig()`。
 
-若：
-
-- display 无效；
-- desired 已等于 active；
-- desired config 在真正执行前已被新 policy 排除；
-
-`performSetActiveConfig()` 会调用 `desiredActiveConfigChangeDone()` 清理 pending。
-
-它还会：
-
-- 以最后 desired rate 重新 resync；
-- 更新 phase configuration；
-- `setConfigChangePending(false)`。
-
-但正常成功路径在本段源码中并不直接从 `setActiveConfigInternal()` 调这个 helper；成功后 `mSetActiveConfigPending` 和 active config 已更新，而 desired-change 标记的生命周期依赖后续路径/新请求继续处理。阅读时不要把 helper 名称自动当成所有成功切换都会执行的统一收尾点。
-
-这是 r48 值得继续用 trace/dump 验证的状态边界。
-
----
-
-## 39. 三个“当前刷新率”可能短暂不同
-
-切换中可同时存在：
+此时若没有更新目标覆盖 desired，函数看到：
 
 ```text
-Scheduler preferred/configId       算法刚选中的目标
-SurfaceFlinger desired/upcoming    已缓存或已发给HWC的目标
-DisplayDevice/RefreshRateConfigs current  SF已确认的active config
-VSync predictor currentPeriod      模型已从样本确认的周期
+display->getActiveConfig() == desiredActiveConfig.configId
 ```
 
-严格说是四份状态。
+便调用 `desiredActiveConfigChangeDone()`，清：
 
-诊断时若只看某一条日志，会误判：
+```text
+mDesiredActiveConfig.event
+mDesiredActiveConfigChanged
+LayerHistory configChangePending
+```
 
-- preferred 已是 120 Hz，但 HWC 还在 60 Hz；
-- HWC 请求已发出，但 present fence 未确认；
-- SF active config 已更新，但 predictor 尚在确认 period；
-- idle 切换发生了，但 App config event 被抑制。
+并再次按最后 desired period resync、刷新 phase offsets。
 
----
+若切换途中来了新目标，desired 已被覆盖；active 先更新为旧 upcoming，后段 `performSetActiveConfig()` 会发现新 desired 与 active 不同，继续向 HWC 发下一代请求，而不是错误地清掉新目标。
 
-## 40. 常见误解逐条纠正
+这比“成功路径没有收尾”更准确：收尾不在 `setActiveConfigInternal()` 内，而是依靠同轮后段再次进入 `performSetActiveConfig()`。
 
-### 误解 1：动态刷新率只看前台 App 的 fps
+### 13.5 硬件 VSync 样本独立确认 period
 
-错。它聚合多个 active Layer、面积、焦点、显式 vote、policy 和全局信号。
+`setDesiredActiveConfig()` 已让 Reactor 针对目标 period 开始 transition。后续 `onVsyncReceived()` 把硬件 timestamp 和可选 Composer period 交给 `addResyncSample()`。
 
-### 误解 2：硬件支持的所有 fps 都能随便选
+`VSyncReactor::periodConfirmed()`：
 
-错。尺寸、DPI、group、primaryRange 和 appRequestRange 都会过滤。
+- 若 Composer 直接给 period，要求与目标差值小于目标的 10%；
+- 否则至少需要前一个硬件 VSync，再比较相邻 timestamp distance，容差同为 10%。
 
-### 误解 3：内容检测关闭后 setFrameRate 也失效
+确认后 tracker 与 callbacks 才 `setPeriod(target)`，`periodFlushed=true`，SF 再调用：
 
-错。LayerHistory 仍存在，显式 vote 仍能覆盖默认 Max。
+```cpp
+mVSyncModulator->onRefreshRateChangeCompleted();
+```
 
-### 误解 4：desiredPresentTime 就是实际present fence时间
-
-错。它是客户端期望；实际完成由 present fence 等证据描述。
-
-### 误解 5：数据不足应按最低刷新率省电
-
-错。V2 对未知但可能开始动画的新内容倾向 Max；确认低频后才 Min。
-
-### 误解 6：Fixed Source 请求24fps就必须切24Hz
-
-错。整数倍 cadence、候选合法性和其他 Layer 都会影响结果。
-
-### 误解 7：显式 vote 都能越过 primaryRange
-
-错。评分代码只给 focused ExplicitDefault 这项例外，且仍不能越过 appRequestRange。
-
-### 误解 8：touch 永远压过显式请求
-
-错。ExplicitDefault 可以阻止末尾 touch boost；其他 explicit 类型走不同分支。
-
-### 误解 9：idle 降频一定通知 App config changed
-
-错。idle considered 时传 `ConfigEvent::None`，以后可能再补发缓存事件。
-
-### 误解 10：HWC setActiveConfig返回成功就是切换完成
-
-错。还有 timeline、refresh、present fence、SF active账和VSync period模型确认多个阶段。
+因此 active config 与 predictor period 可短暂分离；第 165 章所讲的 refresh-rate-change early offsets 就覆盖这一过渡窗口。
 
 ---
 
-## 41. macOS 只读练习
+## 14. 常见误解与一套可执行诊断顺序
 
-### 练习 1：画候选过滤器
+### 14.1 十个常见误解
+
+1. **“动态刷新率只看前台 App fps。”**  实际聚合多个 Layer、面积、焦点、显式请求与全局信号。
+2. **“面板支持的 Hz 都是候选。”**  尺寸、DPI、group 与 Policy 会先过滤。
+3. **“内容检测关闭，frame-rate API 也失效。”**  LayerHistory 仍存在，显式 vote 仍参与。
+4. **“desired present time 是实际显示时间。”**  它是客户端意图；queue 与 present fence 是别的事实。
+5. **“新 Layer 应先用最低档省电。”**  V2 对未知且可能开始动画的内容先倾向 Max。
+6. **“24 fps 必须配 24 Hz。”**  48、72、120 等整数倍也可能有完整 cadence。
+7. **“所有显式请求都能越 primaryRange。”**  只有 focused `ExplicitDefault` 有评分例外。
+8. **“touch 一定覆盖显式请求。”**  `ExplicitDefault` 会阻止末尾 boost，ExactOrMultiple 不会。
+9. **“idle 降频一定通知 App。”**  considered idle 使用 `ConfigEvent::None`，可延后补发。
+10. **“HAL 返回成功就是切换完成。”**  active 账与 period model 仍有独立确认链。
+
+### 14.2 为什么没有切到 X Hz：五层排查
+
+```mermaid
+flowchart TD
+    A["硬件是否有目标 config?"] --> B{"尺寸/DPI/group/Policy 合法?"}
+    B -->|否| X["候选池中不存在"]
+    B -->|是| C["核对每层 vote / fps / weight / focused"]
+    C --> D{"DisplayPower/Touch/Idle 早返回?"}
+    D --> E["核对每个候选 score 与 tie 方向"]
+    E --> F{"preferred 是否已变?"}
+    F --> G["desired/upcoming/HAL status"]
+    G --> H["present fence 与 SF active"]
+    H --> I["硬件 VSync 样本与 predictor period"]
+```
+
+按这个顺序比只盯 `ActiveConfigFPS` 更可靠。若第一层就被 Policy 排除，继续手算 cadence 没有意义；若 preferred 已正确，则要转入执行链而非继续怀疑评分。
+
+### 14.3 r48 特有的审计边界
+
+- `maxExplicitWeight` 被计算但未使用；
+- `mUseFrameRatePriority` 被保存但在 V2 `.cpp` 中未控制焦点逻辑；
+- area weight 没有本地 clamp，也不是 occlusion-aware region；
+- config-change pending 只污染 heuristic sample，不暂停所有选择；
+- timer 都是可选配置，属性为 0 就不会出现相应行为；
+- `newVsyncAppliedTimeNanos` 在本版本仅被缓存/钳制，没有成为 active 或 period 的完成门；
+- `getActiveConfig()` 对主显示可能返回 desired，而非已经由 present fence 推进的 active。
+
+这些差异都说明：注释、字段名和新版本设计意图不能替代 r48 的实际调用点。
+
+---
+
+## 15. macOS 只读练习
+
+以下练习都只读源码，可在 `/Users/ninebot/androidSource` 下执行。
+
+### 练习 1：列出两套候选过滤器
 
 ```bash
-sed -n '480,560p' \
+sed -n '470,550p' \
   frameworks/native/services/surfaceflinger/Scheduler/RefreshRateConfigs.cpp
 ```
 
-写出 width/height/DPI/group/range 六类条件，并解释 primary 与 app-request 两次过滤。
+任务：写出尺寸、DPI、group、range 条件，并解释 primary 与 app-request 两次过滤为何都需要。
 
 ### 练习 2：确认默认功能分支
 
@@ -1110,7 +936,7 @@ rg -n "use_content_detection_v2|use_content_detection_for_refresh_rate" \
   frameworks/native/services/surfaceflinger/Scheduler/Scheduler.cpp
 ```
 
-回答：V2 默认值和内容检测默认值分别是什么？
+任务：分别回答“V2 默认值”和“普通内容检测默认值”。
 
 ### 练习 3：追三类 history 输入
 
@@ -1122,195 +948,104 @@ rg -n "recordLayerHistory" \
   frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
 ```
 
-区分 Buffer、AnimationTX、SetFrameRate。
+任务：标记 Buffer、AnimationTX、SetFrameRate，并说明各自携带的时间含义。
 
-### 练习 4：推导新 Layer 的 vote
+### 练习 4：推导 unknown → Max
 
 ```bash
-sed -n '65,210p' \
+sed -n '65,230p' \
   frameworks/native/services/surfaceflinger/Scheduler/LayerInfoV2.cpp
 ```
 
-从“少于3帧”依次判断 isFrequent、hasEnoughData、最终 vote。
+任务：从“少于 3 条 frame time”开始，依次经过 frequent、enough-data 和最终 vote。
 
-### 练习 5：手算 cadence
+### 练习 5：检查显式请求的 tree 传播
 
 ```bash
-sed -n '210,310p' \
+sed -n '1330,1450p' \
+  frameworks/native/services/surfaceflinger/Layer.cpp
+```
+
+任务：说明 `treeHasFrameRateVote` 为什么返回的是 NoVote，而不是复制具体 fps。
+
+### 练习 6：手算 cadence
+
+```bash
+sed -n '180,310p' \
   frameworks/native/services/surfaceflinger/Scheduler/RefreshRateConfigs.cpp
 ```
 
-尝试计算 24 fps 对 60/72/90/120 Hz 哪些是整数倍，注意 800 μs margin。
+任务：对 24 fps 内容比较 60/72/90/120 Hz；先判断整数倍，再观察非整除路径的 `1 / iter`。
 
-### 练习 6：追切换完成点
+### 练习 7：拆开两个 completion
 
 ```bash
-rg -n "setDesiredActiveConfig|performSetActiveConfig|setActiveConfigInternal|periodFlushed" \
+rg -n "mSetActiveConfigPending|setActiveConfigInternal|periodFlushed" \
   frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
 ```
 
-分别标注：选择、HAL请求、present fence确认、active账更新、period模型确认。
+任务：分别标出 present fence 推进 active config、硬件 VSync sample 推进 predictor period 的位置。
 
----
+### 练习 8：证明 timeline 字段有没有消费者
 
-## 42. 复读后补强：一个可执行的选择心智模型
-
-遇到“为什么设备没有切到 X Hz”，不要直接钻进评分公式。按五层排查：
-
-```text
-第一层：硬件有没有这个config？
-第二层：尺寸/DPI/group/policy允许吗？
-第三层：LayerHistory当前到底输出什么vote和weight？
-第四层：touch/idle/display-power有没有早返回？
-第五层：目标选中了，但HWC/active/model走到哪一阶段？
+```bash
+rg -n "newVsyncAppliedTimeNanos|refreshTimeNanos" \
+  frameworks/native/services/surfaceflinger
 ```
 
-```mermaid
-flowchart LR
-    A["HWC configs"] --> B{"Policy合法?"}
-    B -->|"否"| X["候选中根本不存在"]
-    B -->|"是"| C{"Vote是什么?"}
-    C --> D{"Global signal早返回?"}
-    D --> E["Score结果"]
-    E --> F{"HWC接受?"}
-    F --> G{"Present fence完成?"}
-    G --> H{"新period样本确认?"}
-```
-
-这比只看 `ActiveConfigFPS` 一条 trace 更可靠。
+任务：对照两个字段的读写次数，说明 r48 哪一个实际控制重复 repaint。
 
 ---
 
-## 43. 复读后补强：V2 history 的时间字段示例
+## 16. 核心结论、自测与下一章
 
-假设连续三张 buffer：
+### 16.1 核心结论
 
-| buffer | queue now | desired present |
-|---|---:|---:|
-| A | 100 ms | 120 ms |
-| B | 116 ms | 136 ms |
-| C | 132 ms | 152 ms |
+1. SF 真正切换的是 HWC config id；fps 只是由 VSync period 换算的策略量。
+2. 候选必须同时通过尺寸、DPI、group 和 Policy 范围过滤。
+3. primaryRange 是常规自动选择范围，appRequestRange 是绝不越过的外层范围。
+4. r48 默认构造 LayerHistory V2，但普通内容启发式检测的 helper 默认值为 false。
+5. Buffer 记录 desired/queue 时间，AnimationTX 记录动画活跃，SetFrameRate 激活显式请求。
+6. unknown、infrequent、animating 分别倾向 Max、Min、Max；稳定且数据足够才报告 Heuristic fps。
+7. heuristic 需要至少 2 帧，并达到 90 条或 1 秒跨度；稳定性还用 2 秒、1 Hz 波动门防抖。
+8. 切换期间样本只会令 heuristic 本轮放弃计算，不会暂停全部 vote。
+9. Default 与 Fixed Source 分别映射 ExplicitDefault 与 ExplicitExactOrMultiple。
+10. Layer tree 对无请求的亲属返回 NoVote，而不是复制具体 fps。
+11. V2 weight 是 transformed bounds/display area，不是精确可见 region，且本地没有 clamp。
+12. 只有 focused ExplicitDefault 可以给 primary 外、app-request 内候选计分。
+13. Heuristic/Exact 更关心 cadence 是否规整，不是简单寻找数值最近的 Hz。
+14. touch、idle、display-power 可早返回或后置 boost，且对应 timer 都可能不存在。
+15. idle considered 可抑制 App config changed，离开 idle 后再补发缓存状态。
+16. preferred、desired/upcoming、SF active 与 predictor period 是四份可短暂分离的状态。
+17. HAL 接受、present fence 解除 pending、active 账更新、period sample 确认是不同完成点。
+18. 正常成功路径通过同轮后段再次执行 `performSetActiveConfig()` 清 desired pending。
+19. r48 的 `newVsyncAppliedTimeNanos` 只被缓存并钳制，不能当作实际等待或完成证明。
 
-则：
+### 16.2 自测题
 
-```text
-queue delta   = 16ms, 16ms
-present delta = 16ms, 16ms
-lastUpdated   = max(queue,present)，分别120/136/152ms
-```
+1. 两个同为 60 Hz 的 config 为什么可能不是同一 mode？
+2. primaryRange 与 appRequestRange 分别约束谁？
+3. 为什么评分遍历 app-request candidates，却仍常常留在 primaryRange？
+4. 内容检测关闭时，普通 Layer 和显式 frame-rate API 各怎样工作？
+5. desired present time、queue time 与 present fence 各表示什么？
+6. 少于 3 帧的新 Layer 为什么不是立即判为低频？
+7. 90 条、1 秒、2 秒三个门分别属于哪段算法？
+8. 为什么缺 desired time 时不能总是直接改用 queue time？
+9. `frameRate=0` 后 Layer 会回到什么 vote？
+10. `treeHasFrameRateVote` 为什么让亲属返回 NoVote？
+11. focused 给哪一类 vote 增加了什么资格？
+12. 为什么 24 fps 可以在 120 Hz 上得到完整 cadence？
+13. `Min` 不进入 score 循环，系统又怎样选择最低档？
+14. touch 遇到 ExplicitDefault 与 ExactOrMultiple 有何不同？
+15. idle 降频为何可能不向 App 发 config changed？
+16. timeline 的三个字段中，r48 哪两个实际控制重复 repaint？
+17. present fence 与 VSync period sample 分别推进哪份状态？
+18. 切换过程中来了新 desired config，旧 upcoming 完成后会怎样继续？
 
-若后续帧不再提供 desired time，V2 不会在从未获得可靠 reported fps 的情况下立刻用 queue time猜测；只有历史已有 reported 值，才允许 queue delta 验证节奏延续。
-
-这条限制是为 render-ahead 场景设计的，避免 queue ahead 误导内容显示速度。
-
----
-
-## 44. 复读后补强：评分代码里的未使用局部量
-
-r48 `getBestRefreshRate()` 统计：
-
-```cpp
-explicitExactOrMultipleVoteLayers
-maxExplicitWeight
-```
-
-其中前者用于形成 `hasExplicitVoteLayers`；`maxExplicitWeight` 在这份函数后续没有再参与任何分支或 score 调整。
-
-这说明阅读源码时不能仅凭变量名推断“最大显式权重有特殊优先级”。在 r48 当前实现中，显式 Layer 的影响仍主要来自：
-
-- 自己的 vote 类型；
-- 每候选 cadence 分数；
-- 自己的 area weight；
-- focused ExplicitDefault 的越 primaryRange 例外；
-- touch/idle 早返回规则。
-
-未使用变量可能是演进遗留，不能写成已经生效的机制。
-
----
-
-## 45. 复读审计：必须保留的精确边界
-
-### 45.1 `mUseFrameRatePriority` 在本文件中只被构造
-
-V1/V2 都读取 `debug.sf.use_frame_rate_priority` 到成员，但 r48 `LayerHistory*.cpp` 后续直接根据 Layer priority 计算 focused，并未用该成员包住判断。不要声称把属性设 false 就一定关闭焦点作用；至少这份实现中看不到这个门生效。
-
-### 45.2 weight 注释与实现约束不完全相同
-
-接口注释称 `[0,1]`，V2 只是面积相除，没有本地 clamp。文档只能说正常几何预期如此，不能宣称函数强制保证。
-
-### 45.3 config change pending 只污染 heuristic 帧样本
-
-它不会暂停所有显式 vote，也不会阻止 Scheduler 评分；只是 `calculateAverageFrameTime()` 遇到相关相邻样本返回 nullopt。
-
-### 45.4 active config 与 period model 可短暂分离
-
-SF 在 present fence 后更新 active config；VSyncReactor 仍可能等硬件样本确认新 period。第165章的 early offsets 会覆盖过渡阶段。
-
-### 45.5 所有 timer 都是可选配置
-
-属性为0就不创建；没有 touch/idle/display-power timer 时，相应 boost/降频分支不会凭空存在。
-
----
-
-## 46. 本章核心结论
-
-1. 系统真正切换的是 HWC config id；fps 只是由 vsync period 换算的策略值。
-2. 合法候选不仅看 fps，还要求与 default config 的尺寸、DPI、group和policy范围匹配。
-3. primaryRange 是自动选择常规范围，appRequestRange 是不可越过的外层边界。
-4. r48 工厂默认 LayerHistory V2，但内容启发式检测若设备未设属性则默认关闭；显式FrameRate API仍工作。
-5. V2 从 Buffer、AnimationTX 和 SetFrameRate 三类事件更新 Layer 状态。
-6. desired present time 是客户端期望；queue time 是提交事实；二者均不是实际present fence。
-7. 新/未知内容倾向 Max，确认低频后投 Min，数据足够且稳定后才投 Heuristic。
-8. heuristic 至少需要2帧，并需90帧或1秒跨度；稳定历史还要求约2秒窗口内波动不超过1Hz。
-9. config change期间的样本不用于平均fps，避免新旧period污染。
-10. Default映射ExplicitDefault，Fixed Source映射ExactOrMultiple；frameRate=0清除具体请求。
-11. V2用transformed bounds/displayArea作面积权重，但本地没有显式clamp或精确遮挡扣除。
-12. focused ExplicitDefault可评分primaryRange外但appRequestRange内的候选；其他显式票没有同样例外。
-13. Heuristic/Exact评分关注整数倍cadence，不是只找数值最近的Hz。
-14. touch、idle、DisplayPower可在评分前后改变结果，且timer均为设备可选配置。
-15. idle considered的切换可抑制App config changed event，离开idle后再补发。
-16. 选择目标、HWC接受、present fence确认、SF active账更新和VSync period模型锁定是不同阶段。
-17. HWC setActiveConfig成功返回不是视觉完成，也不是新period已经被Predictor确认。
-18. `maxExplicitWeight` 等遗留局部量在r48函数中未实际参与选择，不能按变量名臆测策略。
-
----
-
-## 47. 自测题
-
-1. config id 与 fps 为什么不能互相替代作为身份？
-2. `constructAvailableRefreshRates()` 有哪些过滤条件？
-3. primaryRange 与 appRequestRange 分别约束什么？
-4. r48 默认使用 LayerHistory V1 还是 V2？内容检测默认又是什么？
-5. 内容检测关闭时普通 Layer 的默认 vote 是什么？
-6. BufferStateLayer 和 BufferQueueLayer 分别从哪里取得 present time？
-7. 为什么 `mLastUpdatedTime` 取 `max(presentTime, now)`？
-8. active、frequent、animating 三个判断有什么区别？
-9. 刚出现、只有一两帧的新 Layer 为什么最终投 Max？
-10. 缺 desired present time 时，何时允许退回 queue time？
-11. 90帧、1秒、2秒三个窗口分别做什么？
-12. config-change sample 为什么让平均计算返回 nullopt？
-13. Fixed Source 在 native 中对应什么 vote？
-14. 哪一类显式 vote 可以在 focused 时评分 primaryRange 外候选？
-15. Layer weight 依据什么几何计算？有哪些不精确边界？
-16. 24 fps 在120 Hz上为何能有高 cadence score？
-17. touch遇到 ExplicitDefault 与 ExactOrMultiple 的处理有何区别？
-18. idle considered为何可能不发 config changed？
-19. DisplayPower timer 为什么会清历史并暂时选Max？
-20. 从 preferred config 到 predictor确认新period有哪些中间状态？
-
----
-
-## 48. 下一章预告
+### 16.3 下一章预告
 
 第 167 章继续学习：
 
-> `FrameTimeline`、Jank 分类与 TimeStats 帧性能统计。
+> `FrameTimeline`、Jank 分类与 `TimeStats` 帧性能统计。
 
-将回答：
-
-- App/SF 如何为一帧建立 token 与时间线；
-- expected/actual timeline如何关联；
-- present fence、acquire fence与deadline怎样参与jank判断；
-- App deadline missed、SF scheduling、display HAL等类别如何区分；
-- TimeStats 如何聚合 Layer、frame duration、present-to-present 与刷新率切换统计；
-- dumpsys/trace 里的“missed frame”为什么不一定等同于用户肉眼卡顿一次。
+下一章会把 expected/actual timeline、frame token、deadline、acquire/present fence 与多类 jank 原因放到同一张时间线上，并继续坚持本章的方法：每个统计值都先回答“它在哪一层产生，又能证明哪个完成点”。
