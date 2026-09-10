@@ -734,3 +734,7 @@ rg -n 'name: ".*connectivity.*"' frameworks packages system -g Android.bp
 不要求第一次全部填对。先用 `rg` 找证据，再逐列补齐。能说明每一列为什么这样填，就达到了本章目的。
 
 下一章进入 Android 系统启动总览时，要继续带着四坐标思维：`init.rc` 是配置源码，Zygote 是进程，SystemServer 是 Java 入口类，system_server 是运行时进程——名字相似的东西不一定处在同一层。
+
+## 第一、二章延伸答疑
+
+目录地图建立以后，最容易出现的下一组问题是：“system_server 里这么多服务是不是这么多进程”“ATMS 是否拿着 Activity 对象”“App 被强杀后谁能知道”。这些问题集中放在：[02A-第一二章疑问答疑-系统进程Activity管理与强杀.md](./02A-第一二章疑问答疑-系统进程Activity管理与强杀.md)。

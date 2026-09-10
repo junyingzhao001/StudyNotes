@@ -1,581 +1,659 @@
 # 209 Android LaunchActivityItem：实例化 Activity 与 Context、Window 组装
 
-> 源码版本：Android 11 `android-11.0.0_r48`。  
-> 当前在 Mac 上只读源码，不实际启动 Activity 或连接设备 WMS。
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`。
+>
+> 当前环境只有源码快照，可以证明对象建立顺序、同步调用点、生命周期状态转换与窗口提交边界；不能据此测出某台设备的真实启动耗时，也不能把 `onCreate()` 返回、`WindowManager.addView()` 返回或客户端 `activityResumed()` 回报直接解释成首帧已经呈现。
 
-## 1. 本章目标
+第 208 章停在 App 主线程开始分派 `H.EXECUTE_TRANSACTION`：`handleBindApplication()` 已完成，`LaunchActivityItem` 所在事务也已经从 Binder 接收账进入主队列。本章继续追同一个目标 `B_target`，直到业务 `Activity`、Activity Context 与 `PhoneWindow` 在客户端完成组装，并划清它们与 `DecorView`、`ViewRootImpl`、WMS `WindowState`、Surface 和首帧之间的边界。
 
-第208章解释 LaunchActivityItem怎样排进主线程，本章进入它的 execute：服务端 ActivityRecord 如何变成客户端 ActivityClientRecord，Activity对象怎样由 Factory创建，Context、Application、PhoneWindow、WindowManager和生命周期又怎样逐步接上。
+本章只追一个问题：**固定普通 App 的 `LaunchActivityItem.execute()` 已经开始；当开发者看到 `onCreate()` 末尾日志时，客户端创建链究竟交付到了哪个完成点？** 答案必须同时解释三件事：哪些对象一定存在、哪些客户端登记还隔着一步，以及为什么 system_server 可以早已把 `ActivityRecord` 标成 `RESUMED`，WMS 却仍可能没有这个 Activity 的客户端主窗口。
 
-读完应能区分：
+## 1. 固定 B_target，把“Activity 已创建”拆成十三个完成点
 
-- 服务端 ActivityRecord、客户端 ActivityClientRecord和业务 Activity实例；
-- Activity类实例化、attachBaseContext、Activity.attach、onCreate的顺序；
-- Activity Context为什么带 token、display和override configuration；
-- PhoneWindow、DecorView、ViewRootImpl、WMS WindowState与Surface何时才出现；
-- onCreate完成究竟证明了什么，没有证明什么。
+沿用第 203—208 章的 `P_B` 与目标 `B_target`，先冻结主路径：
 
-## 2. 一句话主线
+| 维度 | 固定值或前提 |
+|---|---|
+| 进程 | 普通远端 App 进程 `P_B`，已 attach 且 `handleBindApplication()` 正常完成 |
+| 组件 | 初始包中的真实 Activity，不走 alias，显式 Intent |
+| 生命周期目标 | `andResume=true`，事务最终请求是 `ResumeActivityItem` |
+| Context | 默认 display、无 isolated split、无 fixed-rotation adjustment |
+| Application | 第 205 章的初始 `Application` 已存在 |
+| 重建 | 首次 launch，无 preserved Window 与 non-config instance |
+| 回调 | 默认 Instrumentation；`onCreate()` 调用 `super`，不 finish、不启动另一 Activity |
+| UI | 可见 Activity；是否在 `onCreate()` 调用 `setContentView()`暂不固定 |
 
-```text
-ActivityRecord服务端状态
-  → LaunchActivityItem跨Binder
-  → ActivityClientRecord客户端账本
-  → Activity Context与Resources
-  → AppComponentFactory创建Activity空壳
-  → Activity.attach组装Application/Token/PhoneWindow
-  → Instrumentation调用onCreate
-  → 记录进入mActivities
-  → 后续Start/Resume才把Decor加入WindowManager
-```
+alias、多 display、isolated split、relaunch、system-process 本地调用与异常都是真实路径，但它们会改变局部顺序或证据强度；后文逐一从固定主线分叉。
 
-## 3. 三个“Activity”不是同一对象
+先定义十三个完成点：
 
-| 对象 | 所在进程 | 职责 |
+| 点 | 精确定义 | 仍不能推出 |
 |---|---|---|
-| `ActivityRecord` | system_server | Task层级、可见性、服务端生命周期和窗口token |
-| `ActivityClientRecord` | App | Intent/state/config、真实Activity引用和客户端生命周期 |
-| `Activity`子类实例 | App | 开发者生命周期、Context、Window和UI业务 |
+| `S_submit` | 远端 App 路径中，system_server 的 launch oneway 已被 Binder 驱动接纳 | App Stub 已进入或服务端 Java 代理已返回 |
+| `P_pre` | App 侧 `ClientTransaction.preExecute()` 已完成 | 主线程已取到事务 |
+| `Q_tx` | `H.EXECUTE_TRANSACTION` 已入主队列 | `LaunchActivityItem.execute()` 已开始 |
+| `L_exec` | 主线程开始执行 launch callback | `ActivityClientRecord` 已构造完 |
+| `R_record` | 新 `ActivityClientRecord` 已返回，含 token 与 `LoadedApk` | Activity Context 或业务实例存在 |
+| `C_context` | `createBaseContextForActivity()` 已返回 | Activity 构造函数已执行 |
+| `N_instance` | `AppComponentFactory.instantiateActivity()` 已返回 | base Context、Application、Intent、token 或 Window 已写入实例 |
+| `A_attach` | `Activity.attach()` 已返回 | `onCreate()` 已开始 |
+| `O_create` | Instrumentation 的 create 调用正常返回，且 super 检查通过 | `mActivities[token]` 已登记 |
+| `M_commit` | `r.activity`、客户端 `ON_CREATE` 与 `mActivities[token]` 已提交 | `onStart()` 或 `onResume()` 已执行 |
+| `T_start` | executor 已完成 Start、状态恢复与 `onPostCreate()`阶段 | `onResume()` 或主窗口加入已完成 |
+| `U_resume` | `performResumeActivity()` 已正常把客户端账设为 `ON_RESUME` | `WindowManager.addView()` 已执行或首帧已绘制 |
+| `W_add` | 普通新窗口的 `wm.addView()` 正常返回，WMS 接受 add 请求 | 首次 traversal、buffer 提交或 SurfaceFlinger present 已完成 |
 
-它们靠 Binder token关联，不共享 Java引用。
-
-## 4. 完整对象组装图
-
-```mermaid
-flowchart TD
-  AR["system_server ActivityRecord"] --> LI["LaunchActivityItem Parcelable"]
-  LI --> ACR["App ActivityClientRecord"]
-  ACR --> CTX["ContextImpl Activity Context\ntoken/display/config/resources"]
-  CTX --> FACTORY["Instrumentation → AppComponentFactory"]
-  FACTORY --> ACT["Activity对象\n尚未attach Context"]
-  ACT --> ATTACH["Activity.attach"]
-  ATTACH --> PW["PhoneWindow + local WindowManager"]
-  ATTACH --> APP["Application/token/Intent/ActivityInfo"]
-  ATTACH --> CREATE["Instrumentation.callActivityOnCreate"]
-  CREATE --> CONTENT["可选 setContentView → DecorView/content"]
-  CREATE --> MAP["mActivities[token] = record"]
-  MAP --> RESUME["Start/Resume"]
-  RESUME --> ADD["WindowManager.addView → ViewRootImpl/WMS"]
-```
-
-## 5. 服务端从 realStartActivityLocked 开始
-
-ActivityStackSupervisor确认旧 Activity pause完成、目标进程已有 IApplicationThread，给 ActivityRecord设置进程、可见性、launch count、配置与compat信息，然后构造 ClientTransaction。
-
-若目标进程还没有 thread，就不能进入本章客户端实例化。
-
-## 6. LaunchActivityItem 携带什么
-
-它包含 Intent、ActivityInfo、进程/override Configuration、CompatibilityInfo、referrer、voice interactor、proc state、saved state、pending results/intents、Profiler、assist token和fixed rotation adjustments等。
-
-这不是只传一个 Activity类名，而是一份“创建客户端实例所需状态快照”。
-
-## 7. Intent 为什么再 new 一份
-
-服务端调用 `LaunchActivityItem.obtain(new Intent(r.intent), ...)`，先复制服务端当前 Intent；跨 Binder Parcel后，App得到自己的对象图。
-
-App后续设置 component、extras ClassLoader不会修改 system_server中的 ActivityRecord Intent。
-
-## 8. token 是跨进程主键
-
-ClientTransaction以 `r.appToken`为 activity token；LaunchActivityItem.execute收到同一 IBinder token并写入 ActivityClientRecord。
-
-后续生命周期、窗口 LayoutParams、配置、结果和服务端回报都用 token定位同一逻辑 Activity代际。
-
-## 9. ident 不是稳定业务ID
-
-r48服务端传 `System.identityHashCode(r)`作为 ident，主要用于事件日志等进程内身份提示；它不是跨重启稳定主键，也不能替代 Binder token。
-
-## 10. final lifecycle request 与 launch callback
-
-事务先添加 LaunchActivityItem callback，再按 `andResume`设置 ResumeActivityItem或PauseActivityItem为最终状态。
-
-因此“launch Activity”通常是一笔包含 create与目标生命周期的事务，不是每个 onCreate/onStart/onResume各发一笔 Binder。
-
-## 11. preExecute 先在 Binder接收侧运行
-
-LaunchActivityItem.preExecute会增加 launching activities计数、更新进程状态和pending configuration。
-
-它发生在主线程真正 execute前，用于提前建立客户端配置/进程状态；不创建 Activity实例。
-
-## 12. execute 首先创建 ActivityClientRecord
-
-```java
-ActivityClientRecord r = new ActivityClientRecord(
-        token, mIntent, mIdent, mInfo, ...);
-client.handleLaunchActivity(r, pendingActions, null);
-```
-
-此时 r.activity仍为空，它只是把跨进程参数收拢成客户端账本。
-
-## 13. ActivityClientRecord 构造时已有 LoadedApk
-
-构造函数通过 `client.getPackageInfoNoCheck(activityInfo.applicationInfo, compatInfo)`取得 LoadedApk，保存 ActivityInfo、Intent、state、pending结果、配置和fixed rotation信息。
-
-LoadedApk是包代码/资源/ClassLoader环境，不是 Activity对象。
-
-## 14. 客户端初始生命周期
-
-ActivityClientRecord的 mLifecycleState初始为 PRE_ON_CREATE。init还建立 configCallback，初始化 paused/stopped/hideForNow等兼容字段。
-
-服务端可能已把 ActivityRecord标成INITIALIZING甚至准备RESUMED，客户端状态仍从PRE_ON_CREATE开始，两边不是同一个变量。
-
-## 15. handleLaunchActivity 的准备工作
-
-主线程取消后台GC idle，标记进程中Activity有变化，按需启动Profiler；若有fixed rotation adjustment，先覆盖应用display adjustments，再处理最新Configuration。
-
-Activity创建前先校准资源视图，避免构造/onCreate看到旧旋转或旧密度。
-
-## 16. 图形环境先做轻量预备
-
-硬件加速Activity且Renderer未禁用时调用 HardwareRenderer.preload；随后 `WindowManagerGlobal.initialize()`并提示 GraphicsEnvironment即将启动Activity。
-
-这不等于已经创建RenderThread绘制一帧，也不等于 WMS已有该Activity窗口。
-
-## 17. performLaunchActivity 是核心组装方法
-
-它依次完成：
+主路径的核心全序是：
 
 ```text
-确认LoadedApk和组件名
-→ createBaseContextForActivity
-→ newActivity
-→ makeApplication
-→ Activity.attach
-→ theme/network gate
-→ callActivityOnCreate
-→ 写ActivityClientRecord和mActivities
+S_submit → P_pre → Q_tx → L_exec → R_record → C_context → N_instance
+         → A_attach → O_create → M_commit → T_start → U_resume → W_add
 ```
 
-顺序比记住单个方法名更重要。
+对本章开头那条开发者日志，还要保留一个更细的局部关系：
 
-## 18. 组件名可能来自三处
+```text
+A_attach < 子类onCreate末尾日志 < O_create < M_commit
+```
 
-优先用 `r.intent.getComponent()`；为空时由 PackageManager resolve并写回Intent；若 ActivityInfo.targetActivity非空（Activity alias），实例化类切换为targetActivity。
+所以看到这条日志时，十三个已定义点中最新完成的是 `A_attach`；日志本身位于尚未命名的中间区间，不能提前算作 `O_create`。这条直线只属于表中固定的成功主路径。服务端 `ActivityRecord` 状态不嵌在这条客户端全序里；`DecorView` 可能在 O_create 之前由 `setContentView()` 懒创建，也可能到 W_add 前的 `getDecorView()` 才创建；preserved Window 更会绕过本次 `addView()`。因此“Activity 已创建”必须附带具体完成点。
 
-alias场景中“Intent逻辑组件名”和“实际Java类名”可以不同。
+## 2. 三个 Activity、多种 token 与七本不能合并的账
 
-## 19. 先创建 Activity Context，再创建 Activity
+名字相近的对象分布在不同进程和层级：
+
+| 对象 | 所在位置 | 何时出现 | 主要职责 |
+|---|---|---|---|
+| `ActivityRecord` | system_server | 客户端进程甚至尚不存在时即可建立 | Task/Display 层级、服务端生命周期、可见性与窗口容器 |
+| `ActivityRecord.Token` / `appToken` | system_server Binder 对象，App 持其 Binder 身份 | `ActivityRecord` 建立时 | 跨进程定位同一逻辑 Activity，并作为应用窗口 token |
+| `ClientTransaction` / `LaunchActivityItem` | 服务端构造；远端路径经 Parcel 到 App | `realStartActivityLocked()` | 携带一次 launch 快照与最终生命周期请求 |
+| `ActivityClientRecord` | App | `LaunchActivityItem.execute()` | 客户端 Intent/state/config/生命周期账与业务实例引用 |
+| `ContextImpl` | App | Activity 实例化之前 | Activity 专属资源、display、split ClassLoader、服务代理与 token |
+| 业务 `Activity` 实例 | App | Factory 返回时 | 开发者生命周期与 `ContextWrapper` 外层对象 |
+| `PhoneWindow` | App | `Activity.attach()` | 窗口策略、属性、回调、Decor 懒创建入口与本地 WindowManager |
+
+`assistToken` 是 Assist/语音能力使用的另一 Binder 身份，不能与 activity token 混称。固定无 parent 路径里，activity token 同时连接 `ActivityRecord`、`ActivityClientRecord`、Activity Context 资源分组和主窗口 `LayoutParams.token`；它不是任一 Java 对象的跨进程地址。
+
+排障时至少要分开七本账：
+
+| 账本 | 典型字段或调用 | 它能回答什么 |
+|---|---|---|
+| 服务端 Activity 账 | `ActivityRecord.state`、`r.appToken`、Task/Display | system_server 希望该逻辑 Activity 到什么状态 |
+| 事务账 | callback 列表、final lifecycle item、Parcel 数据 | 本次请求携带了什么 |
+| 客户端 record 账 | `mActivities[token]`、`mLifecycleState` | App 已登记到哪个客户端状态 |
+| Context/资源账 | `ContextImpl.mToken`、ActivityResources、Resources/ResourcesKey | 代码、资源、display 与 override config 怎样关联 |
+| 实例账 | `r.activity`、`Activity.mToken/mApplication/mIntent` | 业务对象是否已组装并提交 |
+| 本地窗口账 | `PhoneWindow`、`DecorView`、`mWindowAdded`、`ViewRootImpl` | App 侧窗口对象推进到哪里 |
+| 服务端窗口/呈现账 | `WindowState`、Surface、buffer、present | WMS/SF 是否已有可显示内容 |
+
+同一个 token 能关联多本账，不代表这些账同步提交。服务端可先写 `RESUMED`，客户端仍在构造函数；Activity 可已有 `PhoneWindow`，WMS 仍无该客户端主窗口对应的 `WindowState`；WMS 可已接受主窗口，屏幕仍没有该 Activity 的首帧。
+
+## 3. 交接复盘：system_server 发送的是启动快照，不是已创建回执
+
+`ActivityStackSupervisor.realStartActivityLocked()` 先检查 pause 门槛、把 `ActivityRecord` 关联到已有 `WindowProcessController`，处理配置与可见性，再确认 `proc.hasThread()`。固定主路径随后构造：
 
 ```java
-ContextImpl appContext = createBaseContextForActivity(r);
-Activity activity = null;
+ClientTransaction transaction = ClientTransaction.obtain(
+        proc.getThread(), r.appToken);
+transaction.addCallback(LaunchActivityItem.obtain(
+        new Intent(r.intent), System.identityHashCode(r), r.info, ...));
+transaction.setLifecycleStateRequest(
+        ResumeActivityItem.obtain(isForward));
 ```
 
-Factory创建 Activity时需要其 ClassLoader；这个ClassLoader来自已按Activity split/display/config准备的 Context。
+这里有四个容易被“跨 Binder 传对象”掩盖的细节。
 
-## 20. displayId 要向 ATMS 查询
+第一，`new Intent(r.intent)` 在服务端主动复制 Intent。普通远端 App 还会经历 Parcel；即使 Activity 恰在 system_server 内、调用走本地接口而不 Parcel，这个显式副本仍避免客户端修改 `ActivityRecord.intent`。不能由此反推每个字段都做了同等深度的主动复制。
 
-createBaseContextForActivity先用 token调用 `ActivityTaskManager.getDisplayId()`，取得 Activity当前所属display。
+第二，r48 特意新建 `MergedConfiguration`，其构造器把 process 与 override configuration 复制到自身的 `Configuration` 字段。源码注释给出的原因正是 system-process Activity 可能不跨 Binder，不能依赖 Parcel 顺手制造新对象。
 
-这是主线程上的同步 Binder查询；多显示环境下不能默认所有Activity都使用 Display.DEFAULT_DISPLAY。
+第三，saved state、persistent state、referrer、profiler、assist token、fixed-rotation adjustment 都可进入 item；`results` 和 `newIntents` 只有 `andResume=true` 时才随 launch 交付。`System.identityHashCode(r)` 只是本次服务端对象的 ident 提示，不是稳定业务 ID，也不能替代 Binder token。
 
-## 21. Activity Context 带 token
+第四，callback 是 launch，final request 才决定事务末态。`andResume=true` 选择 `ResumeActivityItem`；否则选择 `PauseActivityItem`。后者不表示客户端只执行 Create 后静置，executor 会补齐通往 Pause 所需的中间生命周期。
 
-`ContextImpl.createActivityContext()`构造 ContextImpl时写入 activityToken、splitName和目标ClassLoader，并标记它是 UI Context、与display关联。
+对固定远端 App，`IApplicationThread` 是 `oneway interface`。所以服务端 `scheduleTransaction()` 返回只证明异步事务已经提交；它不等待 `onCreate()`。随后 `realStartActivityLocked()` 甚至可立即调用 `minimalResumeActivityLocked()`，把服务端 `ActivityRecord` 写成 `RESUMED` 并完成服务端 resume bookkeeping。
 
-Application Context通常没有某个Activity token，因此二者不能无条件互换。
+```text
+服务端 RESUMED
+  ≠ App 已收到 transaction
+  ≠ ActivityClientRecord 已存在
+  ≠ Activity.onCreate 已执行
+  ≠ 客户端 ON_RESUME
+  ≠ WindowState 或首帧已存在
+```
 
-## 22. isolated split loading
+system-process 本地接口是重要反例：本地 Stub 调用会直接执行 `scheduleTransaction()`，所以 `preExecute()` 与主队列入队可在服务端调用返回前完成；AIDL 上写着 oneway 也不会强迫本地 Java 调用异步化。本章固定远端路径使用 `S_submit`，不能把这项证据原封不动移到本地路径。
 
-若包请求 isolated split loading，ContextImpl按 ActivityInfo.splitName取得专用 split ClassLoader和split资源路径。
+## 4. 交接复盘：preExecute、主队列与“已销毁前取消”门槛
 
-同一APK安装单元中的不同Activity也可能并非都由完全相同的类加载路径实例化。
+普通远端路径中，App Binder worker 进入 `ApplicationThread.scheduleTransaction()`，转调 `ActivityThread.this.scheduleTransaction()`。`ClientTransactionHandler` 的顺序只有两步：
 
-## 23. Activity Resources 按token建基线
+```java
+transaction.preExecute(this);
+sendMessage(ActivityThread.H.EXECUTE_TRANSACTION, transaction);
+```
 
-ResourcesManager的 `createBaseTokenResources()`用token、resDir、split/overlay/shared-library路径、displayId、overrideConfig、compatInfo和ClassLoader组成ResourcesKey。
+`LaunchActivityItem.preExecute()` 此时做三件事：launching count 加一、更新 process state、登记 pending configuration。final `ResumeActivityItem` 也有自己的可选 process-state 预处理。它们发生在 `Q_tx` 之前，却不创建 `ActivityClientRecord`、Context 或 Activity。
 
-以后同token的配置Context会在这份base override上合并，token同时是资源配置隔离键。
+“发生在 Binder 接收线程”只适用于固定远端路径的常态。测试可调用 `executeTransaction()` 立即执行，本地 IApplicationThread 也可在调用者线程预处理；可靠表述是：**preExecute 发生在真正调度或立即执行 transaction 之前，而不是无条件绑定某一种线程。**
 
-## 24. INVALID_DISPLAY 的回退
+主线程取到 `H.EXECUTE_TRANSACTION` 后调用 `TransactionExecutor.execute()`。在 callback 前还有一扇取消门：若同一 token 已在 `mActivitiesToBeDestroyed` 中，且客户端尚无对应 record，executor 会跳过整笔预销毁 transaction。于是：
 
-若服务端返回 INVALID_DISPLAY，ContextImpl回退DEFAULT_DISPLAY；非默认display时使用默认CompatibilityInfo，而默认display使用包compat信息。
+```text
+P_pre 与 Q_tx 已发生
+  ≠ L_exec 一定会发生
+  ≠ Activity 一定会被实例化
+```
 
-多显示和旧应用兼容会共同影响Resources/Display，不能只看全局Configuration。
+未被跳过时，executor 先执行 callbacks，再执行 final lifecycle state。`LaunchActivityItem` 自己没有声明 post-execution lifecycle state；它在 handler 内把新 record 提交到 `ON_CREATE`。callback 正常返回后，`postExecute()` 才把 launching count 减一；然后 final request 从客户端当前状态继续补 Start/Resume 或 Start/Resume/Pause。
 
-## 25. fixed rotation 为什么早于实例化
+这两节只负责承接第 208 章；第 209 章新增的对象组装主线从 `L_exec` 开始。`H.EXECUTE_TRANSACTION` 已 dispatch 只交付这个入口点，不是整笔 transaction 完成。
 
-若Activity在过渡期使用fixed rotation，ActivityThread先把调整应用到token资源和display adjustments，再创建Activity。
+## 5. ActivityClientRecord 先聚合参数，组件名再决定实例化类
 
-这样Activity构造或onCreate早期读取DisplayInfo时看到的是过渡期目标方向，而不是等窗口创建后再突然修正。
+`LaunchActivityItem.execute()` 首先调用 `new ActivityClientRecord(...)`。构造器保存 token、assist token、Intent、ActivityInfo、config、state、pending result/intent 等字段，并同步调用：
 
-## 26. AppComponentFactory 是真正实例化钩子
+```java
+packageInfo = client.getPackageInfoNoCheck(
+        activityInfo.applicationInfo, compatInfo);
+```
+
+这里得到的是 `LoadedApk`：它封装包的代码、资源、ClassLoader、Application 缓存与组件 Factory 环境，不是业务 Activity，也不保证这个 `LoadedApk` 已有 Application。固定初始包路径通常命中 bind 阶段建立的对象。
+
+新 record 的 `mLifecycleState` 初值是 `PRE_ON_CREATE`；`init()` 把 `paused=false`、`stopped=false`。稍后 `r.setState(ON_CREATE)` 才会把两个兼容布尔值都改成 true，表达“尚未 Start/Resume”的位置，而不是证明真实执行过 `onPause()` 与 `onStop()`。
+
+`performLaunchActivity()` 再决定实例化类：
+
+1. 优先取 `r.intent.getComponent()`；为空才调用 PackageManager resolve 并写回 Intent。
+2. 若 `ActivityInfo.targetActivity != null`，局部 `component` 改成 alias 的目标类。
+3. Instrumentation 把这个局部 component 的 class name 交给选中的 `AppComponentFactory`。
+
+默认 Factory 路径中，运行时类是 alias 的目标 Java 类，并由该 Factory 完成类加载与 `newInstance()`；自定义 Factory 则只承诺返回它选择的 Activity 实例。无论走哪条路径，稍后 `Activity.attach()` 都把 `mComponent = intent.getComponent()` 写回，因而仍可保留 manifest alias；`getComponentName()` 与运行时类名不必相同。
+
+activity token 才是客户端主键：它进入 record、ContextImpl、Activity 与窗口参数，并作为 `mActivities` key。ident 来自服务端对象的 identity hash，只适合日志提示；进程重启或对象重建后不稳定，也没有 Binder 身份能力。
+
+`R_record` 能证明 LoadedApk 查找已经返回，却不能证明 component resolve、Context 创建或任何开发者代码已经执行。
+
+## 6. Activity Context 先于实例：display、split、资源与旋转各有独立账
+
+`performLaunchActivity()` 在 `newActivity()` 之前调用 `createBaseContextForActivity(r)`。固定远端 App 的主线程先同步调用 ATMS `getDisplayId(r.token)`；r48 服务端在 token 找不到、stack 为空或 display 无效时都返回默认 display。`ContextImpl.createActivityContext()` 仍额外把 `INVALID_DISPLAY` clamp 到默认值，这是防御性边界，不是当前调用者通常能观察到的第四种 display 状态。
+
+若包启用 isolated split loading，ContextImpl 按 `ActivityInfo.splitName` 取专用 split ClassLoader 与 split 路径；否则使用 `LoadedApk` 的普通 ClassLoader 与 split 资源目录。随后创建带下列性质的 `ContextImpl`：
+
+- `mToken` 是 activity token；
+- `mSplitName` 与 ClassLoader 已选定；
+- 标记为 UI Context 且关联 display；
+- Resources 以 res/split/overlay/library 路径、display、override config、compat、loaders 等条件建立。
+
+这里必须拆开三个常被混成一个 key 的概念：
+
+| 概念 | r48 中实际角色 |
+|---|---|
+| activity token | 在 `ResourcesManager.mActivityResourceReferences` 中索引独立 `ActivityResources` 结构 |
+| `ResourcesKey` | 包含资源路径、display、override config、compat 与 loaders；**不包含 token** |
+| ClassLoader | 单独参与查找/创建 `Resources` 对象；**也不是 ResourcesKey 字段** |
+
+`createBaseTokenResources()` 先确保 token 对应的 ActivityResources 存在，再更新该 token 的 base override、rebase key，并按 key 加 ClassLoader 寻找或创建 Resources。于是可以说 token 隔离 Activity 资源更新账，却不能说 token“被塞进 ResourcesKey”。
+
+fixed rotation 支路也不是一句“先改配置”：`handleLaunchActivity()` 先把 adjustment 设到 Application display adjustments，再处理最新 Configuration；进入 `createBaseContextForActivity()` 建好 token 资源后，又把最后一个 active adjustment 覆盖到该 token 的 display adjustments，并消费 pending 字段。所有这些都早于 Factory，所以构造期读取 display 的代码可看到过渡目标；它仍不表示窗口已创建。
+
+到 `C_context` 时，ContextImpl 的底层服务与资源能力已经存在，但 `mOuterContext` 暂时仍是它自身。Activity 对象尚不存在，开发者也拿不到这个 Context。
+
+## 7. AppComponentFactory 只交付 Java 实例，不交付 Android 环境
+
+ActivityThread 从 `appContext.getClassLoader()` 取得实际 ClassLoader，再走：
 
 ```java
 activity = mInstrumentation.newActivity(
         cl, component.getClassName(), r.intent);
 ```
 
-Instrumentation根据目标包取得AppComponentFactory，再调用 `instantiateActivity(cl, className, intent)`；默认实现才是ClassLoader加载类并newInstance。
+Instrumentation 根据 Intent component 的包名选择 `AppComponentFactory`：包名为空或 Instrumentation 未绑定 ActivityThread 时直接用默认 Factory；`peekPackageInfo()` 未命中时则取 system Context 的 `LoadedApk` factory。默认 `instantiateActivity()` 用 ClassLoader 加载类并 `newInstance()`。
 
-## 27. Factory 返回的是未初始化Activity
+`N_instance` 只证明：
 
-AppComponentFactory源码注释明确：返回对象还没有作为Context初始化，不应在Factory里用它调用依赖Android Context的API。
+- 选中的 Factory 已返回一个 Activity；默认 Factory 路径的类加载、静态初始化、对象分配、字段初始化与构造函数已经完成；
+- 自定义 Factory 有机会选择替代实例或实现构造期依赖注入，不能把默认 Factory 的反射细节外推为通用保证；
+- `StrictMode.incrementExpectedActivityCount()` 随后记录预期实例数量。
 
-此时Java字段初始化/构造函数已执行，但 `Activity.attachBaseContext()`尚未执行。
+它不证明：
 
-## 28. 依赖注入的安全边界
+- `ContextWrapper.mBase` 已设置；
+- `mApplication`、`mIntent`、`mToken`、`mActivityInfo` 已写入；
+- `PhoneWindow` 或本地 WindowManager 已建立；
+- 任何生命周期回调已开始。
 
-自定义Factory可替换Activity子类、定制ClassLoader或做构造期注入；但不能假设Application字段、Window、token、Intent和Resources已经全部写入Activity。
+AppComponentFactory 的注释直接警告，返回对象尚未作为 Context 初始化，不应在这里调用依赖 Android Context 的 API。因此 Activity 构造函数适合普通 Java 字段初值；调用 `getResources()`、`getSystemService()`、`getWindow()` 或做重 I/O，都越过了这一步能保证的边界。
 
-需要Context/Window的初始化应等attach或生命周期阶段。
+Factory 返回后，ActivityThread 才把 Intent extras 与 saved-state Bundle 的 ClassLoader 改成 Activity ClassLoader，并调用 `intent.prepareToEnterProcess()`。跨进程外壳到达不等于嵌套自定义 Parcelable 已用正确 loader 展开。persistent state 是受限类型的 `PersistableBundle`，源码并未在这里对它调用同样的 `setClassLoader()`。
 
-## 29. StrictMode 记录预期Activity数量
+自定义 Factory 能改变“new 出谁”，不能把 attach 提前。若 Factory 为了注入而调用尚无 base Context 的方法，问题发生在 `N_instance` 之前或之后的构造区间，不应归咎于 `onCreate()`。
 
-实例化后 `StrictMode.incrementExpectedActivityCount(activity.getClass())`记录实例计数，帮助VM策略检测 Activity泄漏。
+## 8. Application、合并配置、资源 loader 与 preserved Window 在 attach 前汇合
 
-这是诊断账本，不改变服务端ActivityRecord数量。
+第 6 节解决“实例化前，Activity Context 与资源身份是什么”；本节解决“attach 前，Context、实例、Application 与重建输入怎样最终汇合”。两处都出现 config 或资源，不代表它们是同一个完成点。
 
-## 30. Intent extras 必须换 ClassLoader
-
-ActivityThread设置 Intent extras和saved state Bundle的ClassLoader为Activity ClassLoader，并调用 `intent.prepareToEnterProcess()`。
-
-否则自定义Parcelable在系统ClassLoader下反序列化可能报ClassNotFound；跨进程容器到达不等于所有嵌套对象已用正确类加载器展开。
-
-## 31. Application 通常已经存在
+Activity 实例化尝试结束后，ActivityThread 调用：
 
 ```java
 Application app = r.packageInfo.makeApplication(
         false, mInstrumentation);
 ```
 
-普通冷启动第205章已创建初始Application，所以LoadedApk直接返回缓存对象，不会再次调用onCreate。
+固定初始包路径在第 205 章已经建立 `LoadedApk.mApplication`，这里直接返回缓存，既不重新 new Application，也不再次调用其 `onCreate()`。共享进程后续加载另一个尚无 Application 的 `LoadedApk` 是反例：因为传入非空 Instrumentation，`makeApplication()` 会创建对象、登记到 `mAllApplications`，并在返回前调用这个 Application 的 `onCreate()`。
 
-## 32. makeApplication 的非普通边界
+接着，成功主线依次准备：
 
-共享进程或后续加载另一个包的LoadedApk可能尚无Application；这里传入非null Instrumentation时，makeApplication创建对象后会在内部调用该Application.onCreate。
+1. 从 `ActivityInfo` 加载 title；
+2. 复制 `mCompatConfiguration`，再合并 Activity override config；
+3. 若是保留窗口的 relaunch，取出 `mPendingRemoveWindow` 作为 preserved Window；
+4. 把 Application Resources 当前的 `ResourcesLoader` 加到 Activity Resources；
+5. `appContext.setOuterContext(activity)`；
+6. 调用 `activity.attach(...)`。
 
-因此“所有Activity launch都绝不会创建Application”也过强，只是普通初始包路径通常已完成。
+ContextImpl 与 Activity 是合作关系，不是同一对象。底层 ContextImpl 保存资源、服务代理、包/display/token；外层 Activity 继承 ContextWrapper，开发者的 Context API 经 base delegate 下沉。`setOuterContext(activity)` 又让底层需要“外层 Context”语义时返回 Activity。
 
-## 33. title 与合并Configuration
+preserved Window 只用于 relaunch：新 `PhoneWindow` 可复用旧 Decor、elevation 和 app token，并在 resume 时跳过本次 `addView()`。它不是普通首次 launch 的默认优化，也不等于复用旧 Activity 实例；新 Activity 与新 PhoneWindow 仍会建立。
 
-ActivityThread从ActivityInfo加载label作为title，复制 mCompatConfiguration并叠加Activity overrideConfig，形成传给Activity.attach的config。
+到调用 `attach()` 前，Activity Context、Activity 空壳和 Application 可以同时存在，但三者尚未在 Activity 字段中闭合。`setOuterContext()` 已发生也不等于 `ContextWrapper.mBase` 已接上，真正的桥从下一节第一行开始。
 
-它不是直接复用服务端可变Configuration引用。
+## 9. Activity.attach：先接 base Context，再组装 PhoneWindow 与核心字段
 
-## 34. preserved Window 用于重建优化
+`Activity.attach()` 的第一条实质调用是 `attachBaseContext(context)`。Activity override 先交给 `ContextWrapper.attachBaseContext()` 设置唯一 base，再把 Autofill client 与 Content Capture options 接到新 base。此后 Activity 的 `getResources()`、`getSystemService()` 等 ContextWrapper API 才有可靠 delegate。
 
-若 relaunch请求保留旧Window，ActivityClientRecord可把 mPendingRemoveWindow作为构造PhoneWindow的preservedWindow，并清pending字段。
+`attachBaseContext()` 是可覆写方法；固定主路径假设子类 override 会继续调用 super。这里没有像 `onCreate()` 那样的 `mCalled` 强制检查，不调用 super 往往会让 base 仍为空并在后续组装中失败，不能把“方法被调用”误当成 Context 已接好。
 
-普通首次启动window为null；保留路径会复用Decor等状态，不能把每次relaunch都写成全新窗口树。
+随后 attach 按程序顺序完成四组工作。
 
-## 35. Application ResourceLoader 同步到Activity
-
-在attach前，Activity Context Resources加入Application Resources当前的ResourcesLoader列表。
-
-这保证运行时资源loader（例如动态加载资源）在Activity资源环境中一致，不只是APK静态路径一致。
-
-## 36. outer Context 在 attach 前回填
-
-```java
-appContext.setOuterContext(activity);
-activity.attach(appContext, ...);
-```
-
-ContextImpl负责底层服务/资源实现，外层Activity提供ContextWrapper语义。两者不是同一个对象，却共同表现为开发者使用的Activity Context。
-
-## 37. Activity.attach 首先接 base Context
-
-Activity.attach调用 `attachBaseContext(context)`，然后把FragmentController接到host。
-
-从这里开始Activity的getResources/getSystemService等Context API才有可靠base实现。
-
-## 38. PhoneWindow 在 onCreate 前创建
+第一组是 Fragment 与窗口策略：
 
 ```java
-mWindow = new PhoneWindow(this, preservedWindow,
-        activityConfigCallback);
+mFragments.attachHost(null);
+mWindow = new PhoneWindow(this, preservedWindow, activityConfigCallback);
+mWindow.setWindowControllerCallback(...);
+mWindow.setCallback(this);
+mWindow.getLayoutInflater().setPrivateFactory(this);
 ```
 
-PhoneWindow是客户端Window策略对象，负责Decor、feature、LayoutInflater和LayoutParams；此刻不是system_server的WindowState。
+还会在 `onCreate()` 前写入 manifest 的 `softInputMode` 与 `uiOptions`。`PhoneWindow` 构造本身可读取全局设置与 PackageManager feature，不应想象成完全无外部工作的空字段赋值。
 
-## 39. Window callback 指向Activity
+第二组是 Activity 身份与宿主字段：当前 UI 线程、ActivityThread、Instrumentation、activity/assist token、ident、Application、Intent、referrer、component、ActivityInfo、title、parent、non-config 与 voice interactor。构造函数阶段缺失的 Android 环境在这里集中接入。
 
-attach设置WindowControllerCallback、Window.Callback、dismiss callback，并把Activity设为LayoutInflater private factory。
+第三组是窗口门面：`PhoneWindow.setWindowManager()` 接收 Context 的 WindowManager、activity token、component 字符串与硬件加速位，创建绑定当前 PhoneWindow 的 local `WindowManagerImpl`；Activity 再保存 `mWindowManager`。若有 legacy parent，还会设置 container，`getActivityToken()` 也会返回 parent token；固定无 parent 主路径直接使用本 Activity token。
 
-于是按键、窗口属性、content变化和XML中View创建钩子可回到Activity。
+第四组是当前 Configuration、color mode、minimal post-processing、Autofill 与 Content Capture 选项。
 
-## 40. softInputMode 和 uiOptions 先写入Window
+alias 支路的双身份在这里落地：`mComponent = intent.getComponent()` 可保留 alias；默认 Factory 路径中实例的 Java class 是 `targetActivity`，自定义 Factory 则以其实际返回类为准。传给 WindowManager 的 app name 仍来自这个 Intent component。
 
-ActivityInfo中的softInputMode/uiOptions在onCreate前设置，Activity随后读取Window属性或inflate Decor时已有Manifest配置。
+`A_attach` 正常返回后，可以安全断言 base Context、Application、Intent、token、PhoneWindow 与 local WindowManager 都已写入；仍不能断言主题已应用、`onCreate()` 已执行、Decor 已生成或 WMS 收到 add 请求。
 
-但IME是否显示仍取决于窗口加入、焦点和WMS/IMMS后续状态。
+## 10. 对象层级：PhoneWindow 已存在，不等于 Decor、ViewRoot 或客户端主 WindowState 已存在
 
-## 41. attach 写入Activity核心字段
+固定首次 launch 中，`new PhoneWindow(this, null, callback)` 建立的是客户端窗口策略对象。`PhoneWindow` 继承 `Window`，不是 View；普通构造器建立 LayoutInflater 等状态，却不调用 `installDecor()`。
 
-包括当前UI线程、ActivityThread、Instrumentation、activity token、assist token、ident、Application、Intent、referrer、component、ActivityInfo、title、parent、non-config实例和voice interactor。
+本地对象层级要逐层辨认：
 
-Activity构造函数阶段这些字段大多尚未就绪。
-
-## 42. alias 下 mComponent 的细节
-
-Activity.attach写 `mComponent = intent.getComponent()`；而实例化类名可能因targetActivity换成alias目标类。
-
-因此 `getComponentName()`可反映Manifest入口/alias，`getClass()`反映实际Activity类，二者不必相同。
-
-## 43. setWindowManager 仍是客户端组装
-
-PhoneWindow取得Context的WindowManager服务，写app token/app name/hardware accelerated，并创建一个绑定当前PhoneWindow的local WindowManagerImpl。
-
-Window.java注释明确：这个设置主要供Window添加panel/subwindow，不负责把Activity主Window本身立即显示出来。
-
-## 44. mWindowManager 是本地门面
-
-`Activity.mWindowManager = mWindow.getWindowManager()`得到local WindowManagerImpl；其addView最终会进WindowManagerGlobal。
-
-持有WindowManager对象不等于已经调用addView，更不等于WMS创建WindowState。
-
-## 45. theme 在 onCreate 前设置
-
-attach返回后，ActivityThread等待必要的NetworkPolicy状态更新，再读取ActivityInfo主题资源并调用 `activity.setTheme(theme)`。
-
-因此开发者onCreate中的styled attribute、setContentView通常使用Manifest指定主题。
-
-## 46. 为什么可能阻塞网络规则
-
-若进程状态更新伴随NetworkPolicy规则序号，`checkAndBlockForNetworkAccess()`同步等待AMS确认规则应用，再允许Activity代码继续。
-
-这是防止进程前后台状态变化与网络访问政策短暂错位；它也可能成为onCreate前的等待点。
-
-## 47. Instrumentation 调用 Activity.onCreate
-
-```java
-mInstrumentation.callActivityOnCreate(activity, state);
+```text
+Activity
+  └─ PhoneWindow                 A_attach 前建立
+       ├─ WindowManagerImpl      A_attach 内建立的本地门面
+       └─ DecorView              setContentView/getDecorView 时懒创建
+            └─ ViewRootImpl      WindowManagerGlobal.addView 时创建
+                 └─ IWindow      交给 WMS 建 WindowState
+                      └─ Surface/buffer/合成/present
 ```
 
-默认实现执行prePerformCreate、`activity.performCreate()`、postPerformCreate；Instrumentation可监控、等待或处理异常。
+`Window.setWindowManager()` 的源码注释特意说明：这个 manager 供 Window 添加 panel/subwindow，本身不负责显示 Activity 主 Window；主窗口必须由客户端稍后显式 `addView()`。因此持有 `mWindowManager` 不是 WMS 完成点。
 
-## 48. Activity.performCreate 的内部顺序
+`handleLaunchActivity()` 在实例化前还有两个容易误判的预热：
 
-它发送pre-created生命周期callback，初始化PiP/多窗口状态、恢复权限请求状态，再调用开发者onCreate；之后写EventLog、恢复transition state、计算mVisibleFromClient并分发Fragment/post-created callback。
+- 满足硬件加速且 renderer 未禁用时，`HardwareRenderer.preload()` 的 native 实现通过 `RenderThread::getInstance()` 创建并启动 RenderThread，再把 EGL/Vulkan driver preload 投到其队列；方法返回不证明异步 preload 已跑完，更不证明存在某个窗口的 `CanvasContext` 或一帧。
+- `WindowManagerGlobal.initialize()` 首次调用会取得 WMS 代理，并同步查询 animator scale 与 BLAST 使用状态；它不打开本 Activity 的窗口。IWindowSession 通常到构造 `ViewRootImpl`、调用 `getWindowSession()` 时才按需建立，当然也可能已被进程中其他窗口缓存。
 
-所以 `onCreate()`只是performCreate中间的重要一步。
+若 `onCreate()` 调用 `setContentView()` 或主动 `getDecorView()`，Decor 可在 O_create 之前出现；若不触发，resume 路径会通过 `getDecorView()` 确保它存在。Decor 是本地 View 根容器，也仍不等于 ViewRoot、WindowState 或 Surface。
 
-## 49. super.onCreate 强制检查
+## 11. network gate、主题与 Instrumentation 怎样围住 onCreate
 
-ActivityThread在调用前设置 `activity.mCalled=false`；Activity基类onCreate会置true。返回后仍为false则抛SuperNotCalledException。
+`Activity.attach()` 返回后，`performLaunchActivity()` 的顺序不是直接调用开发者代码：
 
-子类必须调用 `super.onCreate()`，否则Framework内部Fragment/Window/状态恢复不变量无法保证。
+```text
+可选 customIntent 替换
+→ 清 lastNonConfigurationInstances
+→ checkAndBlockForNetworkAccess
+→ mStartedActivity = false
+→ setTheme(ActivityInfo theme)
+→ mCalled = false
+→ Instrumentation.callActivityOnCreate
+→ 检查 mCalled
+```
 
-## 50. saved state 与persistent state
+若 AMS 此前通过独立的 `IApplicationThread.setNetworkBlockSeq(procStateSeq)` 写入了 `mNetworkBlockSeq`，`checkAndBlockForNetworkAccess()` 会同步调用 AMS `waitForNetworkStateUpdate()`；否则立即返回。它位于主题和 `onCreate()` 之前，是合法的主线程等待点。
 
-ActivityInfo声明persistable时，Instrumentation调用带Bundle和PersistableBundle的重载；普通Activity只传saved instance Bundle。
+主题在 attach 之后、create 之前应用。因此 `onCreate()` 中读取 styled attribute 或 `setContentView()` 通常已使用 manifest 选择的主题；但 PhoneWindow 早已建立，Decor 则仍可不存在。
 
-这两个state来源、序列化类型和生命周期用途不同，不应统称为同一个“缓存”。
+默认 Instrumentation 的 create 调用依次是 `prePerformCreate()`、`activity.performCreate()`、`postPerformCreate()`。`performCreate()` 又按顺序：
 
-## 51. setContentView 可能在 onCreate 创建Decor
+- 分发 pre-created callback；
+- 初始化多窗口/PiP 标志并恢复权限请求状态；
+- ActivityThread 会按 `r.isPersistable()` 选择 Instrumentation overload；进入 `Activity.performCreate(icicle, persistentState)` 后，只有 `persistentState != null` 才调用业务两参数 `onCreate()`，否则仍调用一参数版本；
+- 记录事件、恢复 transition state；
+- 从 Window style 计算 `mVisibleFromClient`；
+- 分发 Fragment created 与 post-created callback。
 
-开发者调用Activity.setContentView最终到PhoneWindow.setContentView；若mContentParent为空，会执行 `installDecor()`生成DecorView和主题对应content layout，再inflate业务布局。
+Activity 基类 `onCreate()` 自己会恢复 Fragment 状态、分发兼容 created callback，并把 `mCalled=true`。子类可以在自身方法中选择何时调用 `super`，所以一条写在子类末尾的日志只证明开发者方法快要返回；它还早于 Instrumentation 的 `postPerformCreate()` 与 ActivityThread 的 super 检查。
 
-因此Decor可能在onCreate中出现，但前提是访问了setContentView/getDecorView等触发点。
+若返回后 `mCalled` 仍为 false，ActivityThread 抛 `SuperNotCalledException`。只有 Instrumentation 调用正常返回且这项检查通过，才到 `O_create`。`onCreate()` 中可选择建立 Decor/内容树，但 PhoneWindow、Decor、ViewRoot 与客户端主窗口对应的 WMS `WindowState` 仍是四个不同完成层。
 
-## 52. onCreate 不要求必须 setContentView
+## 12. onCreate 返回后还有客户端提交，再由 executor 补 Start/Resume
 
-无UI、延迟构建或特殊Activity可以不在onCreate调用setContentView。PhoneWindow对象已存在不代表Decor一定存在，Decor存在也不代表已经attach到ViewRootImpl。
-
-要分开“Window策略对象”“View根容器”“系统窗口连接”。
-
-## 53. onCreate 后才把真实实例写回Record
-
-成功回调后：
+成功主路径在 O_create 之后才执行：
 
 ```java
 r.activity = activity;
+mLastReportedWindowingMode.put(activity.getActivityToken(), ...);
 r.setState(ON_CREATE);
 synchronized (mResourcesManager) {
     mActivities.put(r.token, r);
 }
 ```
 
-Activity对象在onCreate期间已持token，但ActivityThread的mActivities主表直到回调完成后才正式登记它。
+这形成一个虽短但真实的 `O_create → M_commit` 窗口。`onCreate()` 执行期间，Activity 自己已经持有 token，却还没有通过 `ActivityThread.mActivities[token]` 对其他客户端路径公开。map 修改借 `mResourcesManager` 锁保护，是因为其他线程的 pending activity configuration 更新会读取这张表；它不把所有 ActivityClientRecord 字段自动变成跨线程安全状态。
 
-## 54. 为什么 mActivities 修改要加资源锁
+`r.setState(ON_CREATE)` 会把 `paused=true`、`stopped=true`，只是 executor 的兼容状态编码。不能由这两个布尔值伪造出 `onPause()`、`onStop()` 已发生的历史。
 
-注释指出其他线程的pending activity configuration更新会读取mActivities；修改在 mResourcesManager锁内完成，避免配置到达与实例登记竞态。
+`performLaunchActivity()` 返回后、`handleLaunchActivity()` 返回前，固定成功且未 finish 的路径把 `r.state` 以及 `shouldRestoreInstanceState`、`shouldCallOnPostCreate` 两个标志写入 `PendingTransactionActions`；后续 Start 据此恢复状态并调用 `onPostCreate()`。对于固定 final Resume，TransactionExecutor 的路径是：
 
-这不表示所有ActivityClientRecord字段都可在任意线程无锁读写。
+```text
+M_commit
+→ handleStartActivity / performStart / 客户端 ON_START
+→ 可选 onRestoreInstanceState
+→ onPostCreate / T_start
+→ ResumeActivityItem.handleResumeActivity
+```
 
-## 55. 客户端ON_CREATE兼容字段
+因此恢复回调与 `onPostCreate()` 不在 `performLaunchActivity()` 内，也不是另一笔服务端 Binder 请求；`onPostCreate()` 阶段完成后形成 `T_start`。
 
-`r.setState(ON_CREATE)`同时把paused=true、stopped=true。这里stopped/paused是客户端路径兼容账本，不代表刚执行完真实onStop/onPause回调。
+final Pause 支路会从 ON_CREATE 补 `ON_START → ON_RESUME`，再由 `PauseActivityItem` 执行 Pause；这与服务端“以 paused 状态启动”的注释一致。中间 ON_RESUME 调用 `handleResumeActivity(..., finalStateRequest=false)`，仍可能执行正常窗口 add，不能把 final Pause 理解成跳过 Resume 的窗口阶段。
 
-它表达“尚未走Start/Resume”的初始生命周期位置，不能反推回调历史。
+服务端用无参 `PauseActivityItem.obtain()` 创建该请求，使 `mDontReport=true`；它的 `postExecute()` 因而不再回报 `activityPaused`，而服务端已自行把 ActivityRecord 记为 PAUSED。
 
-## 56. LaunchActivityItem execute 到此只负责Create
+`performResumeActivity()` 在交付 pending intents/results、调用 `Activity.performResume()` 后把客户端账设为 `ON_RESUME`，形成 U_resume。接下来的窗口工作仍在同一个 `handleResumeActivity()` 中，不能把 `onResume()` 返回当成 W_add。
 
-performLaunchActivity返回后，handleLaunchActivity记录createdConfig、上报size configurations，并让PendingTransactionActions在后续Start阶段恢复实例状态、调用onPostCreate。
+## 13. 动态提交：resume 才交主窗口，mWindowAdded 也不是 WMS 回执
 
-Launch callback本身不直接完成整笔Resume目标。
-
-## 57. TransactionExecutor 自动补Start
-
-事务最终若是ResumeActivityItem，Executor会在Launch callback后补到目标前一状态：调用handleStartActivity→`Activity.performStart()`，再由最终Resume item执行resume。
-
-onStart/onResume不是performLaunchActivity内部偷偷调用的。
-
-## 58. Window何时真正 addView
-
-`handleResumeActivity()`完成performResume后，若Activity可见且未结束：
+普通新窗口要进入下面这段代码，至少还需 `performResumeActivity()` 返回非空、token 不在待销毁表、`r.window == null`、Activity 未 finish、`willBeVisible=true`，并在内层满足 `mVisibleFromClient=true`；启动了另一 Activity 时还会同步询问 ATMS 是否仍应可见。固定主路径满足这些条件，`handleResumeActivity()` 在 U_resume 后执行：
 
 ```java
+r.window = r.activity.getWindow();
 View decor = r.window.getDecorView();
+decor.setVisibility(View.INVISIBLE);
+ViewManager wm = activity.getWindowManager();
+activity.mDecor = decor;
+layoutParams.type = TYPE_BASE_APPLICATION;
+activity.mWindowAdded = true;
 wm.addView(decor, layoutParams);
 ```
 
-这里才进入WindowManagerGlobal、创建ViewRootImpl并通过Session与WMS协商添加主窗口。
+这里有三个必须分开的点。
 
-## 59. Decor可能在resume才首次创建
+第一，`getDecorView()` 会在需要时调用 `installDecor()`，所以未在 `onCreate()` 建 Decor 的 Activity 仍可在 resume 建立本地 View 根。它是否包含业务内容取决于应用是否设置内容；第 210 章专门拆这一步。
 
-若onCreate未触发installDecor，resume路径的 `getDecorView()`会调用installDecor。因此“DecorView一定在setContentView时创建”也不完整。
+第二，`mWindowAdded=true` 写在 `wm.addView()` **之前**；preserved Window 路径也会直接把它置 true 并跳过本次 add。因此单独读到 true 既不是 `addView()` 正常返回证明，也不是 WMS `WindowState` 的实时回读。它更接近防重入/复用控制位。
 
-最终要显示主窗口时Framework会确保Decor存在。
+第三，普通 `WindowManagerImpl.addView()` 进入 `WindowManagerGlobal`，创建 `ViewRootImpl`，把 View/root/params 放入进程全局表，然后 `ViewRootImpl.setView()` 先 request layout，再同步调用 `IWindowSession.addToDisplayAsUser()`。负返回码会转成 BadToken、InvalidDisplay 等异常；正常 `wm.addView()` 返回才可作为 W_add，说明客户端 ViewRoot 已建立且 WMS 接受了 add。
 
-## 60. addView 仍不等于Surface已经显示
+W_add 之后仍有：首次 traversal、measure/layout/draw、relayout、Surface/BufferQueue、GPU/CPU 渲染、buffer queue、SurfaceFlinger latch/composition/present。`ResumeActivityItem.postExecute()` 随后同步调用 ATMS `activityResumed(token)`，这份客户端回报也不携带“首帧已呈现”证明。
 
-WindowManager.addView开始客户端ViewRoot/WMS窗口连接；随后还需relayout、Surface/BufferQueue、measure/layout/draw、buffer提交、SurfaceFlinger latch/composition/present。
-
-所以 Window已add、View已draw、windows drawn和硬件present仍是不同完成边界。
-
-## 61. mWindowAdded 的意义
-
-Activity用mWindowAdded防止重复addView；preserved Window路径可直接标true并通知旧ViewRoot child rebuilt。
-
-它是客户端“是否已把Decor交给WindowManager”账本，不是WMS WindowState实时回读。
-
-## 62. 异常处理
-
-实例化、attach或onCreate异常先交给 `Instrumentation.onException(activity, e)`；未处理则包装成Unable to instantiate/start activity异常，让主线程崩溃并由system_server处理进程死亡。
-
-若handleLaunchActivity最终得到null，会请求ATMS finish对应token，避免服务端ActivityRecord无限等待一个不存在的实例。
-
-## 63. Activity构造函数为何应轻量
-
-构造时Context、Application、Intent、token和Window尚未attach；重I/O还会直接占用主线程启动关键路径。
-
-构造函数适合普通Java字段初值，不适合依赖Android环境或做昂贵初始化。
-
-## 64. Context边界总结
+这里讨论的是 App 客户端提交的 Activity 主窗口。为了遮住冷启动空白，system_server 可能更早为同一 ActivityRecord 安排 starting/snapshot/splash window；那类 WMS `WindowState` 的存在既不证明 N_instance，也不证明客户端主窗口已到 W_add。
 
 ```text
-Application Context：进程/包级，生命周期长
-Activity Context：带activity token/display/override config的UI Context
-PhoneWindow Context：使用Activity作为外层Context
-Decor Context：可能按Window主题建立
+PhoneWindow存在
+  ≠ Decor存在
+  ≠ ViewRootImpl存在
+  ≠ WMS接受Window
+  ≠ Surface可用
+  ≠ 首帧draw/submit
+  ≠ SurfaceFlinger present
 ```
 
-随意把Application Context用于主题/窗口，会丢失Activity级display和配置语义。
+## 14. 异常、本地调用、relaunch 与 finish 会在哪一层截断主线
 
-## 65. Token边界总结
+固定成功主线之外，要按 catch 范围和提交点判断：
 
-- activity token：ActivityRecord/ActivityClientRecord、资源和主Window身份；
-- assist token：Assist/语音上下文独立授权身份；
-- window token写入LayoutParams：WMS关联窗口层级；
-- Binder token不是Activity Java对象地址。
+| 分支或失败 | r48 边界 | 不能笼统声称 |
+|---|---|---|
+| 服务端无 thread / schedule `RemoteException` | 首次失败标 `launchFailed`、解绑 Activity 后抛出重试；第二次会结束 Activity 并处理进程死亡 | transaction 已到 App |
+| pre-destroyed transaction | `P_pre/Q_tx` 后可在 executor callback 前跳过 | ActivityClientRecord 一定创建 |
+| record 构造、package 修复、component resolve、Context 创建 | 位于实例化 catch 之外，异常直接越过该 `onException()` 分支 | 所有 launch 异常都交给 Instrumentation |
+| newActivity/StrictMode/Intent-state loader | 第一段 `catch (Exception)` 可询问 `Instrumentation.onException()` | 返回 true 就等于 launch 完整成功 |
+| makeApplication/attach/theme/onCreate/客户端提交 | 外层 `catch (Exception)` 可询问 Instrumentation；`Error` 不在此 catch 内 | 任意异常都可恢复到 M_commit |
+| 未调用 `super.onCreate()` | `SuperNotCalledException` 被专门重新抛出 | custom Instrumentation 可把它当普通异常吞掉 |
+| 实例化异常被处理且 Activity 仍为 null | handler 最终返回 null，`handleLaunchActivity()` 请求 ATMS finish token | system_server 会无限等实例 |
+| Activity 在 create 中 finish | record 仍可提交，但 pending Start/Resume 与窗口路径受 finished 条件抑制 | O_create 必然导向 W_add |
+| system-process Activity | IApplicationThread 可为本地调用，参数不一定经过 Parcel，preExecute/入队可发生在服务端调用栈 | remote oneway 的弱完成语义原样适用 |
+| preserved Window relaunch | 新 Activity/PhoneWindow 复用旧 Decor/ViewRoot 关联，resume 跳过本次 add | 每次 N_instance 都对应全新窗口树 |
 
-同名token概念需看字段来源与消费者。
+`Instrumentation.onException()` 返回 true 只是表示该 catch 不立即包装抛出，并不替后续字段建立不变量。尤其在 Activity 非空却尚未赋给 `r.activity` 时，继续执行的代码可能仍因缺失提交而失败；不能把它当成通用事务回滚或恢复协议。
 
-## 66. 完成点阶梯
+窗口 add 失败发生在 Create/Start/Resume 之后。此时 Activity 对象与 `mActivities` 记录可能早已存在，但主线程仍会因 BadToken 等异常终止当前路径。反过来，构造函数失败时连 A_attach 都没有，WMS 不应成为第一调查点。
 
-```text
-① LaunchActivityItem已到App
-② ActivityClientRecord已创建
-③ Activity Java对象已实例化
-④ Activity.attach已完成/PhoneWindow已创建
-⑤ Activity.onCreate已完成
-⑥ Start/Resume已完成
-⑦ Decor已addView/ViewRoot已建立
-⑧ 首帧已draw并提交
-⑨ SurfaceFlinger已present
-```
+## 15. 用最小证据定位卡点，并把 Decor 细节交给第 210 章
 
-冷启动日志必须明确说的是哪一级。
+看到日志时，先问它属于哪个完成点：
 
-## 67. 常见误解一：ActivityRecord就是Activity对象
+| 最小证据 | 至少说明 | 仍不能说明 |
+|---|---|---|
+| `LaunchActivityItem.execute()` 入口 trace | L_exec | record 构造成功 |
+| Activity 构造函数末尾日志 | 默认 Factory 构造路径尚未到 N_instance；自定义路径不可据此定位 | base Context 已 attach |
+| `attachBaseContext()` 返回后的探针 | attach 正在推进 | PhoneWindow 与全部字段已完成 |
+| 子类 `onCreate()` 入口 | A_attach、network gate、theme 已越过 | super 已调用或 O_create |
+| 子类 `onCreate()` 末尾日志 | 开发者方法将返回 | Instrumentation post、super check 与 M_commit |
+| `mActivities[token]` 可见且 state 为 ON_CREATE | M_commit | Start/Resume 或窗口已加入 |
+| `onResume()` 返回后的 framework trace | U_resume 附近 | `wm.addView()` 已正常返回 |
+| WMS 已有客户端主 `IWindow` 对应的 `WindowState` | addToDisplay 已被接受 | 首帧 buffer 已提交/present |
+| frame timeline / present fence 证据 | 对应绘制或 present 点 | 不能反向替代更早对象为何变慢的调用栈 |
 
-ActivityRecord在system_server，业务Activity在App；中间还有ActivityClientRecord。服务端先有记录，App进程甚至可以尚未存在。
+用对象可用性再做一次反向检查：
 
-跨进程只能传token和状态快照，不能传业务对象引用。
+| 阶段 | base Context | Application/token/Intent 字段 | PhoneWindow | Decor | 客户端 ViewRootImpl | 客户端主窗口的 WMS WindowState |
+|---|---:|---:|---:|---:|---:|---:|
+| Activity 构造函数 | 否 | 否 | 否 | 否 | 否 | 否 |
+| A_attach 之后 | 是 | 是 | 是 | 普通路径未必 | 否 | 否 |
+| O_create 之后 | 是 | 是 | 是 | 取决于是否触发安装 | 否 | 否 |
+| U_resume 之后、窗口分支之前 | 是 | 是 | 是 | 可能已有 | 否 | 否 |
+| W_add 之后 | 是 | 是 | 是 | 是 | 是 | 是 |
 
-## 68. 常见误解二：new Activity后就能getSystemService
+回到唯一问题：严格关系是 `A_attach < 子类 onCreate 末尾日志 < O_create < M_commit`。所以十三个定义点中最新完成的是 `A_attach`，日志只把调查推进到 A_attach 与 O_create 之间；它还不能替代 Instrumentation 返回、super 检查、`r.activity` 赋值、客户端 map 登记、Start/Resume 与窗口 add。system_server 的早期 `RESUMED` 又只是服务端预期状态，不能补强这些客户端证据。
 
-Factory返回时尚未attach base Context。只有Activity.attachBaseContext完成后，ContextWrapper API才有有效delegate。
+本章交付 `A_attach/O_create/M_commit` 三个核心边界，并只向后追到 W_add 以防止“有 Window 就已上屏”的误读。第 210 章从 `PhoneWindow` 已存在、Decor 仍可为空的位置继续，专门分析 theme feature、`installDecor()`、系统骨架与 `setContentView()`。
 
-AppComponentFactory文档专门警告不要过早使用Activity Android API。
+## 16. 九组只读练习：亲手重建实例、Context 与窗口边界
 
-## 69. 常见误解三：onCreate里已有系统窗口
+以下命令默认在 Android 11 源码根目录运行；也可预先设置 `ANDROID_BUILD_TOP`。每段只读取源码，不编译、不连接设备，也不修改工作区。
 
-onCreate前有PhoneWindow对象，onCreate可创建Decor；主窗口通常到resume阶段才wm.addView并接入WMS。
-
-PhoneWindow存在、Decor存在、ViewRoot存在、WindowState存在、Surface有buffer是五个阶段。
-
-## 70. 常见误解四：setContentView就是绘制
-
-setContentView只建立/替换View层级并请求insets/layout。实际measure/layout/draw要等ViewRoot traversal和VSync，buffer再经SurfaceFlinger处理。
-
-布局inflate完成不等于屏幕出现像素。
-
-## 71. Mac只读练习一：还原对象顺序
+### 练习 1：证明服务端提交与客户端创建不是同一点
 
 ```bash
-sed -n '3310,3425p' \
-  frameworks/base/core/java/android/app/ActivityThread.java
-
-sed -n '7885,7960p' \
-  frameworks/base/core/java/android/app/Activity.java
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+A="$SRC/frameworks/base/services/core/java/com/android/server/wm/ActivityStackSupervisor.java"
+I="$SRC/frameworks/base/core/java/android/app/IApplicationThread.aidl"
+C="$SRC/frameworks/base/services/core/java/com/android/server/wm/ClientLifecycleManager.java"
+test -f "$A" && test -f "$I" && test -f "$C"
+grep -nE 'allPausedActivitiesComplete|ClientTransaction\.obtain|LaunchActivityItem\.obtain|new Intent\(r\.intent\)|ResumeActivityItem\.obtain|PauseActivityItem\.obtain|scheduleTransaction\(clientTransaction\)|minimalResumeActivityLocked|setState\(PAUSED' "$A"
+grep -nE '^oneway interface IApplicationThread|scheduleTransaction' "$I"
+grep -nE 'scheduleTransaction|transaction\.schedule|instanceof Binder|remote call|local calls' "$C"
 ```
 
-按Context、Factory、Application、outerContext、attach、theme、onCreate、mActivities登记编号，检查每一步Activity中哪些字段已经可用。
+画出 system_server、App Binder worker 与 App main 三条泳道，把 `S_submit`、服务端 `minimalResumeActivityLocked()` 与 L_exec 分开。再说明为何 system-process 本地 IApplicationThread 会改变线程归属和“调用返回”能证明的内容。
 
-## 72. Mac只读练习二：证明Factory对象尚无Context
+完成标准：不得由服务端 `RESUMED` 推出 Activity 构造函数已运行。
+
+### 练习 2：从 preExecute 追到预销毁取消门
 
 ```bash
-sed -n '1240,1265p' \
-  frameworks/base/core/java/android/app/Instrumentation.java
-
-sed -n '80,110p' \
-  frameworks/base/core/java/android/app/AppComponentFactory.java
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+L="$SRC/frameworks/base/core/java/android/app/servertransaction/LaunchActivityItem.java"
+H="$SRC/frameworks/base/core/java/android/app/ClientTransactionHandler.java"
+T="$SRC/frameworks/base/core/java/android/app/ActivityThread.java"
+X="$SRC/frameworks/base/core/java/android/app/servertransaction/TransactionExecutor.java"
+test -f "$L" && test -f "$H" && test -f "$T" && test -f "$X"
+grep -nE 'void preExecute|countLaunchingActivities|updateProcessState|updatePendingConfiguration|void execute|new ActivityClientRecord|postExecute' "$L"
+grep -nE 'void scheduleTransaction|transaction\.preExecute|sendMessage.*EXECUTE_TRANSACTION|executeTransaction' "$H"
+grep -nE 'public void scheduleTransaction|ActivityThread\.this\.scheduleTransaction|case EXECUTE_TRANSACTION|mTransactionExecutor\.execute' "$T"
+grep -nE 'activitiesToBeDestroyed|getActivitiesToBeDestroyed|getActivityClient\(token\) == null|Skip pre-destroyed|executeCallbacks|executeLifecycleState' "$X"
 ```
 
-阅读instantiateActivity的Javadoc，把“构造完成”和“Android Context初始化完成”分成两栏。
+把 P_pre、Q_tx、L_exec 标到调用链，另画一条在 callback 前返回的 pre-destroyed 分支。解释为什么 launching count 变化不证明 ActivityClientRecord 存在。
 
-## 73. Mac只读练习三：证明Window分阶段出现
+完成标准：能写出 `P_pre → Q_tx`，也能指出二者之后仍有取消门。
+
+### 练习 3：核准 record 初值、LoadedApk 与 alias 双身份
 
 ```bash
-sed -n '430,490p' \
-  frameworks/base/core/java/com/android/internal/policy/PhoneWindow.java
-
-sed -n '4470,4540p' \
-  frameworks/base/core/java/android/app/ActivityThread.java
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+T="$SRC/frameworks/base/core/java/android/app/ActivityThread.java"
+A="$SRC/frameworks/base/services/core/java/com/android/server/wm/ActivityStackSupervisor.java"
+test -f "$T" && test -f "$A"
+grep -nE 'mLifecycleState = PRE_ON_CREATE|ActivityClientRecord\(IBinder|paused = false|stopped = false|getPackageInfoNoCheck|case ON_CREATE|paused = true|stopped = true' "$T"
+grep -nE 'intent\.getComponent|resolveActivity|setComponent|targetActivity|new ComponentName|newActivity\(|mComponent = intent\.getComponent' "$T" "$SRC/frameworks/base/core/java/android/app/Activity.java"
+grep -nE 'System\.identityHashCode\(r\)|r\.appToken' "$A"
 ```
 
-定位setContentView/installDecor与resume中的getDecorView/wm.addView，画出PhoneWindow→Decor→ViewRoot/WMS的边界。
+分别记录 record 构造时、M_commit 时的 lifecycle/paused/stopped，并画出 alias Intent component 与实际 class name。说明 ident 为何不能当跨进程主键。
 
-## 74. 自测题
+完成标准：不能把 `PRE_ON_CREATE` 记录误写成业务 Activity 已存在。
 
-1. ActivityRecord、ActivityClientRecord和Activity实例各在哪里？
-2. 为什么先创建Activity Context再调用AppComponentFactory？
-3. Factory刚返回的Activity可以安全使用Window吗？为什么？
-4. alias场景下Intent component与实际Activity类有什么不同？
-5. Activity.attach在onCreate前组装了哪些关键对象？
-6. PhoneWindow创建为什么不代表WMS已有窗口？
-7. DecorView最早和最迟可能在哪个阶段创建？
-8. onCreate完成距离首帧present还隔哪些步骤？
+### 练习 4：拆开 token、ResourcesKey 与 ClassLoader
 
-## 75. 本章结论
-
-LaunchActivityItem把服务端ActivityRecord的启动快照转换为App内ActivityClientRecord；ActivityThread先按token/display/config建立Activity Context和Resources，再通过Instrumentation与AppComponentFactory创建尚未attach的Activity对象，随后Activity.attach接入base Context、Application、Intent、token、PhoneWindow与local WindowManager，最后由Instrumentation调用onCreate并登记客户端账本。
-
-必须牢牢记住：
-
-```text
-Activity实例已new
-≠ Context已attach
-≠ onCreate已完成
-≠ DecorView已创建
-≠ Window已add到WMS
-≠ ViewRoot已完成首帧
-≠ SurfaceFlinger已present
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+T="$SRC/frameworks/base/core/java/android/app/ActivityThread.java"
+C="$SRC/frameworks/base/core/java/android/app/ContextImpl.java"
+R="$SRC/frameworks/base/core/java/android/app/ResourcesManager.java"
+M="$SRC/frameworks/base/services/core/java/com/android/server/wm/ActivityTaskManagerService.java"
+test -f "$T" && test -f "$C" && test -f "$R" && test -f "$M"
+grep -nE 'createBaseContextForActivity|getDisplayId\(r\.token\)|createActivityContext|overrideTokenDisplayAdjustments' "$T"
+grep -nE 'requestsIsolatedSplitLoading|getSplitClassLoader|getSplitPaths|mIsUiContext|mIsAssociatedWithDisplay|INVALID_DISPLAY|createBaseTokenResources|getAdjustedDisplay' "$C"
+grep -nE 'mActivityResourceReferences|getOrCreateActivityResourcesStructLocked|new ResourcesKey|findResourcesForActivityLocked|createResources\(token' "$R"
+grep -nE 'int getDisplayId|ActivityRecord\.getStackLocked|return DEFAULT_DISPLAY' "$M"
 ```
 
-下一章专门拆PhoneWindow与DecorView：主题feature怎样选择Decor布局、setContentView怎样inflate到content parent，以及为何requestFeature必须早于内容安装。
+画三栏：token 索引、ResourcesKey 字段、ClassLoader 参数。再把 fixed rotation 的 application adjustment 与 token adjustment 标到 Activity 实例化之前。
+
+完成标准：答案必须明确 ResourcesKey 本身没有 token 和 ClassLoader 字段。
+
+### 练习 5：证明 Factory 返回的是未 attach 的实例
+
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+T="$SRC/frameworks/base/core/java/android/app/ActivityThread.java"
+I="$SRC/frameworks/base/core/java/android/app/Instrumentation.java"
+F="$SRC/frameworks/base/core/java/android/app/AppComponentFactory.java"
+W="$SRC/frameworks/base/core/java/android/content/ContextWrapper.java"
+test -f "$T" && test -f "$I" && test -f "$F" && test -f "$W"
+grep -nE 'appContext\.getClassLoader|mInstrumentation\.newActivity|incrementExpectedActivityCount|setExtrasClassLoader|prepareToEnterProcess|r\.state\.setClassLoader' "$T"
+grep -nE 'Activity newActivity\(ClassLoader|getFactory\(pkg\)|instantiateActivity' "$I"
+grep -nE 'instantiateActivity|will not be initialized|newInstance' "$F"
+grep -nE 'Context mBase|attachBaseContext|Base context already set|mBase\.getResources' "$W"
+```
+
+按 C_context、默认 Factory 的类加载/构造、Factory 返回形成 N_instance、extras loader、A_attach 排序；再单列自定义 Factory 可返回替代实例的分支。列出 Factory 内可做的普通 Java 注入与必须延后的 Context/Window 操作。
+
+完成标准：只有 Factory 返回才交付 N_instance；默认构造函数末尾日志仍在它之前，且两者都不能交付 A_attach。
+
+### 练习 6：重建 makeApplication 到 Activity.attach 的闭合顺序
+
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+T="$SRC/frameworks/base/core/java/android/app/ActivityThread.java"
+L="$SRC/frameworks/base/core/java/android/app/LoadedApk.java"
+A="$SRC/frameworks/base/core/java/android/app/Activity.java"
+test -f "$T" && test -f "$L" && test -f "$A"
+grep -nE 'makeApplication\(false|loadLabel|new Configuration\(mCompatConfiguration\)|mPendingRemoveWindow|addLoaders|setOuterContext|activity\.attach|checkAndBlockForNetworkAccess|activity\.setTheme' "$T"
+grep -nE 'makeApplication\(|mApplication != null|newApplication|mAllApplications\.add|callApplicationOnCreate' "$L"
+grep -nE 'final void attach\(|attachBaseContext|new PhoneWindow|setWindowManager|mApplication =|mIntent =|mToken =|mWindowManager =' "$A"
+```
+
+先画固定初始包的缓存 Application 路径，再画共享进程中另一个 LoadedApk 首次创建 Application 的分支。给 `setOuterContext()` 与 `attachBaseContext()` 分配不同完成点。
+
+完成标准：A_attach 必须晚于 Context、Activity 空壳和 Application 三者出现。
+
+### 练习 7：证明 PhoneWindow、Decor 与 RenderThread 是三条独立线
+
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+A="$SRC/frameworks/base/core/java/android/app/Activity.java"
+P="$SRC/frameworks/base/core/java/com/android/internal/policy/PhoneWindow.java"
+W="$SRC/frameworks/base/core/java/android/view/Window.java"
+G="$SRC/frameworks/base/core/java/android/view/WindowManagerGlobal.java"
+R="$SRC/frameworks/base/libs/hwui/renderthread/RenderProxy.cpp"
+Q="$SRC/frameworks/base/libs/hwui/renderthread/RenderThread.cpp"
+test -f "$A" && test -f "$P" && test -f "$W" && test -f "$G" && test -f "$R" && test -f "$Q"
+grep -nE 'new PhoneWindow|setWindowManager|mWindowManager =' "$A"
+grep -nE 'PhoneWindow\(Context context, Window|preservedWindow|getDecorView|installDecor|generateDecor' "$P"
+grep -nE 'not.*used for displaying|createLocalWindowManager' "$W"
+grep -nE 'static void initialize|getWindowManagerService|getWindowSession|openSession' "$G"
+grep -nE 'void RenderProxy::preload|RenderThread::getInstance|queue\(\)\.post' "$R"
+grep -nE 'RenderThread::getInstance|RenderThread::RenderThread|start\("RenderThread"\)' "$Q"
+```
+
+分别回答：RenderThread 已启动、图形驱动 preload 已完成、PhoneWindow 已有、Decor 已有、IWindowSession 已有，这五件事之间哪些能由当前代码建立必然边。
+
+完成标准：既不能说 `HardwareRenderer.preload()` 没启动 RenderThread，也不能说它返回时某 Activity 已有 renderer 或帧。
+
+### 练习 8：标出 onCreate 与 M_commit 之间的真实窗口
+
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+T="$SRC/frameworks/base/core/java/android/app/ActivityThread.java"
+I="$SRC/frameworks/base/core/java/android/app/Instrumentation.java"
+A="$SRC/frameworks/base/core/java/android/app/Activity.java"
+X="$SRC/frameworks/base/core/java/android/app/servertransaction/TransactionExecutor.java"
+H="$SRC/frameworks/base/core/java/android/app/servertransaction/TransactionExecutorHelper.java"
+test -f "$T" && test -f "$I" && test -f "$A" && test -f "$X" && test -f "$H"
+grep -nE 'mCalled = false|callActivityOnCreate|SuperNotCalledException|r\.activity = activity|r\.setState\(ON_CREATE\)|mActivities\.put|handleStartActivity|setRestoreInstanceState|setCallOnPostCreate' "$T"
+grep -nE 'prePerformCreate|activity\.performCreate|postPerformCreate' "$I"
+grep -nE 'final void performCreate|dispatchActivityPreCreated|onCreate\(icicle|mVisibleFromClient|dispatchActivityPostCreated|mCalled = true' "$A"
+grep -nE 'executeCallbacks|executeLifecycleState|handleStartActivity|handleResumeActivity|handlePauseActivity' "$X"
+grep -nE 'getLifecyclePath|excludeLastState|ON_START|ON_RESUME' "$H"
+```
+
+画 O_create、`r.activity` 赋值、state、map 四个点；再从 ON_CREATE 分别推演 final Resume 与 final Pause。说明 `paused=true/stopped=true` 为什么不是回调历史。
+
+完成标准：子类 `onCreate()` 末尾日志不得被标成 M_commit。
+
+### 练习 9：从 U_resume 追到 WMS 接受窗口，但停在首帧之前
+
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+T="$SRC/frameworks/base/core/java/android/app/ActivityThread.java"
+W="$SRC/frameworks/base/core/java/android/view/WindowManagerImpl.java"
+G="$SRC/frameworks/base/core/java/android/view/WindowManagerGlobal.java"
+V="$SRC/frameworks/base/core/java/android/view/ViewRootImpl.java"
+R="$SRC/frameworks/base/core/java/android/app/servertransaction/ResumeActivityItem.java"
+S="$SRC/frameworks/base/services/core/java/com/android/server/wm/Session.java"
+M="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java"
+test -f "$T" && test -f "$W" && test -f "$G" && test -f "$V" && test -f "$R" && test -f "$S" && test -f "$M"
+grep -nE 'performResumeActivity|r\.setState\(ON_RESUME\)|getDecorView|mWindowAdded = true|wm\.addView|makeVisible|addIdleHandler' "$T"
+grep -nE 'void addView|mGlobal\.addView|createLocalWindowManager' "$W"
+grep -nE 'new ViewRootImpl|mViews\.add|mRoots\.add|root\.setView' "$G"
+grep -nE 'ViewRootImpl\(Context|requestLayout\(\)|addToDisplayAsUser|ADD_BAD_APP_TOKEN|ADD_INVALID_DISPLAY' "$V"
+grep -nE 'addToDisplayAsUser|mService\.addWindow' "$S"
+grep -nE 'int addWindow\(|new WindowState\(|return res' "$M"
+grep -nE 'handleResumeActivity|activityResumed|getTargetState|ON_RESUME' "$R"
+```
+
+把 U_resume、`mWindowAdded=true`、ViewRoot 构造、WMS add 返回、`activityResumed()` 与首帧画成六个点。搜索不到本段中的 draw/present 完成边，正是 W_add 不能证明首帧的依据之一。
+
+完成标准：`mWindowAdded=true` 必须画在 `wm.addView()` 调用之前，并给 preserved Window 另画一条绕过本次 add 的支路。
+
+把九组练习合起来，应能重建这条诊断句：**固定远端普通 App 中，LaunchActivityItem 先建立客户端 record 和带 token/display/config 的 Activity Context，再由 Factory 交付尚未 attach 的 Java 实例；`Activity.attach()` 才接上 Application、Intent、token、PhoneWindow 与 local WindowManager，Instrumentation 正常完成 create 后又要经过 M_commit、Start/Resume 和窗口 add，最终才把调查交给绘制与呈现链。**

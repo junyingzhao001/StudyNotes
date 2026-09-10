@@ -1,0 +1,18 @@
+Commands: add TITLE | done ID | remove ID | list | quit
+No tasks.
+Error: title must be a non-empty single line
+Error: title must be a non-empty single line
+Invalid id.
+Invalid id.
+Invalid id.
+Invalid id.
+Invalid id.
+Invalid id.
+Not found.
+Unknown command.
+Unexpected argument.
+Unexpected argument.
+Added 1
+Completed.
+Completed.
+1 [x] Keep learning

@@ -1,0 +1,4 @@
+after copy: 10
+returned copy: 11
+after reference: 11
+length: 5

@@ -1,602 +1,391 @@
 # 213 Android ViewRootImpl 首次 performTraversals：测量、relayout 与 Surface 建立
 
-> 源码版本：Android 11 `android-11.0.0_r48`。  
-> 当前在 macOS 上只读源码，不实际运行Traversal、分配图形Buffer或采集首帧trace。
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`。
+>
+> 当前环境只读源码，可以证明 App 主线程、同步窗口 Binder、system_server 窗口状态机与渲染回报之间的源码顺序；不能据此测量某台设备的首帧耗时，也不能用 `performTraversals()` 返回代替 SurfaceFlinger latch 或显示硬件 present 证据。
 
-## 1. 本章目标
+第 212 章停在 `Activity.makeVisible()`：Decor 已经有 ViewRootImpl parent，WMS 也已经登记 WindowState，但 View 树还没有 AttachInfo，窗口还没有可绘制的 Java `Surface`。
 
-第212章停在 `ViewRootImpl.setView()`：WindowState和InputChannel已经登记，第一次Traversal也已排入Choreographer，但Decor尚未执行窗口attach，当前窗口还没有可绘制Surface。
+本章只追一个问题：**普通首次可见 Activity 的第一轮 `performTraversals()` 怎样把一次 App 尺寸提议变成 WMS frame 和可写 Surface；为什么 attach、measure、relayout、layout、draw、`finishDrawing()`、show 与 present 必须分别结账？**
 
-本章进入：
+## 1. 固定普通首次窗口，用十八个完成点定义“首轮走完”
 
-```java
-private void performTraversals()
-```
+先固定 `B_target`，避免把不同窗口、渲染后端与可见性分支揉成一条伪全序：
 
-读完应能说明：
+| 维度 | 固定值或前提 |
+|---|---|
+| 上游 | 沿用第 212 章的普通 Activity 首次主窗口；`addView()` 已正常返回，随后同一主线程执行了 `makeVisible()` |
+| 窗口 | `TYPE_BASE_APPLICATION`，宽高均为 `MATCH_PARENT`；不是子窗、starting window、IME、壁纸或其他系统窗 |
+| ViewRoot | `mAdded=true`、`mFirst=true`、`mSurface` 尚无效；第一次 traversal 已排队，尚未 dispatch attach |
+| 可见性 | Decor 为 VISIBLE，`mAppVisible=true`；服务端 `ActivityRecord.isClientVisible()` 为 true |
+| 图形分支 | 普通硬件加速 Decor；DecorView 虽实现 `RootViewSurfaceTaker`，但 `willYouTakeTheSurface()` 返回 null，故 `mSurfaceHolder==null`；主线固定 WMS 的 `mUseBLAST=false`，第 9 节再比较 BLAST 分支 |
+| 尺寸/焦点 | add 返回的 frame hint 与本次 relayout 返回的当前 frame 相同；无 compat scale、拖拽缩放、Window weight；add 与 relayout 的 touch mode 一致，不引起焦点变化 |
+| Insets/config | 初始 Insets 稳定，首次分发后 `mApplyInsetsRequested` 保持 false；relayout 不带来新的 cutout、always-consume-bars、caption、system UI visibility 或 Configuration 变化 |
+| 回调 | attach、Insets、GlobalLayout、InternalInsets、PreDraw 等可控回调正常返回，不 remove 根、不改可见性，也不制造新的有效 layout 请求；无需要等待的 `WindowCallbacks` draw latch |
+| 并发 | 当前窗口不被其他线程或 system_server 事件并发 remove、replace、resize、hide；Surface 分配与 Renderer 初始化成功 |
+| 显示门 | relayout 返回 `RELAYOUT_RES_FIRST_TIME`；PreDraw 全部放行，Activity 容器允许 show，目标 Buffer 最终有独立 present 证据 |
 
-- 首次View attach、Insets、measure、relayout、Surface、layout、draw的真实顺序；
-- 为什么第一次Traversal可能测量两次甚至更多次；
-- App测量尺寸与WMS最终窗口frame怎样协商；
-- SurfaceSession、SurfaceControl、BLASTBufferQueue和Surface的区别；
-- `RELAYOUT_RES_FIRST_TIME`、`reportNextDraw()`和`finishDrawing()`的关系；
-- 首次performDraw完成为什么仍不等于屏幕硬件已present。
+十八个完成点如下：
 
-## 2. 一句话主线
+| 点 | 精确定义 | 仍不能推出 |
+|---|---|---|
+| `T_start` | Choreographer 调用 TraversalRunnable；`doTraversal()` 撤 barrier 并进入 `performTraversals()` | View 已 attached |
+| `A_tree` | `dispatchAttachedToWindow()`、window-attached 通知和首轮 `dispatchApplyInsets()` 已返回 | 根 View 已测量 |
+| `M_offer` | 首次 `measureHierarchy()` 返回，根 measured size 成为 App 尺寸提议 | WMS 已接受这个尺寸 |
+| `B_enter` | App 主线程进入同步 `IWindowSession.relayout()` | WMS 已完成窗口布局 |
+| `W_record` | WMS 找到原 WindowState，记录请求尺寸、属性、可见性与 Insets pending 状态 | 本次 frame 已算出 |
+| `W_layout` | 强制 `performSurfacePlacement(true)` 返回，服务端本轮 WindowState frame/layout 已按窗口政策结算 | 后续焦点、IME、orientation 与回复用 Insets/control 快照已全部结算 |
+| `W_layer` | `createSurfaceLocked()` 成功，WindowSurfaceController 已存在且 draw state 为 `DRAW_PENDING` | 图层已经 show |
+| `B_reply` | WMS 完成后续窗口状态更新，填好 frame、Insets/control、SurfaceControl 等 out 参数，并从同步 relayout Binder 返回 App | Java `Surface` 已接好 |
+| `S_ready` | ViewRoot 已连接 Java `Surface`、接纳 frame/Insets，并完成新 Surface 的 Renderer 初始化 | View 已按返回 frame layout |
+| `M_settle` | relayout 后的补测条件已结算；固定路径尺寸、touch mode、Insets 与 Configuration 均稳定，因此不补测 | 子 View 坐标已确定 |
+| `L_tree` | `performLayout()` 返回，Decor 与子树的窗口局部坐标已确定 | 本帧一定会 draw |
+| `P_allow` | GlobalLayout/InternalInsets/焦点阶段结束，`dispatchOnPreDraw()` 未取消 | RenderThread 已完成帧 |
+| `D_submit` | 硬件 `performDraw()` 与本轮 traversal 返回；UI 线程已调用 Renderer 提交帧工作 | WMS 已收到完成回报 |
+| `C_ready` | 主 Handler 开始执行 Renderer frame-complete callback 投来的 Runnable，并调用 `pendingDrawFinished()` 结算 | WindowState 已可显示 |
+| `F_commit` | WMS 在同步 `finishDrawing()` 调用内部把 draw state 从 `DRAW_PENDING` 写成 `COMMIT_DRAW_PENDING`，并请求后续 traversal | App 已观察到 Binder 返回，或 WindowState 已是 `HAS_DRAWN` |
+| `W_drawn` | 后续 surface placement 把状态推进到 `READY_TO_SHOW`，显示门通过后写成 `HAS_DRAWN` | Surface show 已提交给合成器 |
+| `S_show` | 后续 animation/prepare-surfaces 阶段对窗口 Buffer 图层发出 show，并提交相应 SurfaceControl 事务 | 目标 Buffer 已 latch 或上屏 |
+| `F_present` | 目标首帧以 present fence、SurfaceFlinger latency 或等价显示时间戳证据完成 present | 较早任一阶段没有耗时问题 |
 
-```text
-Choreographer执行TraversalRunnable
-→ 首次dispatchAttachedToWindow与初始Insets
-→ 用addWindow返回的frame提示第一次measure
-→ 同步IWindowSession.relayout提交测量需求/可见性
-→ WMS布局WindowState并创建隐藏SurfaceControl
-→ App建立普通Surface或BLASTBufferQueue Surface
-→ 若真实frame/Insets/config变化则重新measure
-→ layout与GlobalLayout/InternalInsets
-→ OnPreDraw可取消
-→ performDraw
-→ 首帧需要时finishDrawing通知WMS
-→ WMS把窗口推进到可显示状态
-```
-
-## 3. 首次Traversal时序图
-
-```mermaid
-sequenceDiagram
-  participant CH as App Choreographer
-  participant VRI as ViewRootImpl
-  participant VIEW as Decor/View树
-  participant SES as IWindowSession
-  participant WMS as WMS/WindowState
-  participant SF as SurfaceFlinger侧SurfaceControl
-  participant RT as ThreadedRenderer/RenderThread
-
-  CH->>VRI: TraversalRunnable.doTraversal
-  VRI->>VIEW: dispatchAttachedToWindow + applyInsets
-  VRI->>VIEW: measure(提示尺寸)
-  VRI->>SES: relayout(measuredWidth/Height, VISIBLE)
-  SES->>WMS: relayoutWindow
-  WMS->>WMS: SurfacePlacement / Window frame
-  WMS->>SF: 创建隐藏SurfaceControl/BLAST层
-  WMS-->>VRI: final frame + Insets + SurfaceControl
-  VRI->>VRI: 建立Surface/BLASTBufferQueue
-  opt frame/Insets/config不一致
-    VRI->>VIEW: 再次measure
-  end
-  VRI->>VIEW: layout
-  VRI->>VIEW: OnGlobalLayout / OnPreDraw
-  alt OnPreDraw未取消且可见
-    VRI->>RT: performDraw
-    RT-->>VRI: frame complete/commit callback
-    VRI->>SES: finishDrawing(IWindow)
-  else 取消或不可见
-    VRI->>VRI: 重新schedule或跳过draw
-  end
-```
-
-## 4. “measure→layout→draw”为什么不够
-
-这三个词描述单棵View树内部的主要阶段，却漏掉窗口级协商：
+在固定非 BLAST 硬件路径上，可以使用这条局部全序：
 
 ```text
-attach/Insets
-→ 初测
-→ 跨Binder relayout
-→ Surface建立
-→ 可能重测
-→ layout
-→ draw与finishDrawing协议
+T_start < A_tree < M_offer < B_enter < W_record < W_layout
+        < W_layer < B_reply < S_ready < M_settle < L_tree < P_allow
+        < D_submit < C_ready < F_commit < W_drawn < S_show < F_present
 ```
 
-要理解首帧和卡顿，必须把WMS往返放回主线。
+其中 `performTraversals()` 的正常返回只到 `D_submit`。原始 Renderer frame-complete callback 与该返回没有固定全序；但 callback 投给主 Handler 的 Runnable 执行、`pendingDrawFinished()`、服务端 `F_commit`、WMS 后续 traversal、SurfaceControl show 与物理 present 都在 `D_submit` 之后。
 
-## 5. TraversalRunnable从哪里来
+## 2. traversal callback 先撤调度债，再读取本轮可见性
 
-第212章看到setView先调用requestLayout，最终：
-
-```java
-mChoreographer.postCallback(
-        Choreographer.CALLBACK_TRAVERSAL,
-        mTraversalRunnable, null);
-```
-
-收到合适VSync调度后，Choreographer执行TraversalRunnable，进入 `doTraversal()`。
-
-## 6. doTraversal先撤同步屏障
+第 212 章已经看到 `setView()` 先排 traversal，再同步 add 窗口：
 
 ```java
-if (mTraversalScheduled) {
-    mTraversalScheduled = false;
-    queue.removeSyncBarrier(mTraversalBarrier);
-    performTraversals();
+void scheduleTraversals() {
+    if (!mTraversalScheduled) {
+        mTraversalScheduled = true;
+        mTraversalBarrier =
+                mHandler.getLooper().getQueue().postSyncBarrier();
+        mChoreographer.postCallback(
+                Choreographer.CALLBACK_TRAVERSAL,
+                mTraversalRunnable, null);
+    }
 }
 ```
 
-屏障只服务于这次调度优先关系。进入Traversal后立即撤掉，避免主Looper普通同步消息永久饥饿。
+`mTraversalScheduled` 把同一段等待期内的多次布局/重绘请求合成一个 callback；它不保证 callback 内只 measure 一次，也不保证一帧不会因回调再排下一轮。
 
-## 7. 重复requestLayout会不会排很多Traversal
+callback 真正被调度时：
 
-`scheduleTraversals()` 先检查 `mTraversalScheduled`。同一轮已经安排时，后续requestLayout通常只更新布局标志/脏区，不重复投递同一个TraversalRunnable。
+```java
+void doTraversal() {
+    if (mTraversalScheduled) {
+        mTraversalScheduled = false;
+        queue.removeSyncBarrier(mTraversalBarrier);
+        performTraversals();
+    }
+}
+```
 
-这是“合并失效请求”的基础，但不保证一帧只会发生一次内部measure或layout。
-
-## 8. performTraversals的第一道门
+所以 `T_start` 不是 `requestLayout()` 那一刻，而是主 Looper 已经执行 traversal callback 的时刻。`performTraversals()` 随即检查：
 
 ```java
 final View host = mView;
-if (host == null || !mAdded) return;
+if (host == null || !mAdded) {
+    return;
+}
+mIsInTraversal = true;
+mWillDrawSoon = true;
 ```
 
-窗口已移除或setView未建立时不遍历。随后设置 `mIsInTraversal=true`、`mWillDrawSoon=true`，这些是过程状态，不代表一定走到draw。
+这两个过程位不承诺最终会 draw。Surface 资源异常、不可见、PreDraw 取消和 View 被移除都可能让本轮停在更早的位置。
 
-## 9. mFirst控制首次专用逻辑
-
-ViewRootImpl构造时：
-
-```java
-mFirst = true;
-```
-
-第一次performTraversals用它触发attach、完整重绘、初始布局、焦点与首次draw报告；尾部才置false。
-
-如果中途因Surface资源异常提前return，不能简单假设所有首次步骤都完成。
-
-## 10. getHostVisibility不只看View.getVisibility
+本轮向 WMS 提交的可见性也不是只读 `Decor.getVisibility()`：
 
 ```java
 return (mAppVisible || mForceDecorViewVisibility)
         ? mView.getVisibility() : View.GONE;
 ```
 
-它综合WMS add结果中的App可见状态、强制Decor可见标志和Decor自身visibility。单独看到Decor.VISIBLE不代表host一定以VISIBLE向WMS relayout。
+固定路径中，`ActivityThread` 在仍占用主线程时先执行 `makeVisible()`，随后才回到 Looper 运行已经排好的 callback，因此第一轮看到 VISIBLE。Theme 的 no-display 只把 `mVisibleFromClient` 初始为 false；若该值保持到 `handleResumeActivity()`，就会跳过 add/ViewRoot，targetSdk 大于 22 且尚未 finish 时还会在 resume 检查抛错。应用可以调用 `setVisible(true)` 覆盖初值，所以不能仅凭 theme 标签断言永不进入。延迟可见、Activity 切换或服务端可见性变化也不共享固定前提。
 
-## 11. 第一次Traversal通常已看到VISIBLE
+## 3. 首轮先分发 AttachInfo 与初始 Insets，再开始 measure
 
-ActivityThread先以INVISIBLE addView，add返回后调用Activity.makeVisible把Decor设为VISIBLE；主线程回到Looper后才执行此前排好的Traversal。
-
-所以普通冷启动首次Traversal常以VISIBLE进入，但特殊no-display、延迟可见、Activity切换或系统策略可以不同。
-
-## 12. addWindow返回的mWinFrame是初始提示
-
-ViewRoot.setView同步addToDisplay时，WMS通过DisplayPolicy.getLayoutHint返回frame。第一次performTraversals读取 `mWinFrame`，多数MATCH_PARENT应用窗口把它当desired width/height。
-
-这不是最终relayout承诺，而是帮助App减少无谓重测的提示。
-
-## 13. WRAP_CONTENT首次为何不用frame宽高
-
-当Window LayoutParams某维是WRAP_CONTENT，源码用Configuration的screenWidthDp/screenHeightDp换算成像素作为可用上限。
-
-因为窗口希望由内容决定大小，不能先假定最终frame就是它必须填满的尺寸。
-
-## 14. 特殊系统窗口可直接用Display真实尺寸
-
-`shouldUseDisplaySize()` 对附加状态栏、IME、音量overlay等特定type返回true，初始desired size来自Display.getRealSize。
-
-普通Activity基础窗口通常走frame提示或Configuration上限，不应把这个特殊分支套到所有窗口。
-
-## 15. 首次attach发生在measure之前
-
-首次分支依次：
+`mFirst` 构造时为 true。第一轮先选择 desired window size，随后按下面的顺序接入整棵 View 树：
 
 ```java
+mAttachInfo.mWindowVisibility = viewVisibility;
 host.dispatchAttachedToWindow(mAttachInfo, 0);
-treeObserver.dispatchOnWindowAttachedChange(true);
+mAttachInfo.mTreeObserver.dispatchOnWindowAttachedChange(true);
 dispatchApplyInsets(host);
 ```
 
-然后才进入后面的measureHierarchy。故 `onAttachedToWindow()` 中View还未必拥有最终测量宽高。
+`setView()` 末尾的 `view.assignParent(this)` 只写 ViewParent 桥；这里的 `dispatchAttachedToWindow()` 才会递归把同一个 AttachInfo 交给 Decor 和子 View，并触发 `onAttachedToWindow()`。WMS 的 WindowState 又早在 add 阶段存在，三种“接入”不能互换。
 
-## 16. assignParent与dispatchAttached再次区分
+初始 Insets 来自 add 返回后交给 `InsetsController` 的状态。`dispatchApplyInsets()` 会重新计算 WindowInsets、清掉 `mApplyInsetsRequested`，再调用 `host.dispatchApplyWindowInsets()`。它是第一份可用快照，不是本轮永不变化的最终承诺；relayout 仍可能返回新的 InsetsState、cutout、controls 或配置。
 
-setView末尾的 `view.assignParent(ViewRootImpl)` 只是建立ViewParent桥；第一次Traversal的dispatchAttached才把AttachInfo递归下发整棵树并触发View窗口attach生命周期。
+这给生命周期读法加上两条边界：
 
-WindowState则早在WMS addWindow阶段存在，三者不是同一“attach”。
+- `onAttachedToWindow()` 发生在第一次根测量之前，不能假定 `getWidth()/getHeight()` 已是本轮 layout 几何。
+- Insets 回调可以改 padding 或调用 `requestLayout()`；通用路径会吸收这些变化，固定路径则明确排除这类重入改写。
 
-## 17. attach期间会发生什么
-
-View树递归获得AttachInfo、window token、可见性与硬件加速环境，执行各View的 `onAttachedToWindow()`，注册树观察者和需要依赖窗口的资源。
-
-自定义View可在这个回调请求布局或Insets，因此首次Traversal必须容纳回调造成的新状态变化。
-
-## 18. 初始Insets也在第一次measure之前分发
-
-ViewRoot根据addWindow返回的InsetsState、DisplayCutout、Window flags/softInputMode计算WindowInsets，然后：
-
-```java
-host.dispatchApplyWindowInsets(insets);
-```
-
-View处理padding、consume或requestLayout后，测量应看到这些影响。
-
-## 19. addWindow Insets只是当前快照
-
-第一次relayout还会返回新的frame、InsetsState与controls；若cutout、always-consume-system-bars、caption或系统UI状态变化，performTraversals会再次dispatchApplyInsets并可能重测。
-
-所以“第一次measure前已分发Insets”不等于Insets在本帧绝不会再变化。
-
-## 20. RunQueue在每次Traversal执行
-
-尚未attach的View可能通过ViewRootImpl.RunQueue暂存动作；performTraversals调用：
+接下来无条件调用：
 
 ```java
 getRunQueue().executeActions(mAttachInfo.mHandler);
 ```
 
-这些动作被post到Handler，不等于在这一行同步执行全部Runnable；它保证detach时期积累的请求重新进入正确Looper。
+名字容易误导：`HandlerActionQueue.executeActions()` 是把每个 action 用 `postDelayed()` 投给 Handler，然后清空队列；它不在这一行同步执行这些 action。因此 RunQueue action 不能插进固定路径的 `A_tree < M_offer`。
 
-## 21. layoutRequested还受停止状态限制
+这还是 ViewRootImpl 的线程局部静态 RunQueue；每个尚未 attach 的 View 所持有的私有 `mRunQueue` 是另一套。`View.post()` 会暂存到后者，并在该 View 的 `dispatchAttachedToWindow()` 中转交 Handler。两者都使用 HandlerActionQueue，但所有权和清空点不同。
 
-```java
-boolean layoutRequested = mLayoutRequested
-        && (!mStopped || mReportNextDraw);
-```
+## 4. frame hint、Configuration 上限与根 MeasureSpec 是三件事
 
-停止窗口可以暂缓常规布局，但若WMS等待下一次draw报告，仍需完成必要Traversal，避免系统一直等待。
+首轮 desired size 的来源先按 Window 类型与 LayoutParams 分流：
 
-## 22. 首次同步touch mode
-
-首次layoutRequested时，源码故意把AttachInfo缓存设成相反值，再调用 `ensureTouchModeLocally(mAddedTouchMode)`，确保touch mode初始化逻辑执行。
-
-焦点选择会受touch mode影响，不能把WMS返回的ADD_FLAG_IN_TOUCH_MODE只当调试字段。
-
-## 23. measureHierarchy是窗口根测量入口
-
-普通路径最终生成根MeasureSpec并调用：
-
-```java
-performMeasure(childWidthMeasureSpec,
-        childHeightMeasureSpec);
-```
-
-performMeasure再调用 `mView.measure()`，View.measure进入DecorView.onMeasure并向下递归各ViewGroup/child。
-
-## 24. MeasureSpec包含size和mode
-
-它不是两个独立参数，而是编码后的整数。根规格由Window LayoutParams决定：
-
-| Window根维度 | MeasureSpec mode | size |
+| 条件 | `desiredWindowWidth/Height` 来源 | 适用边界 |
 |---|---|---|
-| MATCH_PARENT | EXACTLY | 可用windowSize |
-| WRAP_CONTENT | AT_MOST | 可用windowSize |
-| 明确像素值 | EXACTLY | 指定值 |
+| `shouldUseDisplaySize(lp)` | `Display.getRealSize()` | additional status bar、IME、volume overlay 三类特殊窗口 |
+| width 或 height 任一为 `WRAP_CONTENT` | Configuration 的 `screenWidthDp/screenHeightDp` 换算像素 | 给内容决定型窗口一个候选上限 |
+| 其余 | add 阶段写入 `mWinFrame` 的 frame hint | 普通 `MATCH_PARENT` Activity 主线 |
 
-子树各层再根据父规格、padding、margin和自己的LayoutParams派生新规格。
+frame hint 的价值是提高初测命中率。源码明确希望它“多数窗口接近 relayout 结果”，却没有把它升级成 WMS 本次 relayout 将返回的当前 frame。
 
-## 25. MATCH_PARENT不表示屏幕物理尺寸
+`measureHierarchy()` 最终为根 View 生成 MeasureSpec：
 
-这里的EXACTLY size是ViewRoot当前认为的窗口可用尺寸，可能已受多窗口、DisplayArea、Insets策略、兼容缩放或surfaceInsets影响。
+| 根维度 | mode | size |
+|---|---|---|
+| `MATCH_PARENT` | `EXACTLY` | 当前传入的 windowSize |
+| `WRAP_CONTENT` | `AT_MOST` | 当前传入的 windowSize |
+| 明确像素值 | `EXACTLY` | LayoutParams 中的明确值 |
 
-“match parent=铺满整块物理屏”是错误推导。
+因此 `MATCH_PARENT` 只表示填满当前窗口约束，不等于物理屏幕尺寸；多窗口、DisplayArea、兼容缩放与窗口政策都可能改变 windowSize。
 
-## 26. WRAP_CONTENT不是随便多大
+大屏 Dialog 的小宽度试探还有三道门：width 为 `WRAP_CONTENT`、`config_prefDialogWidth` 能解析出非零 `baseSize`，并且 desired width 大于它。全部满足时才先测 baseSize；报告 `MEASURED_STATE_TOO_SMALL` 后尝试中间宽度，仍太小才使用完整 desired width。小档或中档足够时，`goodMeasure` 会跳过完整宽度测量以及后面的旧 `mWidth` 比较；门不满足时则直接测完整 desired width。因此一次 `measureHierarchy()` 可包含一到三次 `performMeasure()`，其返回值也不能简单等同“measured size 是否变化”。
 
-AT_MOST给出上限，View在不超过它的前提下报告需要的measured dimension，并可带 `MEASURED_STATE_TOO_SMALL` 状态。
+`performMeasure()` 再调用 `mView.measure()`。`View.measure()` 还会比较旧 spec、force-layout、精确尺寸与 measure cache：某次根调用可能真正进入 `onMeasure()`，也可能恢复缓存。源码中 `performMeasure()` 的次数不能直接替换每个子 View 的 `onMeasure()` 次数。
 
-最终WMS还要决定窗口frame，所以内容期望与窗口政策之间仍有一次relayout协商。
+## 5. 初测只是 App 提议；属性与 Insets 还能在 Binder 前改写它
 
-## 27. 浮动窗口可能先尝试较窄宽度
+进入初测的门是：
 
-measureHierarchy对Window width=WRAP_CONTENT有Dialog优化：先用 `config_prefDialogWidth` 测量；若未报告TOO_SMALL就接受，否则尝试它与desired width的中间值，仍不合适再用完整desired width。
+```java
+boolean layoutRequested =
+        mLayoutRequested && (!mStopped || mReportNextDraw);
+```
 
-因此第一次“measureHierarchy调用”内部就可能执行1至3次performMeasure。
+停止窗口可以推迟普通布局；若 WMS 正等待下一次 draw 回报，`mReportNextDraw` 又允许必要工作继续。固定首次窗口未 stopped。
 
-## 28. View.measure本身还有缓存
+第一轮先用 add 返回的 touch-mode 位初始化本地焦点语义，再调用：
 
-View.measure比较新旧spec、FORCE_LAYOUT和已测尺寸，可能调用onMeasure，也可能从mMeasureCache恢复结果；最终必须设置measured dimension，否则抛异常。
+```java
+windowSizeMayChange |= measureHierarchy(
+        host, lp, res, desiredWindowWidth, desiredWindowHeight);
+```
 
-所以“源码出现performMeasure一次”等于“每个子View onMeasure一定执行一次”也不准确。
+得到的 `host.getMeasuredWidth()/getMeasuredHeight()` 是 App 在当前约束下的尺寸提议，不是 WindowState frame。之后仍有三类 Binder 前修正：
 
-## 29. 自定义View必须正确实现onMeasure
+1. `collectViewAttributes()` 汇总 keep-screen-on、system UI visibility 等 View 树属性，必要时令 `params=lp`。
+2. `SOFT_INPUT_ADJUST_UNSPECIFIED` 会依据当前已显示的 scroll container 选择 resize 或 pan，并更新参数；这不表示 IME 已显示。
+3. 若 `mApplyInsetsRequested`，再次分发 Insets；回调重新置 `mLayoutRequested` 时，会在当前 traversal 再跑一次 `measureHierarchy()`。
 
-Inflater只创建对象，真正尺寸在这里确定。自定义View.onMeasure应尊重MeasureSpec并调用setMeasuredDimension；否则会得到错误布局或IllegalStateException。
-
-当前Mac静态阅读只能验证协议，不能证明某个业务View运行时测量结果。
-
-## 30. 第一次测量输出是App的尺寸请求
-
-根View的measuredWidth/Height代表在当前提示约束下App希望的内容/窗口尺寸。ViewRoot随后把经compat scale转换后的值作为requestedWidth/Height传给WMS.relayout。
-
-它不是App单方面最终决定的WindowState frame。
-
-## 31. windowSizeMayChange怎样产生
-
-常规测量后，如果ViewRoot缓存的mWidth/mHeight与host measured尺寸不同，measureHierarchy返回true；WRAP_CONTENT、drag resize、Activity relaunch等也可强制windowShouldResize。
-
-首次无论这个布尔值如何，mFirst本身就确保执行relayout。
-
-## 32. collectViewAttributes可能修改Window参数
-
-View树可通过keepScreenOn、systemUiVisibility等属性影响AttachInfo。`collectViewAttributes()` 汇总后更新Window LayoutParams并让params非空，促使本次relayout把新属性送到WMS。
-
-因此窗口属性不只来自Theme和Activity显式API，也可能由View树聚合产生。
-
-## 33. softInput adjust模式可能在首遍确定
-
-若softInputMode是ADJUST_UNSPECIFIED，ViewRoot检查已显示的scroll container：存在则选ADJUST_RESIZE，否则ADJUST_PAN，并更新params。
-
-这是兼容决策，不表示IME此刻一定显示或窗口立即被缩小。
-
-## 34. Insets回调可能触发补测
-
-若mApplyInsetsRequested为true，ViewRoot再次dispatchApplyInsets；若回调产生mLayoutRequested，会立刻再measureHierarchy，尽量在同一次Traversal中吸收变化。
-
-这也是首帧measure次数不能只按主干数行代码计算的原因。
-
-## 35. 何时决定必须relayout
-
-满足任一条件：
+随后代码清掉旧的 `mLayoutRequested`，以便捕获本方法后半段新产生的布局债。是否跨 Binder 的总门是：
 
 ```text
 mFirst
-windowShouldResize
-viewVisibilityChanged
-cutoutChanged
-params != null
-mForceNextWindowRelayout
+|| windowShouldResize
+|| viewVisibilityChanged
+|| cutoutChanged
+|| params != null
+|| mForceNextWindowRelayout
 ```
 
-首次永远命中。后续只有窗口级状态需要WMS参与时才跨Binder，单纯局部invalidate未必每帧relayout。
+首次必定命中。固定路径中 `mWindowAttributesChanged` 仍来自 `setView()`，所以 attrs 不为 null；后续 relayout 则允许 attrs 为 null，只单独提交 requested size、visibility、flags 与 frame number。
 
-## 36. Internal Insets为什么有pending协议
+`computesInternalInsets` 同时覆盖“当前有 ComputeInternalInsets listener”和“过去上报过非空值、现在可能需要清零”两种情况；全新的固定根还没有后一笔历史。首次可见且该条件成立时，relayout 会带 `RELAYOUT_INSETS_PENDING`。它让 WMS 暂不把尚未 layout 完成的 content/visible/touchable 区域当最终信息；这与向 View 分发 WindowInsets 是两套方向相反的协议。
 
-若ViewTreeObserver有ComputeInternalInsets监听，首次/可见性变化时先在relayout传 `RELAYOUT_INSETS_PENDING`，让WMS暂时不要根据尚未layout完成的原始窗口内部区域影响其他窗口。
+## 6. relayout 是继 add 后的同步窗口 Binder，并携带 measured size 而非 View 树
 
-View完成layout后再通过IWindowSession.setInsets回报最终content/visible/touchable区域。
-
-## 37. relayout前暂停ThreadedRenderer
-
-若已有ThreadedRenderer，源码先调用pause，因为WMS relayout可能销毁或替换Surface；若动画在运行，还会标脏以便恢复后补帧。
-
-首次Surface尚未建立时也统一走防御式窗口布局路径。
-
-## 38. relayoutWindow传给WMS什么
-
-ViewRoot传：
-
-- IWindow和seq；
-- 必要时更新的Window LayoutParams；
-- 经过applicationScale的measuredWidth/Height；
-- 当前viewVisibility；
-- Insets pending flags；
-- 已有Surface时的下一frameNumber。
-
-WMS返回frame、Insets、cutout、MergedConfiguration、SurfaceControl、BLAST SurfaceControl及surface size。
-
-## 39. 不需要更新属性时params可为null
-
-relayout协议允许attrs为空，表示不重新提交整份属性；requested size、visibility等仍单独传递。
-
-首次通常因mWindowAttributesChanged而传params，但后续不能假设每次relayout都带一份新LayoutParams。
-
-## 40. Window type加入后不可随意改变
-
-ViewRoot兼容旧target时会恢复mOrigWindowType；WMS也检查：
+跨进程前，已有 ThreadedRenderer 会先 `pause()`，因为 WMS 可能销毁或替换当前 Surface。随后 ViewRoot 调用：
 
 ```java
-if (win.mAttrs.type != attrs.type) {
-    throw new IllegalArgumentException(
-        "Window type can not be changed after the window is added.");
-}
+relayoutResult =
+        relayoutWindow(params, viewVisibility, insetsPending);
 ```
 
-Insets provider types同样有不可变约束。想换窗口种类通常应移除并重新添加，而非update属性。
+包装方法计算：
 
-## 41. WMS先记录请求尺寸与可见性
+```text
+requestedWidth  = round(host.measuredWidth  * applicationScale)
+requestedHeight = round(host.measuredHeight * applicationScale)
+frameNumber     = mSurface 有效时的 nextFrameNumber，否则 -1
+flags           = 是否 RELAYOUT_INSETS_PENDING
+```
 
-非GONE时 `win.setRequestedSize(requestedWidth, requestedHeight)`；随后复制允许变化的attrs，更新requested visibility并标记display layout needed。
+再同步调用 `IWindowSession.relayout()`。接口不是 oneway；App 主线程要等 system_server 填回这些 out 参数：
 
-WMS并不读取App View子树，只接收根测量结果和窗口协议状态。
+- frame、content/visible/stable Insets 与 backdrop frame；
+- DisplayCutout、MergedConfiguration；
+- 主 SurfaceControl、InsetsState、InsetsSourceControl；
+- SurfaceControl 尺寸与可选 BLAST SurfaceControl；
+- 一组 `RELAYOUT_RES_*` 结果位。
 
-## 42. shouldRelayout是Surface创建门
+`Session.relayout()` 本身只包围 Trace，并把参数转给 `WindowManagerService.relayoutWindow()`；但每进程 Session 对象还持有 callback、服务端 `SurfaceSession`、窗口计数、overlay 集合、权限能力、scale 与 package 等会话状态，不能概括成“只保存调用身份”。WMS 从来不读取 App 的 Decor 或子 View；它只看到 IWindow、LayoutParams 副本、根 measured size、可见性与协议状态。
 
-r48要求viewVisibility=VISIBLE，并且：
+这也是尺寸协商的最短表达：
 
-- Window无ActivityRecord；或
-- 是starting window；或
-- ActivityRecord.isClientVisible。
+```text
+add frame hint
+→ App 根测量提议
+→ relayout(requestedWidth, requestedHeight)
+→ WMS 窗口政策 frame
+→ App 按返回 frame 决定是否补测
+```
 
-即使App Decor.VISIBLE，若Activity服务端客户端可见状态不允许，也不会在该分支创建新Surface。
+## 7. WMS 先更新原 WindowState、强制布局，再决定是否给 Surface
 
-## 43. WMS强制执行SurfacePlacement
+`relayoutWindow()` 清调用身份、取得全局锁，并用 Session 与 IWindow 找到第 212 章已经登记的 WindowState。它不会为这次 relayout 新建第二个 WindowState。
 
-源码调用：
+固定路径的关键顺序是：
+
+```text
+非 GONE：setRequestedSize
+→ 如有 attrs：Policy 调整、type/providesInsetsTypes 不变校验、copyFrom
+→ mRelayoutCalled=true、mInRelayout=true
+→ setViewVisibility(VISIBLE)
+→ setDisplayLayoutNeeded
+→ 写 mGivenInsetsPending
+→ 计算 shouldRelayout
+→ performSurfacePlacement(true)
+→ relayoutVisibleWindow
+→ createSurfaceControl
+```
+
+`shouldRelayout` 不是“Decor 是 VISIBLE”一个条件：
 
 ```java
-mWindowPlacerLocked.performSurfacePlacement(true);
+viewVisibility == View.VISIBLE
+        && (win.mActivityRecord == null
+        || win.mAttrs.type == TYPE_APPLICATION_STARTING
+        || win.mActivityRecord.isClientVisible())
 ```
 
-它运行窗口布局/层级/Insets等系统级计算，使返回给客户端的frame与状态基于当前DisplayContent布局，而不是照抄App请求。
+普通真实 Activity 主窗口还要通过服务端 `isClientVisible()`。固定路径通过；若失败且旧 Surface 不存在，WMS 不会在本次调用创建新 Surface。
 
-## 44. Window frame由谁最终决定
+`performSurfacePlacement(true)` 位于 `createSurfaceControl()` 之前。它强制消化当前窗口布局请求，使 DisplayPolicy、Activity/Task 边界、系统栏、IME、cutout、父窗口与 Display 布局共同决定 WindowState frame。App measured size 是输入，WMS frame 是系统侧决议，二者都不能单独解释最终窗口尺寸。
 
-WMS结合Window LayoutParams、DisplayPolicy、Activity/Task边界、多窗口、系统栏/IME、cutout和父窗口等计算WindowState frame。
-
-App的measured尺寸是重要输入，WMS frame是协商结果；两边都不能脱离另一边单独解释最终尺寸。
-
-## 45. relayoutVisibleWindow设置首次显示标志
+`relayoutVisibleWindow()` 再设置结果位：
 
 ```java
 result |= (!wasVisible || !isDrawnLw())
         ? RELAYOUT_RES_FIRST_TIME : 0;
 ```
 
-它不只看“Java第一次调用relayout”，而看服务端WindowState之前是否可见/已drawn。Surface重建等路径也可能再次要求下一draw报告。
+所以 `FIRST_TIME` 不是 Java 方法“第几次调用”的计数器。窗口从不可见回来、尚未 drawn、格式重建或某些 resize 也可能再次要求下一次 draw 回报。
 
-## 46. createSurfaceControl位于relayout
+## 8. 新 WindowSurfaceController 从 DRAW_PENDING 和隐藏状态开始
 
-shouldRelayout为true时：
-
-```java
-result = createSurfaceControl(
-        outSurfaceControl, outBLASTSurfaceControl,
-        result, win, winAnimator);
-```
-
-这再次证明addWindow只建WindowState/Session，窗口SurfaceControl在可见relayout阶段创建或取回。
-
-## 47. WindowStateAnimator创建的Surface初始隐藏
-
-`createSurfaceLocked()` 使用：
+`createSurfaceControl()` 最终进入 `WindowStateAnimator.createSurfaceLocked()`。如果已有 controller，它直接复用；真正首次创建才执行：
 
 ```java
+w.setHasSurface(false);
+resetDrawState();              // DRAW_PENDING
 int flags = SurfaceControl.HIDDEN;
+calculateSurfaceBounds(...);
+mSurfaceController = new WindowSurfaceController(...);
+w.setHasSurface(true);
 ```
 
-再根据secure、opaque、format、surfaceInsets和计算尺寸构造WindowSurfaceController。创建图层对象不等于立刻让用户看到它。
+初始 HIDDEN 是协议，不是偶然：客户端还没有向新生产端画出目标帧，WMS 不能把空内容当成完成画面。
 
-## 48. 为什么Surface初始隐藏
+创建参数也说明 frame 与 Buffer 尺寸不是同义词：
 
-应用还没画出有效内容。若创建后立即显示，SurfaceFlinger可能合成空白、未初始化或旧内容。WMS用draw state与finishDrawing协议等到首帧准备好再show。
+- 普通路径以 compat frame 加 `surfaceInsets` 计算 Surface 范围；
+- `FLAG_SCALED` 使用 requested size；
+- drag-resize 可使用整屏 Surface，避免持续重分配；
+- 硬件加速时底层 format 可选 `TRANSLUCENT`；
+- `FLAG_SECURE` 映射为 SurfaceControl secure；
+- 无 alpha、无 surfaceInsets、非 drag-resize 时才可能加 OPAQUE。
 
-## 49. Window draw state从DRAW_PENDING开始
+WindowSurfaceController 的主 SurfaceControl 以 WindowState 自己的 container SurfaceControl 为 parent。固定非 BLAST 分支中，它就是承载 Buffer 的图层；它仍被 HIDDEN 标志挡住。
 
-创建Surface时WindowStateAnimator.resetDrawState设为DRAW_PENDING；后续客户端finishDrawing使其到COMMIT_DRAW_PENDING，WMS提交显示时到READY_TO_SHOW/HAS_DRAWN。
+WMS 随后把主 SurfaceControl、可选 BLAST SurfaceControl、frame、Insets、配置与 `outSurfaceSize` 写入 Binder 回复。`W_layer` 只证明服务端图层对象和 `DRAW_PENDING` 已建立，不证明 App 有 Java `Surface`，更不证明已有 Buffer。
 
-它是WMS窗口画面就绪状态机，不是View的PFLAG或Choreographer frame状态。
+## 9. 非 BLAST 与 BLAST 只在“怎样接成 Surface”处分叉
 
-## 50. Surface尺寸可能与Window frame不同
+r48 中，WMS 启动时从 native-boot DeviceConfig 读取 `wm_use_blast_adapter`，缺省回退为 false。add 成功结果只有在服务端开关为 true 时才带 `ADD_FLAG_USE_BLAST`，ViewRoot 才令 `useBLAST()` 成立。
 
-Surface尺寸会考虑surfaceInsets；drag resize可能使用全屏Surface避免频繁重分配；FLAG_SCALED可采用requested size。
+两条客户端接线如下：
 
-因此window frame width/height、View measured size、Surface buffer size不是无条件相等。
+| 分支 | WMS 图层 | App 怎样得到 `mSurface` |
+|---|---|---|
+| 非 BLAST 固定主线 | WindowSurfaceController 的主 SurfaceControl 是 Buffer layer | `mSurface.copyFrom(mSurfaceControl)` |
+| BLAST | 主 SurfaceControl 改为 container；其下另建非隐藏 BLAST layer，但祖先仍隐藏 | 用 BLAST layer 和 outSurfaceSize 创建/更新 `BLASTBufferQueue`，首次 `getSurface()` 后 `mSurface.transferFrom()` |
 
-## 51. secure与opaque在SurfaceControl层生效
+BLAST 后续 update 若没有产生新 `Surface`，不会无谓 `transferFrom()`，以免改变 generation id 并迫使 EGL 资源重建。它解决 Buffer 与 SurfaceControl transaction 的同步衔接，不替 View 执行 measure、layout 或 draw。
 
-FLAG_SECURE影响SurfaceControl.SECURE，非alpha格式且无surfaceInsets/drag resize时可能设置OPAQUE；硬件加速路径Surface format又可能用TRANSLUCENT。
+同一窗口周围至少有七个名字相近但职责不同的对象：
 
-这些标志参与合成、安全截图和优化，不能只从View背景颜色推断。
+| 对象 | 所在侧与最早时点 | 职责 |
+|---|---|---|
+| ViewRootImpl `mSurfaceSession` | App；ViewRoot 构造 | 仅供可选 bounds child layer 等客户端 SurfaceControl 使用，不是窗口 Buffer |
+| Session `mSurfaceSession` | system_server；该 Session 首窗 attach | 创建服务端窗口 SurfaceControl 的会话 |
+| WindowState container SurfaceControl | system_server；add 挂入容器树 | 窗口层级节点，本身不是固定非 BLAST 的 Java Canvas |
+| WindowSurfaceController 主 SurfaceControl | system_server；可见 relayout | 非 BLAST 的 Buffer layer，或 BLAST 的父 container |
+| BLAST SurfaceControl | system_server；开启 BLAST 的 `createSurfaceLocked()` 内、Binder reply 前 | 主 SurfaceControl 下的非隐藏 Buffer child |
+| BLASTBufferQueue | App；开启 BLAST 的 relayout reply 后 | 把 App 生产队列与 BLAST SurfaceControl 接起来的适配器 |
+| Java `Surface` | App；wrapper 在 ViewRoot 构造时已有，relayout reply 后才连接 producer | Canvas/HWUI 面向的 Buffer producer 接口 |
 
-## 52. OutOfResources不是普通测量失败
+因此“ViewRoot 构造已有 SurfaceSession”“WMS add 已有 container SurfaceControl”“relayout 返回 SurfaceControl”都不能单独推出 Java `Surface` 已有效。
 
-SurfaceControl创建可能抛OutOfResourcesException；WMS尝试回收Surface内存，App端ThreadedRenderer初始化失败也会调用outOfMemory协议，严重时应用可能自杀以恢复。
+## 10. relayout 回复后先接 Surface，再按本次 frame 决定补测
 
-当前Mac只读阶段不会实际触发或验证这种资源压力行为。
-
-## 53. WMS返回的是SurfaceControl不是Java Canvas
-
-AIDL relayout out参数包含SurfaceControl及BLAST SurfaceControl、surface size。ViewRoot收到后才把这些图层控制对象接成App可生产buffer的Surface。
-
-SurfaceControl负责图层/事务控制；Surface提供producer绘制/queue buffer接口，两者职责不同。
-
-## 54. 非BLAST路径怎样得到Surface
-
-```java
-if (!useBLAST()) {
-    mSurface.copyFrom(mSurfaceControl);
-}
-```
-
-ViewRoot让Java Surface连接到WMS返回SurfaceControl所关联的buffer生产环境。`mSurface.isValid()`只说明可用句柄存在，不代表已有一帧内容。
-
-## 55. BLAST路径怎样得到Surface
-
-ViewRoot用WMS返回的mBlastSurfaceControl创建或更新：
-
-```java
-mBlastBufferQueue = new BLASTBufferQueue(
-        mBlastSurfaceControl, width, height,
-        mEnableTripleBuffering);
-Surface blastSurface = mBlastBufferQueue.getSurface();
-mSurface.transferFrom(blastSurface);
-```
-
-后续尺寸更新可复用BLASTBufferQueue而不必每次换Surface generation。
-
-## 56. BLASTBufferQueue解决什么层次的问题
-
-它把buffer提交与SurfaceControl.Transaction更紧密地同步，支持窗口同步变换、resize和多窗口事务协调。
-
-它不是View绘制算法，也不会替View执行measure/layout；它位于渲染buffer与图层事务衔接层。
-
-## 57. mSurface generation ID用来识别替换
-
-relayout前记录generation，返回后比较：
+同步 Binder 返回到 `ViewRootImpl.relayoutWindow()` 后，固定非 BLAST 路径先执行 `mSurface.copyFrom(mSurfaceControl)`，并接纳 always-consume-bars、frame、InsetsState 与 controls。外层 `performTraversals()` 随后比较 Surface generation：
 
 ```text
-surfaceCreated：原无效→现有效
-surfaceDestroyed：原有效→现无效
-surfaceReplaced：generation变化且现有效
-surfaceSizeChanged：WMS result flag
+surfaceCreated   = 原无效 && 现有效
+surfaceDestroyed = 原有效 && 现无效
+surfaceReplaced  = generation 变化 && 现有效
+surfaceSizeChanged = relayout result 中的显式位
 ```
 
-这些事件决定Renderer初始化、updateSurface、完整重绘和Surface回调。
+新 Surface 会先触发 full redraw、Renderer `initialize(mSurface)`，并在不请求透明区域时尝试 `allocateBuffers()`，然后发出 ViewRoot 的 surface-created callback。随后 ViewRoot 才把返回 frame 的宽高写入 `mWidth/mHeight`；若有 SurfaceHolder，相关尺寸和 created/changed callback 也在这里处理；启用的 Renderer 再以新 `mWidth/mHeight` 执行 `setup(...)`。最后才进入补测条件判断。
 
-## 58. Surface created不等于Buffer已分配完毕
+这些点仍有严格边界：
 
-Surface刚有效后ViewRoot标记full redraw，ThreadedRenderer.initialize连接Surface；必要时allocateBuffers可预分配，但透明区域场景可能推迟。
+- `mSurface.isValid()` 只说明 native producer 句柄可用；
+- `initialize()` 只说明 Renderer 已连接；
+- `allocateBuffers()` 即使成功，也不表示业务 View 像素已经画入并 queue；
+- ViewRoot 的 surface-created callback 与 View 的 `onAttachedToWindow()` 是不同生命周期。
 
-即使allocateBuffers执行，也不能据此断言某个业务View像素已绘入并提交。
+满足任一条件时，ViewRoot 按已经接纳的本次 frame 生成新根 spec 再测：
 
-## 59. ThreadedRenderer在Surface创建后初始化
-
-```java
-hwInitialized = renderer.initialize(mSurface);
-renderer.setup(mWidth, mHeight, attachInfo,
-        windowAttributes.surfaceInsets);
+```text
+relayout touch mode 改变焦点
+|| mWidth/mHeight 与 host measured size 不同
+|| relayout 后重新分发 Insets
+|| 接纳了新 Configuration
 ```
 
-initialize连接渲染后端，setup配置根尺寸/Insets。真正记录DisplayList、交给RenderThread和queue buffer在performDraw路径继续。
+Window `horizontalWeight/verticalWeight` 还可在这次补测后按 `(mWidth-width)*weight` 或 `(mHeight-height)*weight` 调整尺寸，再以 `EXACTLY` 多测一次；差值为负时并不是“扩大”。固定路径的 hint 与本次返回 frame 相同、add/relayout touch mode 一致、`mApplyInsetsRequested` 持续为 false，Insets/config 也稳定，所以 `M_settle` 只完成判断，不发生补测。
 
-## 60. SurfaceHolder分支不同
+同一 traversal 的实际 measure 次数不是固定值：Dialog 宽度试探、Binder 前 Insets、Binder 后 frame/Insets/config、Window weight，以及 layout 中的错误请求都能增加根测量轮次；`View.measure()` cache 又会让根调用数与每个 `onMeasure()` 数不同。
 
-若Decor实现RootViewSurfaceTaker并接管Surface，ViewRoot通过SurfaceHolder回调 `surfaceCreated/surfaceChanged/surfaceDestroyed` 通知持有者，普通ThreadedRenderer策略也会不同。
+## 11. layout 只处理窗口局部坐标，后面仍有两类窗口回报
 
-普通Activity Decor通常不走自持有Surface主线，不能把SurfaceView/Wallpaper式回调直接套到所有Activity窗口。
-
-## 61. relayout返回后更新真实mWidth/mHeight
+补测结算后：
 
 ```java
-if (mWidth != frame.width()
-        || mHeight != frame.height()) {
-    mWidth = frame.width();
-    mHeight = frame.height();
-}
-```
-
-这把ViewRoot窗口缓存切到WMS最终frame尺寸，随后比较host measured size决定是否补测。
-
-## 62. 为什么通常会有第二次measure
-
-若以下任一变化：
-
-- touch mode导致焦点变化；
-- WMS frame与host measured size不同；
-- relayout后重新分发Insets；
-- 合并Configuration更新；
-
-ViewRoot按新的mWidth/mHeight生成根MeasureSpec，再调用performMeasure。
-
-## 63. 第一次frame提示相同可避免补测
-
-addWindow返回的frameHint多数普通窗口会接近relayout结果；初测后若host measured尺寸与mWidth/mHeight一致，Insets/config也稳定，可以跳过第二次测量。
-
-所以源码的优化目标是“可能一遍”，不是协议保证永远一遍。
-
-## 64. Window LayoutParams weight还可触发再测
-
-补测后，如果horizontalWeight/verticalWeight>0，ViewRoot按剩余空间比例增大width/height，重新生成EXACTLY spec再测一次。
-
-因此同一Traversal中根measure次数受Window级weight影响，不只受ViewGroup内部weight影响。
-
-## 65. measure次数与onMeasure次数再次区分
-
-View.measure缓存可能让某次performMeasure不重新调用所有onMeasure；而不同spec、forceLayout或Insets变化会使缓存失效。
-
-性能分析应看实际trace/调用栈，不能仅数源码中performMeasure文本出现次数。
-
-## 66. layout只在didLayout为true时执行
-
-```java
-boolean didLayout = layoutRequested
-        && (!mStopped || mReportNextDraw);
+final boolean didLayout =
+        layoutRequested && (!mStopped || mReportNextDraw);
 if (didLayout) {
     performLayout(lp, mWidth, mHeight);
 }
 ```
 
-首次正常可见窗口layoutRequested为true；后续仅draw脏区而尺寸不变时可能跳过measure/layout直接draw。
-
-## 67. performLayout把Decor放在窗口局部原点
+`performLayout()` 把 Decor 放在窗口局部原点：
 
 ```java
 host.layout(0, 0,
@@ -604,376 +393,342 @@ host.layout(0, 0,
         host.getMeasuredHeight());
 ```
 
-子ViewGroup的onLayout再递归确定孩子left/top/right/bottom。窗口在屏幕上的frame.left/top由WMS管理，不需要把Decor layout到屏幕绝对坐标。
+子 ViewGroup 再递归决定孩子坐标。窗口在屏幕上的 `frame.left/top` 属于 WMS；把 Decor layout 到 `(0,0)` 不是忽略屏幕位置。
 
-## 68. measure与layout输出不同
+若某个 View 在第一遍 layout 中留下有效 `requestLayout()`，ViewRoot 会清理标志并在同一 traversal 再做一次 measure/layout。第二遍仍产生的请求被放进 RunQueue，下一次 traversal 才重新投给 Handler，避免当前调用栈无限循环。这是特定防护机制，不是“所有 Android 布局每帧最多两次”的普遍定律。
 
-- measure输出measuredWidth/measuredHeight和状态，是尺寸提议；
-- layout写left/top/right/bottom，是父容器给孩子的实际位置范围。
+固定路径确实执行 layout，但后续几项各有自己的门，不能笼统绑定到本轮 layout：
 
-测量完成不代表位置已确定；layout完成也不代表像素已经绘制。
+1. 只有 `didLayout=true` 时才采集请求的透明区域；区域变化会经同步 `setTransparentRegion()` 告知 WMS。
+2. `didLayout=true` 或 `mRecomputeGlobalAttributes=true` 时，`dispatchOnGlobalLayout()` 才让观察者看到当前几何。
+3. 当前有 ComputeInternalInsets listener，或者过去上报过非空值、现在需要清账时，都会重置并计算 content/visible/touchable 区域；只有前面 pending 或计算值变化，才经同步 `IWindowSession.setInsets()` 回报 WMS。后一个历史分支保证最后一个 listener 移除后仍能向 WMS 发送空值。
+4. 首轮按 touch mode 与现有焦点尝试恢复默认焦点。
 
-## 69. layout期间requestLayout怎样处理
+GlobalLayout、InternalInsets 回报和焦点完成都不是 draw；回调也可能再制造下一轮 traversal。
 
-ViewRoot收集在layout期间仍有有效布局请求的View，完成第一遍后可在同一Traversal执行第二次measure/layout，并打印警告。
+## 12. mFirst 会在 PreDraw 前清零；FIRST_TIME 只登记一笔 draw 债
 
-若第二遍仍请求，源码把请求post到下一帧，避免当前帧无限循环。
-
-## 70. “一帧最多两次layout”也不是普遍数学定律
-
-这里的防护针对ViewRoot发现的layout-during-layout请求；自定义ViewGroup内部可有自身测量轮次，窗口Insets/配置还可重新schedule下一Traversal。
-
-正确结论是ViewRoot有二次补救与跨帧限流机制，而不是整个Android布局系统固定次数。
-
-## 71. layout后处理透明区域
-
-请求透明区域的根View会计算透明Region，变化时通过：
-
-```java
-mWindowSession.setTransparentRegion(
-        mWindow, mTransparentRegion);
-```
-
-WMS/合成侧可据此优化或正确处理下层内容；透明区域属于窗口级信息，不只是Canvas alpha。
-
-## 72. OnGlobalLayout发生在layout之后
-
-didLayout或全局属性需要重算时：
-
-```java
-treeObserver.dispatchOnGlobalLayout();
-```
-
-监听器此时可读取本次layout后的几何，但在它里面再次requestLayout会影响后续Traversal；也仍不能宣称当前帧已draw/present。
-
-## 73. Internal Insets最终回报在layout后
-
-ComputeInternalInsets监听器根据最终View几何给出content/visible/touchable区域；ViewRoot必要时通过IWindowSession.setInsets通知WMS，结束前面RELAYOUT_INSETS_PENDING的暂存状态。
-
-这对输入可触区域、窗口交互和其他窗口布局有影响。
-
-## 74. 首次焦点恢复发生在layout后
-
-ViewRoot根据touch mode、兼容target和现有焦点，尝试 `restoreDefaultFocus()`。部分ScrollView等容器在有真实尺寸后才适合把焦点交给孩子。
-
-窗口焦点由WMS控制，View树内部焦点又由ViewRoot/ViewGroup管理，两者相关但不是同一变量。
-
-## 75. mFirst在draw前被置false
-
-源码先完成layout、焦点、可见性状态，然后：
+layout 与焦点阶段之后，源码先执行：
 
 ```java
 mFirst = false;
 mWillDrawSoon = false;
-...
 ```
 
-再处理reportNextDraw、OnPreDraw和performDraw。故看到mFirst=false不等于首帧draw已经完成。
-
-## 76. RELAYOUT_RES_FIRST_TIME触发draw报告
+然后才解释 relayout 结果：
 
 ```java
-if ((relayoutResult
-        & RELAYOUT_RES_FIRST_TIME) != 0) {
+if ((relayoutResult & RELAYOUT_RES_FIRST_TIME) != 0) {
     reportNextDraw();
+}
+if ((relayoutResult & RELAYOUT_RES_BLAST_SYNC) != 0) {
+    reportNextDraw();
+    setUseBLASTSyncTransaction();
 }
 ```
 
-reportNextDraw增加待报告计数并设置mReportNextDraw，要求下一次成功绘制后向WMS finishDrawing。
+`reportNextDraw()` 只有在 `mReportNextDraw` 原先为 false 时才调用一次 `drawPending()` 增加 `mDrawsNeededToReport`，随后把布尔位置 true。因此同一结果同时带 FIRST_TIME 与 BLAST_SYNC 时会调用两次方法，却不会为这两行重复增加计数。
 
-## 77. BLAST Sync也会要求报告下一draw
-
-RELAYOUT_RES_BLAST_SYNC触发reportNextDraw、设置下一帧使用BLAST同步transaction，并要求把下一frame交给WMS协调。
-
-这是多窗口/事务同步机制，不等于普通FIRST_TIME标志的同义词。
-
-## 78. OnPreDraw可以取消本次绘制
+接着才到真正 draw gate：
 
 ```java
 boolean cancelDraw =
-    treeObserver.dispatchOnPreDraw()
-        || !isViewVisible;
+        treeObserver.dispatchOnPreDraw() || !isViewVisible;
 ```
 
-监听器返回取消或窗口不可见时不执行performDraw；若仍可见则重新scheduleTraversals，等待下一次机会。
+`dispatchOnPreDraw()` 内部对每个 listener 执行 `cancelDraw |= !listener.onPreDraw()`：listener 返回 false 才取消。可见窗口被取消时会重新 `scheduleTraversals()`；但 attach、relayout、Surface 创建都不会倒退，`mFirst` 也已经是 false。
 
-## 79. 为什么OnPreDraw取消可能拖慢首帧
+这解释了常见“已 attached、有尺寸、有 Surface，但首窗仍没出现”：WMS 的 Buffer layer 仍隐藏并等待 `finishDrawing()`，PreDraw 可以把这笔 draw 债留给后续 traversal。
 
-WMS已经有隐藏Surface并等待finishDrawing，若监听器持续返回false/取消，ViewRoot会反复排Traversal，首帧报告被延后。
+## 13. 硬件、软件和 SurfaceHolder 用不同方式结清 draw 债
 
-这常用于等共享元素/布局准备，但错误使用可造成界面长期不出现。
-
-## 80. performDraw并不一定使用GPU
-
-硬件加速且ThreadedRenderer enabled时走HWUI记录/RenderThread路径；否则可走软件Canvas lock/draw/unlockAndPost。SurfaceHolder接管又有自己的回调协调。
-
-本章只建立分叉边界，下一章再精读硬件渲染主线。
-
-## 81. UI线程在硬件绘制中做什么
-
-通常遍历View树、更新DisplayList/RenderNode并把帧工作提交给ThreadedRenderer；RenderThread执行更靠近GPU的渲染与buffer提交。
-
-因此“硬件加速=所有draw代码都不占主线程”不准确，业务View.draw/onDraw和记录工作仍会影响UI线程帧预算。
-
-## 82. reportNextDraw怎样等到合适完成点
-
-硬件路径在需要时给ThreadedRenderer设置frame-complete callback，回到主Handler后调用pendingDrawFinished；非异步路径可能先renderer.fence，再pendingDrawFinished。
-
-SurfaceHolder路径则用surfaceRedrawNeededAsync等回调聚合完成后再报告。
-
-## 83. finishDrawing通知WMS什么
+固定路径进入 `performDraw()`。初始 full-redraw 让 dirty 覆盖整个窗口，硬件分支会在需要 report 时安装 frame-complete callback，再调用：
 
 ```java
-mWindowSession.finishDrawing(
-        mWindow, mSurfaceChangedTransaction);
+mAttachInfo.mThreadedRenderer.draw(
+        mView, mAttachInfo, this);
 ```
 
-它告诉WMS：客户端已完成本轮要求报告的绘制，可把WindowState draw state从DRAW_PENDING推进，并在Surface placement/事务中考虑show。
+UI 线程仍要遍历 View、运行 `draw/onDraw` 并记录 RenderNode/DisplayList；“硬件加速”不等于业务绘制完全离开主线程。`ThreadedRenderer.draw()` 返回和 `performTraversals()` 返回，只能证明客户端已走完本轮记录/提交 API，不证明 GPU 已完成或 Buffer 已 present。
 
-不是把整张Bitmap通过Binder传给WMS。
-
-## 84. WMS draw state怎样推进
-
-概念顺序：
+固定硬件路径的回报是异步的：
 
 ```text
-NO_SURFACE
-→ DRAW_PENDING（Surface创建）
-→ COMMIT_DRAW_PENDING（finishDrawing）
-→ READY_TO_SHOW
-→ HAS_DRAWN（满足Activity/transition策略并show）
+Renderer frame-complete callback
+→ finishBLASTSync(...)
+→ Handler.postAtFrontOfQueue(...)
+→ pendingDrawFinished()
+→ reportDrawFinished()
+→ IWindowSession.finishDrawing(...)
 ```
 
-具体commit/show可能在WMS后续Surface placement中完成，而不是finishDrawing Binder栈内一步到终态。
+回调可以在渲染线程侧触发，但 `pendingDrawFinished()` 的 Runnable 要等主线程退出当前 traversal 后才能在同一 Looper 执行，所以固定路径有 `D_submit < C_ready < F_commit`。
 
-## 85. 为什么WMS还要等待Activity级条件
+还有一层容易漏掉的 WindowCallbacks 等待：`updateContentDrawBounds()` 若要求额外窗口绘制，`requestDrawWindow()` 会按 callback 数创建 `mWindowDrawCountDown`；`performDraw()` 在报告前执行无超时 `await()`。对应 callback 必须调用 `reportDrawFinish()` 才能释放 UI 线程。固定路径明确没有这笔 latch，通用路径却可能停在这里。
 
-真实窗口可能和starting window、Activity transition、兄弟窗口、Task可见性协同。WindowState准备好Buffer不代表系统立刻展示它；WMS要保证Activity窗口集合和动画时序一致。
+其他分支不能硬套这个时序：
 
-首个真实主窗口drawn后，ActivityRecord还会处理starting window移除、all-drawn和启动可见性报告。
-
-## 86. performDraw完成不等于屏幕present
-
-绘制命令/Buffer提交之后还要经过：
-
-```text
-BufferQueue acquire/latch
-→ SurfaceFlinger层事务与合成选择
-→ HWC/GPU合成
-→ 显示VSync/面板扫描present
-```
-
-finishDrawing更不是物理显示时间戳。要证明present需SurfaceFlinger/FrameTimeline等运行时证据。
-
-## 87. 首帧的多个完成点
-
-| 完成点 | 能证明什么 |
+| 分支 | draw/report 方式 |
 |---|---|
-| onAttachedToWindow | View树接入ViewRoot窗口环境 |
-| 第一次measure | App在提示约束下给出尺寸 |
-| relayout返回 | WMS给出frame/Insets/Surface控制对象 |
-| layout完成 | View局部位置确定 |
-| performDraw提交 | 客户端生成/提交绘制工作 |
-| finishDrawing | 客户端通知WMS本轮draw完成 |
-| WindowState HAS_DRAWN | WMS窗口画面状态已推进 |
-| SF latch/compose | 合成器接收并参与合成 |
-| hardware present | 最终图像真正扫描到显示设备 |
+| ThreadedRenderer 可异步 | frame-complete callback 后回主 Handler |
+| Renderer 不能使用异步回报 | 清 callback，必要时 fence，再在当前 `performDraw()` 内调用 `pendingDrawFinished()` |
+| 软件绘制 | `Surface.lockCanvas()`、View 树 draw、`unlockCanvasAndPost()` 后在当前调用栈结算 |
+| 根 Surface 被接管且 `mSurface.isValid()` | ViewRoot 自己不画，由 `surfaceRedrawNeededAsync` callbacks 聚合，随后以 Handler 消息结算 |
 
-任何较早一行都不能自动替代后面完成点。
+“Renderer 不能使用异步回报”和普通软件绘制这两条非 SurfaceHolder 路径，可能在 `performTraversals()` 返回前就同步调用 `finishDrawing()`，所以不能把固定硬件路径的 `D_submit < F_commit` 移植过去。根 Surface 已接管且有效时，即使没有 callback、或 callback 同步完成，也只会调用 `postDrawFinished()` 发送 `MSG_DRAW_FINISHED`，再由后续主 Looper 消息执行 `pendingDrawFinished()`，不会在当前栈内直接结算；若 holder 存在但 Surface 无效，则会落入 `!usingAsyncReport` 的当前栈结算分支。并且 `draw()` 某些失败/接管分支返回 false 后，非异步报告仍可能平账；`reportNextDraw` 不是“只在成功画出业务像素后才允许回报”的事务保证。
 
-## 88. Surface对象关系图
+`finishDrawing(IWindow, Transaction)` 传的是窗口身份和可选 SurfaceControl transaction，不是 Bitmap 或整块像素。它是客户端对 WMS 的“本轮所要求 draw 已完成”协议。
 
-```mermaid
-flowchart TD
-  SS["Session.mSurfaceSession\n客户端SurfaceControl会话"] --> WSC["WindowSurfaceController\nsystem_server窗口Surface包装"]
-  WSC --> SC["SurfaceControl\n图层/事务控制"]
-  SC --> BSC["可选BLAST SurfaceControl"]
-  BSC --> BBQ["App BLASTBufferQueue"]
-  BBQ --> SURF["App Surface\nBuffer producer接口"]
-  SC --> NBL["非BLAST copyFrom"]
-  NBL --> SURF
-  SURF --> BUF["GraphicBuffer队列"]
-  BUF --> SF["SurfaceFlinger latch/compose"]
-```
+## 14. finishDrawing 只推进 WMS 状态机；show 和 present 仍在后面
 
-图是职责关系，不表示所有对象都由同一进程new，也不表示创建后已有Buffer。
-
-## 89. 首次Traversal成功时已经有什么
-
-普通可见硬件加速路径走完通常已有：
-
-- View树AttachInfo与onAttached回调；
-- 至少一次有效根测量和layout；
-- WMS最终WindowState frame/Insets；
-- WindowSurfaceController/SurfaceControl；
-- App有效Surface或BLASTBufferQueue；
-- ThreadedRenderer与Surface连接；
-- performDraw提交路径；
-- 必要时finishDrawing报告已安排或完成。
-
-## 90. 仍不能无证据断言什么
-
-不能仅靠静态源码/performTraversals返回断言：
-
-- 每个View onMeasure恰好调用一次；
-- GPU命令已全部执行；
-- Buffer已经被SurfaceFlinger latch；
-- WindowState已经show且无遮挡；
-- starting window已经移除；
-- Activity windowsDrawn已回报；
-- 用户肉眼已在面板看到首帧；
-- 具体首帧耗时是多少毫秒。
-
-## 91. 常见误解集中纠正
-
-### 误解一：首次Traversal固定只测量一次
-
-Dialog宽度试探、relayout尺寸/Insets变化、Window weight和layout中requestLayout都可增加轮次。
-
-### 误解二：onAttachedToWindow时宽高一定最终可用
-
-attach发生在首次measure之前，通常应在layout/size changed后使用几何。
-
-### 误解三：View测量尺寸就是WMS窗口尺寸
-
-它是App请求；WMS结合系统政策返回frame，必要时App再测。
-
-### 误解四：SurfaceControl就是可draw Canvas的Surface
-
-前者控制图层；ViewRoot还要建立Surface/BLASTBufferQueue生产buffer。
-
-### 误解五：Surface.isValid说明首帧已有像素
-
-只说明句柄/连接有效，不证明已经queue buffer。
-
-### 误解六：finishDrawing说明硬件已present
-
-它是App→WMS的draw完成协议，后面仍有show、latch、compose与present。
-
-## 92. 一次普通MATCH_PARENT首遍的简化推演
-
-假设：Activity已可见、普通全屏、无新Insets变化、addWindow frame提示等于最终frame。
+Session 把 `finishDrawing()` 同步转给 WMS。普通非 BLAST 路径中：
 
 ```text
-dispatchAttached + 初始Insets
-→ EXACTLY(frameWidth, frameHeight) measure
-→ relayout(measured尺寸, VISIBLE)
-→ WMS创建隐藏SurfaceControl并返回相同frame
-→ App建立Surface，初始化Renderer
-→ 尺寸相同，可能无需第二次measure
-→ layout(0,0,w,h)
-→ global layout / pre-draw
-→ performDraw
-→ frame complete后finishDrawing
+WindowState.finishDrawing
+→ WindowStateAnimator.finishDrawingLocked
+→ DRAW_PENDING → COMMIT_DRAW_PENDING
+→ WindowManagerService 请求下一次 surface placement
 ```
 
-这是常见优化路径，不是所有窗口的固定模板。
+这里的服务端 COMMIT 写入和 `requestTraversal()` 才是固定路径的 `F_commit`，不是 App 观察到 Binder reply 的时刻。正常的同步调用返回可以证明服务端已经经过 `F_commit`；但 global lock 释放后，AnimationThread 可能在 reply 到达 App 之前就取得锁并推进后续 placement。因此可靠偏序是 `F_commit < W_drawn < S_show`，客户端代理返回与 `W_drawn` 之间没有固定先后。
 
-## 93. 一次WRAP_CONTENT浮动窗口推演
+后续 placement 遍历窗口时，`commitFinishDrawingLocked()` 把状态推进为 `READY_TO_SHOW`。只有 Activity 没有额外等待，或者普通窗口满足 `ActivityRecord.canShowWindows()`，才调用 `performShowLocked()`；它通过 `isReadyForDisplay()` 后写 `HAS_DRAWN` 并安排 animation。
+
+Activity 的 `onFirstWindowDrawn()`、all-drawn/starting-window 协调也处在 WMS 状态层。源码甚至在 `performShowLocked()` 的 ready gate 前调用 first-window 通知，因此这些名字都不能充当像素 present 时间戳。
+
+真正取消初始隐藏还要等 `WindowState.prepareSurfaces()`：
 
 ```text
-以config_prefDialogWidth试测
-→ TOO_SMALL则中间宽度再测
-→ 必要时desired上限再测
-→ relayout把内容期望交WMS
-→ WMS按display/policy给最终frame
-→ frame或Insets不同时按最终尺寸补测
-→ layout/draw
+WindowStateAnimator.prepareSurfaceLocked
+→ draw state 已是 HAS_DRAWN
+→ WindowSurfaceController.showRobustlyInTransaction
+→ SurfaceControl.show
+→ WMS 关闭/提交 Surface transaction
 ```
 
-同一帧多次onMeasure在这种场景可能是正常协议，不应一看到次数>1就判定bug。
+`S_show` 只把图层可见性事务交给合成系统。目标 Buffer 的 acquire/latch 与 show 不能强排：SurfaceFlinger 也可提前 latch、release 暂时隐藏或 offscreen 图层的 ready Buffer；有效 show 与合适的 Buffer 要在可见合成前汇合，之后才由 HWC/GPU 与显示时序完成 `F_present`。静态 Java 源码不能证明某台设备的 `F_present`，应使用该版本可获得的 present fence、SurfaceFlinger latency 或等价运行时显示证据。
 
-## 94. macOS只读练习一：给performTraversals分段
+## 15. 失败、重入与诊断证据都必须停在最窄完成点
+
+固定主线排除了异常；真实系统没有一个跨 App、WMS、RenderThread、SurfaceFlinger 的原子事务：
+
+| 分支 | r48 行为 | 诊断边界 |
+|---|---|---|
+| callback 到达时 `mView==null` 或 `!mAdded` | `performTraversals()` 立即返回 | traversal 被调度过不等于 attach |
+| attach/Insets/layout/observer 自身抛 RuntimeException | 当前调用栈可被截断，没有覆盖整方法的统一回滚 | 不能假定 `mIsInTraversal/mFirst` 等过程位已走到底 |
+| WMS 找不到原 WindowState | 在锁内直接返回 0，未走该方法底部的显式 identity restore | 0 也是正常位集合，不能当作独立成功回执 |
+| attrs 改了 type 或 providesInsetsTypes | WMS 抛 `IllegalArgumentException`；它不是 `RELAYOUT_RES_*` | requested size 等较早写入不因此自动回滚 |
+| `shouldRelayout=false` | 不创建新 Surface；VISIBLE 且旧 Surface 存在时可返回旧 control，否则释放 out control | Decor.VISIBLE 不足以证明新 Surface |
+| `createSurfaceLocked()` 内部捕获资源/构造异常 | draw state 回到 `NO_SURFACE`，返回 null 并释放 out control；结果位不构成独立错误码 | 不能因 relayout 返回非负就认定有 Surface |
+| 外层 `createSurfaceControl()` 调用仍抛异常 | WMS 强制更新输入窗口、显式恢复身份并返回 0 | 0 不足以区分这条失败与正常零结果位 |
+| relayout Binder `RemoteException` | `performTraversals()` 的局部 catch 吞掉异常并继续 | 本轮后续字段可能沿用旧值，不能宣称 WMS 成功 |
+| Renderer 初始化资源不足 | ViewRoot 请求 WMS 回收图形内存；WMS 只有在“回收了泄漏 Surface 或杀掉候选 App”时返回 true，二者都没做到而返回 false 且当前不是 system UID 时，客户端会调用 `killProcess(myPid())`；代码随后置 `mLayoutRequested=true`，调用点若继续执行则提前返回并跳过尾部 `mIsInTraversal=false` | Surface control 存在不等于 Renderer 可画，WMS 返回 true 也不等于杀过进程 |
+| relayout 后的 Insets/control listener 重入改 visibility 或 remove | 后面的 `isViewVisible` 仍是 traversal 开头快照 | PreDraw 的可见性判断不自动重读最新 View 状态 |
+| PreDraw 取消 | 可见时再排 traversal；WMS 继续等待 draw 回报 | `mFirst=false` 不等于首帧已提交 |
+| `finishDrawing()` 抛 `RemoteException` | `reportDrawFinished()` 已先清待报告计数并吞异常 | 客户端本地平账不证明 WMS 进入 COMMIT，也不保证自动重试 |
+| Activity/transition 尚不允许 show | draw state 可停在 `READY_TO_SHOW` | `finishDrawing()` 不等于 `HAS_DRAWN` |
+| show 命令已写入或提交，但没有目标 Buffer present 证据 | WMS 已发出解除初始隐藏的事务意图，合成侧进度仍未知 | WMS show 不等于用户看到 |
+
+回调还能在同一主线程重入 `requestLayout()`、改属性、改 Insets 或 remove View；system_server 也可能并发发 resize/visibility。只有固定前提成立时，十八点才构成这一条局部全序。
+
+排障时应让证据停在它真正证明的位置：
+
+| 证据 | 至少证明 | 仍不能证明 |
+|---|---|---|
+| `decor.isAttachedToWindow()` | Decor 的 `mAttachInfo` 已非空 | 整棵树 attach、window-attached 通知或初始 Insets 已返回 |
+| `getMeasuredWidth/Height()` 非零 | 某次 View 测量给出结果 | 等于 WMS frame |
+| 单独读取客户端 `mWinFrame` | 已有 add frame hint、relayout reply 或 resize 中最近一次写入的快照 | 一定完成过 relayout/window placement |
+| WMS WindowState frame 加本次 placement 证据 | 服务端本轮窗口布局快照存在 | App 已收到或按该结果补测/layout |
+| `mSurface.isValid()` | App 有可用 producer 句柄 | 已 queue 目标 Buffer |
+| WSA `COMMIT_DRAW_PENDING` | WMS 收到所需 draw 回报 | 图层已 show |
+| WSA `HAS_DRAWN` | WMS 显示门已推进并安排可见 | show 事务已被 SF 应用 |
+| `showRobustlyInTransaction()` 返回 true | 当前隐藏条件已解除，且内部可见状态机认为 Surface 已 shown | 本次一定调用了 `SurfaceControl.show()`、事务已应用、合成侧已取消隐藏或目标 Buffer 已 present |
+| 目标帧 present 时间戳 | 所选帧到达显示完成点 | 较早阶段没有卡顿 |
+
+本章结算点不是一个笼统“首帧完成”，而是：`M_offer` 结算 App 提议，`W_layout` 结算 WMS frame，`S_ready` 结算 producer 接线，`L_tree` 结算 View 几何，`F_commit` 结算客户端 draw 回报；`F_present` 仍需独立证据。
+
+## 16. 九组只读练习：重建 attach、尺寸、Surface 与显示账
+
+以下命令只检查文件并检索文本。可在 Android 11 r48 源码根运行，也可先设置 `ANDROID_BUILD_TOP`；每组都应在 Bash 3.2 与 Zsh 5.9 中独立以 0 退出。
+
+### 练习 1：证明 callback 调度、barrier 与首次可见性的顺序
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '2350,3120p' \
-  frameworks/base/core/java/android/view/ViewRootImpl.java
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+V="$SRC/frameworks/base/core/java/android/view/ViewRootImpl.java"
+A="$SRC/frameworks/base/core/java/android/app/ActivityThread.java"
+Y="$SRC/frameworks/base/core/java/android/app/Activity.java"
+test -f "$V" && test -f "$A" && test -f "$Y"
+grep -nE 'int getHostVisibility\(\)|void scheduleTraversals\(\)|postSyncBarrier\(\)|CALLBACK_TRAVERSAL|void doTraversal\(\)|removeSyncBarrier\(|private void performTraversals\(\)|host == null|mIsInTraversal = true' "$V"
+grep -nE 'decor.setVisibility\(View.INVISIBLE\)|wm.addView\(decor, l\)|r.activity.makeVisible\(' "$A"
+grep -nE 'void setVisible\(boolean visible\)|mVisibleFromClient = !mWindow.getWindowStyle|if \(!mVisibleFromClient && !mFinished\)' "$Y"
 ```
 
-在自己的笔记上标出attach、first measure、relayout、second measure、layout、global layout、pre-draw和draw八段，不修改源码。
+画出 `addView 返回 → makeVisible → T_start`，再说明多次 `scheduleTraversals()` 为什么不等于多次 callback。
 
-## 95. macOS只读练习二：验证根MeasureSpec
+完成标准：`T_start` 定义在 callback 真正执行，不定义在首次 `requestLayout()`。
+
+### 练习 2：区分 parent、AttachInfo、初始 Insets 与 RunQueue
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '3615,3660p' \
-  frameworks/base/core/java/android/view/ViewRootImpl.java
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+V="$SRC/frameworks/base/core/java/android/view/ViewRootImpl.java"
+W="$SRC/frameworks/base/core/java/android/view/View.java"
+Q="$SRC/frameworks/base/core/java/android/view/HandlerActionQueue.java"
+test -f "$V" && test -f "$W" && test -f "$Q"
+grep -nE 'view.assignParent\(this\)|mFirst = true|host.dispatchAttachedToWindow\(|dispatchOnWindowAttachedChange\(true\)|dispatchApplyInsets\(host\)|getRunQueue\(\).executeActions|mFirst = false' "$V"
+grep -nE 'void dispatchAttachedToWindow\(AttachInfo info|mAttachInfo = info|onAttachedToWindow\(\)|private HandlerActionQueue getRunQueue\(\)|mRunQueue.executeActions\(info.mHandler\)|getRunQueue\(\).post\(action\)' "$W"
+grep -nE 'void executeActions\(Handler handler\)|handler.postDelayed\(|mActions = null|mCount = 0' "$Q"
 ```
 
-分别代入MATCH_PARENT、WRAP_CONTENT和600px，写出EXACTLY/AT_MOST及size来源。
+按真实顺序标出 ViewParent、View AttachInfo、WindowInsets 与 Handler action，判断哪些在 `A_tree` 同步完成。
 
-## 96. macOS只读练习三：追Surface创建两端
+完成标准：RunQueue 的 `executeActions()` 是 post，不把 action 本体插进 measure 之前。
+
+### 练习 3：推导 desired size、根 MeasureSpec 与 Dialog 试探
 
 ```bash
-cd /Users/ninebot/androidSource
-rg -n "createSurfaceControl|createSurfaceLocked|getOrCreateBLASTSurface|copyFrom\(mSurfaceControl\)|transferFrom" \
-  frameworks/base/services/core/java/com/android/server/wm/{WindowManagerService.java,WindowStateAnimator.java} \
-  frameworks/base/core/java/android/view/ViewRootImpl.java
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+V="$SRC/frameworks/base/core/java/android/view/ViewRootImpl.java"
+W="$SRC/frameworks/base/core/java/android/view/View.java"
+test -f "$V" && test -f "$W"
+grep -nE 'shouldUseDisplaySize\(lp\)|mDisplay.getRealSize\(|config.screenWidthDp|frame contains the frameHint|measureHierarchy\(|boolean goodMeasure = false|config_prefDialogWidth|baseSize != 0 && desiredWindowWidth > baseSize|MEASURED_STATE_TOO_SMALL|if \(!goodMeasure\)|windowSizeMayChange = true|getRootMeasureSpec\(|MeasureSpec.EXACTLY|MeasureSpec.AT_MOST' "$V"
+grep -nE 'public final void measure\(|mMeasureCache.indexOfKey|onMeasure\(widthMeasureSpec, heightMeasureSpec\)|PFLAG_MEASURED_DIMENSION_SET|mMeasureCache.put' "$W"
 ```
 
-把system_server创建图层控制对象和App创建buffer producer Surface分别标色。
+分别代入 `MATCH_PARENT`、`WRAP_CONTENT`、600px，并列出一次 `measureHierarchy()` 内可能出现的三档 Dialog 宽度。
 
-## 97. macOS只读练习四：追首次draw回报
+完成标准：frame hint 是初测输入；小档/中档命中会走 `goodMeasure` 短路；根 measure 次数与每个子 View 的 `onMeasure()` 次数不是同一统计。
+
+### 练习 4：还原 relayout 门、参数与同步 AIDL
 
 ```bash
-cd /Users/ninebot/androidSource
-rg -n "RELAYOUT_RES_FIRST_TIME|reportNextDraw|pendingDrawFinished|finishDrawing" \
-  frameworks/base/core/java/android/view/{ViewRootImpl.java,WindowManagerGlobal.java} \
-  frameworks/base/services/core/java/com/android/server/wm/{WindowManagerService.java,WindowStateAnimator.java,WindowState.java}
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+V="$SRC/frameworks/base/core/java/android/view/ViewRootImpl.java"
+Q="$SRC/frameworks/base/core/java/android/view/IWindowSession.aidl"
+test -f "$V" && test -f "$Q"
+grep -nE 'mApplyInsetsRequested|collectViewAttributes\(\)|SOFT_INPUT_ADJUST_UNSPECIFIED|mWindowAttributesChanged|mForceNextWindowRelayout|RELAYOUT_INSETS_PENDING|mThreadedRenderer.pause\(\)|relayoutWindow\(params, viewVisibility, insetsPending\)|mWindowSession.relayout\(' "$V"
+grep -nE '^interface IWindowSession|int relayout\(IWindow window|out Rect outFrame|out SurfaceControl outSurfaceControl|out Point outSurfaceSize|out SurfaceControl outBlastSurfaceControl' "$Q"
 ```
 
-画出FIRST_TIME→App draw→finishDrawing→WMS draw state/show，注明这仍不是hardware present。
+写出首次为什么必跨 Binder、后续为何 attrs 可以为 null，以及 measured size 如何独立于 attrs 传输。
 
-## 98. 自测题
+完成标准：AIDL 方法不是 oneway；`RELAYOUT_INSETS_PENDING` 不是 WindowInsets 对象。
 
-1. 首次performTraversals中onAttached、measure、relayout、layout谁先谁后？
-2. addWindow返回的frame为什么只是测量提示？
-3. MATCH_PARENT和WRAP_CONTENT分别得到什么根MeasureSpec？
-4. measureHierarchy一次调用为什么可能执行多次performMeasure？
-5. App measured尺寸与WMS frame是什么关系？
-6. shouldRelayout为什么同时看Decor visibility和ActivityRecord clientVisible？
-7. SurfaceSession、SurfaceControl和Surface有什么区别？
-8. BLAST路径如何把SurfaceControl接成App Surface？
-9. relayout后为什么可能第二次measure？
-10. layout期间继续requestLayout会怎样？
-11. OnPreDraw取消对首帧有什么影响？
-12. finishDrawing与hardware present有什么区别？
+### 练习 5：证明 WMS 先布局 frame，再创建窗口 Buffer 图层
 
-## 99. 自测答案
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+M="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java"
+W="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowState.java"
+D="$SRC/frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java"
+test -f "$M" && test -f "$W" && test -f "$D"
+grep -nE 'win.setRequestedSize\(|win.mAttrs.type != attrs.type|win.mRelayoutCalled = true|win.setViewVisibility\(|final boolean shouldRelayout|performSurfacePlacement\(true|win.relayoutVisibleWindow\(|createSurfaceControl\(|win.getCompatFrame\(|outSurfaceSize.set' "$M"
+grep -nE 'int relayoutVisibleWindow\(|!wasVisible|!isDrawnLw\(\)|RELAYOUT_RES_FIRST_TIME' "$W"
+grep -nE 'getDisplayPolicy\(\).layoutWindowLw\(|w.updateLastFrames\(\)|w.updateLastInsetValues\(\)' "$D"
+```
 
-1. 首次attach/Insets→初测→relayout/Surface→按需重测→layout→pre-draw→draw。
-2. 它由add阶段policy给出，最终还要结合App measured需求和当时系统布局在relayout计算。
-3. MATCH_PARENT用windowSize的EXACTLY；WRAP_CONTENT用windowSize的AT_MOST。
-4. WRAP_CONTENT Dialog会试探多档宽度；每次View.measure内部也可能按spec/cache决定onMeasure。
-5. measured是App在约束下的尺寸请求；WMS结合窗口政策返回最终frame，App必要时适配重测。
-6. 只有View想显示且服务端Activity允许客户端窗口显示，才应创建/返回可见Surface。
-7. SurfaceSession是SurfaceControl创建会话；SurfaceControl管图层/事务；Surface是App生产GraphicBuffer的接口。
-8. 用BLAST SurfaceControl创建/更新BLASTBufferQueue，取得Surface后transfer到mSurface。
-9. 最终frame、Insets、Configuration或touch mode可能与初测假设不同。
-10. ViewRoot可同一Traversal补一次measure/layout；第二遍再请求则post到下一帧避免死循环。
-11. 本次不draw，可见时重新schedule；WMS等待的首次finishDrawing被延后。
-12. finishDrawing通知WMS客户端draw就绪；present还需WMS show、SF latch/compose和显示硬件扫描。
+按源码排出 `W_record → W_layout → W_layer → B_reply`，并解释 `shouldRelayout=false` 为什么能阻止新 Surface。
 
-## 100. 本章结论
+完成标准：WMS frame 不是 App measured size 的原样回显；`FIRST_TIME` 也不是调用次数。
 
-第一次performTraversals不是单向的 `measure→layout→draw`，而是App与WMS的尺寸、可见性和Surface协商。View树先获得AttachInfo与初始Insets，再依据addWindow frame提示测量；relayout把测量需求同步交给WMS，WMS完成窗口布局并创建初始隐藏的SurfaceControl，App再通过普通或BLAST路径建立可生产buffer的Surface。若真实frame、Insets、配置或touch mode变化，App在layout前重新测量。
+### 练习 6：追踪隐藏 SurfaceControl、SurfaceSession 与 BLAST 子层
 
-layout之后还有GlobalLayout、Internal Insets、PreDraw和实际draw；首次窗口由reportNextDraw/finishDrawing把客户端绘制完成回报WMS，WMS才能推进draw state并选择何时show。即便如此，SurfaceFlinger latch、合成和硬件present仍是更后的完成点。
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+M="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java"
+T="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowToken.java"
+N="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowContainer.java"
+D="$SRC/frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java"
+S="$SRC/frameworks/base/services/core/java/com/android/server/wm/Session.java"
+A="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowStateAnimator.java"
+C="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowSurfaceController.java"
+test -f "$M" && test -f "$T" && test -f "$N" && test -f "$D"
+test -f "$S" && test -f "$A" && test -f "$C"
+grep -nE 'win.mToken.addWindow\(win\)' "$M"
+grep -nE 'void addWindow\(final WindowState win\)|addChild\(win, mWindowComparator\)' "$T"
+grep -nE 'protected void addChild\(E child, Comparator|child.setParent\(this\)|void onParentChanged\(ConfigurationContainer newParent|createSurfaceControl\(false|getSyncTransaction\(\).show\(mSurfaceControl\)' "$N"
+grep -nE 'SurfaceControl.Builder makeChildSurface\(WindowContainer child\)|setContainerLayer\(\)' "$D"
+grep -nE 'void windowAddedLocked|mSurfaceSession = new SurfaceSession\(\)|mNumWindow\+\+' "$S"
+grep -nE 'void resetDrawState\(\)|mDrawState = DRAW_PENDING|SurfaceControl.HIDDEN|calculateSurfaceBounds\(|new WindowSurfaceController\(|w.setHasSurface\(true\)' "$A"
+grep -nE 'setParent\(win.getSurfaceControl\(\)\)|setContainerLayer\(\)|setParent\(mSurfaceControl\)|setHidden\(false\)|setBLASTLayer\(\)' "$C"
+```
 
-## 101. 复读后的边界修订
+画出 WindowState container、WindowSurfaceController 主层和可选 BLAST layer 的 parent 关系，并标出哪一层初始隐藏。
 
-- 不把首次View attach放到measure之后；r48首次分支先dispatchAttached和初始Insets，再进入measureHierarchy。
-- 不把addWindow frameHint称为最终窗口大小；它是减少二次measure的预测输入，relayout结果才更新mWidth/mHeight。
-- 不把一次measureHierarchy等同每个View只onMeasure一次；Dialog试探、补测、weight、layout请求和View measure cache都会改变调用情况。
-- 不把MATCH_PARENT解释为物理全屏；EXACTLY size来自当前窗口可用尺寸。
-- 不把Internal Insets pending和WindowInsets分发混成同一对象；前者是View树向WMS回报content/visible/touchable区域的协议。
-- 不把SurfaceSession首次创建扩大为当前窗口Surface已存在；WindowSurfaceController在可见relayout创建。
-- 不把SurfaceControl、BLAST SurfaceControl、BLASTBufferQueue和Java Surface合并成一个对象。
-- 不把Surface valid或Renderer initialize解释成已有业务像素Buffer。
-- 不把 `RELAYOUT_RES_FIRST_TIME` 解释为Java首次调用计数；它与服务端可见/drawn状态相关。
-- 不把mFirst=false解释为首帧已完成；r48在OnPreDraw/performDraw之前就清它。
-- 不把OnGlobalLayout、OnPreDraw、performDraw、frame-complete callback、finishDrawing、WindowState HAS_DRAWN和hardware present合并。
-- 不把当前Mac源码推演写成真机已验证次数或耗时；动态分支需未来trace/FrameTimeline证据。
+完成标准：服务端 Session 的 SurfaceSession 早于本次 relayout；创建图层不等于 App 已有 Java `Surface`。
 
-下一章将继续精读硬件渲染首帧：DisplayList/RenderNode怎样在UI线程记录，ThreadedRenderer如何把工作交给RenderThread，并经过BLAST/BufferQueue提交给SurfaceFlinger。
+### 练习 7：比较非 BLAST copyFrom 与 BLAST transferFrom
+
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+V="$SRC/frameworks/base/core/java/android/view/ViewRootImpl.java"
+S="$SRC/frameworks/base/core/java/android/view/Surface.java"
+M="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java"
+D="$SRC/frameworks/base/core/java/com/android/internal/policy/DecorView.java"
+test -f "$V" && test -f "$S" && test -f "$M" && test -f "$D"
+grep -nE 'mSurface = new Surface\(\)|ADD_FLAG_USE_BLAST|mUseBLASTAdapter = true|boolean useBLAST\(\)|mSurfaceHolderCallback =|mSurfaceHolder = new TakenSurfaceHolder|mSurface.copyFrom\(mSurfaceControl\)|getOrCreateBLASTSurface\(|new BLASTBufferQueue\(|mSurface.transferFrom\(|surfaceCreated|allocateBuffers\(\)|initialize\(mSurface\)' "$V"
+grep -nE 'boolean isValid\(\)|void copyFrom\(SurfaceControl other\)|nativeGetFromSurfaceControl|void transferFrom\(Surface other\)' "$S"
+grep -nE 'WM_USE_BLAST_ADAPTER_FLAG|mUseBLAST = DeviceConfig.getBoolean|ADD_FLAG_USE_BLAST' "$M"
+grep -nE 'implements RootViewSurfaceTaker|willYouTakeTheSurface\(\)|mTakeSurfaceCallback' "$D"
+```
+
+分别写出两条 `W_layer → S_ready` 接线，并说明 generation id 为什么只描述 Surface 句柄代际。
+
+完成标准：Decor 实现接口不等于它接管根 Surface；Java wrapper 存在、`isValid()`、Renderer initialize 和 Buffer present 也是不同完成点。
+
+### 练习 8：重建补测、layout 与 InternalInsets 回报
+
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+V="$SRC/frameworks/base/core/java/android/view/ViewRootImpl.java"
+Q="$SRC/frameworks/base/core/java/android/view/IWindowSession.aidl"
+test -f "$V" && test -f "$Q"
+grep -nE 'mWidth != frame.width\(\)|focusChangedDueToTouchMode|updatedConfiguration|performMeasure\(childWidthMeasureSpec|lp.horizontalWeight|lp.verticalWeight|performLayout\(lp, mWidth, mHeight\)|requestLayoutDuringLayout\(|dispatchOnGlobalLayout\(\)|hasComputeInternalInsetsListeners\(\)|mHasNonEmptyGivenInternalInsets|if \(isViewVisible\)|dispatchOnComputeInternalInsets\(|insetsPending \|\| !mLastGivenInsets.equals|mWindowSession.setInsets\(' "$V"
+grep -nE 'void setInsets\(IWindow window' "$Q"
+```
+
+列出 Binder 后触发补测的四类条件，再跟踪 layout 中第一遍、补救遍与下一 traversal 三个处理层次。
+
+完成标准：Decor 的 `(0,0)` 是窗口局部原点；InternalInsets 是 View→WMS 的回报。
+
+### 练习 9：从 PreDraw 追到 show，并在 present 前停笔
+
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+V="$SRC/frameworks/base/core/java/android/view/ViewRootImpl.java"
+T="$SRC/frameworks/base/core/java/android/view/ViewTreeObserver.java"
+M="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java"
+A="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowStateAnimator.java"
+W="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowState.java"
+D="$SRC/frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java"
+C="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowSurfaceController.java"
+R="$SRC/frameworks/base/services/core/java/com/android/server/wm/RootWindowContainer.java"
+P="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowSurfacePlacer.java"
+test -f "$V" && test -f "$T" && test -f "$M" && test -f "$A" && test -f "$W"
+test -f "$D" && test -f "$C" && test -f "$R" && test -f "$P"
+grep -nE 'RELAYOUT_RES_FIRST_TIME|reportNextDraw\(\)|dispatchOnPreDraw\(\)|performDraw\(\)|setFrameCompleteCallback|postDrawFinished\(\)|MSG_DRAW_FINISHED|pendingDrawFinished\(\)|mWindowSession.finishDrawing\(' "$V"
+grep -nE 'cancelDraw \|= !\(access.get\(i\).onPreDraw\(\)\)' "$T"
+grep -nE 'void finishDrawingWindow\(|win.finishDrawing\(|mWindowPlacerLocked.requestTraversal\(\)|void closeSurfaceTransaction\(String where\)|SurfaceControl.closeTransaction\(\)' "$M"
+grep -nE 'mDrawState = COMMIT_DRAW_PENDING|commitFinishDrawingLocked\(\)|mDrawState = READY_TO_SHOW|void prepareSurfaceLocked\(final boolean recoveringMemory\)|showSurfaceRobustlyLocked\(\)' "$A"
+grep -nE 'boolean performShowLocked\(\)|onFirstWindowDrawn\(|isReadyForDisplay\(\)|mWinAnimator.mDrawState = HAS_DRAWN|void prepareSurfaces\(\)' "$W"
+grep -nE 'winAnimator.commitFinishDrawingLocked\(\)|prepareSurfaces\(\)' "$D"
+grep -nE 'boolean showRobustlyInTransaction\(\)|private boolean showSurface\(\)|mSurfaceControl.show\(\)' "$C"
+grep -nE 'applySurfaceChangesTransaction\(\)|closeSurfaceTransaction\("performLayoutAndPlaceSurfaces"\)' "$R"
+grep -nE 'void requestTraversal\(\)|mService.mAnimationHandler.post\(mPerformSurfacePlacement\)' "$P"
+```
+
+画出 `P_allow → D_submit → C_ready → F_commit → W_drawn → S_show`，并在图末另画一条虚线指向运行时 `F_present`。
+
+完成标准：源码搜索能证明 WMS 状态与 show 调用，不能单靠这些 Java 行证明 SurfaceFlinger latch 或硬件 present。
+
+完成九组练习后，应能对任何“首帧已经完成”的说法追问：完成的是 App 尺寸提议、WMS frame、Java Surface、View layout、客户端 draw 回报、WMS show，还是目标帧 present。

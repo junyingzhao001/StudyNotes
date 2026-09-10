@@ -1,0 +1,8 @@
+Commands: add TITLE | done ID | remove ID | list | quit
+Added 1
+Added 2
+Completed.
+1 [x] Learn references
+2 [ ] Build a CLI
+Removed.
+1 [x] Learn references

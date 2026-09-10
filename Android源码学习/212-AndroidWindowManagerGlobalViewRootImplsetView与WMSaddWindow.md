@@ -1,524 +1,284 @@
-# 212 Android WindowManagerGlobal、ViewRootImpl.setView 与 WMS addWindow
+# 212 Android WindowManagerGlobal：ViewRootImpl.setView 与 WMS addWindow
 
-> 源码版本：Android 11 `android-11.0.0_r48`。  
-> 当前在 macOS 上只读源码，不实际启动Activity、连接WMS或抓取Surface/InputChannel运行状态。
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`。
+>
+> 当前环境只读源码，可以证明本地顶层窗口账、同步 Binder、服务端 WindowState、输入通道与首次 traversal 的源码顺序；不能据此测量某台设备的 add 延迟，也不能把窗口登记、容器层 SurfaceControl、可绘制 Surface、首个 Buffer 与屏幕 present 合并成一个完成点。
 
-## 1. 本章目标
-
-第211章已经构造好DecorView及其业务子树，但它仍只是App进程中的本地View对象树。本章从Activity resume时这句继续：
+第 211 章已经把业务 XML 同步挂进 `PhoneWindow` 的 content，但 Decor 还没有接入窗口系统。普通首次 resume 会走到：
 
 ```java
+a.mWindowAdded = true;
 wm.addView(decor, l);
 ```
 
-读完应能准确区分：
+本章只追一个问题：**这次 `WindowManager.addView()` 正常返回时，App 与 system_server 各自已经提交了什么；为什么 Decor 有了 ViewRoot parent 和 WMS WindowState，仍不能说 `onAttachedToWindow()`、可绘制 Surface 或首帧已经完成？**
 
-- WindowManagerImpl、WindowManagerGlobal与ViewRootImpl的职责；
-- Activity token、IWindow、IWindowSession与InputChannel token；
-- 本地View账本和system_server WindowState账本；
-- `setView()` 为什么先排Traversal再同步调用WMS；
-- WMS addWindow做哪些授权、token、层级、输入和Insets工作；
-- addWindow完成时为什么仍没有可绘制窗口Surface和首帧。
+## 1. 固定普通首次主窗口，用十八个完成点回答“add 已完成”
 
-## 2. 一句话主线
+先固定 `B_target`：
 
-```text
-ActivityThread resume
-→ WindowManagerImpl.addView(DecorView, LayoutParams)
-→ WindowManagerGlobal建立View/ViewRoot/Params本地账本
-→ ViewRootImpl.setView先scheduleTraversal
-→ 通过IWindowSession同步addToDisplayAsUser
-→ WMS校验权限/display/user/token
-→ 创建WindowState并挂入WindowToken层级
-→ 创建并注册InputChannel对
-→ 返回frame/insets/控制权与状态flags
-→ App创建InputEventReceiver并让ViewRoot成为Decor的parent
-→ 下一次Traversal才attach View、relayout、申请Surface并绘制
-```
+| 维度 | 固定值或前提 |
+|---|---|
+| 上游 | 普通 Activity 首次 `handleResumeActivity()`；`performResumeActivity()` 成功，未进入待销毁集合；无待清理旧 Window，`r.newConfig==null` |
+| 可见门 | Activity 未 finish、没有因启动另一 Activity 被隐藏，`willBeVisible=true`、`mVisibleFromClient=true` |
+| 本地窗口 | `r.window==null`、非 preserved；PhoneWindow、Decor 与业务子树已存在，Decor 尚无 parent/AttachInfo |
+| 参数 | 主窗口 `TYPE_BASE_APPLICATION`；Activity token 有效；无兼容缩放、手动 Surface 接管与特殊输入队列 |
+| 身份 | 同用户、可访问 Display；不是子窗口、Toast、IME、Overlay 或其他系统窗口 |
+| 服务端 | Display ready；对应 ActivityRecord 仍在容器树；权限、Policy 与死亡监听均通过；没有重复 IWindow |
+| 输入 | 未设置 `INPUT_FEATURE_NO_INPUT_CHANNEL`，InputChannel 创建与客户端 receiver 均成功 |
+| 可重入 | 从 `D_hide` 到 `D_show` 的 RootViewSurfaceTaker、PendingInsets、无障碍等同步可控回调均正常返回，且不改 Decor visibility/parent、Activity `mWindowAdded` 或窗口账 |
+| 并发 | 从 `D_hide` 到 `D_show` 无其他线程 add/remove/update 目标 Decor/Window，也不并发修改其 visibility/parent、`mWindowAdded` 或本地窗口账 |
+| 返回 | `addToDisplayAsUser()` 返回非负成功位，包含 App 可见；后续 makeVisible、首次 relayout 与首帧也正常 |
 
-## 3. 跨进程序列图
+十八个完成点如下：
 
-```mermaid
-sequenceDiagram
-  participant AT as App主线程 ActivityThread
-  participant WMG as WindowManagerGlobal
-  participant VRI as ViewRootImpl
-  participant SES as system_server Session
-  participant WMS as WindowManagerService
-  participant IM as InputManager
+| 点 | 精确定义 | 仍不能推出 |
+|---|---|---|
+| `H_gate` | resume 后续 UI 门已通过 | Decor 已交给 WindowManager |
+| `D_hide` | Decor 已设为 INVISIBLE，type 已设为 BASE，Activity 已先写 `mWindowAdded=true` | 本地三联账已建立 |
+| `G_book` | WindowManagerGlobal 已创建 ViewRootImpl，并追加 View/Root/Params 三联账 | 首次 traversal 已排队 |
+| `T_queue` | ViewRootImpl 已写 `mAdded=true` 并排好 traversal barrier/callback | measure 已开始 |
+| `B_enter` | App 主线程进入同步 `IWindowSession.addToDisplayAsUser()` | WMS 已接受窗口 |
+| `W_gate` | permission、Display、user、重复 IWindow 与 Activity token 门均通过 | WindowState 已进入正式账本 |
+| `W_state` | WindowState 已构造、复制 attrs、链接死亡监听，Policy 校验也通过 | 输入通道或提交点已到 |
+| `I_server` | WMS 已创建 InputChannel pair，注册服务端端点并转移客户端端点 | 新窗口已经可收输入 |
+| `C_commit` | 执行越过“此后不允许错误”的意图提交线 | 全部服务端挂账已做完 |
+| `W_link` | Session、mWindowMap 与 Activity token 层级已挂账，Policy 后置调用、初始 Insets 和输入更新请求等已完成 | App 已收到回复 |
+| `B_return` | 同步 Binder 回复把非负结果、frame hint、Insets、controls 与客户端 channel 带回 App | Decor 已成为 ViewRoot 的 child |
+| `I_client` | App 已用客户端 channel 创建主 Looper 的 InputEventReceiver | 输入 stage 已全部串好 |
+| `P_parent` | `view.assignParent(ViewRootImpl)` 已写入 Decor 的 `mParent` | View 已 attached |
+| `V_ready` | touch/app flags、无障碍入口、输入 stage 链与 Decor 的 PendingInsets 重放已完成，`setView()` 正常返回 | 外层 add 已返回 |
+| `G_return` | `WindowManagerGlobal.addView()` 与 void `WindowManager.addView()` 正常返回 | Decor 已改为 VISIBLE |
+| `D_show` | 同一主线程稍后执行 `Activity.makeVisible()`，Decor 改为 VISIBLE | WMS 已收到 VISIBLE relayout |
+| `T_relayout` | 首次 traversal 已 dispatch attach、measure，并以 VISIBLE 完成 relayout、取得可绘制 Surface | draw 或 Buffer present 已完成 |
+| `F_present` | 首个目标可见 Buffer 达到所选 present 证据 | 较早 add 没有性能问题 |
 
-  AT->>WMG: addView(Decor, LayoutParams)
-  WMG->>VRI: new ViewRootImpl(context, display)
-  Note over VRI: 取得/复用IWindowSession<br/>创建IWindow.W与AttachInfo
-  WMG->>VRI: setView(Decor, attrs)
-  VRI->>VRI: requestLayout / scheduleTraversals
-  VRI->>SES: addToDisplayAsUser(IWindow, attrs, out...)
-  SES->>WMS: addWindow(session, client, attrs, ...)
-  WMS->>WMS: permission/display/token/WindowState
-  WMS->>IM: registerInputChannel(server endpoint)
-  WMS-->>SES: result + frame/insets + client InputChannel
-  SES-->>VRI: 同步Binder返回
-  VRI->>VRI: InputEventReceiver + input stages
-  VRI->>VRI: Decor.assignParent(ViewRootImpl)
-  VRI-->>WMG: setView返回
-  WMG-->>AT: addView返回
-  Note over VRI: 后续VSync Traversal<br/>dispatchAttached→relayout→Surface→draw
-```
-
-## 4. 先区分两种addView
-
-第211章的 `ViewGroup.addView(child)` 只是在一棵本地View树里建立父子关系。
-
-本章的 `WindowManager.addView(decor, params)` 是把一棵顶层View树接入窗口系统：创建ViewRootImpl、向WMS登记WindowState并建立输入通道。
-
-方法名相同，边界完全不同。
-
-## 5. 为什么在resume阶段才加入窗口
-
-`ActivityThread.handleResumeActivity()` 先调用 `performResumeActivity()` 完成客户端onResume，再根据Activity是否finished、是否将被destroy、能否可见及是否已添加窗口决定后续UI操作。
-
-所以“Activity对象已onCreate并setContentView”不是WMS必须立即接受窗口的充分条件。
-
-## 6. handleResumeActivity 的可见性门
-
-普通主线要求：
+固定路径的局部全序是：
 
 ```text
-r.window == null
-Activity未finish
-willBeVisible为true
-mVisibleFromClient为true
-mWindowAdded为false
+H_gate < D_hide < G_book < T_queue < B_enter
+       < W_gate < W_state < I_server < C_commit < W_link
+       < B_return < I_client < P_parent < V_ready < G_return
+       < D_show < T_relayout < F_present
 ```
 
-不满足时可能延迟加入、隐藏、复用保留窗口或直接跳过。源码中的willBeVisible还可能同步询问ATMS。
+`G_return` 没有 View 返回值；外层 API 是 `void`。它证明 App 的顶层根账、WMS 的窗口账和输入连接已经正常建立，第一次 traversal 也已经排队。此刻 Decor 仍是 INVISIBLE，View 自身仍无 AttachInfo；没有 measure、relayout、可承载 Buffer 的窗口 Surface、draw 或 present。
 
-## 7. Decor先以INVISIBLE加入
+## 2. 四本对象账与四类身份同时出现，但不能互相替代
 
-加入前ActivityThread执行：
+一笔 add 跨过四本账：
+
+| 账本 | 进程 | 关键对象 | 表达什么 |
+|---|---|---|---|
+| View 树 | App | Decor → content → 业务 View | 应用 UI 父子关系 |
+| 顶层窗口账 | App | WindowManagerGlobal 的 `mViews/mRoots/mParams` | 每棵顶层树对应哪个 ViewRootImpl 与请求参数 |
+| 根控制账 | App | ViewRootImpl、AttachInfo、IWindow、IWindowSession | traversal、Insets、输入与窗口协议 |
+| 窗口容器账 | system_server | DisplayContent → ActivityRecord/WindowToken → WindowState | 跨应用层级、Policy、输入与 Surface 管理 |
+
+ViewRootImpl 不是 View，也不是 system_server 的 WindowState。它实现 ViewParent，在 App 内控制一棵顶层 View 树；WMS 不能持有 Decor 的 Java 引用，只能持有 IWindow Binder、Parcelable 参数和服务端状态。
+
+同一路径还有四类不能串号的身份：
+
+| 身份 | 固定路径来源 | 服务对象 |
+|---|---|---|
+| Activity token / `attrs.token` | system_server 创建后随 Activity 代际交给 App | 找到既有 ActivityRecord/WindowToken |
+| IWindow / `ViewRootImpl.W` Binder | 每个 ViewRootImpl 新建 | 标识具体客户端窗口，也是 WMS→App 回调端点与 `mWindowMap` key |
+| IWindowSession | `openSession()` 返回，普通进程由 WindowManagerGlobal 缓存 | 承载 add/relayout/remove，并保存客户端 uid/pid 与窗口计数 |
+| InputChannel token | WMS 创建的 channel pair | InputDispatcher 路由和 `mInputToWindowMap` 身份 |
+
+顶层 Activity token 指“这扇窗口属于哪一代 Activity”；IWindow 指“具体是哪一个客户端窗口”。子窗口常把父 IWindow token 放进 `attrs.token`，但固定主窗口放的是 Activity token。
+
+## 3. resume 先隐藏 Decor、先写 mWindowAdded，再调用 void addView
+
+`handleResumeActivity()` 先完成 `performResumeActivity()`，再排除目标已待销毁、已 finish 或当前不应可见等情况。普通首次路径的关键顺序是：
 
 ```java
 View decor = r.window.getDecorView();
 decor.setVisibility(View.INVISIBLE);
-...
+WindowManager.LayoutParams l = r.window.getAttributes();
+l.type = WindowManager.LayoutParams.TYPE_BASE_APPLICATION;
+a.mWindowAdded = true;
 wm.addView(decor, l);
 ```
 
-稍后满足服务端与客户端可见条件时，`Activity.makeVisible()` 才把Decor设为VISIBLE。
+`willBeVisible` 初值是 `!a.mStartedActivity`；必要时还会同步询问 ATMS。`mVisibleFromClient=false` 时，即使其他门通过，也不会在这里 add。preserved Window 则复用既有根并走 callback 重绑，不属于固定路径。
 
-这避免窗口刚登记但布局/状态尚未准备好时立刻暴露内容。
+这里有三个容易混淆的事实：
 
-## 8. TYPE_BASE_APPLICATION在这里确定
+- `mWindowAdded=true` 是 **调用前的客户端意图位**，不是 add 成功回执；异常不会由 ActivityThread 自动改回 false。
+- 传给 WMS 的初始 host visibility 来自 Decor 当前状态；固定路径此时是 INVISIBLE。
+- `TYPE_BASE_APPLICATION` 决定应用 token、Policy 与层级语义，不只是日志标签。
 
-ActivityThread设置：
+正常 add 返回后，ActivityThread 还会处理配置和 soft-input 标志，再写 `mVisibleFromServer=true` 并调用 `makeVisible()`。因此 `G_return < D_show`；固定主线程尚未回到 Looper，先前排队的 traversal 不会插进这段同步调用栈。
 
-```java
-l.type = WindowManager.LayoutParams.TYPE_BASE_APPLICATION;
-```
+## 4. Activity 的本地 WindowManager 负责把 Activity token 填进请求
 
-它告诉WMS这是Activity的基础应用窗口。类型影响token合法性、层级、策略、权限和焦点规则，不只是一个调试标签。
-
-## 9. WindowManager.LayoutParams是跨进程窗口请求
-
-它包含：
-
-- type、token、packageName、title；
-- width/height、gravity、x/y；
-- flags/privateFlags/inputFeatures；
-- softInputMode、format、alpha、animation；
-- system UI、cutout、Insets与Surface相关属性。
-
-它继承ViewGroup.LayoutParams，但语义已扩展为顶层窗口和WMS之间的协议对象。
-
-## 10. Activity怎样取得自己的WindowManager
-
-`Activity.attach()` 调用PhoneWindow的 `setWindowManager()`，Window内部最终执行：
+`Activity.attach()` 已把 Activity token 交给 PhoneWindow：
 
 ```java
-mWindowManager = ((WindowManagerImpl) wm)
-        .createLocalWindowManager(this);
+mWindow.setWindowManager(
+        context.getSystemService(Context.WINDOW_SERVICE),
+        mToken, mComponent.flattenToString(), hardwareAccelerated);
 ```
 
-这个WindowManagerImpl记住父PhoneWindow，使新增窗口能补齐Activity token、标题、包名和硬件加速策略。
-
-## 11. WindowManagerImpl不是WMS Binder代理本身
-
-它是App进程中的轻量门面，字段包括Context、ParentWindow、DefaultToken以及全局WindowManagerGlobal引用。
-
-真正的Binder接口由WindowManagerGlobal缓存的IWindowManager/IWindowSession承担。
-
-## 12. adjustLayoutParamsForSubWindow名字有迷惑性
-
-WindowManagerGlobal只要收到非空parentWindow，就调用：
-
-```java
-parentWindow.adjustLayoutParamsForSubWindow(wparams);
-```
-
-这个方法不仅处理子窗口；对于普通应用窗口的else分支，也会在token为空时填 `mAppToken`、补title/packageName并设置硬件加速flag。
-
-## 13. Activity token怎样进入LayoutParams
-
-Activity.attach保存从服务端传来的 `mToken`，并把它传给Window.setWindowManager成为 `mAppToken`。添加普通应用窗口时：
-
-```java
-if (wp.token == null) {
-    wp.token = mContainer == null
-            ? mAppToken : mContainer.mAppToken;
-}
-```
-
-WMS后面用这个token查已有ActivityRecord/WindowToken，防止应用凭空伪造Activity窗口归属。
-
-## 14. DefaultToken不是Activity主窗口的主要来源
-
-WindowManagerImpl的 `applyDefaultToken()` 只在mDefaultToken非空且没有parentWindow时使用，并且仅在LayoutParams.token仍为空时补入。
-
-Activity本地WindowManager有parentPhoneWindow，普通主窗口token主要由Window.adjustLayoutParamsForSubWindow的应用窗口分支填入。
-
-## 15. WindowManagerGlobal是进程内全局协调者
-
-它是App进程单例，核心并行数组：
-
-```java
-ArrayList<View> mViews;
-ArrayList<ViewRootImpl> mRoots;
-ArrayList<WindowManager.LayoutParams> mParams;
-```
-
-同一索引表示同一个顶层窗口的Decor/ViewRoot/Params。Dialog、Popup或其他顶层窗口通常也会各占一个条目。
-
-## 16. 一个进程不是只有一个ViewRootImpl
-
-每次成功添加新的顶层View通常创建一个ViewRootImpl。一个应用进程可以同时有多个Activity窗口、Dialog窗口或不同Display窗口。
-
-“ViewRootImpl是整个应用唯一根”是错误的；它是一棵顶层窗口View树的根控制器。
-
-## 17. WindowManagerGlobal先检查重复添加
-
-它用View对象在mViews中查找。若同一个View已添加且不在异步死亡清理路径，会抛：
+`Window.setWindowManager()` 保存 `mAppToken`，并基于进程 WindowManagerImpl 创建带 `mParentWindow=this` 的本地门面。于是主窗口 add 的路径是：
 
 ```text
-View ... has already been added to the window manager.
+Activity WindowManagerImpl
+→ applyDefaultToken()
+→ WindowManagerGlobal.addView(..., parentWindow=PhoneWindow, userId)
+→ PhoneWindow.adjustLayoutParamsForSubWindow()
 ```
 
-这与ViewGroup中“child已有parent”相关但不是同一个账本检查。
+方法名 `adjustLayoutParamsForSubWindow()` 不能按字面理解。固定 `TYPE_BASE_APPLICATION` 走它的普通应用分支：token 为空时补 `mAppToken`；标题为空且 `mAppName` 非空时补 `mAppName`，Activity 路径传入的是 component flatten 字符串。packageName 是随后独立补齐的字段，不是 title 的回退值；所有类型最后还会按 Window 的硬件加速状态补 flag。真正的 sub-window 分支才会尝试 Decor 的 window token。
 
-## 18. 子窗口怎样找到本地父View
+`applyDefaultToken()` 在 `mDefaultToken!=null && mParentWindow==null` 时才补 token；Activity 本地门面有 parentWindow，所以它不是主窗口 token 的来源。
 
-当type在FIRST_SUB_WINDOW到LAST_SUB_WINDOW之间，WindowManagerGlobal遍历现有ViewRoot，比较：
+参数也会分叉成多份：
 
-```java
-mRoots.get(i).mWindow.asBinder() == wparams.token
+| 阶段 | 参数关系 |
+|---|---|
+| PhoneWindow → WMG | 调用者 `l` 被本地补 token/title/package/flag |
+| Decor 与 WMG | `view.setLayoutParams(wparams)` 与 `mParams.add(wparams)` 保存这份本地对象 |
+| ViewRootImpl | `mWindowAttributes.copyFrom(attrs)` 建独立快照 |
+| Binder / WMS | `in LayoutParams` 经 Parcel 成为 system_server 对象 |
+| WindowState | `mAttrs.copyFrom(a)` 再建服务端窗口快照 |
+
+因此调用者事后直接改原对象并不会自动修改 ViewRoot/WMS；正常更新要走 `updateViewLayout()` 协议。
+
+## 5. WindowManagerGlobal 先记三联账，再把有外部效果的 setView 放到最后
+
+`WindowManagerGlobal.addView()` 先检查 view、Display 和参数类型，然后在 `mLock` 下：
+
+1. 按 View 身份查重；若旧异步 remove 尚未结束，先 `doDie()`；
+2. 只为 sub-window 按父 IWindow token 找本地 `panelParentView`；
+3. `new ViewRootImpl(view.getContext(), display)`；
+4. 给 Decor 写顶层 LayoutParams；
+5. 依次追加 `mViews/mRoots/mParams`；
+6. 最后调用 `root.setView()`。
+
+三张并行列表的同一索引是一组本地顶层窗口记录；一个进程可有多个 Activity、Dialog 或其他顶层窗口，所以可有多个 ViewRootImpl。
+
+“new ViewRootImpl 在首次跨 Binder 前”并不成立。两参构造器先求值 `WindowManagerGlobal.getWindowSession()`；冷路径会经 IWindowManager 同步 `openSession()`。准确边界是：
+
+```text
+可能的 openSession Binder
+< ViewRootImpl 构造完成
+< WMG 三联账追加
+< 本次 addToDisplayAsUser Binder
 ```
 
-匹配后把对应mViews条目作为panelParentView，供新ViewRoot记录父窗口token和局部关系。
+普通路径随后复用静态缓存的 IWindowSession。源码只说一般每进程一个 Session；这不是协议层禁止多个 Session。
 
-## 19. 创建ViewRootImpl发生在跨Binder之前
+还有一个并发边界：WMG 的 `mLock` 覆盖 `root.setView()`，所以也覆盖本次同步 add Binder 等待。它保护本地列表一致性，不会把 App 与 WMS 变成共享 Java 事务。
 
-```java
-root = new ViewRootImpl(view.getContext(), display);
-view.setLayoutParams(wparams);
-mViews.add(view);
-mRoots.add(root);
-mParams.add(wparams);
-root.setView(...);
-```
+## 6. ViewRootImpl 已有线程、IWindow 与 AttachInfo，但 View 还没有 AttachInfo
 
-因此App本地账本和ViewRoot对象先出现，随后setView才尝试让system_server接受窗口。
-
-## 20. setView被放到最后是因为会产生外部效果
-
-源码注释说明setView会发消息启动工作。它会排Traversal、同步Binder请求、创建输入接收器和建立ViewParent关系。
-
-前面的参数校验与本地对象准备完成后再调用，可减少半初始化过程被其他逻辑观察的机会；异常路径仍必须按源码实际状态清理，不能假设所有数组天然事务化提交。
-
-## 21. ViewRootImpl构造时绑定调用线程
+ViewRootImpl 构造阶段已经：
 
 ```java
+mWindowSession = session;
 mThread = Thread.currentThread();
-mChoreographer = Choreographer.getInstance();
-```
-
-Activity主窗口由主线程创建，所以这个ViewRoot以后用 `checkThread()` 约束View树布局/更新线程，并使用主线程Choreographer调度帧。
-
-## 22. ViewRootImpl不是View
-
-它实现ViewParent等接口，负责：
-
-- 顶层树的measure/layout/draw调度；
-- IWindowSession/relayout通信；
-- InputChannel事件接收与输入stage；
-- Insets、Configuration、可见性和焦点回调；
-- ThreadedRenderer/Surface接入；
-- 无障碍、IME和生命周期桥接。
-
-DecorView才是View对象树的Java根View。
-
-## 23. 构造时取得IWindowSession
-
-普通构造调用：
-
-```java
-this(context, display,
-        WindowManagerGlobal.getWindowSession(), false);
-```
-
-第一次使用时WindowManagerGlobal通过IWindowManager.openSession创建会话，之后在进程内缓存sWindowSession。
-
-## 24. IWindowManager与IWindowSession的分工
-
-IWindowManager是WMS总入口，可openSession、查询display/动画比例等；IWindowSession是面向一个客户端进程的高频窗口会话，提供add、remove、relayout、finishDrawing等调用。
-
-应用通常不会为每个窗口重新openSession，而是多个ViewRoot共享进程级会话。
-
-## 25. system_server Session记录原始调用身份
-
-Session构造时保存：
-
-```java
-mUid = Binder.getCallingUid();
-mPid = Binder.getCallingPid();
-```
-
-并预先计算是否拥有内部系统窗口、隐藏overlay、获取sleep token等权限。后续WMS不能只相信LayoutParams.packageName自报身份。
-
-## 26. Session一般是一进程一个，但不是逻辑定律
-
-Session源码注释是“generally one Session object per process”。普通应用WindowManagerGlobal确实缓存一个；测试、系统内部或特殊调用环境可能传显式Session。
-
-因此准确表述是r48普通应用路径进程级复用，而非协议绝对禁止多个Session。
-
-## 27. Session首次窗口会创建SurfaceSession
-
-`windowAddedLocked()` 在mSurfaceSession为空时执行：
-
-```java
-mSurfaceSession = new SurfaceSession();
-mService.mSessions.add(this);
-```
-
-SurfaceSession是该客户端与SurfaceFlinger侧SurfaceControl创建的会话环境；这一步不等于已经为当前WindowState创建可绘制Surface。
-
-## 28. ViewRootImpl构造时创建IWindow回调Stub
-
-```java
 mWindow = new W(this);
+mAttachInfo = new View.AttachInfo(
+        mWindowSession, mWindow, display, this, mHandler, this, context);
 ```
 
-内部 `W extends IWindow.Stub`，是App暴露给WMS的Binder回调端点。WMS以后通过它通知resize、Insets、可见性、焦点、关闭、拖放等事件。
+固定主窗口由 App 主线程构造，后续 `checkThread()` 以 `mThread` 约束 View 树操作，并使用主线程 Choreographer。`W extends IWindow.Stub` 是每窗 Binder 回调端，内部弱引用 ViewRootImpl；WMS 回调进入 App Binder 线程并不自动等于 View 回调已在主线程执行，仍要看各 dispatch 方法怎样投递。
 
-## 29. W为什么弱引用ViewRootImpl
-
-```java
-WeakReference<ViewRootImpl> mViewAncestor;
-```
-
-Binder Stub可能被远端引用；弱引用避免它单独把已经应释放的ViewRoot/View树永久强保活。真正窗口生命周期仍由本地账本、WMS记录和remove协议共同管理。
-
-## 30. IWindow回调不等于直接在主线程调用View
-
-WMS回调进入App Binder线程。W的方法通常取得ViewRoot弱引用，再调用dispatch方法；这些dispatch方法进一步把消息投到ViewRoot的Handler/主Looper处理。
-
-所以“WMS调用IWindow”是跨进程回调入口，不代表system_server线程直接执行Activity View代码。
-
-## 31. AttachInfo在构造期建立
-
-ViewRootImpl创建 `View.AttachInfo`，其中关联IWindowSession、IWindow、Display、ViewRoot Handler、窗口可见性/Insets/硬件渲染等共享树状态。
-
-此时只是准备共享上下文；Decor尚未执行 `dispatchAttachedToWindow()`。
-
-## 32. setView只允许设置一次主View
-
-方法在 `synchronized(this)` 内检查 `mView == null`。首次设置后保存Decor引用、复制Window属性并建立后续通道；重复用同一ViewRoot设置另一棵树不是普通API路径。
-
-## 33. 为什么复制LayoutParams
-
-```java
-mWindowAttributes.copyFrom(attrs);
-attrs = mWindowAttributes;
-```
-
-ViewRoot维护自己的当前属性快照，后续updateViewLayout/Traversal计算变化并传给WMS。不能依赖调用者原对象在任意线程随意修改就自动生效。
-
-## 34. setView补齐packageName与BLAST私有flag
-
-若packageName为空，用base package补齐；r48还加入 `PRIVATE_FLAG_USE_BLAST`，后续根据WMS返回flags决定是否采用BLAST adapter。
-
-这只是能力协商初值，不表示setView此刻已建立BLASTBufferQueue或提交帧。
-
-## 35. surfaceInsets在add前估算
-
-若调用者未手动指定，ViewRoot按View elevation等估算surfaceInsets；硬件加速也在add前根据Window flags和Surface持有模式启用。
-
-这些是创建/布局Surface所需参数准备，不代表Surface已经由WMS创建。
-
-## 36. 兼容模式可能临时转换LayoutParams
-
-旧屏幕兼容Translator会备份attrs、转换窗口坐标/尺寸，Binder返回后再restore；ViewRoot同时记录applicationScale和scalingRequired。
-
-因此跨给WMS的几何可与App逻辑坐标不同，返回frame/insets也要按需转回App空间。
-
-## 37. setView先标记mAdded
-
-在调用WMS前：
+`setView()` 只在 `mView==null` 时接受根 View。它会复制 attrs、补 packageName、加入 `PRIVATE_FLAG_USE_BLAST`、准备 surfaceInsets/兼容缩放/硬件渲染状态，然后写：
 
 ```java
 mAttachInfo.mRootView = view;
 mAdded = true;
 ```
 
-这是客户端进入添加流程的内部状态，不证明服务端已创建WindowState。若RemoteException或负错误码，源码会撤回若干字段并取消Traversal。
+这里的 AttachInfo 仍是 **ViewRootImpl 持有的准备对象**。Decor 自己的 `View.mAttachInfo` 要等首次 `dispatchAttachedToWindow()` 才写入。因此 `mAdded=true` 只说明客户端 add 流程开始，既不证明 WMS 接受，也不证明 `View.isAttachedToWindow()`。
 
-## 38. 为什么先requestLayout再addWindow
+ViewRootImpl 构造时还已有一个客户端 `SurfaceSession` 字段；它同样不是当前窗口已经取得可绘制 Surface 的证据。Surface 名字相似的对象要到第 14 节再逐层结账。
 
-源码注释非常直接：
+## 7. requestLayout 先排一笔 traversal 债，当前栈并不执行 measure
+
+`setView()` 在调用 WMS 前明确执行：
 
 ```java
-// Schedule the first layout -before- adding to the window
-// manager, to make sure we do the relayout before receiving
-// any other events from the system.
+mAdded = true;
 requestLayout();
+mWindowSession.addToDisplayAsUser(...);
 ```
 
-目的是让第一次Traversal尽早排队，在系统回调到来前已建立后续relayout节奏。
-
-## 39. requestLayout并不在这里同步测量
-
-```java
-mLayoutRequested = true;
-scheduleTraversals();
-```
-
-它只是标记并调度。当前主线程仍继续同步执行addToDisplay；measure/layout/draw要等消息循环和Choreographer回调。
-
-## 40. scheduleTraversals怎样入队
+`requestLayout()` 标记 `mLayoutRequested=true`，`scheduleTraversals()` 再：
 
 ```java
 mTraversalBarrier = queue.postSyncBarrier();
 mChoreographer.postCallback(
-        CALLBACK_TRAVERSAL, mTraversalRunnable, null);
+        Choreographer.CALLBACK_TRAVERSAL, mTraversalRunnable, null);
 ```
 
-同步屏障会暂缓普通同步消息，让异步VSync/Choreographer相关工作按调度规则推进；TraversalRunnable最终调用doTraversal/performTraversals。
+这证明 `T_queue < B_enter`，但不能推出 traversal 已运行。同步屏障和 Choreographer callback 建立的是未来调度；固定 App 主线程仍在当前 `handleResumeActivity()` 调用栈，马上进入同步 Binder 并等待。
 
-## 41. “先schedule”不等于Traversal先于addWindow完成
+成功路径更强的顺序是：
 
-schedule只排回调，当前主线程尚未返回Looper。紧接着的 `mWindowSession.addToDisplayAsUser()` 是同步Binder调用，通常先等WMS返回，主Looper以后才执行Traversal。
-
-若Binder回调并发到达，也由Binder线程/Handler边界处理，不能把“代码先调用requestLayout”写成“已经完成layout”。
-
-## 42. 是否申请InputChannel由inputFeatures决定
-
-若没有 `INPUT_FEATURE_NO_INPUT_CHANNEL`：
-
-```java
-InputChannel inputChannel = new InputChannel();
+```text
+schedule callback
+< 同步 add Binder 返回
+< InputEventReceiver / assignParent / input stages
+< WindowManager.addView 返回
+< Activity.makeVisible
+< 主线程回到 Looper 后的首次 traversal
 ```
 
-这个新对象是AIDL out参数的接收容器，此刻还不是已经连接InputDispatcher的完整客户端端点。
+WMS 期间可以并发调用 App 的 IWindow Binder；那是 Binder worker 的入口，通常还要转 ViewRoot Handler，不能据此把主线程 traversal 插到同步 add 中间。
 
-## 43. addToDisplayAsUser传递哪些数据
+## 8. addToDisplayAsUser 是同步协议，Session 既转发也保存客户端身份
 
-核心输入：
+`IWindowSession.aidl` 的 `addToDisplayAsUser()` 有 int 返回值和多个 out 参数，不是 oneway。App 主线程发送后要等 system_server 的 Session/WMS 执行并把结果写回。
 
-- App的IWindow Binder；
-- seq与WindowManager.LayoutParams；
-- 当前host visibility；
-- displayId与userId。
+固定调用的主要输入与输出是：
 
-核心输出：
+| 方向 | 内容 |
+|---|---|
+| 输入 | IWindow、seq、ViewRoot attrs 快照、INVISIBLE host visibility、displayId、userId |
+| 输出 | frame hint、content/stable Insets、DisplayCutout、InsetsState、controls、客户端 InputChannel |
+| 返回 int | 负值表示拒绝；非负值是成功 bitset |
 
-- frame提示；
-- content/stable Insets与DisplayCutout；
-- InputChannel客户端端点；
-- InsetsState和可控InsetsSourceControl；
-- 整数结果码/flags。
+Session 的方法主体转调 `mService.addWindow()`，但 Session 不是无状态代理。`openSession()` 时它已保存原始 `mUid/mPid` 和若干权限能力；成功 `win.attach()` 还会增加窗口计数，并在首窗创建服务端 SurfaceSession。
 
-## 44. 这是同步Binder边界
+WMS 的身份顺序需要精确写：
 
-App主线程通过IWindowSession Proxy发送Parcel，system_server Binder线程执行Session.addToDisplayAsUser，再调用WMS.addWindow；结果和out对象写回后App主线程才继续。
-
-所以窗口添加慢可以直接延长启动主线程的resume阶段，但当前Mac只读分析不能量化具体设备耗时。
-
-## 45. Session只是转发吗
-
-addToDisplayAsUser主体确实转到WMS.addWindow，但Session不是无状态透传：它持uid/pid、权限能力、SurfaceSession、窗口计数和客户端死亡状态，并作为WMS创建WindowState的所有者会话。
-
-## 46. WMS先检查窗口类型权限
-
-进入全局锁前，policy `checkAddPermission()` 按type、圆角overlay、packageName等检查是否允许添加。普通Activity基础应用窗口与系统alert/overlay窗口的授权规则不同。
-
-BadToken和permission denied是不同失败类别。
-
-## 47. WMS保存原调用者后清Binder身份
-
-```java
-int callingUid = Binder.getCallingUid();
-int callingPid = Binder.getCallingPid();
-long origId = Binder.clearCallingIdentity();
+```text
+Policy.checkAddPermission()
+→ 保存本次 Binder callingUid/callingPid
+→ clearCallingIdentity()
+→ 在 system_server 身份下处理内部对象
 ```
 
-后续在system_server身份下操作内部对象，但仍显式把原pid/uid用于policy和用户校验；结束前恢复身份。
+后续仍显式使用保存的 calling uid/pid 与 Session uid。成功路径离开全局锁后调用 `restoreCallingIdentity(origId)`；多个早退分支没有在这个方法内经过该语句，失败边界见第 15 节。
 
-## 48. Display必须存在且调用者可访问
+## 9. WMS 的门按顺序缩小候选，普通 Activity 不会凭空创建 token
 
-WMS取得或创建DisplayContent，失败返回ADD_INVALID_DISPLAY；即使display存在，`displayContent.hasAccess(session.mUid)`不通过也拒绝。
+`WMS.addWindow()` 先在全局锁外做 type permission 检查，再在 `mGlobalLock` 内依次核对：
 
-多显示添加不是只把displayId写进LayoutParams，还要经过访问权和display类型约束。
-
-## 49. system_server也防重复IWindow
-
-```java
-if (mWindowMap.containsKey(client.asBinder())) {
-    return ADD_DUPLICATE_ADD;
-}
-```
-
-本地WindowManagerGlobal按View对象防重复，WMS按IWindow Binder身份防重复。这是两个进程各自维护的不变量。
-
-## 50. 子窗口token语义与Activity token不同
-
-子窗口的attrs.token通常是父窗口IWindow Binder；WMS据此找parentWindow，并禁止把子窗口继续作为另一个子窗口的父token。
-
-普通顶层Activity窗口的attrs.token则指Activity/应用WindowToken。不能把所有“window token”压成一种身份证。
-
-## 51. 四类关键身份表
-
-| 身份 | 创建/来源 | 主要用途 |
+| 门 | 固定路径要求 | 典型拒绝 |
 |---|---|---|
-| Activity token / attrs.token | system_server ActivityRecord代际传给App | 顶层应用窗口归属、Task/Activity生命周期 |
-| IWindow `mWindow` Binder | App ViewRootImpl.W | 每个客户端窗口身份及WMS→App回调 |
-| IWindowSession Binder | WMS openSession | 一个客户端会话的add/relayout/remove调用 |
-| InputChannel token | InputChannel pair | InputDispatcher路由与连接身份 |
+| Display | 服务已 ready，Display 存在且 `hasAccess(session.mUid)` | 未 ready 抛 `IllegalStateException`；其余为 `ADD_INVALID_DISPLAY` |
+| 重复窗 | `mWindowMap` 不含同一 IWindow Binder | `ADD_DUPLICATE_ADD` |
+| 窗口种类 | 不是非法 sub-window/presentation 组合 | BAD_SUBWINDOW、PERMISSION 或 INVALID_DISPLAY |
+| user | 请求 user 与 Session user 一致，或通过 incoming-user 校验 | `ADD_INVALID_USER` |
+| token | 找到既有 Activity WindowToken | `ADD_BAD_APP_TOKEN` |
+| Activity | token 可转 ActivityRecord，且仍有 parent | NOT_APP_TOKEN 或 APP_EXITING |
+| WindowState | IWindow 能 link death，Display 尚未移除 | APP_EXITING 或 INVALID_DISPLAY |
+| Policy | adjust 与 validate 均接受 | `SecurityException`，或 permission/type/singleton 类 `ADD_*` |
 
-它们可能在同一条添加链出现，但不可互换。
+固定主窗口的 `rootType` 落在 application 范围。若 `attrs.token` 未知，`unprivilegedAppCanCreateTokenWith()` 会拒绝，而不是替应用造一个 Activity token；已有 token 不是 ActivityRecord 会报 NOT_APP_TOKEN；ActivityRecord 已脱离父容器会报 APP_EXITING。
 
-## 52. 应用窗口token必须对应ActivityRecord
+Display 选择也不是无条件信任传入的 displayId。`getDisplayContentOrCreate(displayId, attrs.token)` 会先查既有 token；命中时返回 token 所属 DisplayContent，未命中才按 displayId 取得或创建。随后仍以 `session.mUid` 做 Display access 检查。
 
-当rootType在应用窗口范围，WMS要求已有WindowToken能转成ActivityRecord；否则返回：
+sub-window 则先用 `attrs.token` 找父 WindowState，且父本身不能再是 sub-window；随后沿用父窗口的 token 和 rootType 规则。IME、Wallpaper、Toast、Accessibility Overlay 等各有专门 token/权限分支，不能把 Activity 规则外推给所有 type。
 
-- ADD_NOT_APP_TOKEN；
-- ADD_APP_EXITING；
-- 未知应用token时ADD_BAD_APP_TOKEN。
+## 10. WindowState 是服务端副本，构造成功仍早于正式挂账
 
-这就是Activity已结束或使用错误Context/token时常见BadTokenException的服务端根源。
-
-## 53. 非应用窗口的token规则各自不同
-
-IME、VoiceInteraction、Wallpaper、Accessibility Overlay、Toast、QS Dialog等类型都有对应token/权限检查；某些非特权非应用窗口允许WMS创建新WindowToken，某些严格禁止未知token。
-
-不能从Activity主窗口规则直接外推所有Window type。
-
-## 54. 请求userId也要校验
-
-若请求用户与Session uid所属用户不同，WMS调用ActivityManager内部用户入口校验；失败返回ADD_INVALID_USER。
-
-这防止应用只改userId参数就向其他用户空间任意加窗口。
-
-## 55. WindowState是服务端窗口记录
-
-通过前置校验后：
+前置身份通过后，WMS 构造：
 
 ```java
 WindowState win = new WindowState(
@@ -527,421 +287,407 @@ WindowState win = new WindowState(
         session.mUid, userId, ...);
 ```
 
-它保存服务端属性、token/parent、owner uid、可见性、frame、Animator、InputWindowHandle等，是WMS层级中的真实窗口节点。
+WindowState 会复制 attrs，保存 owner/show user、ActivityRecord 与 IWindow，链接 IWindow death recipient，创建 WindowStateAnimator 和 InputWindowHandle。此时 system_server 没有 Decor 引用；客户端 View 属性只有经协议同步的副本。
 
-## 56. WindowState不是App里的View对象
+固定顶层 Activity 的 WindowState 在构造器里不会立即加入 Activity token；`win.mToken.addWindow(win)` 位于后面的提交段。sub-window 构造器却会先 `parentWindow.addChild()`，这是失败分析时不能忽略的旁支。
 
-system_server无法持有DecorView Java引用。它持IWindow Binder和Parcelable后的LayoutParams等服务端副本；App与WMS用Binder消息、frame/Insets/SurfaceControl结果保持协作。
+构造出 `WindowStateAnimator` 也不等于已有窗口 Buffer surface：它的 `mSurfaceController` 仍为空。DisplayPolicy 随后先调整 `win.mAttrs`，再执行 `validateAddingWindowLw()`；只有通过才进入输入通道步骤。
 
-因此WMS“管理窗口”不是跨进程直接遍历应用View树。
+死亡监听同样只是清理能力：它让客户端 Binder 死亡时 WMS 有机会回收状态，不证明 add 已正常返回。
 
-## 57. WindowState建立客户端死亡监控
+## 11. InputChannel 在意图提交线之前成对创建，注册不等于能收触摸
 
-构造阶段给IWindow Binder链接DeathRecipient；若已无法建立死亡通知，说明客户端可能已死，addWindow返回APP_EXITING。
-
-后续App进程死亡时，WMS可清理WindowState、输入通道和Surface资源，避免孤儿窗口长期存在。
-
-## 58. Policy还会调整并验证参数
-
-DisplayPolicy对WindowState/LayoutParams执行adjust和validate，例如系统窗口限制、cutout/栏策略、特定类型单例等。通过前面token检查仍不表示所有policy约束都满足。
-
-服务端有权修正客户端请求，LayoutParams不是无条件命令。
-
-## 59. InputChannel在哪一侧真正成对创建
-
-WMS确定需要输入时调用：
+App 在 Binder 前创建的 `new InputChannel()` 只是 out 参数容器。固定 Policy 通过后，WindowState 才真正：
 
 ```java
-InputChannel[] channels =
-        InputChannel.openInputChannelPair(name);
+InputChannel[] channels = InputChannel.openInputChannelPair(name);
 mInputChannel = channels[0];
 mClientChannel = channels[1];
+mWmService.mInputManager.registerInputChannel(mInputChannel);
+mInputWindowHandle.token = mInputChannel.getToken();
+mClientChannel.transferTo(outInputChannel);
+mClientChannel.dispose();
+mClientChannel = null;
+mWmService.mInputToWindowMap.put(mInputWindowHandle.token, this);
 ```
 
-服务端端点注册到InputManager，客户端端点transfer到AIDL outInputChannel后由服务端释放自己的客户端包装引用。
+服务端端点先被 InputManager 注册，channel token 再写进 InputWindowHandle；随后 `transferTo(outInputChannel)` 只在 system_server 内把客户端端点所有权移入服务端的 out 容器，WMS 释放原包装引用，最后才以 token 为 key 写入 `mInputToWindowMap`。真正的跨进程 Parcel 要等整个 addWindow 返回，由 Binder reply 把 out 容器带回 App；这几步相邻却不是同一点。
 
-## 60. InputChannel创建不等于立即收到触摸
+这个动作发生在源码注释的意图提交线之前：
 
-WMS还要把InputWindowHandle纳入输入窗口快照、选择焦点/触摸目标；App端还要创建InputEventReceiver并让主Looper消费事件。
-
-此外窗口当前INVISIBLE时也未必可成为普通触摸目标。
-
-## 61. “从此不能失败”是WMS提交边界
-
-源码在InputChannel和Toast检查后写：
-
-```java
-// From now on, no exceptions or errors allowed!
-res = ADD_OKAY;
+```text
+WindowState + death link
+< Policy validate
+< InputChannel pair/register/transfer
+< “From now on, no exceptions or errors allowed!”
+< Session/map/token 正式挂账
 ```
 
-含义是后续开始正式挂账，代码必须按成功提交路径维护一致性，不再随意返回错误；它不是说系统运行中永远不会发生异步死亡或后续relayout失败。
+注释表达后续代码必须按成功路径维持一致性，不是语言或运行时保证“绝不会抛异常”。
 
-## 62. win.attach连接Session窗口计数
+固定窗口的服务端 `mViewVisibility` 是 INVISIBLE，而 `canReceiveKeys()` 明确要求 VISIBLE，所以它在 add 阶段不是新的按键焦点候选。WMS 稍后只会让 InputMonitor 经 Handler 排异步更新；add 返回不证明新快照已推给 InputDispatcher。App 也要等 Binder 返回后才创建 `WindowInputEventReceiver`。因此 channel pair、服务端注册、快照推送、窗口可命中、App receiver 和某个事件被消费是六个完成点。
 
-`win.attach()` 调用 `session.windowAddedLocked(packageName)`：首次窗口创建SurfaceSession并把Session加入WMS集合，然后窗口计数加一。
+## 12. 服务端提交把 WindowState 挂入三套关系，却刻意不做最终 layout
 
-这里的attach是WindowState→Session账本动作，不是View.onAttachedToWindow回调。
-
-## 63. mWindowMap用IWindow Binder作主键
+越过 `C_commit` 后，固定主线的关键顺序是：
 
 ```java
+win.attach();
 mWindowMap.put(client.asBinder(), win);
-```
-
-后续relayout/remove/finishDrawing传同一个IWindow，WMS据此找回WindowState并校验Session。
-
-这解释了IWindow为什么既是回调接口又是服务端窗口身份键。
-
-## 64. WindowToken把WindowState挂入层级
-
-```java
+win.initAppOpsState();
 win.mToken.addWindow(win);
 displayPolicy.addWindowLw(win, attrs);
 ```
 
-ActivityRecord作为应用WindowToken可拥有基础窗口、starting window和相关子窗口；容器层级、策略层级与App View层级是不同树。
+这几行分别完成：
 
-## 65. addWindow会更新焦点与输入窗口快照
+- Session 首窗时创建服务端 SurfaceSession、加入 WMS Session 集合并增加窗口计数；
+- 以 IWindow Binder 为 key 登记 WindowState；
+- 建立 AppOps/挂起或 overlay 隐藏状态；
+- 把 WindowState 加到 ActivityRecord/WindowToken 容器层级；
+- 调用 DisplayPolicy 的后置入口；只有特定系统窗口或 Insets provider 会在这里登记角色，固定普通主窗通常没有新增 Policy 角色账。
 
-WMS按窗口是否能收键尝试更新focused window，重算IME target，设置InputMonitor需要更新，并把当前窗口集合推给输入系统。
+随后 WMS 标记进入动画意图，调用 `getLayoutHint()` 填初始 frame/content/stable Insets/cutout，复制 InsetsState，组合 touch/app-visible/BLAST 等返回位，处理焦点/IME 候选与子层级，调用 InputMonitor 经 Handler 排异步快照更新，最后填可控 Insets controls。`getLayoutHint()` 自己说明数据来自最近一次 layout，不保证与新窗口的最终 layout 相同；add 返回也不保证 InputDispatcher 已收到新快照。
 
-焦点变化可能发生在窗口尚未真正绘制之前；“成为WMS焦点候选”和“用户已看到内容”仍是两件事。
+固定 INVISIBLE 窗口不会因 add 就成为新焦点；`ADD_FLAG_APP_VISIBLE` 又读取 ActivityRecord 的 client-visible 状态，不等同于 Decor 当前 Java visibility。
 
-## 66. addWindow返回的是初始frame提示
-
-DisplayPolicy.getLayoutHint填outFrame、content/stable Insets和cutout；WMS还返回当前InsetsState/控制权。
-
-ViewRoot把outFrame写入mWinFrame，第一次Traversal可用它估计测量尺寸，减少relayout后重复测量的机会。
-
-## 67. WMS源码明确说add阶段不做最终layout
-
-```java
-// Don't do layout here, the window must call
-// relayout to be displayed, so we'll do it there.
-```
-
-因此addWindow创建WindowState和层级记录，但要等客户端首次Traversal调用relayout，WMS才进行Surface placement和可见Surface创建。
-
-## 68. addWindow不会为当前窗口创建WindowSurfaceController
-
-Session首次窗口可能已有SurfaceSession，WindowState也已有WindowStateAnimator；但 `createSurfaceControl()` 位于WMS.relayoutWindow的可见shouldRelayout路径。
-
-必须区分：
+源码在这里明确不做最终 layout：
 
 ```text
-SurfaceSession会话
-WindowStateAnimator对象
-WindowSurfaceController/SurfaceControl
-App可绘制Surface
-已提交Buffer
-已present画面
+Don't do layout here; the window must call relayout to be displayed.
 ```
 
-## 69. 返回值同时包含成功flags
+所以 outFrame 是 layout hint，不是首次 relayout 的最终 frame；WindowState 已存在也不是可绘制 Surface 已交给 App。
 
-非负res可附带：
+## 13. 非负结果先被拆成状态，再按 receiver → parent → stages → PendingInsets 完成接线
 
-- 当前touch mode；
-- Activity客户端可见性；
-- BLAST/三缓冲能力；
-- 是否总消费系统栏提示。
-
-ViewRoot据此初始化mAddedTouchMode、mAppVisible、Insets和渲染策略。不要只判断“res==0才成功”，源码用 `res < ADD_OKAY` 识别错误。
-
-## 70. 负错误码怎样变成App异常
-
-ViewRootImpl把ADD_BAD_APP_TOKEN/ADD_NOT_APP_TOKEN/ADD_APP_EXITING等转成 `WindowManager.BadTokenException`，把无效display转成InvalidDisplayException，权限/type/user错误也给出对应消息。
-
-所以App看到的BadTokenException往往是WMS状态/授权拒绝的客户端翻译，不是DecorView token字段空这一种原因。
-
-## 71. RemoteException与业务拒绝不同
-
-Binder通信本身失败进入catch：撤回mAdded/mView/AttachInfo root、取消Traversal并抛“Adding window failed”。
-
-WMS正常返回负错误码则是一次成功通信后的业务校验失败。诊断时要看异常类型和cause，不能把二者统称为“Binder断了”。
-
-## 72. Binder返回后先接收Insets状态
-
-ViewRoot更新content/stable Insets、DisplayCutout、InsetsController state与controls，并按兼容缩放转换坐标。
-
-这些是WMS初始窗口环境快照；后续系统栏、IME、旋转和窗口大小变化仍会经IWindow回调更新。
-
-## 73. App端何时创建InputEventReceiver
-
-add成功且收到客户端InputChannel后：
-
-```java
-mInputEventReceiver =
-        new WindowInputEventReceiver(
-                inputChannel, Looper.myLooper());
-```
-
-它绑定当前Looper，原始InputChannel消息到达后进入ViewRoot输入stage链。
-
-## 74. 输入stage链在setView末尾组装
-
-r48建立：
+Binder 返回后，ViewRootImpl 先接收 frame/Insets/cutout/controls，再判断 `res < ADD_OKAY`。固定非负路径随后按源码顺序：
 
 ```text
-NativePreIme
-→ ViewPreIme
-→ Ime
-→ EarlyPostIme
-→ NativePostIme
-→ ViewPostIme
-→ SyntheticInputStage
+读取 BLAST / triple-buffering 成功位
+→ 可选 RootViewSurfaceTaker input queue
+→ new WindowInputEventReceiver(clientChannel, Looper.myLooper())
+→ view.assignParent(this)
+→ 写 mAddedTouchMode 与 mAppVisible
+→ 检查无障碍状态；enabled 时建立连接
+→ NativePreIme ... SyntheticInputStage
+→ Decor 提供 PendingInsetsController，并 replayAndAttach 到真实 InsetsController
+→ setView 返回
 ```
 
-这只是管道结构就绪；具体Key/Motion怎样流经这些stage在输入专题已有深入章节。
+不能把 receiver、assignParent、stage 链与 PendingInsets 重放画成同一点：receiver 在 parent 之前，stage 链在 parent 之后；固定 Decor 始终返回自己的 PendingInsetsController，`replayAndAttach()` 又在 stage 链之后、`setView()` 返回之前执行。它可能同步重放此前积累的 Insets 请求与监听器，因此也是独立的异常边界。
 
-## 75. assignParent把Decor的ViewParent设为ViewRootImpl
+r48 的成功位还有一个必须保留的源码事实：
+
+| 常量 | r48 值 | ViewRoot 用途 |
+|---|---:|---|
+| `ADD_FLAG_IN_TOUCH_MODE` | `0x1` | 初始化 touch mode |
+| `ADD_FLAG_APP_VISIBLE` | `0x2` | 初始化 `mAppVisible` |
+| `ADD_FLAG_USE_TRIPLE_BUFFERING` | `0x4` | 打开 triple buffering |
+| `ADD_FLAG_ALWAYS_CONSUME_SYSTEM_BARS` | `0x4` | 初始化 always-consume-bars |
+| `ADD_FLAG_USE_BLAST` | `0x8` | 选择 BLAST adapter |
+
+triple-buffering 与 always-consume-bars 在 r48 共享 `0x4`，WMS 可因任一来源置位，客户端会把两者都读成 true。它是此版本常量别名，不代表两个概念相同，也不能从该 bit 反推唯一来源。
+
+`P_parent` 之后 Decor 的 `mParent` 已是 ViewRootImpl，但它自己的 `mAttachInfo` 仍为空。因此在 `G_return`：
+
+```text
+decor.getParent() == ViewRootImpl
+decor.isAttachedToWindow() == false
+decor.getViewRootImpl() == null
+decor.getWindowToken() == null
+```
+
+`getViewRootImpl()` 与 `getWindowToken()` 都依赖 View 的 AttachInfo，不只看 parent。外层 add 返回 void；调用者拿不到服务端 result，只能观察这些分层副作用。
+
+## 14. makeVisible 与首次 traversal 才跨入 attach、relayout 和 Buffer surface
+
+正常 `G_return` 后，ActivityThread 才写服务端可见镜像并调用：
 
 ```java
-view.assignParent(this);
+r.activity.mVisibleFromServer = true;
+r.activity.makeVisible();
 ```
 
-从此Decor向上调用requestLayout/invalidate等可到达ViewRoot。ViewRoot不是ViewGroup，却作为顶层ViewParent承接树与窗口调度。
+`makeVisible()` 固定路径不再 add，只把 Decor 改为 VISIBLE。因为 `assignParent()` 已完成，这次 View 状态变化可以继续请求 ViewRoot 调度；WMS 仍要等首次 traversal 的 relayout 才收到 VISIBLE。
 
-## 76. assignParent不等于dispatchAttachedToWindow
+第一次 `performTraversals()` 的关键相对顺序是：
 
-setView末尾只建立parent关系。第一次 `performTraversals()` 的mFirst分支才执行：
-
-```java
-host.dispatchAttachedToWindow(mAttachInfo, 0);
-treeObserver.dispatchOnWindowAttachedChange(true);
-dispatchApplyInsets(host);
+```text
+dispatchAttachedToWindow + 初始 Insets
+→ measure
+→ IWindowSession.relayout
+→ WMS layout / 可见 Surface 创建
+→ App 接收 Surface
+→ layout
+→ pre-draw 决策
+→ draw
 ```
 
-所以WindowState可以已经存在，而View的onAttachedToWindow尚未回调。
+所以 `onAttachedToWindow()` 甚至早于本次可见 relayout；attached 也不能证明已有可绘制 Surface。pre-draw 还可以取消当次 draw，首 Buffer 与 present 更晚。
 
-## 77. 为什么WMS add成功后View仍可能是INVISIBLE
+“Surface 已有”至少要区分五层：
 
-ActivityThread在add前设INVISIBLE；add返回后、完成配置和softInput属性处理，再设置 `mVisibleFromServer=true` 并调用Activity.makeVisible，将Decor改为VISIBLE。
-
-第一次Traversal随后读取最新visibility并通过relayout告诉WMS。
-
-## 78. Activity.makeVisible也可能补addView
-
-```java
-if (!mWindowAdded) {
-    wm.addView(mDecor, attrs);
-    mWindowAdded = true;
-}
-mDecor.setVisibility(View.VISIBLE);
-```
-
-普通handleResume主线通常已添加，但setVisible等特殊路径允许makeVisible负责补加。不能把唯一入口绝对化成ActivityThread那一处。
-
-## 79. 第一次Traversal才进入relayout
-
-Choreographer执行TraversalRunnable后，performTraversals：
-
-- 首次dispatchAttachedToWindow和Insets；
-- 计算期望尺寸并measure；
-- 调用IWindowSession.relayout；
-- WMS进行layout/Surface placement，按可见条件创建SurfaceControl；
-- App更新Surface并layout/draw。
-
-本章止于入口，后续章节继续拆每一步。
-
-## 80. addWindow完成边界清单
-
-成功返回通常能证明：
-
-- App已有ViewRootImpl/IWindow/AttachInfo；
-- WindowManagerGlobal本地账本已登记顶层View；
-- WMS已有WindowState并挂入token/display层级；
-- IWindow死亡监控建立；
-- 普通可输入窗口已有InputChannel pair并注册服务端端点；
-- App拿到frame/Insets初值与结果flags；
-- ViewRoot已排第一次Traversal。
-
-## 81. addWindow不能证明什么
-
-它不能单独证明：
-
-- Decor已经执行onAttachedToWindow；
-- measure/layout已完成；
-- WMS relayout已完成；
-- 当前WindowState已有WindowSurfaceController；
-- App已有有效可绘制Surface；
-- RenderThread已提交首Buffer；
-- SurfaceFlinger已latch/compose；
-- 屏幕硬件已present首帧。
-
-## 82. 三棵树不要混在一起
-
-```mermaid
-flowchart LR
-  subgraph APPVIEW["App View树"]
-    D["DecorView"] --> C["content"]
-    C --> V["业务Views"]
-  end
-  subgraph APPROOT["App顶层窗口账本"]
-    G["WindowManagerGlobal"] --> R["ViewRootImpl"]
-    R --> W["IWindow.W"]
-    R --> D
-  end
-  subgraph WMSTREE["system_server窗口容器树"]
-    DC["DisplayContent"] --> T["ActivityRecord / WindowToken"]
-    T --> WS["WindowState"]
-  end
-  W -. "Binder identity/callback" .-> WS
-  R -. "attrs.token定位归属" .-> T
-```
-
-View树表达UI父子；WindowManagerGlobal表达App顶层根账本；WMS树表达跨应用窗口层级、策略和Surface管理。
-
-## 83. 线程与进程表
-
-| 阶段 | 进程 | 线程 |
+| 对象 | 最早出现 | `G_return` 能否证明 |
 |---|---|---|
-| handleResume/wm.addView | App | 主线程 |
-| WindowManagerGlobal/ViewRoot.setView | App | 主线程 |
-| IWindowSession.addToDisplay | App发起 | 主线程同步等待 |
-| Session/WMS.addWindow | system_server | Binder线程，持WMS全局锁处理核心账本 |
-| IWindow回调接收 | App | Binder线程入口，通常转主Handler |
-| 首次Traversal | App | 主线程Choreographer回调 |
+| ViewRootImpl 客户端 SurfaceSession | ViewRoot 构造 | 能证明对象已建；不能证明窗口 Buffer surface |
+| system_server Session SurfaceSession | `win.attach()` 的首窗 | 能证明会话已建；不能证明当前窗口可画 |
+| WindowState 继承的 container-layer SurfaceControl | `win.mToken.addWindow(win)` 触发 parent/onParentChanged | 成功 add 可已有；它是容器层，不是窗口 Buffer |
+| WindowStateAnimator 的 WindowSurfaceController | 可见 `relayoutWindow()` 的 `createSurfaceLocked()` | `G_return` 不能证明 |
+| App 可绘制 Surface、首 Buffer、present | relayout 返回后及图形流水线 | `G_return` 全都不能证明 |
 
-锁只保护各自账本，不把跨进程两边变成一份共享Java对象。
+因此“add 阶段没有任何 SurfaceControl”也是错误说法。准确结论是：服务端层级用 container SurfaceControl 可以已经存在，但承载窗口 Buffer 的 WindowSurfaceController 与交给 App 的有效 Surface 仍等待可见 relayout。
 
-## 84. 常见误解集中纠正
+## 15. add 不是跨进程原子事务：失败残留与诊断证据必须逐点看
 
-### 误解一：WindowManagerImpl就是system_server的WMS对象
+固定主线正常返回；通用失败路径却不能用“抛异常就全部回滚”概括：
 
-它是App本地门面，真正跨进程经IWindowSession。
+| 失败位置 | r48 已可能留下什么 | 不能声称 |
+|---|---|---|
+| 本地参数/重复 View 检查 | token/title/package/硬件 flag 可能已写进调用者 attrs | 所有输入原样 |
+| 冷 `openSession()` | 本次 addToDisplay 尚未发生；参数已被 parentWindow 调整 | ViewRoot/三联账必已建立 |
+| WMS 早期 display/token/user 拒绝 | 无正式 WindowState 挂账；方法内多个 return 不经过底部显式 identity restore | 每个出口都执行了该 restore |
+| WindowState/Policy 阶段拒绝 | death link 已可能建立；sub-window 还可能先入本地父 WindowState | 服务端零副作用 |
+| InputChannel 后的 Toast 拒绝 | channel 注册/映射已可能发生，源码无统一 rollback 块 | 注释提交线以前天然原子 |
+| 负 ADD_* 或 RemoteException 回到 App | traversal 会取消，部分 ViewRoot 字段复位；Activity `mWindowAdded` 已提前为 true | WMG 三联数组必删除 |
+| WMS/Policy 直接抛 RuntimeException | Policy 前可已有 death link、sub-window parent 或新非应用 token；提交线后还可已有 Session/map/token/container surface | 一定转成负 ADD_*，或执行 ViewRoot 的负码/RemoteException 清理 |
+| WMS 已提交、客户端 receiver/无障碍/stage/PendingInsets 重放再异常 | WindowState 与输入服务端账可能已存在 | 客户端异常会自动 remove 远端窗口 |
+| 首次 traversal/relayout/draw 失败 | add 账仍可能完整；没有目标首帧 | add 成功等于显示成功 |
 
-### 误解二：一个App只有一个ViewRootImpl
+WindowManagerGlobal 的 r48 细节尤其关键：fresh View 的
 
-每个顶层窗口通常各有一个，进程内可有多个。
-
-### 误解三：Activity token就是IWindow Binder
-
-前者关联Activity/WindowToken，后者标识具体客户端WindowState和承载回调。
-
-### 误解四：setView返回就执行了onAttachedToWindow
-
-onAttached通常在稍后的首次Traversal分发。
-
-### 误解五：addWindow已经创建可绘制Surface
-
-r48明确把最终layout和SurfaceControl创建留给relayout。
-
-### 误解六：InputChannel存在就一定能收到触摸
-
-还取决于窗口可见、输入窗口快照、焦点/触摸命中和App接收器。
-
-### 误解七：requestLayout紧接着完成measure
-
-它只排Traversal，当前线程先继续同步addWindow调用。
-
-## 85. BadTokenException诊断思路
-
-按顺序核对：
-
-1. LayoutParams.type属于哪类窗口；
-2. attrs.token到底是Activity token、父IWindow token还是空；
-3. ActivityRecord是否仍在层级、是否exiting；
-4. 使用的是Activity WindowManager还是无token的其他Context WindowManager；
-5. display/user是否有效且有访问权；
-6. type是否需要额外permission或专用token；
-7. 是否重复添加同一View/IWindow。
-
-不要先用catch吞掉异常，而应找到服务端返回的具体ADD_*原因。
-
-## 86. macOS只读练习一：从resume追到setView
-
-```bash
-cd /Users/ninebot/androidSource
-rg -n "wm.addView\(|void addView\(|root.setView\(|void setView\(" \
-  frameworks/base/core/java/android/app/ActivityThread.java \
-  frameworks/base/core/java/android/view/{WindowManagerImpl.java,WindowManagerGlobal.java,ViewRootImpl.java}
+```java
+int index = findViewLocked(view, false);
 ```
 
-画出每次调用所在类、进程和是否跨Binder。
+通常得到 `-1`。代码随后追加三联数组；`root.setView()` 抛 RuntimeException 时，catch 却只在旧 `index >= 0` 时调用 `removeViewLocked(index, true)`。所以普通首次 BadToken、InvalidDisplay 或包装后的 RemoteException 可以留下已追加的本地条目。这个 guard 复用了 add 前的查重索引，不能当成新条目的可靠回滚。
 
-## 87. macOS只读练习二：区分四类token
+ViewRootImpl 对负结果也先更新部分 frame/Insets 状态，随后才检查 `res < 0`；RemoteException 与负业务拒绝的字段复位还不完全相同。常见翻译包括 BadTokenException、InvalidDisplayException 与未知码 RuntimeException；`ADD_STARTING_NOT_NEEDED` 则只在 starting-window 旁支静默返回。
 
-```bash
-cd /Users/ninebot/androidSource
-rg -n "mAppToken|attrs.token|client.asBinder|openInputChannelPair|mInputWindowHandle.token" \
-  frameworks/base/core/java/android/view/Window.java \
-  frameworks/base/services/core/java/com/android/server/wm/{WindowManagerService.java,WindowState.java}
+还有第三类不能并入这两支：`DisplayPolicy.validateAddingWindowLw()` 的权限强制可直接抛 `SecurityException`。它经 Binder 回到 App 后不会命中 ViewRootImpl 只捕获 `RemoteException` 的 catch，也不会经过负码 switch，因此 `mAdded/mView` 与已排 traversal 都可能保持；外层 WMG 的 fresh `index=-1` 又不删除刚追加的三联账。非应用 token 可在构造时先入 Display，sub-window 可在 WindowState 构造时先入 parent；越过意图提交线后若容器 Surface 创建等运行时代码再抛错，还可能已留下 Session、map 或 token 的更深提交。
+
+WMS 在成功落底才显式 `restoreCallingIdentity(origId)`；多个锁内拒绝 return 和异常没有在 `addWindow()` 内使用统一 finally。Binder transaction 退栈还有自己的身份边界，但不能把底部语句画成所有源码出口的必经点。
+
+正常 remove 也有自己的完成点，不能拿 parent 为空当成清账完成：
+
+```text
+removeView(false)
+→ ViewRootImpl.die(false) 排 MSG_DIE
+→ 立即 view.assignParent(null)，加入 mDyingViews
+→ 稍后 doDie / dispatchDetachedFromWindow
+→ 同步 IWindowSession.remove → WMS removeWindow → WindowState.removeIfPossible
+   ↳ 可立即 removeImmediately → postWindowRemoveCleanupLocked
+   ↳ 也可因 replacement / 已显示的退出动画先标记并返回
+→ App 释放 InputEventReceiver，WindowManagerGlobal.doRemoveView 删除本地三联数组与 mDyingViews 条目
+→ 若服务端延迟，稍后才 removeImmediately 并删除 mWindowMap 条目
 ```
 
-为每个命中标注Activity token、IWindow、Session或InputChannel身份，避免见到token就认为同一对象。
+排队后、`doDie()` 前，三联数组仍在，View 的 AttachInfo 也可能仍在；`removeViewImmediate()` 若恰处于 traversal 同样会退化为排 `MSG_DIE`。即使它在客户端同步走完，Session.remove 正常返回也只证明服务端 `removeIfPossible()` 已返回：replacement 或已显示窗口的退出动画仍可推迟 `removeImmediately()`，真正的 `mWindowMap.remove()` 要等 `postWindowRemoveCleanupLocked()`。客户端的 immediate 不会强迫服务端 immediate。
 
-## 88. macOS只读练习三：证明Surface不在add阶段创建
+若 detach 内的 Session.remove 遇 RemoteException，异常会被吞掉，本地仍继续释放 receiver 和删三联账，所以本地清账甚至不证明 WMS 收到 remove。回调异常又可能截断这串没有统一 finally 的清理，诊断时仍要逐点取证。
+
+诊断时用最窄证据：
+
+| 证据 | 至少证明 | 仍不能证明 |
+|---|---|---|
+| `Activity.mWindowAdded=true` | 客户端曾决定 add 或复用 | WMG/WMS 成功 |
+| WMG 三联数组有 Decor | 本地 append 已发生 | `setView` 正常返回 |
+| 同一 WMG/Decor 先见三联账、后确认已无 | 客户端 `doRemoveView()` 已删该本地条目 | WMS `mWindowMap` 已删 WindowState |
+| WMS `mWindowMap` 有 IWindow | 服务端已越过 map 提交点 | 客户端 parent/stages 已完成 |
+| Decor parent 是 ViewRootImpl | `assignParent` 已执行 | View AttachInfo 已分发 |
+| `decor.isAttachedToWindow()` | 首次 traversal 已 dispatch attach | relayout Surface 或 draw |
+| InputEventReceiver 非空 | App 已接客户端 channel | 窗口可命中或已消费事件 |
+| `mWinAnimator.mSurfaceController!=null` | 窗口 Buffer surface 已在 relayout 创建 | Buffer 已提交或 present |
+| 目标帧 present 证据 | 所选画面已到显示完成点 | 较早阶段耗时无异常 |
+
+本章结算在 `G_return`：本地顶层账、远端窗口账、输入连接和未来 traversal 债都已建立；可见性提交、attach、relayout、Surface、draw 与 present 仍必须分别取证。
+
+## 16. 九组只读练习：重建 resume、add、输入、Surface 与失败账
+
+以下命令只检查文件并检索文本。可在 Android 11 r48 源码根运行，也可先设置 `ANDROID_BUILD_TOP`；每组在 Bash 3.2 与 Zsh 5.9 中都应独立以 0 退出。
+
+### 练习 1：证明 INVISIBLE、mWindowAdded 与 makeVisible 的顺序
 
 ```bash
-cd /Users/ninebot/androidSource
-rg -n "Don't do layout here|relayoutWindow\(|createSurfaceControl\(|createSurfaceLocked\(" \
-  frameworks/base/services/core/java/com/android/server/wm/{WindowManagerService.java,WindowStateAnimator.java}
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+T="$SRC/frameworks/base/core/java/android/app/ActivityThread.java"
+A="$SRC/frameworks/base/core/java/android/app/Activity.java"
+test -f "$T" && test -f "$A"
+grep -nE 'performResumeActivity\(|mActivitiesToBeDestroyed|willActivityBeVisible|r.window == null|decor.setVisibility\(View.INVISIBLE\)|l.type = WindowManager.LayoutParams.TYPE_BASE_APPLICATION|a.mWindowAdded = true|wm.addView\(decor, l\)|mVisibleFromServer = true|r.activity.makeVisible\(' "$T"
+grep -nE 'void makeVisible\(\)|wm.addView\(mDecor|mWindowAdded = true|mDecor.setVisibility\(View.VISIBLE\)' "$A"
 ```
 
-目标是用源码位置证明WindowState添加与窗口Surface创建是两个阶段。
+画出 `onResume 返回 → D_hide → G_return → D_show → 首次 traversal`，并标注 `mWindowAdded=true` 在 add 调用前。
 
-## 89. macOS只读练习四：追InputChannel两端
+完成标准：不能用 Activity 字段 true 证明 WMS 成功，也不能把 INVISIBLE 当成 GONE 或已显示。
+
+### 练习 2：找到主窗口 token 的本地补齐点与参数副本
 
 ```bash
-cd /Users/ninebot/androidSource
-rg -n "new InputChannel|openInputChannel\(|openInputChannelPair|transferTo|WindowInputEventReceiver" \
-  frameworks/base/core/java/android/view/ViewRootImpl.java \
-  frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+A="$SRC/frameworks/base/core/java/android/app/Activity.java"
+W="$SRC/frameworks/base/core/java/android/view/Window.java"
+I="$SRC/frameworks/base/core/java/android/view/WindowManagerImpl.java"
+G="$SRC/frameworks/base/core/java/android/view/WindowManagerGlobal.java"
+V="$SRC/frameworks/base/core/java/android/view/ViewRootImpl.java"
+S="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowState.java"
+test -f "$A" && test -f "$W" && test -f "$I" && test -f "$G" && test -f "$V" && test -f "$S"
+grep -nE 'mWindow.setWindowManager\(|mToken, mComponent.flattenToString' "$A"
+grep -nE 'mAppToken = appToken|createLocalWindowManager\(this\)|adjustLayoutParamsForSubWindow|wp.token = mContainer == null|wp.packageName = mContext.getPackageName|FLAG_HARDWARE_ACCELERATED' "$W"
+grep -nE 'applyDefaultToken\(|mParentWindow == null|mGlobal.addView\(' "$I"
+grep -nE 'view.setLayoutParams\(wparams\)|mParams.add\(wparams\)' "$G"
+grep -nE 'mWindowAttributes.copyFrom\(attrs\)' "$V"
+grep -nE 'mAttrs.copyFrom\(a\)' "$S"
 ```
 
-记录哪端由InputManager注册、哪端通过AIDL out参数回到App、何时绑定主Looper。
+给 caller attrs、WMG mParams、ViewRoot 快照、Parcel 对象和 WindowState 快照画引用/复制关系。
 
-## 90. 自测题
+完成标准：固定 Activity token 来自 parent PhoneWindow 的 mAppToken；DefaultToken 不是这条主线。
 
-1. 为什么Activity setContentView后还没有ViewRootImpl？
-2. WindowManagerImpl、Global和ViewRootImpl分别负责什么？
-3. Activity token与IWindow Binder各自定位什么？
-4. 为什么一个进程能有多个ViewRootImpl却常复用一个IWindowSession？
-5. setView为何先requestLayout再addToDisplay？
-6. scheduleTraversals后为什么不会立刻在当前栈measure？
-7. WMS addWindow主要有哪些校验层？
-8. WindowState与DecorView为什么不能互相直接引用？
-9. InputChannel pair的两端怎样分配？
-10. Session创建SurfaceSession是否等于当前窗口已有Surface？
-11. addWindow成功后onAttachedToWindow为何还可能没执行？
-12. 什么时候才进入窗口Surface创建？
+### 练习 3：还原三联账、冷 openSession、失败与 remove guard
 
-## 91. 自测答案
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+G="$SRC/frameworks/base/core/java/android/view/WindowManagerGlobal.java"
+V="$SRC/frameworks/base/core/java/android/view/ViewRootImpl.java"
+S="$SRC/frameworks/base/services/core/java/com/android/server/wm/Session.java"
+M="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java"
+W="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowState.java"
+test -f "$G" && test -f "$V" && test -f "$S" && test -f "$M" && test -f "$W"
+grep -nE 'findViewLocked\(view, false\)|mDyingViews.contains\(view\)|new ViewRootImpl|mViews.add\(view\)|mRoots.add\(root\)|mParams.add\(wparams\)|root.setView\(|catch \(RuntimeException e\)|if \(index >= 0\)|removeViewLocked\(index, true\)' "$G"
+grep -nE 'IWindowSession getWindowSession\(|getWindowManagerService\(\)|openSession\(|sWindowSession =' "$G"
+grep -nE 'WindowManagerGlobal.getWindowSession\(\)|mThread = Thread.currentThread\(\)|mWindow = new W\(this\)|new View.AttachInfo' "$V"
+grep -nE 'catch \(RemoteException e\)|res < WindowManagerGlobal.ADD_OKAY|mAdded = false|unscheduleTraversals\(\)' "$V"
+grep -nE 'removeView\(View view, boolean immediate\)|removeViewLocked\(|root.die\(immediate\)|view.assignParent\(null\)|mDyingViews.add\(view\)|void doRemoveView\(' "$G"
+grep -nE 'boolean die\(boolean immediate\)|if \(immediate && !mIsInTraversal\)|sendEmptyMessage\(MSG_DIE\)|void doDie\(\)|dispatchDetachedFromWindow\(\)|mWindowSession.remove\(mWindow\)|doRemoveView\(this\)' "$V"
+grep -nE 'void remove\(IWindow window\)|mService.removeWindow\(this, window\)' "$S"
+grep -nE 'void removeWindow\(Session session, IWindow client\)|win.removeIfPossible\(\)|void postWindowRemoveCleanupLocked\(|mWindowMap.remove\(win.mClient.asBinder\(\)\)' "$M"
+grep -nE 'void removeIfPossible\(\)|mWillReplaceWindow|setupWindowForRemoveOnExit\(\)|void removeImmediately\(\)' "$W"
+```
 
-1. setContentView只建本地View树；resume时WindowManager.addView才new ViewRootImpl。
-2. Impl补本地Window/token策略并转Global；Global维护进程顶层窗口账本；ViewRoot连接单棵View树、IWindowSession、输入和Traversal。
-3. Activity token定位服务端Activity/WindowToken归属；IWindow Binder唯一标识具体客户端窗口并承载WMS回调。
-4. 每个顶层树需要独立根状态；Session是进程级WMS会话，可服务多个WindowState。
-5. 先把首Traversal排队，确保系统事件到来前已建立relayout调度意图。
-6. 它向Choreographer排回调，当前主线程仍继续同步Binder add，回Looper后才执行。
-7. type permission、display访问、重复IWindow、父/Activity/专用token、userId、Policy参数与单例约束。
-8. 位于不同进程，只能用Binder接口和Parcelable状态协作。
-9. WMS创建pair，服务端端点注册InputManager，客户端端点经out InputChannel返回并绑定App主Looper接收器。
-10. 不等于；窗口WindowSurfaceController/SurfaceControl通常在后续可见relayout创建。
-11. setView只assignParent；首次performTraversals才dispatchAttachedToWindow。
-12. 第一次Traversal调用IWindowSession.relayout，WMS shouldRelayout为真时createSurfaceControl。
+分别画冷 Session 与热 Session 的顺序，再令 fresh View 的 `index=-1` 推演 `setView` 抛错后的三联账；最后比较 `removeView(false)`、traversal 内的 immediate remove 与真正 `doRemoveView()`。
 
-## 92. 本章结论
+完成标准：只能说三联账早于 addToDisplay Binder，不能说 ViewRoot 构造早于可能的 openSession Binder；parent 清空或客户端 immediate 完成，也不等于三联账、AttachInfo 与 WMS 窗口均已清除。
 
-WindowManager.addView是本地View树第一次正式接入跨进程窗口系统的边界。App先由WindowManagerGlobal建立View、ViewRootImpl和LayoutParams三联账本；ViewRoot创建IWindow回调端、复用进程IWindowSession，先排Traversal，再同步向WMS addWindow。WMS依据真实uid/pid、display、user、type和token创建WindowState、挂入WindowToken层级并建立InputChannel，返回frame/Insets和能力状态。
+### 练习 4：证明 traversal 只是先排队，add Binder 是同步调用
 
-但这一完成点仍只是“窗口登记成功”。Decor尚可能未dispatchAttachedToWindow，WMS明确没有在add阶段完成layout，当前窗口的SurfaceControl通常要等首次Traversal的relayout才创建，更不代表首Buffer已提交或屏幕已显示。
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+V="$SRC/frameworks/base/core/java/android/view/ViewRootImpl.java"
+Q="$SRC/frameworks/base/core/java/android/view/IWindowSession.aidl"
+test -f "$V" && test -f "$Q"
+grep -nE 'if \(mView == null\)|mAttachInfo.mRootView = view|mAdded = true|requestLayout\(\)|new InputChannel\(\)|mWindowSession.addToDisplayAsUser|setFrame\(mTmpFrame\)|postSyncBarrier\(\)|CALLBACK_TRAVERSAL|void doTraversal\(\)|performTraversals\(\)' "$V"
+grep -nE '^interface IWindowSession|int addToDisplayAsUser|out Rect outFrame|out InputChannel outInputChannel' "$Q"
+```
 
-## 93. 复读后的边界修订
+按当前主线程写出 `T_queue < B_enter < B_return < G_return < D_show < doTraversal`。
 
-- 不把ActivityThread中的addView写成唯一入口；Activity.makeVisible和其他顶层窗口类型也可进入WindowManager链。
-- 不把Window.adjustLayoutParamsForSubWindow理解为只处理sub-window；普通Activity主窗口也经它补app token/title/packageName。
-- 不把WindowManagerGlobal三联数组当成system_server窗口表；WMS另有以IWindow Binder为键的mWindowMap与容器树。
-- 不把“Session一般一进程一个”写成协议强制唯一；这是普通WindowManagerGlobal缓存路径。
-- 不把ViewRoot构造、mAdded=true、WMS WindowState创建、assignParent、dispatchAttached、relayout、Surface创建和首帧present合并。
-- 不把SurfaceSession、WindowStateAnimator、WindowSurfaceController、Surface和Buffer当成同一对象或同一时刻完成。
-- 不把WMS `clearCallingIdentity`误解为丢失调用者；它先保存callingPid/Uid，Session也持有原客户端身份。
-- 不把InputChannel out对象创建当成通道已注册；真正pair在WMS创建，服务端端点注册后客户端端点才传回。
-- 不把ADD_FLAG_APP_VISIBLE解释成Decor已经VISIBLE或画面已显示；它反映ActivityRecord客户端可见条件。
-- 不把requestLayout的代码顺序外推为layout完成顺序；同步Binder add通常先返回，Traversal以后执行。
-- 不把setView的assignParent当成onAttachedToWindow；后者位于首次performTraversals。
-- 不把BadTokenException缩成“token为null”；错误token类型、Activity退出、权限、display、user和重复窗口都要分别取证。
+完成标准：AIDL 方法不是 oneway；`requestLayout()` 没在当前调用栈同步 measure。
 
-下一章将精读第一次 `performTraversals()`：measure、relayout、Surface建立、layout、draw的真实先后，以及为什么首帧可能发生二次测量。
+### 练习 5：按顺序重建 WMS 的身份、Display、user 与 token 门
+
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+M="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java"
+P="$SRC/frameworks/base/services/core/java/com/android/server/wm/DisplayPolicy.java"
+test -f "$M" && test -f "$P"
+grep -nE 'mPolicy.checkAddPermission\(|Binder.getCallingUid\(\)|Binder.getCallingPid\(\)|Binder.clearCallingIdentity\(\)|getDisplayContentOrCreate\(|displayContent.hasAccess\(session.mUid\)|mWindowMap.containsKey\(client.asBinder\(\)\)|handleIncomingUser\(|getWindowToken\(|unprivilegedAppCanCreateTokenWith\(|token.asActivityRecord\(\)|activity.getParent\(\) == null|new WindowState\(' "$M"
+grep -nE 'if \(token != null\)|mRoot.getWindowToken\(token\)|wToken.getDisplayContent\(\)|mRoot.getDisplayContentOrCreate\(displayId\)' "$M"
+grep -nE 'ADD_INVALID_DISPLAY|ADD_DUPLICATE_ADD|ADD_BAD_SUBWINDOW_TOKEN|ADD_INVALID_USER|ADD_BAD_APP_TOKEN|ADD_NOT_APP_TOKEN|ADD_APP_EXITING' "$M"
+grep -nE 'int validateAddingWindowLw\(|mContext.enforcePermission\(' "$P"
+```
+
+把固定 Activity 路径和 sub-window 路径分开；标注 calling uid/pid、Session uid 与 request user 分别被谁使用。
+
+完成标准：未知 application token 被拒绝，不会现场创建 ActivityRecord；底部 identity restore 不是所有早退的必经点，Policy 权限强制也可能直接抛出 SecurityException。
+
+### 练习 6：追踪 WindowState death link 与 InputChannel 两端
+
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+V="$SRC/frameworks/base/core/java/android/view/ViewRootImpl.java"
+Q="$SRC/frameworks/base/core/java/android/view/IWindowSession.aidl"
+M="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java"
+W="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowState.java"
+N="$SRC/frameworks/base/services/core/java/com/android/server/input/InputManagerService.java"
+test -f "$V" && test -f "$Q" && test -f "$M" && test -f "$W" && test -f "$N"
+grep -nE 'INPUT_FEATURE_NO_INPUT_CHANNEL|new InputChannel\(\)|WindowInputEventReceiver' "$V"
+grep -nE 'out InputChannel outInputChannel' "$Q"
+grep -nE 'mDeathRecipient == null|openInputChannels|win.openInputChannel\(outInputChannel\)' "$M"
+grep -nE 'linkToDeath\(|openInputChannelPair|registerInputChannel|mInputWindowHandle.token|transferTo|mInputToWindowMap.put' "$W"
+grep -nE 'void registerInputChannel\(|nativeRegisterInputChannel' "$N"
+```
+
+给空 out 容器、服务端 endpoint、客户端 endpoint、InputWindowHandle token 与 App receiver 分别编号。
+
+完成标准：服务端注册不等于 App receiver 已创建；固定 INVISIBLE WindowState 也不是新输入焦点。
+
+### 练习 7：核准提交顺序、初始 hint 与 r48 成功位别名
+
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+M="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java"
+S="$SRC/frameworks/base/services/core/java/com/android/server/wm/Session.java"
+G="$SRC/frameworks/base/core/java/android/view/WindowManagerGlobal.java"
+I="$SRC/frameworks/base/services/core/java/com/android/server/wm/InputMonitor.java"
+V="$SRC/frameworks/base/core/java/android/view/ViewRootImpl.java"
+test -f "$M" && test -f "$S" && test -f "$G" && test -f "$I" && test -f "$V"
+grep -nE 'From now on, no exceptions or errors allowed|sEnableTripleBuffering|ADD_FLAG_USE_TRIPLE_BUFFERING|win.attach\(\)|mWindowMap.put\(client.asBinder\(\), win\)|win.initAppOpsState\(\)|win.mToken.addWindow\(win\)|displayPolicy.addWindowLw|getLayoutHint\(|ADD_FLAG_ALWAYS_CONSUME_SYSTEM_BARS|outInsetsState.set|setUpdateInputWindowsNeededLw|updateInputWindowsLw|Don.t do layout here|restoreCallingIdentity\(origId\)' "$M"
+grep -nE 'void windowAddedLocked|mSurfaceSession = new SurfaceSession\(\)|mNumWindow\+\+' "$S"
+grep -nE 'ADD_FLAG_IN_TOUCH_MODE = 0x1|ADD_FLAG_APP_VISIBLE = 0x2|ADD_FLAG_USE_TRIPLE_BUFFERING = 0x4|ADD_FLAG_ALWAYS_CONSUME_SYSTEM_BARS = 0x4|ADD_FLAG_USE_BLAST = 0x8' "$G"
+grep -nE 'mAlwaysConsumeSystemBars =|ADD_FLAG_ALWAYS_CONSUME_SYSTEM_BARS|ADD_FLAG_USE_TRIPLE_BUFFERING|mEnableTripleBuffering = true' "$V"
+grep -nE 'void updateInputWindowsLw\(boolean force\)|scheduleUpdateInputWindows\(\)|mHandler.post\(mUpdateInputWindows\)' "$I"
+```
+
+按源码列出 WMS 成功挂账顺序，并分别找出谁能置 `0x4`、ViewRoot 又怎样读取它。
+
+完成标准：frame 是 hint；`0x4` 在 r48 无法区分 triple-buffering 与 always-consume-bars 的来源。
+
+### 练习 8：证明 receiver、parent、input stages 与 PendingInsets 不是同一点
+
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+V="$SRC/frameworks/base/core/java/android/view/ViewRootImpl.java"
+W="$SRC/frameworks/base/core/java/android/view/View.java"
+D="$SRC/frameworks/base/core/java/com/android/internal/policy/DecorView.java"
+test -f "$V" && test -f "$W" && test -f "$D"
+grep -nE 'mInsetsController.onStateChanged|mInsetsController.onControlsChanged|res < WindowManagerGlobal.ADD_OKAY|mUseBLASTAdapter = true|new WindowInputEventReceiver|view.assignParent\(this\)|mAddedTouchMode =|mAppVisible =|mFirstInputStage =|providePendingInsetsController\(\)|replayAndAttach\(mInsetsController\)' "$V"
+grep -nE 'boolean isAttachedToWindow\(\)|return mAttachInfo != null|ViewRootImpl getViewRootImpl\(\)|IBinder getWindowToken\(\)' "$W"
+grep -nE 'mPendingInsetsController = new PendingInsetsController\(\)|PendingInsetsController providePendingInsetsController\(\)|return mPendingInsetsController' "$D"
+```
+
+写出 `B_return < I_client < P_parent < input stages < PendingInsets replay < V_ready`，并解释 parent 已写但三个 View 查询为何仍受 AttachInfo 限制。
+
+完成标准：固定 Decor 的 PendingInsetsController 非空且在 stages 后重放；命令能在 Bash 3.2 与 Zsh 5.9 中都以 0 退出；assignParent 不等于 dispatchAttached。
+
+### 练习 9：区分 container SurfaceControl、窗口 Buffer surface 与首帧
+
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+K="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowToken.java"
+C="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowContainer.java"
+M="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java"
+A="$SRC/frameworks/base/services/core/java/com/android/server/wm/WindowStateAnimator.java"
+V="$SRC/frameworks/base/core/java/android/view/ViewRootImpl.java"
+D="$SRC/frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java"
+test -f "$K" && test -f "$C" && test -f "$M" && test -f "$A" && test -f "$V" && test -f "$D"
+grep -nE 'void addWindow\(final WindowState|addChild\(win' "$K"
+grep -nE 'void onParentChanged|createSurfaceControl\(false|setInitialSurfaceControlProperties|SurfaceControl.Builder makeSurface\(\)|return p.makeChildSurface\(this\)' "$C"
+grep -nE 'SurfaceControl.Builder makeChildSurface\(WindowContainer child\)|makeSurfaceBuilder\(s\).setContainerLayer\(\)|setParent\(mSurfaceControl\)' "$D"
+grep -nE 'shouldRelayout|createSurfaceControl\(outSurfaceControl|winAnimator.createSurfaceLocked' "$M"
+grep -nE 'WindowSurfaceController createSurfaceLocked|new WindowSurfaceController|mSurfaceController' "$A"
+grep -nE 'performTraversals\(\)|dispatchAttachedToWindow|measureHierarchy\(|relayoutWindow\(params|performLayout\(|dispatchOnPreDraw\(\)|cancelDraw|performDraw\(\)' "$V"
+```
+
+画 `container layer → dispatch attach → visible relayout/buffer surface → pre-draw → draw → Buffer → present`。
+
+完成标准：add 成功可已有 container SurfaceControl；只有 relayout 才创建本章所说的窗口 Buffer surface，draw 仍可被 pre-draw 取消。

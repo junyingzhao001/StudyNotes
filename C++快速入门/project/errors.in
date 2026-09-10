@@ -1,0 +1,18 @@
+list
+add
+add    
+done abc
+done 0
+done -1
+done 1x
+done 999999999999999999999999
+done 1 extra
+done 99
+oops
+list extra
+quit extra
+add Keep learning
+done 1
+done 1
+list
+quit

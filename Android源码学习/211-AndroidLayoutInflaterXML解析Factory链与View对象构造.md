@@ -1,226 +1,184 @@
-# 211 Android LayoutInflater：XML解析、Factory链与View对象构造
+# 211 Android LayoutInflater：XML 解析、Factory 链与 View 对象构造
 
-> 源码版本：Android 11 `android-11.0.0_r48`。  
-> 当前在 macOS 上只读源码，不实际编译APK、运行Activity或测量inflate耗时。
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`。
+>
+> 当前环境只读源码，可以证明资源选择、Parser 所有权、Factory 优先级、构造与父子提交的同步关系；不能据此测量某台设备的 inflate 耗时，也不能把“业务树已挂到 content”扩大成 ViewRoot、measure/layout/draw、Surface 或首帧已经完成。
 
-## 1. 本章目标
-
-第210章看到 `PhoneWindow.setContentView()` 调用：
+第 210 章停在 `PhoneWindow` 的这行：
 
 ```java
 mLayoutInflater.inflate(layoutResID, mContentParent);
 ```
 
-本章把这行展开，回答一个看似简单、实际跨越资源系统和对象构造的问题：一个 `R.layout.xxx` 整数怎样变成带父子关系、Context、属性和LayoutParams的Java View树。
+本章只追一个问题：**固定普通首次 `setContentView(int)`，这次 `inflate(resource, root)` 正常返回时，`R.layout` 整数怎样变成带 Context、LayoutParams 和父子关系的 View 树；返回的究竟是业务根还是传入的 content；为什么这仍不是“页面已经显示”？**
 
-读完应能区分：
+## 1. 固定一次普通 inflate，用十六个完成点拆开“布局已加载”
 
-- 工程纯文本XML、APK编译XML、XmlBlock和XmlResourceParser；
-- LayoutInflater、Factory2/Factory、PrivateFactory和默认反射创建；
-- View自己的属性与父ViewGroup解释的layout属性；
-- `root`、`attachToRoot`、返回值和最终parent四者关系；
-- 普通标签、`<view>`、`<merge>`、`<include>`、`ViewStub`的不同语义；
-- inflate完成与measure/layout/draw完成的边界。
+先固定 `B_target`，让主线只有一个答案：
 
-## 2. 一句话主线
+| 维度 | 固定值或前提 |
+|---|---|
+| 上游 | 第 210 章固定首次 `setContentView(int)`；`installDecor()` 已返回，`mContentParent` 是非空 `FrameLayout`，但 Decor 尚无 ViewRoot |
+| Inflater | Activity Context 对应的 `PhoneLayoutInflater`；Activity private Factory 已安装，且 Activity 对非 fragment 使用基类回调并返回 null；无公开 Factory/Factory2 与 Filter |
+| 资源 | 有效 `R.layout`；当前配置能选出一份编译 XML；使用 r48 常规路径，预编译布局未启用 |
+| XML | 普通单根，非 `<merge>`、`<include>`、`<view>`、`<fragment>`、`<blink>` 等特殊标签；没有标签级 `android:theme` |
+| View | 短名平台 View 或完整限定名业务 View 都存在，并提供 public `(Context, AttributeSet)` 构造器 |
+| 参数 | 调用两参数重载，`root=mContentParent`，所以 `attachToRoot=true` |
+| 执行 | App 主线程；Factory、构造器、`generateLayoutParams()`、`onFinishInflate()` 与 `addView()` 均正常返回 |
+| 下游 | Activity 不 finish，后续正常 Resume、窗口 add 与首帧显示 |
+
+定义十六个完成点：
+
+| 点 | 精确定义 | 仍不能推出 |
+|---|---|---|
+| `I_ready` | PhoneLayoutInflater、Activity private Factory 与 content root 已就绪 | 业务 XML 已解析 |
+| `L_enter` | `inflate(layoutResID, mContentParent)` 资源重载开始 | 资源变体已选中 |
+| `R_select` | `getValue(id, value, true)` 已把 id 解析为当前配置的 file 与 assetCookie | Parser 已存在 |
+| `P_open` | `ResourcesImpl` 从缓存或新 XmlBlock 创建的 Parser 已返回 | 已到根标签 |
+| `X_root` | Parser 从当前位置推进到首个根 `START_TAG` | 根 View 已构造 |
+| `V_root` | 固定根标签经 private Factory 放行、默认类创建并从构造器返回 | 根 LayoutParams 或孩子已完成 |
+| `Q_params` | 外部 content 已根据根标签 attrs 生成根 LayoutParams | 业务根已挂到 content |
+| `D_tree` | 所有后代都完成创建、自己的递归与向 XML 父节点的加入 | XML 根 `onFinishInflate()` 已返回 |
+| `O_finish` | XML 根的 `onFinishInflate()` 正常返回 | 已加入外部 content |
+| `A_content` | `mContentParent.addView(temp, params)` 正常返回 | Parser 已关闭 |
+| `I_inner` | `inflate(parser, root, true)` 已计算返回值并离开核心构树段 | 资源重载已经返回 |
+| `P_close` | 资源重载的 finally 已关闭本次 Parser 计数持有 | XmlBlock 必已销毁 |
+| `L_return` | 两参数资源 inflate 正常返回传入的 content root | PhoneWindow 的 Insets/callback/explicit 尾部已完成 |
+| `S_return` | 第 210 章的 `Activity.setContentView(int)` 正常返回 | ViewRoot 或 WMS 窗口已存在 |
+| `W_add` | 后续普通主窗口 add 正常返回，WMS 已接受窗口 | draw 或 present 已完成 |
+| `F_present` | 首个目标可见帧达到所选显示完成证据 | 早先 inflate 没有性能问题 |
+
+固定局部全序是：
 
 ```text
-R.layout整数
-→ Resources解析当前配置对应资源文件
-→ AssetManager打开编译XML XmlBlock
-→ XmlResourceParser输出START_TAG/END_TAG事件
-→ LayoutInflater递归读取标签
-→ 主题包装Context
-→ Factory2/Factory/PrivateFactory尝试创建
-→ 默认ClassLoader+反射调用(Context, AttributeSet)
-→ 父ViewGroup生成LayoutParams
-→ 递归子节点并onFinishInflate
-→ 按attachToRoot决定是否加到root
+I_ready < L_enter < R_select < P_open < X_root
+        < V_root < Q_params < D_tree < O_finish
+        < A_content < I_inner < P_close < L_return
+        < S_return < W_add < F_present
 ```
 
-## 3. 完整调用与对象图
+答案先钉死：标准 XML 路径的 `L_return` 返回 **传入的 content**，不是业务 XML 根；业务根此时已经带着 content 生成的 LayoutParams 挂入 content，内部子树和普通节点的 `onFinishInflate()` 也已同步完成。Parser 已关闭，但缓存中的 XmlBlock 可以继续存活。Decor 仍没有 ViewRoot，因此 measure、layout、draw、Surface 和 present 都不由这次返回证明。
 
-```mermaid
-flowchart TD
-  ID["R.layout.activity_main\n32位资源ID"] --> RES["Resources.getLayout"]
-  RES --> VALUE["ResourcesImpl.getValue\n选配置/文件/cookie"]
-  VALUE --> ASSET["AssetManager.openXmlBlockAsset"]
-  ASSET --> BLOCK["XmlBlock\n编译XML native对象"]
-  BLOCK --> PARSER["XmlBlock.Parser\nXmlResourceParser + AttributeSet"]
-  PARSER --> INF["LayoutInflater.inflate"]
-  INF --> TAG["createViewFromTag"]
-  TAG --> THEME["可选ContextThemeWrapper"]
-  THEME --> F2["Factory2 / Factory"]
-  F2 --> PF["Activity PrivateFactory"]
-  PF --> DEF["PhoneLayoutInflater / createView反射"]
-  DEF --> VIEW["View(Context, AttributeSet)"]
-  VIEW --> LP["父ViewGroup.generateLayoutParams"]
-  LP --> CHILD["rInflateChildren递归"]
-  CHILD --> ADD["parent.addView / root.addView"]
+## 2. 资源、游标、对象与父容器是六类不同证据
+
+“XML 变成 View”至少跨六层：
+
+```text
+R.layout 整数
+→ TypedValue(file, assetCookie)
+→ XmlBlock（编译 XML 与字符串池的 native 包装）
+→ XmlBlock.Parser（独立 parse state，同时充当 AttributeSet）
+→ Java View / ViewGroup 对象
+→ 父容器解释出的 LayoutParams 与 addView 父子关系
 ```
 
-整个普通inflate主线发生在App进程调用线程；Activity的setContentView通常在主线程执行。
+固定返回点的账如下：
 
-## 4. LayoutInflater不是“把字符串XML翻译成View”的孤立工具
+| 对象或账 | 角色 | `L_return` 状态 |
+|---|---|---|
+| layout resource id | package/type/entry 身份 | 已解析 |
+| TypedValue | 当前配置选中的 file、cookie 与类型 | 临时对象已归还 Resources 池 |
+| XmlBlock cache | 最近编译 XML block 的四槽循环缓存 | 可能命中或新写入 |
+| Parser/native parse state | 当前调用的事件游标与 AttributeSet | 已关闭 |
+| Inflater base Context | 资源、ClassLoader 与默认 Theme 来源 | 仍由 Inflater 持有 |
+| 每标签 viewContext | 标签级 Theme 传给 Factory/构造器的候选 Context | 根固定为 Activity；后代从 XML parent 的实际 Context 起步 |
+| View 实例 | 构造器与自身属性状态 | 全部已创建 |
+| LayoutParams | 由将接纳该孩子的 ViewGroup 解释 `layout_*` | 已生成并写入/用于 add |
+| XML 内部父子关系 | 业务根以下的层级 | 已建立 |
+| 外部 content 关系 | 业务根到 `mContentParent` 的边 | 已建立 |
+| ViewRoot/WindowState | View 树到窗口 session/WMS 的连接 | 尚不存在 |
 
-它依赖：
+`AttributeSet` 不是事后复制出的 Map；固定 Parser 本身实现该接口，属性读取跟随同一 native 游标当前位置。`View` 构造器应在当前标签仍有效时读取所需属性，不能把这个对象当成稳定快照长期保存。
 
-- Resources选择正确的layout资源变体；
-- AssetManager提供APK/资源包里的编译XML；
-- XmlResourceParser提供事件和AttributeSet；
-- Context提供Resources、Theme和ClassLoader；
-- Factory链提供可替换的创建钩子；
-- 父ViewGroup解释其孩子的LayoutParams。
+## 3. PhoneLayoutInflater 来自 Activity 的可视 Context，private Factory 随 attach 接入
 
-缺少任一层，都无法完整解释inflate结果。
-
-## 5. LayoutInflater从哪里来
-
-`LayoutInflater.from(context)` 实际取得Context系统服务：
+普通 Activity 的 ContextImpl 在 `activity.attach()` 之前先执行：
 
 ```java
-return (LayoutInflater) context.getSystemService(
-        Context.LAYOUT_INFLATER_SERVICE);
+appContext.setOuterContext(activity);
+activity.attach(appContext, ...);
 ```
 
-它不是跨Binder向system_server申请一个远程服务；这是Context内的本地系统服务对象。
-
-## 6. Android 11手机策略返回PhoneLayoutInflater
-
-`SystemServiceRegistry` 注册：
+base ContextImpl 的 LayoutInflater 服务注册使用 outer Context：
 
 ```java
-registerService(Context.LAYOUT_INFLATER_SERVICE,
-        LayoutInflater.class,
-        new CachedServiceFetcher<LayoutInflater>() {
-    public LayoutInflater createService(ContextImpl ctx) {
-        return new PhoneLayoutInflater(ctx.getOuterContext());
-    }
-});
+return new PhoneLayoutInflater(ctx.getOuterContext());
 ```
 
-所以Activity中的典型对象是 `PhoneLayoutInflater`，不是直接实例化抽象基类LayoutInflater。
-
-## 7. 为什么服务使用OuterContext
-
-ContextImpl内部可对应Activity等外层Context。Inflater创建View时需要正确的主题、资源和Activity语义，因此构造PhoneLayoutInflater时传 `ctx.getOuterContext()`。
-
-这与简单保存裸ContextImpl不同，也解释了Activity.attach阶段为何还把Activity设为PrivateFactory。
-
-## 8. PhoneLayoutInflater补充系统类名前缀
-
-r48依次尝试：
+但 Activity 自身继承 `ContextThemeWrapper`。它查询 LayoutInflater 时会先从 base Context 取得上述 PhoneLayoutInflater，再克隆并缓存在 wrapper：
 
 ```java
-private static final String[] sClassPrefixList = {
-    "android.widget.",
-    "android.webkit.",
-    "android.app."
-};
+mInflater = LayoutInflater.from(getBaseContext()).cloneInContext(this);
 ```
 
-因此XML写 `<TextView>` 时，可解析成 `android.widget.TextView`；若是完整类名 `com.example.MyView`，则无需系统前缀。
-
-## 9. 基类的默认前缀只是android.view
-
-LayoutInflater基类 `onCreateView()` 最终尝试：
+`PhoneWindow` 构造从 Activity Context 取得的是这份 wrapper clone，`Activity.attach()` 再把自己接成 private Factory：
 
 ```java
-return createView(name, "android.view.", attrs);
+mLayoutInflater = LayoutInflater.from(context);
+mWindow.getLayoutInflater().setPrivateFactory(this);
 ```
 
-PhoneLayoutInflater先尝试widget/webkit/app，失败后再让基类尝试view。短标签能工作不是Java自动导包，而是Inflater显式拼前缀并逐个加载类。
+所以固定 `I_ready` 可以断言：
 
-## 10. Inflater绑定Context
+- 最终 Inflater 是 Activity `ContextThemeWrapper.mInflater` 缓存的 `PhoneLayoutInflater` clone，base Context 是 Activity；
+- base ContextImpl 也会缓存提供 clone 原型的 PhoneLayoutInflater；两者是本地对象且不是同一实例，更不是向 system_server 取远程 Binder 对象；
+- Activity 作为 private `Factory2` 已在业务 `onCreate()` 前接入；
+- content 是创建对象的外部 root，但尚未连接 ViewRoot。
 
-构造函数保存：
+这条 ContextThemeWrapper clone 正是固定 Activity 路径，不是旁支。clone 会复制原型已有的公开/私有 Factory 与 Filter，并换掉 base Context；它不是只改一个字段。后续某个标签带 `android:theme` 时，Inflater 只是把包装 Context 交给该标签创建者，并不会为每个标签自动再克隆一把 Inflater；标签递归仍由当前这一个实例驱动。
+
+## 4. R.layout 先选择当前配置，再按 cookie 与 file 打开编译 XML
+
+`Resources.getLayout(id)` 只是入口：
 
 ```java
-protected LayoutInflater(Context context) {
-    mContext = context;
-    initPrecompiledViews();
+return loadXmlResourceParser(id, "layout");
+```
+
+内部取得临时 `TypedValue`，调用 `ResourcesImpl.getValue(id, value, true)` 解析引用。资源 id 编码 package/type/entry；AssetManager 结合已应用的 Configuration 在候选中选最佳项，最终要求 value 类型为 `TYPE_STRING`，再把：
+
+```text
+file + resource id + assetCookie
+```
+
+交给 `ResourcesImpl.loadXmlResourceParser()`。因此：
+
+- id 不是文件偏移量；
+- `layout/foo` 不保证永远对应同一变体，方向、night、density 等配置会影响选择；
+- assetCookie 标识所选资源包位置，file 是该包中的资源路径；
+- 选择发生在 `getValue` 链，后面的 `openXmlBlockAsset(cookie, file)` 按已选结果打开，并不重新做一次变体竞赛。
+
+运行时读取的是 aapt 预处理后的编译 XML，不是工程纯文本逐字符直译。Parser 提供高层事件与已编码属性；注释、空白与类型信息的行为也不能照普通文本 PullParser 推断。
+
+## 5. 四槽缓存保存 XmlBlock，不保存 Parser 或 View
+
+`ResourcesImpl` 为每个实例维护四槽循环缓存：
+
+```java
+private static final int XML_BLOCK_CACHE_SIZE = 4;
+```
+
+缓存键是 `assetCookie + file`。命中时仍调用 `cachedXmlBlocks[i].newParser(id)`，所以每次 `getLayout()` 都得到新的 Parser/native parse state；未命中时打开新 XmlBlock，覆盖下一槽并关闭旧 block。它不是 LRU，也不缓存已经生成的 View 树。
+
+生命周期必须按 open count 描述：
+
+- XmlBlock 创建时 owner count 为 1；
+- 每个 `newParser()` 创建独立 native parse state，并把 count 加一；
+- `Parser.close()` 销毁自己的 parse state，再释放这一份计数持有；
+- 缓存淘汰或 flush 调 `XmlBlock.close()`，释放 block owner 的一份计数；
+- 只有 count 归零才销毁底层 native XML tree，并通知 AssetManager。
+
+这不是“没有 Java 引用就立即释放”。Parser 即使 close 后仍有 final `mBlock` 字段；决定 native tree 销毁的是 open count。反过来，所有 Parser 都关闭而 block 仍在缓存时，owner count 仍让它存活；block 已被淘汰但仍有活动 Parser 时，Parser 的计数又会保护 native tree。
+
+## 6. 资源重载拥有 Parser；Parser 重载不替调用者关闭
+
+资源 id 重载的真实骨架是：
+
+```java
+View view = tryInflatePrecompiled(resource, res, root, attachToRoot);
+if (view != null) {
+    return view;
 }
-```
-
-这个Context决定资源、默认Theme和ClassLoader，也是无子级主题覆盖时View构造器得到的基础环境。
-
-## 11. cloneInContext不是随便换一个字段
-
-PhoneLayoutInflater实现：
-
-```java
-public LayoutInflater cloneInContext(Context newContext) {
-    return new PhoneLayoutInflater(this, newContext);
-}
-```
-
-拷贝构造会继承Factory、PrivateFactory和Filter，同时换Context。ViewStub延迟inflate、主题包装等场景需要保持创建策略又使用新环境。
-
-## 12. 从资源ID开始而不是文件路径
-
-应用传入的是编译常量 `R.layout.activity_main`。Resources先根据ID取得TypedValue，其中包含当前配置匹配后的文件路径和asset cookie：
-
-```java
-impl.getValue(id, value, true);
-if (value.type == TypedValue.TYPE_STRING) {
-    return loadXmlResourceParser(value.string.toString(),
-            id, value.assetCookie, "layout");
-}
-```
-
-这一步已体现资源表对语言、横竖屏、尺寸等变体的选择。
-
-## 13. 一个资源ID不是磁盘偏移量
-
-资源ID编码package/type/entry身份，ResourcesImpl结合当前Configuration和资源表解析实际条目。不能仅根据整数低位直接定位APK里的字节，也不能假设同名layout永远选默认目录版本。
-
-## 14. Resources.getLayout返回Parser
-
-公开方法只是：
-
-```java
-public XmlResourceParser getLayout(int id) {
-    return loadXmlResourceParser(id, "layout");
-}
-```
-
-它没有直接生成View；它返回能遍历编译XML事件、同时暴露资源属性值的Parser。
-
-## 15. APK里的布局不是工程纯文本原样
-
-Resources文档明确说明XML已在构建期预解析，文本被合并、注释被移除。LayoutInflater文档也提示普通纯文本XmlPullParser不能直接替代这种运行时编译资源Parser。
-
-因此本章“解析XML”指解析Android编译XML事件流，不是用通用DOM重新读工程文件。
-
-## 16. AssetManager打开XmlBlock
-
-缓存未命中时ResourcesImpl调用：
-
-```java
-final XmlBlock block =
-        mAssets.openXmlBlockAsset(assetCookie, file);
-return block.newParser(id);
-```
-
-AssetManager再经native层打开资源包中的编译XML，得到由Java XmlBlock包装的native对象。
-
-## 17. XmlBlock缓存缓存了什么
-
-ResourcesImpl以 `assetCookie + file` 查一个小型XmlBlock数组缓存。命中时从已有block创建新的Parser；未命中时替换轮转位置并关闭旧block。
-
-它不是缓存最终View树，也不是保证同一layout每次返回同一个Parser对象。
-
-## 18. XmlBlock与Parser生命周期分开
-
-`XmlBlock.newParser()` 创建native parse state，并增加block open count。Parser关闭时释放自己的解析状态和引用；block无引用后才销毁native对象。
-
-这让同一个编译XML block可产生多个独立遍历位置的Parser。
-
-## 19. 为什么inflate必须关闭Parser
-
-资源ID重载使用try/finally：
-
-```java
 XmlResourceParser parser = res.getLayout(resource);
 try {
     return inflate(parser, root, attachToRoot);
@@ -229,178 +187,98 @@ try {
 }
 ```
 
-即使创建View或解析属性抛异常，也要释放parse state及block引用。只读源码时可从这里学习资源句柄的结构化清理。
+所以正常 `I_inner` 先产生返回值，finally 再到 `P_close`，最后才有 `L_return`。标准构树抛出 Exception 时，已经取得的 Parser 同样关闭。
 
-## 20. 三参数inflate是语义核心
+所有权还有三个边界：
 
-资源ID版本最终进入：
+- `res.getLayout(resource)` 位于 try 之前；若资源查找/打开本身抛 `Resources.NotFoundException`，还没有 Parser 可供这段 finally 关闭；
+- 直接调用 `inflate(XmlPullParser, root, attachToRoot)` 时，Inflater 不关闭传入 Parser，所有权仍在调用者；
+- `parseInclude()` 自己打开的 child Parser 由它自己的 finally 关闭。
 
-```java
-inflate(XmlPullParser parser,
-        ViewGroup root,
-        boolean attachToRoot)
-```
+`XmlBlock.Parser.next()` 到 `END_DOCUMENT` 会自动 close，但普通 `rInflate()` 通常在当前元素的匹配 `END_TAG` 就返回，不能依赖“读到文档末尾”代替显式 finally。
 
-`root` 和 `attachToRoot` 必须分开理解：root既可提供将来的父容器类型/LayoutParams，也可成为立即attach目标；attachToRoot决定当前是否真正加入。
+核心 Parser 重载把整次标准递归放在 `synchronized (mConstructorArgs)` 内。这会让同一个 Inflater 的这段共享参数/`mTempValue` 使用不交错，却不能推导 LayoutInflater 已线程安全：类契约仍要求单实例只由一个线程使用，直接 `createView()`、Factory 变更及不同 Inflater 共享的静态 constructor map 也不由这把实例锁统一保护。
 
-## 21. 两参数重载的隐式规则
+## 7. advanceToRootNode 只向前找；AttributeSet 始终跟着游标
 
-```java
-public View inflate(int resource, ViewGroup root) {
-    return inflate(resource, root, root != null);
-}
-```
-
-传非空root时默认立即attach；传null时不attach。第210章PhoneWindow传 `mContentParent`，所以应用布局自动加入 `android.R.id.content`。
-
-## 22. inflate开始时为什么锁mConstructorArgs
-
-核心方法：
-
-```java
-synchronized (mConstructorArgs) {
-    ...
-}
-```
-
-Inflater复用 `mConstructorArgs[0/1]` 作为反射构造参数，并在递归中临时切换Context/AttributeSet；加锁防止同一个Inflater实例被并发inflate时互相覆盖这些数组槽位。
-
-这不等于所有LayoutInflater实例共享一把全局锁。
-
-## 23. 普通Activity为什么仍应在主线程inflate UI
-
-本章源码锁只保护Inflater的构造参数，不让View体系变成线程安全。View创建可能访问Theme、Drawable、Looper相关对象或触发自定义View逻辑；最终加入Activity树和后续ViewRoot操作也要求主线程语义。
-
-不能因看到`synchronized`就推导“后台线程inflate后直接操作UI完全安全”。
-
-## 24. AttributeSet不是复制出的Map
+进入 Parser 重载后，Inflater 先做：
 
 ```java
 final AttributeSet attrs = Xml.asAttributeSet(parser);
+advanceToRootNode(parser);
+final String name = parser.getName();
 ```
 
-对XmlBlock.Parser来说，Parser本身实现AttributeSet。attrs反映Parser当前标签的位置；解析推进后同一对象代表的当前属性也随之变化。
+`advanceToRootNode()` 从 Parser **当前位置**反复 `next()`，直到遇见 `START_TAG` 或 `END_DOCUMENT`。它不 rewind，也不读取 depth；如果调用者已把 Parser 停在某个 `START_TAG`，它会先越过当前事件再向后找。递归边界才使用 `getDepth()`。
 
-自定义View若需要长期保留某个属性，应在构造期间解析/复制所需值，不能无条件保存attrs引用等待以后读取。
-
-## 25. 先推进到第一个根START_TAG
-
-`advanceToRootNode()` 跳过START_DOCUMENT等事件，直到START_TAG或END_DOCUMENT。没有根标签时抛：
+固定根不是 `merge`，因此先调用 `createViewFromTag(root, name, inflaterContext, attrs)`。对一个普通标签的局部顺序是：
 
 ```text
-No start tag found!
+标签名规范化
+→ 可选标签 Theme Context
+→ 特殊 blink / Factory / private Factory / 默认创建择一
+→ View 构造完成
+→ 外层父容器生成 LayoutParams
+→ 深度优先构造孩子
+→ 当前 View.onFinishInflate()
+→ 当前 View 加入 XML 外层父节点
 ```
 
-它不根据缩进或文本猜根节点，而依赖Parser事件类型和深度。
+这不是全树的一条平铺序列。一个孩子会先完成自己的整棵子树和 `onFinishInflate()`，随后才加入它的 XML 父 ViewGroup；较早兄弟已经加入时，较晚兄弟才开始。
 
-## 26. 普通根标签的四步
+## 8. 标签 Theme 是创建输入，不保证成为 Factory 产物的 Context
 
-非`<merge>`根节点走：
+`createViewFromTag()` 先处理两件事：
+
+1. `<view class="...">` 把实际 class 属性改写为标签名；
+2. 未要求忽略时读取 `android:theme`，必要时创建 `ContextThemeWrapper`。
+
+随后这个 `context` 被传给公开 Factory、private Factory 与默认构造路径。固定路径没有标签 Theme，Activity private Factory 又返回 null，所以默认反射确实把 Activity Context 传进根标签的 public 二参数构造器；后代每次改从 XML parent 的实际 `getContext()` 起步。只有沿途父 View 都保留收到的构造 Context，后代构造入参才继续等于 Activity Context；业务 View 若把另一个 Context 传给 `super`，会从该层改变后代的起点。
+
+通用路径不能写成“有 `android:theme` 就保证 `view.getContext()` 是该 wrapper”。Factory 可以忽略收到的 context，自行返回一个使用其他 Context 的 View。Inflater 接下来又通过：
+
+```java
+rInflate(parser, parent, parent.getContext(), attrs, finishInflate);
+```
+
+让 **Factory 实际返回对象的 `getContext()`** 成为其 XML 后代的递归 Context。标签 Theme 是提供给创建者的输入；只有创建者采用它，继承链才按预期继续。
+
+因此 `view.getContext()` 可能是 Activity、ContextThemeWrapper 或 Factory 选择的别的 Context。业务代码不应无条件强转 Activity；Inflater 的 class lookup Context、构造参数 Context 和 View 最终持有的 Context 也必须分别标注。
+
+## 9. 普通标签的创建链是短路选择，不是所有 Factory 依次必经
+
+`tryCreateView()` 的优先级是：
 
 ```text
-createViewFromTag 创建根View temp
-→ root非空时由root生成temp的LayoutParams
-→ rInflateChildren递归创建temp内部子树
-→ attachToRoot=true时root.addView(temp, params)
+name == "blink" ? 直接 new BlinkLayout
+: mFactory2 != null ? 调 Factory2
+: mFactory != null ? 调 Factory
+: 无公开 Factory
+
+公开结果为 null
+→ mPrivateFactory（若存在）
+
+仍为 null
+→ createViewFromTag 的默认创建
 ```
 
-最后根据参数决定返回root还是temp。
+几个边界决定了真实调用数：
 
-## 27. createViewFromTag先处理特殊view标签
+- Factory2 与 Factory 是 `if/else if`，不会对同一标签先后各调一次；
+- 任一 Factory 返回非 null，后续创建者被短路，但 Inflater 仍负责该 View 的孩子递归、LayoutParams 与 add；
+- `blink` 位于全部 Factory 之前；
+- 文档根只由核心入口特判 `merge`；`include/requestFocus/tag` 作为 `rInflate` 子级时才走结构分支。若这些名字出现在文档根，它们仍会进入普通创建链，Factory 可以拦截；没有 Factory 产物时才通常因找不到同名 View 类而失败；
+- Factory2 收到的 parent 只是创建语义输入；`root!=null, attachToRoot=false` 时，XML 根仍收到这个 parent，却不会由 Inflater 挂上去。
 
-若标签名是字面量 `<view>`：
+公开 `setFactory()/setFactory2()` 共用 `mFactorySet`，同一 Inflater 公开设置第二次会抛异常。clone 会复制 `mFactory/mFactory2`，但新对象的 `mFactorySet` 初始仍为 false，所以有一次再设置机会：调用 `setFactory2()` 会同时重建两字段并把新 Factory2 放在旧链之前；若 clone 已带非空 `mFactory2`，却只调用 `setFactory()`，新对象只改 `mFactory`，实际分派仍优先走旧 `mFactory2`，新 Factory 甚至不会被本条路径访问。`setPrivateFactory()` 是隐藏入口，可多次把新 private Factory 合并到旧链之前。
 
-```java
-if (name.equals("view")) {
-    name = attrs.getAttributeValue(null, "class");
-}
-```
+普通 Activity 已是 private Factory2。它对 `fragment` 交给平台 FragmentController；非 fragment 则转旧版 `onCreateView(name, context, attrs)`，Activity 基类默认返回 null，子类仍可覆盖。`AppComponentFactory` 负责 Activity 等组件实例化，不是普通 View 的默认工厂。
 
-因此 `<view class="com.example.MyView">` 与直接写完整类名是两种入口语法，最终都进入相同创建链。
+Factory 返回的 View 绕过默认反射、constructor cache 与 Filter。Filter 不是全链安全沙箱，也约束不到 `blink`。
 
-## 28. 每个标签可以覆盖android:theme
+## 10. 默认反射分短名与全名；缓存键、ClassLoader 和构造 Context 各自独立
 
-未要求忽略主题属性时：
-
-```java
-int themeResId = ta.getResourceId(0, 0);
-if (themeResId != 0) {
-    context = new ContextThemeWrapper(context, themeResId);
-}
-```
-
-该View构造器得到包装Context；递归子节点又使用父View的Context，因此主题可自然向子树传播。
-
-## 29. View的Context可能不等于Activity对象
-
-没有局部主题时常是Activity Context；有 `android:theme`、include主题覆盖或其他Factory包装时，可以是ContextThemeWrapper。
-
-所以业务代码不应无条件把 `view.getContext()` 强转成具体Activity。需要Activity时应明确解包或使用可靠的所有权传递方式。
-
-## 30. Factory调用顺序
-
-`tryCreateView()` 的顺序是：
-
-```java
-if (mFactory2 != null) {
-    view = mFactory2.onCreateView(parent, name, context, attrs);
-} else if (mFactory != null) {
-    view = mFactory.onCreateView(name, context, attrs);
-}
-if (view == null && mPrivateFactory != null) {
-    view = mPrivateFactory.onCreateView(parent, name, context, attrs);
-}
-```
-
-只有前面的钩子返回null，后续创建者才有机会。
-
-## 31. Factory2比Factory多了parent
-
-Factory只能看到name/context/attrs；Factory2还看到“将来的parent”。这有助于基于父层主题、布局语义或兼容策略选择View实现。
-
-这里传入parent不表示View已经attach；它只是创建阶段的上下文信息。
-
-## 32. Factory只允许公开设置一次
-
-`setFactory()`/`setFactory2()`检查 `mFactorySet`，重复设置抛IllegalStateException。若Inflater已有Factory，源码可通过FactoryMerger把新旧链组合。
-
-这避免后设置者悄悄覆盖先设置者，同时也要求库在正确时机安装自己的Factory。
-
-## 33. FactoryMerger的短路规则
-
-合并器先询问第一Factory，返回非null就结束；否则询问第二Factory。Factory2路径优先调用带parent版本，缺失时回退Factory接口。
-
-因此多个Factory的“顺序”会改变谁有权替换某个标签，并非所有Factory都会收到每一个成功创建的View。
-
-## 34. PrivateFactory属于框架内部链
-
-`setPrivateFactory()` 是隐藏API，可合并多个私有Factory。Activity.attach执行：
-
-```java
-mWindow.getLayoutInflater().setPrivateFactory(this);
-```
-
-Activity实现Factory2，因此普通公开Factory未创建标签时，平台Activity还有一次处理机会。
-
-## 35. r48 Activity PrivateFactory具体做什么
-
-Activity的四参数 `onCreateView()` 对非`fragment`标签继续调用旧版回调，默认通常返回null；遇到 `<fragment>` 时交给 `mFragments.onCreateView(...)`。
-
-所以不能笼统说“Activity PrivateFactory创建所有View”。它是一个钩子，是否创建取决于标签和重写实现。
-
-## 36. AppComponentFactory不负责普通View标签
-
-第209章AppComponentFactory参与Activity等组件实例化。LayoutInflater创建普通View使用Factory链和ClassLoader反射，没有默认转去AppComponentFactory。
-
-组件工厂与布局工厂名称相似，但职责和调用链不同。
-
-## 37. Factory返回View后默认反射被跳过
-
-若Factory2/Factory/PrivateFactory任一返回非null，`createViewFromTag()` 直接采用该对象。Inflater仍会继续生成LayoutParams、递归XML子标签并把它加入父容器。
-
-因此Factory替换的是“这个标签对应的对象如何产生”，不是自动接管整个递归与attach流程。
-
-## 38. 所有Factory返回null才走默认创建
+所有创建钩子都返回 null 后：
 
 ```java
 if (-1 == name.indexOf('.')) {
@@ -410,522 +288,327 @@ if (-1 == name.indexOf('.')) {
 }
 ```
 
-无点短类名交给PhoneLayoutInflater逐前缀尝试；含点完整类名直接按原名加载。
+`PhoneLayoutInflater` 对短名依次尝试：
 
-## 39. ClassLoader从Inflater基础Context取得
-
-默认创建使用：
-
-```java
-Class.forName(fullName, false,
-        mContext.getClassLoader()).asSubclass(View.class);
+```text
+android.widget. → android.webkit. → android.app. → android.view.
 ```
 
-传给构造器的 `viewContext` 可是ThemeWrapper，但类查找使用Inflater持有Context的ClassLoader。这两种Context角色不要混为一谈。
+只有 `ClassNotFoundException` 才继续下一个前缀。若某前缀下类存在但不是 View、缺构造器或构造失败，路径会以 InflateException 中止，不会继续“碰运气”。含点完整类名直接按原名创建，和短名前缀链是互斥分支。
 
-## 40. asSubclass先验证类型
+默认 `createView()` 的账要拆开：
 
-`asSubclass(View.class)` 确保加载类确实是View子类。不是View时转成带位置描述的InflateException，而不是让任意Java对象进入View树。
+| 项 | r48 行为 |
+|---|---|
+| class lookup | `Class.forName(fullName, false, mContext.getClassLoader())`，使用 Inflater base Context 的 ClassLoader |
+| 类型门 | `asSubclass(View.class)` |
+| 构造器门 | `Class.getConstructor(Context.class, AttributeSet.class)`，要求 **public** 二参数构造器 |
+| 构造参数 | 使用当前标签的 themed `viewContext` 与活动 AttributeSet |
+| cache key | 静态 Map 以传入的原始 `name` 为键，不含 prefix 与 ClassLoader |
+| cache hit | `verifyClassLoader()` 接受声明 loader 是 boot、等于 base Context ClassLoader，或位于其向上 parent 链 |
+| Filter | 只在默认反射路径检查；命中 constructor 时用当前 Inflater 的 `mFilterMap` 记允许结果 |
+| 实例化 | `constructor.newInstance(args)`，每次仍创建新 View |
 
-这属于类型安全门，不是Android权限或SELinux检查。
+`setAccessible(true)` 发生在找到 public constructor **之后**，不会让 private/protected 二参数构造器被 `getConstructor()` 找到。很多 View 的二参构造器内部继续调用三参/四参以解析默认样式；Inflater 自己仍只反射 public 二参入口。
 
-## 41. 默认反射要求哪个构造器
+ClassLoader 校验只处理缓存兼容性，不核对 prefix，也不能保证静态 Map 绝不持有旧 Constructor。命中不兼容 lookup 时会移除重载；若再无 lookup，Map 仍可能持有既有元数据。缓存的是 Constructor，不是 View 实例。
 
-签名固定为：
+`mConstructorArgs` 会临时放入 viewContext 与 attrs；内外层 finally 恢复旧 Context 并清空 attrs 槽，防止递归主题串位和无意长期持有 Parser。构造器本身是应用代码边界，可以同步读资源、创建对象、执行 Binder 或 I/O，也可以抛异常；“inflate 在 App 进程同步执行”不等于“只有纯本地轻量工作”。
 
-```java
-static final Class<?>[] mConstructorSignature = {
-    Context.class, AttributeSet.class
-};
-```
+## 11. 深度递归决定 onFinishInflate 与 addView 的精确顺序
 
-Inflater取得该构造器并调用 `newInstance(context, attrs)`。自定义View只有单参数Context构造器而缺少XML构造器时，直接从XML inflate会失败。
+`rInflate()` 进入时记录当前 `depth`，循环到：
 
-## 42. 四参数View构造器不是Inflater直接反射目标
+- 当前事件是 `END_TAG` 且 Parser depth 不大于入口 depth；或
+- `END_DOCUMENT`。
 
-很多View类内部让二参数构造器链到三/四参数构造器以应用styleAttr/styleRes。但LayoutInflater默认反射入口仍是 `(Context, AttributeSet)`。
-
-后续默认样式解析发生在View类自己的构造链，不是Inflater为所有View统一反射四参数版本。
-
-## 43. 构造器缓存的目的
-
-```java
-private static final HashMap<String,
-        Constructor<? extends View>> sConstructorMap;
-```
-
-首次成功查类和构造器后缓存Constructor，后续相同标签可跳过部分反射查找成本。
-
-缓存的是构造器元数据，不是View实例；每次inflate仍new一个新对象。
-
-## 44. 构造器缓存为什么校验ClassLoader
-
-命中缓存后先 `verifyClassLoader(constructor)`；不兼容就移除并重新加载。应用/动态代码环境里同名类可能来自不同ClassLoader，盲目复用旧Constructor会创建错误类型或泄漏加载环境。
-
-因此“静态Map按类名永久全局复用”不是完整描述。
-
-## 45. Filter是可选的类加载限制
-
-Inflater可设置Filter，在准备inflate类时调用 `onLoadClass(clazz)`。不允许则抛InflateException；缓存构造器场景还用mFilterMap缓存允许结果。
-
-它是调用者可配置的Inflater级白名单钩子，不等价于Manifest权限、PackageManager校验或SELinux策略。
-
-## 46. 反射参数数组为何需要恢复
-
-createView临时把：
-
-```java
-mConstructorArgs[0] = viewContext;
-mConstructorArgs[1] = attrs;
-```
-
-传给构造器，finally恢复旧Context；外层inflate最终也清空AttributeSet槽位，避免Inflater长期持有Parser/Context引用或递归主题串位。
-
-## 47. 构造器执行的是应用代码边界
-
-`constructor.newInstance(args)` 可能执行自定义View构造逻辑：读取StyledAttributes、创建子对象、加载Drawable，甚至做不合适的I/O。
-
-所以inflate耗时不仅是XML Parser和反射，也包括每个View构造器及其资源解析成本。
-
-## 48. ViewStub为何得到克隆Inflater
-
-若新对象是ViewStub：
-
-```java
-viewStub.setLayoutInflater(
-        cloneInContext((Context) args[0]));
-```
-
-ViewStub稍后变为visible或显式inflate时，使用同一主题Context和Factory策略创建目标布局，而不是在当前递归中立即创建目标子树。
-
-## 49. ViewStub对象已创建不等于目标布局已创建
-
-当前inflate只创建轻量ViewStub并放进树；其 `android:layout` 指向的真实布局留到以后。故查性能和对象数量时，必须区分stub本身与延迟布局。
-
-## 50. rInflate是深度递归
-
-普通子节点循环：
+正常返回时游标停在当前元素匹配的 `END_TAG`。对普通孩子，源码顺序是：
 
 ```java
 View view = createViewFromTag(parent, name, context, attrs);
-ViewGroup group = (ViewGroup) parent;
-LayoutParams params = group.generateLayoutParams(attrs);
+ViewGroup viewGroup = (ViewGroup) parent;
+ViewGroup.LayoutParams params = viewGroup.generateLayoutParams(attrs);
 rInflateChildren(parser, view, attrs, true);
-group.addView(view, params);
+viewGroup.addView(view, params);
 ```
 
-顺序是先构造父对象，再完整构造其子树，最后把该对象加入外层parent。
+因此：
 
-## 51. 为什么先递归孩子再加到外层父容器
+- `layout_width/layout_height/layout_gravity` 等由 **即将接纳孩子的父 ViewGroup** 解释，不是孩子基类统一解释；
+- 当前孩子的全部后代先加入当前孩子；
+- 当前孩子的 `onFinishInflate()` 随 `rInflateChildren(..., true)` 返回前发生；
+- 当前孩子随后才加入外层 parent；
+- 根 View 的 `onFinishInflate()` 也发生在根加入调用者提供的外部 root 之前。
 
-新View对象已存在，可以作为自己的孩子的parent；其内部子树完成并调用onFinishInflate后，外层再addView。
+如果普通 View 标签含普通子标签，`rInflate()` 会把 parent 强转 ViewGroup；非 ViewGroup 因此失败。源码在强转之前已经创建了这个子 View，所以其 Factory/构造器副作用仍可能发生。`requestFocus` 与 `tag` 不要求创建普通孩子，不能把“出现任何子标签”一概等同于 parent 必须是 ViewGroup。`requestFocus` 会先记 pending，当前层元素读完后 `restoreDefaultFocus()`，再调用该 parent 的 `onFinishInflate()`。
 
-这不代表整棵树直到最后都没有任何parent：内层子节点会逐级加入新建的ViewGroup，只是当前节点尚未加入再外一层。
+`onFinishInflate()` 只证明 XML 构造阶段到达相应局部回调。它不证明 `onAttachedToWindow()`、measure、layout 或 draw。顶层 merge 的最外层调用就是 `finishInflate=false`，所以调用者 root 不会因这次 inflate 收到回调；include 到 merge 的那一层嵌套调用也不额外回调当前 parent，但包围 include 的正常外层 `rInflate(..., true)` 最终仍可对同一 parent 调用一次 `onFinishInflate()`。两种 merge 中实际创建的普通孩子仍各自收到回调。
 
-## 52. XML含子标签时父标签必须是ViewGroup
+## 12. root 与 attachToRoot 的矩阵同时决定参数、父子边和返回值
 
-rInflate把parent强转ViewGroup并调用generateLayoutParams/addView。若普通View标签里错误嵌套子View，运行时会失败。
+标准 Parser、普通非 merge 根的四种组合是：
 
-XML的层级合法性不仅靠语法，还是由对应Java对象是否能承载子View决定。
+| root | attachToRoot | 根 LayoutParams | Inflater 建立外部父子边 | 返回值 |
+|---|---:|---|---|---|
+| null | false | 不生成 | 否 | XML 根 `temp` |
+| null | true | 不生成；true 实际不起 attach 作用 | 否 | XML 根 `temp` |
+| 非 null | false | root 生成并 `temp.setLayoutParams(params)` | 否 | XML 根 `temp` |
+| 非 null | true | root 生成并传给 `root.addView` | 是 | 传入的 `root` |
 
-## 53. LayoutParams由父容器创建
+两参数 `inflate(resource, root)` 自动令 `attachToRoot = (root != null)`。固定 PhoneWindow 调用因此走最后一行：content 生成 `FrameLayout.LayoutParams`，业务根在全部子树完成后加入 content，返回值却是 content。PhoneWindow 不使用这个返回值。
 
-关键代码：
+参数的“生成”和“装到根 View 上”也不是同一点：`root!=null, attach=false` 会在递归前执行 `temp.setLayoutParams(params)`；`attach=true` 只先把 params 留在局部变量，直到最终 `root.addView(temp, params)` 才安装。因此根构造器和根 `onFinishInflate()` 在后一条路径中不能依赖 Inflater 已写入外层 LayoutParams。
 
-```java
-ViewGroup.LayoutParams params =
-        viewGroup.generateLayoutParams(attrs);
-```
+这也解释两个常见场景：
 
-`layout_width/height` 以及 `layout_gravity`、RelativeLayout规则等描述“孩子在父容器中怎么摆”，所以由父ViewGroup解释并生成自己的LayoutParams子类。
+- 列表 item 应用 `inflate(layout, recyclerView, false)`：不立即 attach，却取得真正父容器类型的 LayoutParams；
+- `inflate(layout, null)` 虽能返回 View，但缺少父容器对 `layout_*` 的解释，后来加入真实父容器时可能丢语义或触发参数不兼容。
 
-## 54. 同一个子View换父容器为何参数可能不兼容
+`Factory2.parent` 与最终 parent 不能画等号：第三行仍把非空 root 传给根标签 Factory2，却明确不 attach。反过来，`root=null, attach=true` 也不会凭空创造父容器。
 
-LinearLayout.LayoutParams、FrameLayout.LayoutParams等携带不同字段。父容器addView时会检查/转换参数。
+`attachToRoot` 只表示加入传入 ViewGroup，不等于第一次连接 ViewRoot。若调用者给的是已经 attached 的 root，最终 `addView()` 可以在 inflate 返回前同步分发 attach；本章固定 Activity content 尚未 attached，所以 `A_content/L_return` 仍没有 ViewRoot。
 
-因此LayoutParams不是View的绝对尺寸说明书，而是特定父容器与该孩子之间的布局协议。
+以上矩阵只认证标准 Parser 路径。r48 常规实例不会进入预编译布局；测试入口若强行启用并成功，`tryInflatePrecompiled()` 即使 `root!=null && attach=true` 也直接返回生成的 `view`，不是标准路径的 root，必须单列。
 
-## 55. root即使不attach也很重要
+## 13. merge 与 include 改写“根对象”和提交时机
 
-调用：
-
-```java
-inflate(layout, parent, false)
-```
-
-不会把结果加入parent，但会用parent的 `generateLayoutParams(attrs)` 给XML根View生成正确参数并调用 `temp.setLayoutParams(params)`。
-
-这就是Adapter创建item时推荐传parent且attachToRoot=false的核心原因之一。
-
-## 56. 传null root会失去父容器参数语义
-
-`inflate(layout, null, false)` 无法知道未来父容器类型，因此不会在根节点阶段生成对应LayoutParams。之后add入真实父容器时可能只能生成默认参数，或无法体现XML根标签中的某些 `layout_*` 属性。
-
-不是所有场景都会立刻崩溃，但语义信息可能缺失。
-
-## 57. attachToRoot决定谁执行addView
-
-- `root != null && attachToRoot=true`：Inflater最后 `root.addView(temp, params)`；
-- `root != null && attachToRoot=false`：只把params设给temp，由调用者稍后add；
-- `root == null && attachToRoot=false`：返回temp，当前无外层父容器可加；
-- 普通根布局若 `root == null && attachToRoot=true`，add条件仍不成立并返回temp，这个true没有实际attach目标；若根是merge则会因缺少root直接抛异常。
-
-不要在Inflater已attach后再由调用者重复add同一个View，否则会遇到已有parent错误。
-
-## 58. 返回值规则必须单独记
-
-```java
-View result = root;
-...
-if (root == null || !attachToRoot) {
-    result = temp;
-}
-```
-
-所以：
-
-| root | attachToRoot | 返回值 | 是否已加到root |
-|---|---:|---|---:|
-| null | false | XML根View | 否 |
-| null | true（普通根） | XML根View | 否，无root可加 |
-| 非null | false | XML根View | 否 |
-| 非null | true | 传入的root | 是 |
-
-两参数 `inflate(layout, root)` 在root非空时属于最后一行。
-
-## 59. onFinishInflate何时调用
-
-`rInflate(..., finishInflate=true)` 在当前View所有XML孩子完成后调用：
-
-```java
-parent.onFinishInflate();
-```
-
-自定义ViewGroup可在这里通过ID取得XML子View并完成绑定。此时孩子对象已加进它，但整棵树未必已attach到Window。
-
-## 60. onFinishInflate不等于onAttachedToWindow
-
-前者属于XML对象树构造收尾；后者发生在View树接入ViewRoot并分发窗口attach时。两者中间可能隔着Activity onCreate余下逻辑、resume和WindowManager.addView。
-
-同理，onFinishInflate也不代表measure/layout/draw完成。
-
-## 61. `<merge>`为什么没有自己的View对象
-
-根标签是`<merge>`时，Inflater不调用createViewFromTag，而是把它的子节点直接rInflate到调用者提供的root。
-
-```mermaid
-flowchart LR
-  A["普通layout\nLinearLayout root"] --> B["调用者root"]
-  B --> C["额外LinearLayout层"]
-  C --> D["child A / child B"]
-  M["merge layout"] --> R["调用者root"]
-  R --> E["child A"]
-  R --> F["child B"]
-```
-
-它可减少无意义包裹层，但也改变布局参数归属和层级。
-
-## 62. `<merge>`的严格条件
-
-```java
-if (root == null || !attachToRoot) {
-    throw new InflateException(
-        "<merge /> can be used only with a valid "
-        + "ViewGroup root and attachToRoot=true");
-}
-```
-
-因为没有一个独立根View可返回或暂存；孩子必须当场知道并加入真实root。
-
-## 63. `<merge>`不能出现在普通内部位置
-
-rInflate遇到内部merge直接抛：
+顶层 `<merge>` 没有自己的 View 对象，只允许：
 
 ```text
-<merge /> must be the root element
+root != null && attachToRoot == true
 ```
 
-它是布局文件根级扁平化指令，不是任意层级的透明ViewGroup。
+Inflater 直接 `rInflate(parser, root, ..., false)`，把每个实际孩子依次加入外部 root，最后返回初始 `result=root`。`root==null` 或 `attachToRoot=false` 都抛；递归内部再遇 `merge` 也抛“必须是根元素”。由于 `finishInflate=false`，外部 root 不收到本次 Inflater 的 `onFinishInflate()`。
 
-## 64. `<include>`是“解析另一份布局”
+`<include>` 的 include 语义只在子递归的结构分支解析。它要求当前 parent 是 ViewGroup，解析另一份 layout：
 
-`parseInclude()` 先确认当前parent是ViewGroup，再解析include的layout资源引用，打开另一份XmlResourceParser。
+- include 自己的 `android:theme` 若存在，先包 Context，并让被 include 的非 merge 根忽略自己的 theme；
+- layout 可直接是资源，也可经主题属性解析；
+- 被 include 根是 merge 时，孩子直接加入当前 parent，没有单一根可应用 include 的 id/visibility；
+- 普通根时，先尝试用 include 标签 attrs 让外部 parent 生成一整个 LayoutParams 对象；抛 RuntimeException 或返回 null 时，整体改用被 include 根 attrs，不做逐属性合并；
+- include 的 id 与 visibility 若提供，会在子树完成后覆盖被 include 根，再 `group.addView(view)`；
+- child Parser 在 finally 关闭，外层 include 标签剩余元素再被消费。
 
-若被include布局根是merge，就把其子节点直接加入当前parent；否则创建被include的根View、递归其孩子并add。
+这不是文本粘贴。include Theme、LayoutParams、id/visibility 和 Parser 所有权都有单独规则。文档根名为 `include` 时不会自动调用 `parseInclude()`；它会走普通根的 Factory/默认创建。Factory 若主动返回 View 可以成功，固定无 Factory 产物时则因没有同名 View 类而失败。
 
-## 65. include标签可以覆盖主题
+## 14. requestFocus、tag、blink、ViewStub 与预编译各有不同语义
 
-include自身的 `android:theme` 会先包装Context，并在创建被include根节点时忽略该根自己的theme属性，避免两个来源重复覆盖。
+`rInflate()` 在子级位置还识别：
 
-这是一条特定优先规则，不应简单说“被include文件自己的theme永远最高”。
+- `<requestFocus>`：消费其子元素，记录 pending；本层完成时调用 parent.`restoreDefaultFocus()`；
+- `<tag>`：读取 key/value，直接对当前 parent `setTag(key, value)`；
+- `<blink>`：在 `tryCreateView()` 最前直接创建内部 `BlinkLayout`，绕过公开/private Factory 与 Filter；
+- 普通 `ViewStub`：当前只创建零尺寸占位 View，不创建 `android:layout` 指向的目标树。
 
-## 66. include可以覆盖ID与可见性
+默认反射创建 ViewStub 后，Inflater 会给它设置 `cloneInContext(actualConstructorContext)`，让日后展开沿用相应 Context、Factory 与 Filter。若 ViewStub 是 Factory 直接返回，这段默认反射后处理不会执行，不能保证自动得到同一 clone。
 
-r48标准XML解析分支读取include标签的 `id` 和 `visibility`，在被include根View创建后覆盖对应属性。
+`ViewStub.inflate()` 日后用 `factory.inflate(layout, parent, false)` 先创建但不 attach，再移除 Stub，并以 Stub 自己原有的 LayoutParams 把新 View 加回同一索引。占位对象创建、目标布局构造和替换完成是三个时间点。
 
-所以运行时查到的根ID/visibility可能来自include位置，而不是被include XML根标签原始声明。可选预编译布局旁路有自己的生成约束，本章不把标准分支的每个覆盖细节自动外推给它。
+预编译布局则要按版本限定：r48 `initPrecompiledViews()` 明确把 enabled 硬编码为 false，常规生产 Inflater 不会进入该旁路。只有 `@TestApi setPrecompiledLayoutsEnabledForTesting()` 可尝试开启；即使成功且 root 非空，它仍打开 XML 只为生成父参数。不能把测试路径写成 Android 11 应用的默认优化，更不能把它的返回值套入标准矩阵。
 
-## 67. include的LayoutParams优先级
+测试旁路把任意 `Throwable` 捕获在内部，失败后回落到标准 XML；这保证不了旁路调用过的应用代码副作用被撤销。它与 Parser 核心只包装 `Exception` 的边界也不能混为一谈。
 
-系统先尝试用include标签当前attrs让外层parent生成LayoutParams；失败时回退被include根标签的attrs。
+## 15. 异常没有事务回滚；用最小证据定位停点
 
-这使include处声明的layout_width/height等可覆盖复用布局的根参数，同时在缺失时沿用被include布局自身参数。
+标准 Parser 核心分别捕获 `XmlPullParserException` 与其他 `Exception`，包装为 `InflateException`；后者通常附带当前资源/行位置。`Error`、`LinkageError`、OOM 不属于 `Exception`，不会由这层包装，但 Java finally 仍恢复 constructor args、结束 trace，并在资源重载中关闭已取得的 Parser。`Resources.getLayout()` 自身抛出的 NotFoundException 也不经过 Parser 核心包装。
 
-## 68. `<requestFocus>`与`<tag>`不是普通View
+Inflater 没有树事务：
 
-rInflate对两者特殊处理：
+| 失败位置 | 框架已经可能留下什么 | 不应声称 |
+|---|---|---|
+| 资源选择/打开 | 没有本次 Parser 或 View | 构造器失败 |
+| 根 Factory/构造器 | 应用回调副作用；尚无框架外部 add | content 已加入根 |
+| 普通根内部较晚孩子 | temp 内已有较早兄弟；temp 尚未加入调用者 root | 全部自动回滚 |
+| 顶层 merge 的较晚孩子 | 较早孩子已直接留在调用者 root | merge 失败保持 root 原样 |
+| `onFinishInflate()` | 当前局部子树已建；当前节点尚未必加入外层 parent | 回调出现等于外部 attach |
+| 最终 `root.addView` | 完整 temp 与参数已存在；add 可能失败，回调异常时甚至可能已写入部分父子状态 | `L_return` 已到达 |
+| PhoneWindow 重复 set | 它在 inflate 前已 `removeAllViews()` | 新 inflate 失败会恢复旧内容 |
 
-- `<requestFocus>` 记录pending，完成当前层子节点后调用 `restoreDefaultFocus()`；
-- `<tag>` 解析id/value并调用父View的 `setTag(key, value)`。
+固定首次普通根路径中，直到整棵 temp 与根 `onFinishInflate()` 成功，框架才向 content 做最终 add；这比 merge 的逐孩子提交更接近“外部原子”，却仍不是通用回滚承诺。Factory/构造器可以保存对象引用或自行修改别处，`addView()` 本身也可能抛。默认路径还会在 `constructor.newInstance()` 之前把新 Constructor 放进静态 cache；实例构造随后失败不会自动删除这项元数据。
 
-它们不会反射出名为requestFocus或tag的View对象。
+最小诊断表：
 
-## 69. `<blink>`是平台历史特殊标签
+| 证据 | 至少证明 | 仍不能证明 |
+|---|---|---|
+| `Resources.getLayout()` 返回 Parser | 当前 id 已解析并创建 parse state | 已读到根标签 |
+| Factory 日志 | 对应普通标签已到该 Factory | 它返回了 View 或默认路径结束 |
+| View 构造日志 | 该实例构造器已进入/返回到日志点 | 其孩子或 LayoutParams 已完成 |
+| 根 `onFinishInflate()` 日志 | 普通根内部孩子已加入 | 根已加入外部 content |
+| 业务根 `getParent()==content` | 外部父子边至少已经写入 | `addView()` 或 resource inflate 已正常返回 |
+| `inflate` 下一行日志 | `L_return`；资源重载 Parser 已关闭 | PhoneWindow 尾部或 Activity API 已返回 |
+| `Activity.setContentView` 下一行 | `S_return` | ViewRoot/WMS/首帧 |
+| `view.getViewRootImpl()==null` | 尚未 attach 到 ViewRoot | 本地构树失败 |
+| WMS 有对应 WindowState | `W_add` 至少已被接受 | draw、Buffer 或 present |
 
-`tryCreateView()` 对字面量 `blink` 直接创建内部BlinkLayout。它是源码保留的特殊分支，不是Factory或通用反射结果，也不值得作为现代UI实践推荐。
+本章的边界是 `L_return`：资源已选、对象已构、参数已解释、固定父子边已提交、Parser 已关闭。第 210 章再接 Insets、callback、explicit 与 ActionBar；ViewRoot、WMS、traversal 和显示链仍在后面。
 
-阅读它的价值是提醒：标签到对象的映射并不全由类名规则决定。
+## 16. 九组只读练习：亲手重建资源、Factory、递归与返回矩阵
 
-## 70. 预编译布局是可选旁路
+以下命令只做文件存在检查和文本检索。可在源码根运行，也可先设置 `ANDROID_BUILD_TOP`；每组应在 Android 11 r48 快照中独立以 0 退出。
 
-资源ID版本先调用 `tryInflatePrecompiled()`；仅在 `mUseCompiledView` 启用且成功时，才从生成的 `package.CompiledView` 方法取得View。
-
-失败会回到标准编译XML Parser主线。不能看到这段就断言Android 11所有应用布局默认都绕过XML递归。
-
-## 71. 预编译成功仍需父参数
-
-即便CompiledView返回对象，只要root非空，系统仍短暂打开XML、推进到根标签、用root生成LayoutParams，再按attachToRoot选择addView或setLayoutParams。
-
-优化对象创建不代表能丢掉父容器布局协议。
-
-## 72. 异常怎样带出XML位置
-
-Parser/ClassLoader/构造器异常会被包装为InflateException，并加入 `getParserStateDescription(context, attrs)`，通常包含资源和行位置。
-
-排查“Error inflating class”时应继续看cause：可能是类不存在、缺二参数构造器、不是View、自定义构造器抛错、Factory抛错或LayoutParams属性非法，不能只归咎于反射慢。
-
-## 73. inflate完成时已经有什么
-
-普通成功路径已有：
-
-- 当前配置选择出的资源文件；
-- 对应标签的Java View实例；
-- 每个View的构造属性和主题Context；
-- 内部父子关系；
-- 外层父容器生成的LayoutParams；
-- 已执行的onFinishInflate；
-- 若attachToRoot=true，已加入调用者传入的本地root。
-
-## 74. inflate完成时还没有什么
-
-不能仅凭返回成功断言：
-
-- 整棵树已attach到ViewRoot/Window；
-- 已收到真实WindowInsets；
-- 已执行measure/layout；
-- 已建立DisplayList或提交GPU命令；
-- 已申请/取得可用Surface；
-- SurfaceFlinger已合成或屏幕已present。
-
-这些属于后续窗口与遍历阶段。
-
-## 75. 性能成本应怎样分层
-
-inflate耗时可能来自：
-
-```text
-资源变体解析与XmlBlock/Parser
-→ 标签事件遍历
-→ Factory链逻辑
-→ 类加载/首次构造器查找
-→ 自定义View构造器
-→ StyledAttributes与Drawable/字体等资源
-→ 子树递归和addView/requestLayout/invalidate标记
-```
-
-源码静态阅读能找成本来源，但当前Mac阶段没有运行trace，不能声称哪一项在具体应用里最慢。
-
-## 76. 深层嵌套为什么有成本
-
-每多一层通常增加对象、构造、属性解析、LayoutParams和后续measure/layout遍历；某些无意义包裹层还会增加测量传递。
-
-但不能只按XML深度机械判定性能：View类型、测量算法、约束、绘制和复用方式同样重要。`<merge>`只在层级确实冗余且调用条件匹配时才合适。
-
-## 77. 常见误解集中纠正
-
-### 误解一：LayoutInflater运行时直接读工程纯文本XML
-
-实际通常读取构建期编译、资源表选择后的XmlBlock事件流。
-
-### 误解二：所有标签都直接反射
-
-先有Factory2/Factory和PrivateFactory；特殊标签也可绕过默认反射。
-
-### 误解三：LayoutParams由子View自己解析
-
-它表达父子布局协议，由未来父ViewGroup根据标签attrs生成。
-
-### 误解四：attachToRoot=false时root没有作用
-
-root仍用于创建正确的根LayoutParams。
-
-### 误解五：inflate返回的一定是XML根View
-
-root非空且attachToRoot=true时返回传入root。
-
-### 误解六：onFinishInflate表示View已上屏
-
-它只表示该View的XML孩子创建完成。
-
-### 误解七：构造器缓存复用了View对象
-
-只缓存Constructor，每次仍创建新实例。
-
-## 78. 用RecyclerView式item场景理解参数
-
-概念代码：
-
-```java
-View item = inflater.inflate(
-        R.layout.row_item, parent, false);
-```
-
-此时：
-
-- parent帮助生成适用于它的LayoutParams；
-- false避免Inflater立即添加，因为RecyclerView稍后管理attach；
-- 返回值是row_item根View；
-- item当前可能没有parent，但已经携带正确LayoutParams。
-
-如果误用两参数 `inflate(layout, parent)`，它默认attach，调用方随后再add就会冲突。
-
-## 79. 用PhoneWindow场景理解两参数重载
-
-```java
-mLayoutInflater.inflate(layoutResID, mContentParent);
-```
-
-因为mContentParent非空：
-
-```text
-attachToRoot = true
-→ XML根View参数由content FrameLayout生成
-→ 根View加入android.R.id.content
-→ inflate返回mContentParent
-```
-
-PhoneWindow不使用返回值，因为它关心的是内容已被添加。
-
-## 80. 源码阅读入口
-
-建议顺序：
-
-1. `frameworks/base/core/java/android/view/LayoutInflater.java`
-   - `from`、构造与Factory接口
-   - 三组inflate重载
-   - `createViewFromTag`、`tryCreateView`、`createView`
-   - `rInflate`、`parseInclude`
-2. `frameworks/base/core/java/com/android/internal/policy/PhoneLayoutInflater.java`
-3. `frameworks/base/core/java/android/app/SystemServiceRegistry.java`
-   - LayoutInflater服务注册
-4. `frameworks/base/core/java/android/content/res/Resources.java`
-   - `getLayout`、`loadXmlResourceParser`
-5. `frameworks/base/core/java/android/content/res/ResourcesImpl.java`
-   - XmlBlock缓存与打开
-6. `frameworks/base/core/java/android/content/res/AssetManager.java`
-   - `openXmlBlockAsset`
-7. `frameworks/base/core/java/android/content/res/XmlBlock.java`
-8. `frameworks/base/core/java/android/view/ViewGroup.java`
-   - `generateLayoutParams`、`addView`
-
-## 81. macOS只读练习一：画出创建优先级
+### 练习 1：确认 Activity Inflater 的 Context 与 private Factory
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '950,1080p' \
-  frameworks/base/core/java/android/view/LayoutInflater.java
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+T="$SRC/frameworks/base/core/java/android/app/ActivityThread.java"
+R="$SRC/frameworks/base/core/java/android/app/SystemServiceRegistry.java"
+A="$SRC/frameworks/base/core/java/android/app/Activity.java"
+C="$SRC/frameworks/base/core/java/android/view/ContextThemeWrapper.java"
+P="$SRC/frameworks/base/core/java/com/android/internal/policy/PhoneWindow.java"
+L="$SRC/frameworks/base/core/java/android/view/LayoutInflater.java"
+F="$SRC/frameworks/base/core/java/com/android/internal/policy/PhoneLayoutInflater.java"
+test -f "$T" && test -f "$R" && test -f "$A" && test -f "$C" && test -f "$P" && test -f "$L" && test -f "$F"
+grep -nE 'setOuterContext\(activity\)|activity.attach\(' "$T"
+grep -nE 'Context.LAYOUT_INFLATER_SERVICE|new PhoneLayoutInflater|ctx.getOuterContext' "$R"
+grep -nE 'class Activity extends ContextThemeWrapper|getSystemService\(|getLayoutInflater\(\).setPrivateFactory\(this\)|public LayoutInflater getLayoutInflater|onCreateView\(' "$A"
+grep -nE 'LAYOUT_INFLATER_SERVICE.equals|LayoutInflater.from\(getBaseContext\(\)\).cloneInContext|return mInflater' "$C"
+grep -nE 'mLayoutInflater = LayoutInflater.from|getLayoutInflater\(\)' "$P"
+grep -nE 'public static LayoutInflater from|cloneInContext' "$L"
+grep -nE 'class PhoneLayoutInflater|sClassPrefixList|cloneInContext' "$F"
 ```
 
-请画：主题包装→Factory2/Factory→PrivateFactory→短类名PhoneLayoutInflater→完整类名createView。标注“返回非null即短路”。
+画 `setOuterContext → base ContextImpl 的 PhoneLayoutInflater → Activity wrapper clone → PhoneWindow → Activity private Factory`；标出两把 Inflater 不是同一实例，且都在 App 进程内。
 
-## 82. macOS只读练习二：验证root四种语义
+完成标准：不能把 LayoutInflater 系统服务画成 Binder 服务，也不能把 Activity private Factory 说成创建所有普通 View。
+
+### 练习 2：把资源选择、四槽 XmlBlock 与 Parser 计数拆开
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '627,710p' \
-  frameworks/base/core/java/android/view/LayoutInflater.java
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+R="$SRC/frameworks/base/core/java/android/content/res/Resources.java"
+I="$SRC/frameworks/base/core/java/android/content/res/ResourcesImpl.java"
+A="$SRC/frameworks/base/core/java/android/content/res/AssetManager.java"
+X="$SRC/frameworks/base/core/java/android/content/res/XmlBlock.java"
+test -f "$R" && test -f "$I" && test -f "$A" && test -f "$X"
+grep -nE 'XmlResourceParser getLayout|loadXmlResourceParser\(id, "layout"\)|impl.getValue\(id, value, true\)|TypedValue.TYPE_STRING|value.assetCookie' "$R"
+grep -nE 'XML_BLOCK_CACHE_SIZE = 4|mCachedXmlBlockCookies|mCachedXmlBlockFiles|mCachedXmlBlocks|openXmlBlockAsset|newParser\(id\)|oldBlock.close|flushLayoutCache' "$I"
+grep -nE 'openXmlBlockAsset\(int cookie|nativeOpenXmlAsset' "$A"
+grep -nE 'mOpenCount = 1|mOpenCount\+\+|nativeCreateParseState|nativeDestroyParseState|decOpenCountLocked|mOpenCount == 0|ev == END_DOCUMENT' "$X"
 ```
 
-自己填写三种有效组合的返回值、LayoutParams来源和是否addView；再解释为什么 `root=null, attachToRoot=true` 没有实际外层可attach。
+给 cache owner 与两个同时存活的 Parser 各画一份计数持有，再模拟缓存淘汰和两个 Parser 依次 close。
 
-## 83. macOS只读练习三：追资源到XmlBlock
+完成标准：指出缓存键、四槽循环策略与每次新 parse state；不能用“Java 引用为零”替代 open-count 条件。
+
+### 练习 3：区分资源重载、Parser 重载与游标起点
 
 ```bash
-cd /Users/ninebot/androidSource
-rg -n "getLayout\(|loadXmlResourceParser|openXmlBlockAsset|newParser" \
-  frameworks/base/core/java/android/content/res/{Resources.java,ResourcesImpl.java,AssetManager.java,XmlBlock.java}
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+L="$SRC/frameworks/base/core/java/android/view/LayoutInflater.java"
+X="$SRC/frameworks/base/core/java/android/util/Xml.java"
+test -f "$L" && test -f "$X"
+grep -nE 'inflate\(@LayoutRes int resource|tryInflatePrecompiled|XmlResourceParser parser = res.getLayout|parser.close\(\)|inflate\(XmlPullParser parser|synchronized \(mConstructorArgs\)|advanceToRootNode|No start tag found' "$L"
+grep -nE 'asAttributeSet\(XmlPullParser parser\)|parser instanceof AttributeSet|new XmlPullAttributes' "$X"
 ```
 
-目标是区分资源ID解析、编译XML block缓存和每次Parser状态三个对象层次。
+分别写出 getLayout 抛错、核心递归抛 Exception、直接传 Parser 三条所有权线；再说明已停在 START_TAG 的 Parser 为什么不会从该标签重新开始。
 
-## 84. macOS只读练习四：比较merge与include
+完成标准：资源重载取得的 Parser 由 finally 关闭，Parser 重载不越权关闭调用者对象；advance 只向前看事件，不用 depth。
+
+### 练习 4：还原普通标签的 Theme 与 Factory 短路链
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '1088,1280p' \
-  frameworks/base/core/java/android/view/LayoutInflater.java
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+L="$SRC/frameworks/base/core/java/android/view/LayoutInflater.java"
+A="$SRC/frameworks/base/core/java/android/app/Activity.java"
+C="$SRC/frameworks/base/core/java/android/view/ContextThemeWrapper.java"
+test -f "$L" && test -f "$A" && test -f "$C"
+grep -nE 'name.equals\("view"\)|ATTRS_THEME|new ContextThemeWrapper|tryCreateView|name.equals\(TAG_1995\)|mFactory2 != null|else if \(mFactory != null\)|mPrivateFactory|new FactoryMerger|mFactorySet|setPrivateFactory' "$L"
+grep -nE 'onCreateView\(@Nullable View parent|!"fragment".equals\(name\)|mFragments.onCreateView|return null' "$A"
+grep -nE 'LAYOUT_INFLATER_SERVICE.equals|LayoutInflater.from\(getBaseContext\(\)\).cloneInContext|mInflater' "$C"
 ```
 
-记录merge的合法条件、include主题覆盖、id/visibility覆盖和LayoutParams回退规则，不需要创建测试APK。
+画 blink、Factory2/Factory 二选一、private Factory 与默认创建的分支；另画 Factory 返回自选 Context 后，后代怎样从 `parent.getContext()` 继续。
 
-## 85. 自测题
+完成标准：不能把 Factory2 与 Factory 画成两个必经回调，也不能把标签 Theme 强制等同于最终 `view.getContext()`。
 
-1. R.layout整数如何找到当前配置的layout文件？
-2. 为什么运行时Parser不是通用纯文本XML Parser？
-3. Factory2、Factory、PrivateFactory和默认反射的顺序是什么？
-4. Activity PrivateFactory默认重点处理哪类标签？
-5. `<TextView>` 如何定位到android.widget.TextView？
-6. 自定义View从XML创建至少需要哪个反射入口构造器？
-7. LayoutParams为什么由parent生成？
-8. `inflate(layout, parent, false)` 中parent有什么作用？
-9. attachToRoot=true时返回值为什么可能不是XML根View？
-10. `<merge>`为什么必须有非空root且立即attach？
-11. include处的id/visibility和LayoutParams怎样覆盖？
-12. onFinishInflate与onAttachedToWindow有什么区别？
+### 练习 5：核对前缀、public 构造器、缓存键与 Filter 边界
 
-## 86. 自测答案
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+L="$SRC/frameworks/base/core/java/android/view/LayoutInflater.java"
+P="$SRC/frameworks/base/core/java/com/android/internal/policy/PhoneLayoutInflater.java"
+test -f "$L" && test -f "$P"
+grep -nE 'name.indexOf|Class.forName|asSubclass\(View.class\)|mContext.getClassLoader|getConstructor\(mConstructorSignature\)|sConstructorMap.get\(name\)|sConstructorMap.put\(name|verifyClassLoader|mFilter.onLoadClass|mFilterMap|mConstructorSignature|constructor.newInstance|view instanceof ViewStub|cloneInContext' "$L"
+grep -nE 'sClassPrefixList|android.widget|android.webkit|android.app|catch \(ClassNotFoundException|super.onCreateView' "$P"
+```
 
-1. ResourcesImpl结合资源表和Configuration解析TypedValue，得到文件路径和asset cookie。
-2. APK布局在构建期已编译预处理，XmlBlock.Parser遍历的是该格式的高层事件和资源属性。
-3. Factory2优先；没有时Factory；返回null后PrivateFactory；再进入PhoneLayoutInflater/默认createView。
-4. r48平台Activity对 `<fragment>` 交给FragmentController处理。
-5. PhoneLayoutInflater按android.widget、android.webkit、android.app前缀尝试，最后基类尝试android.view。
-6. 默认反射查找 `(Context, AttributeSet)`。
-7. layout属性描述孩子在特定父容器中的关系，不同ViewGroup需要不同LayoutParams子类。
-8. 即使不attach，parent仍为XML根生成正确LayoutParams。
-9. root非空且attachToRoot=true时result保持传入root，XML根只是其新孩子。
-10. merge本身不产生可返回的根对象，只能把孩子当场加入真实root。
-11. include的theme/id/visibility可在复用位置覆盖；父参数先尝试include attrs，失败再用被include根attrs。
-12. onFinishInflate是XML孩子构造完成；onAttachedToWindow是整棵树接入ViewRoot/Window后的生命周期。
+对一个短名与一个完整类名分别标注 lookup ClassLoader、constructor 参数 Context、cache key 和 Filter 生效点；再写出类存在但缺二参构造器时为何不会试下一前缀。
 
-## 87. 本章结论
+完成标准：构造器必须是 public `(Context, AttributeSet)`；Filter 只覆盖默认反射，Factory/blink 产物不受它保证。
 
-LayoutInflater不是单一“XML反射器”，而是一条多阶段对象装配流水线：Resources先按配置解析资源ID，AssetManager/XmlBlock提供编译XML Parser；Inflater按事件递归，每个标签先应用主题Context，再交给Factory链或默认类加载/二参数构造器；父ViewGroup生成孩子的LayoutParams，子树完成后调用onFinishInflate，并由attachToRoot决定何时加入外层root。
+### 练习 6：证明孩子先完成自己，再加入外层父节点
 
-看懂这条链后，`setContentView()` 里的一行inflate就不再神秘：它完成的是App进程本地View对象树构造和内容容器挂接，还没有自动越过ViewRoot、WMS、Surface与屏幕显示边界。
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+L="$SRC/frameworks/base/core/java/android/view/LayoutInflater.java"
+G="$SRC/frameworks/base/core/java/android/view/ViewGroup.java"
+V="$SRC/frameworks/base/core/java/android/view/View.java"
+test -f "$L" && test -f "$G" && test -f "$V"
+grep -nE 'final int depth = parser.getDepth|parser.getDepth\(\) > depth|createViewFromTag\(parent|viewGroup.generateLayoutParams|rInflateChildren\(parser, view|viewGroup.addView|pendingRequestFocus|restoreDefaultFocus|parent.onFinishInflate' "$L"
+grep -nE 'generateLayoutParams\(AttributeSet attrs\)|addView\(View child, int index, LayoutParams params\)|addViewInner' "$G"
+grep -nE 'protected void onFinishInflate|onAttachedToWindow|onMeasure\(' "$V"
+```
 
-## 88. 复读时必须核对的边界
+选一个三层 XML，按事件游标列出每个构造器、LayoutParams、`onFinishInflate` 和 add 的精确顺序。
 
-- 不把Resources选择资源文件写成仅按文件名查找；它先结合资源表和当前Configuration解析TypedValue。
-- 不把XmlBlock缓存说成View树或Parser复用；缓存是编译XML block，每次可创建独立Parser状态。
-- 不把Factory链说成全部都会执行；某一层返回非null后后续创建层被短路。
-- 不把Factory创建View说成接管递归；Inflater仍处理LayoutParams、孩子和addView。
-- 不把局部Theme Context与用于类加载的Inflater基础Context混为一个角色。
-- 不把静态构造器Map描述成无ClassLoader校验的永久复用，也不把Constructor缓存误写成实例缓存。
-- 不把rInflate的“先递归后加外层parent”扩大为整棵子树都无parent；内层节点会逐级加入自己的父ViewGroup。
-- 不把传入root等同立即attach；还必须看attachToRoot。
-- 不把ViewStub对象出现等同其目标布局已经inflate。
-- 不把预编译布局写成r48所有应用默认路径；标准编译XML递归仍是必须掌握的主线与回退。
-- 不把onFinishInflate、attach到ViewRoot、首次Traversal和首帧present合并成一个完成点。
+完成标准：子 ViewGroup 的 `onFinishInflate` 在其后代加入之后、它自己加入外层 parent 之前；不能把它当 attach 或 measure。
 
-下一章将进入 `ViewRootImpl.setView()` 与WindowManagerGlobal：DecorView怎样真正接入应用窗口根、创建InputChannel并向WMS发起addWindow。
+### 练习 7：亲算 root × attachToRoot 返回矩阵
+
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+L="$SRC/frameworks/base/core/java/android/view/LayoutInflater.java"
+P="$SRC/frameworks/base/core/java/com/android/internal/policy/PhoneWindow.java"
+test -f "$L" && test -f "$P"
+grep -nE 'return inflate\(resource, root, root != null\)|View result = root|root != null|root.generateLayoutParams|!attachToRoot|temp.setLayoutParams|root.addView\(temp, params\)|result = temp|TAG_MERGE.equals|ViewGroup root and attachToRoot=true' "$L"
+grep -nE 'mLayoutInflater.inflate\(layoutResID, mContentParent\)|mContentParent.addView|mContentParent.removeAllViews' "$P"
+```
+
+写满普通根四行矩阵，再单列 merge；把 PhoneWindow 的两参数调用映射到矩阵最后一行。
+
+完成标准：固定 `L_return` 返回 content 而非业务根；`root=null, attach=true` 不会 attach，`root!=null, attach=false` 仍会生成父类型参数。
+
+### 练习 8：拆开 merge、include、结构标签、ViewStub 与测试旁路
+
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+L="$SRC/frameworks/base/core/java/android/view/LayoutInflater.java"
+V="$SRC/frameworks/base/core/java/android/view/ViewStub.java"
+test -f "$L" && test -f "$V"
+grep -nE 'TAG_MERGE|TAG_INCLUDE|TAG_REQUEST_FOCUS|TAG_TAG|parseInclude|hasThemeOverride|Include_id|Include_visibility|group.generateLayoutParams|consumeChildElements|new BlinkLayout' "$L"
+grep -nE 'Precompiled layouts are not supported in this release|setPrecompiledLayoutsEnabledForTesting|tryInflatePrecompiled|mUseCompiledView|return view' "$L"
+grep -nE 'inflateViewNoAdd|factory.inflate\(mLayoutResource, parent, false\)|replaceSelfWithView|removeViewInLayout|mInflatedViewRef|setLayoutInflater' "$V"
+```
+
+为五类标签写“是否创建当前标签 View、是否进 Factory、何时加到外部 parent”；再对 ViewStub 标三次完成点。
+
+完成标准：merge 的失败可留下已加孩子，include 非文本粘贴，并区分结构名字位于文档根与子级时是否进入 Factory；Factory 返回的 ViewStub 也不能借用默认反射专属的 clone 保证，r48 常规预编译路径关闭。
+
+### 练习 9：从异常停点追到 setContentView 与 ViewRoot 边界
+
+```bash
+set -eu
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+L="$SRC/frameworks/base/core/java/android/view/LayoutInflater.java"
+P="$SRC/frameworks/base/core/java/com/android/internal/policy/PhoneWindow.java"
+V="$SRC/frameworks/base/core/java/android/view/View.java"
+G="$SRC/frameworks/base/core/java/android/view/WindowManagerGlobal.java"
+test -f "$L" && test -f "$P" && test -f "$V" && test -f "$G"
+grep -nE 'catch \(XmlPullParserException|catch \(Exception e\)|getParserStateDescription|mConstructorArgs\[0\] = lastContext|mConstructorArgs\[1\] = null|Trace.traceEnd' "$L"
+grep -nE 'mLayoutInflater.inflate|requestApplyInsets|onContentChanged|mContentParentExplicitlySet = true' "$P"
+grep -nE 'getViewRootImpl\(\)|isAttachedToWindow\(\)|mAttachInfo' "$V"
+grep -nE 'new ViewRootImpl|mViews.add|mRoots.add|root.setView' "$G"
+```
+
+分别画普通根内部失败、merge 中途失败和 `L_return` 成功三条线，再接第 210 章的 Insets/callback/explicit 与后续 add。
+
+完成标准：Parser 清理和 constructor args 恢复不是树回滚；`L_return` 有本地父子树，却仍没有 ViewRoot、WMS 窗口或首帧。

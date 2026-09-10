@@ -1,606 +1,780 @@
 # 207 Android Zygote：命令解析、fork/specialize 与 RuntimeInit 入口
 
-> 源码版本：Android 11 `android-11.0.0_r48`。  
-> 当前在 Mac 上只读源码；本章所有进程、权限和时序结论来自 r48 源码，不声称在 macOS 上实际执行 Android fork。
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`。
+>
+> 当前环境只有源码快照，可以证明命令边界、父子偏序、权限收敛顺序与入口调用链；不能据此测出某台设备的真实 fork 时长，也不能把固定普通 App 在 regular/unspecialized app process（USAP）路径上的 pid 回复解释成 child 已完成 specialize、Binder 已可回调或 `ActivityThread.main()` 已经执行。wrapper 的已核验 inner pid 具有不同边界，后文单列。
 
-## 1. 本章目标
+第 206 章停在 system_server 的启动账：`startSeq=410` 把 Zygote 结果和子进程 attach 关联到当前一代 `ProcessRecord`。本章进入 socket 另一端，追同一个 `P_B` 怎样从一组文本参数变成受限的 Linux 进程，并最终把控制权交给 `ActivityThread.main()`。
 
-上一章看到 ProcessList 把启动参数送入 Zygote，并接收 pid；本章进入 Zygote 内部，回答“一条 socket 命令怎样真的变成一个 App 主线程”。
+本章只追一个问题：**system_server 已经拿到 `P_B` 的 `pid=24680`，却迟迟没有看到 `attachApplication()`；这个 pid 在 regular 与 USAP 路径上分别最多证明什么，怎样倒推它此前通过的命令与 fork 边界，又怎样向前判断 child 尚在 FD 清理、specialize、RuntimeInit、Binder 启动、入口类解析，还是已经反射进入 `ActivityThread.main(seq=410)`？**
 
-读完应能解释：
+先给最重要的结论：普通无 wrapper 的 Zygote 在 `fork()` 后分成并发的父、子执行流。父进程的 pid 回复不是 child specialize 的回执；USAP 自己的程序顺序更明确，是先完成已有 pid 的 socket 写入，再开始本次 specialize，但客户端何时读到不在这条本地顺序内。只有逐层找到完成点，才能知道“pid 已知”这份证据能覆盖到哪里。
 
-- Zygote 怎样接收、解析并验证启动命令；
-- 为什么每次普通 fork 前要停止后台线程；
-- fork 后父子进程各走哪条分支；
-- UID/GID、mount、seccomp、SELinux 等 specialize 顺序为何不能随意交换；
-- RuntimeInit 怎样启动 Binder 线程池并最终调用 `ActivityThread.main()`；
-- USAP 的“先 fork、后 specialize”与普通路径有什么差异。
+## 1. 固定 P_B、pid 已回而 attach 缺失的唯一问题
 
-## 2. 一句话主线
+沿用第 206 章的普通应用进程，固定主线条件：
+
+| 维度 | 固定值或前提 |
+|---|---|
+| 包与进程 | `com.example.reader`，记作 `P_B` |
+| 用户与身份 | user 0，目标 UID/GID 均为 `10123` |
+| 兼容目标 | `targetSdkVersion=30` |
+| 启动代际 | 剩余参数带 `seq=410` |
+| 入口类 | `android.app.ActivityThread` |
+| Zygote | primary 64-bit 全局 Zygote，已经完成 preload |
+| 主路径 | regular fork，USAP pool 关闭，无 wrapper、native bridge 与 child-Zygote 标志 |
+| 示例 pid | `fork()` 在父分支返回 `24680`，子分支返回 `0` |
+| 观察现象 | system_server 已接收 `pid=24680`，尚未收到 child 的 Binder attach |
+
+固定条件不是说平台只有这一条路。后文还会并列两个反事实分支：
+
+- 同一目标满足 USAP 条件，系统从池中取出一个早已 fork、pid 恰为 `24680` 的未专门化进程；
+- 另一条命令携带 `--start-child-zygote`，入口是 `AppZygoteInit`，目标是建立新的受限孵化器，而不是直接建立最终 App。
+
+主线的 socket 参数末尾可抽象为：
 
 ```text
-Zygote监听socket
-  → 解析并验证system_server请求
-  → 暂停运行时后台线程
-  → native fork
-  → 父进程回pid并继续监听
-  → 子进程切UID/GID、mount、seccomp、SELinux
-  → RuntimeInit建立进程公共环境和Binder线程池
-  → 反射调用ActivityThread.main
+--runtime-args
+--setuid=10123
+--setgid=10123
+--target-sdk-version=30
+--nice-name=com.example.reader
+android.app.ActivityThread
+seq=410
 ```
 
-## 3. 总体父子分叉图
+这里只强调字段角色，不把表格当作实际完整 argv；真实请求还可能有 supplementary groups、mount 模式、runtime flags、`seInfo`、数据目录与包数据映射。`seq=410` 只是 `ActivityThread` 的入口参数，不参与 Zygote 的 UID 授权，也不证明请求者可信。
+
+为避免“启动成功”一词吞掉所有边界，本章定义九个完成点：
+
+| 点 | 已经成立 | 仍不能推出 |
+|---|---|---|
+| Q0 | 普通 spawn 参数已解析并通过 Java 请求策略 | 已经调用 `fork()` |
+| F0 | `ForkCommon()` 产生父、子两个执行流 | child 已完成 specialize |
+| S0 | child 完成 `SpecializeCommon()` 与其末段 child post-fork hook | Java Daemon 启动调用已发出或入口已找到 |
+| P0 | 固定普通 App 的无 wrapper regular 父进程或 USAP 进程完成 pid 的 socket 写入 | 请求端已经读到；regular child 已到 S0 |
+| D0 | ordinary child 执行完 `postForkCommon()`，Java Daemon 的启动调用已发出 | Binder pool 启动调用已发生 |
+| C0 | `RuntimeInit.commonInit()` 完成通用 Java 初始化 | B0 的 pool 启动调用已发生 |
+| B0 | `ProcessState::startThreadPool()` 已被调用 | `ActivityThread` 或 `IApplicationThread` 已创建 |
+| R0 | `findStaticMain()` 初始化入口类并返回 Runnable | `main()` 已被调用 |
+| M0 | 最外层 `caller.run()` 已反射进入 `ActivityThread.main()` | 主 Looper、attach 或首条消息已经完成 |
+
+九个点服务于“固定普通 App 最终进入 `ActivityThread.main()`”这条诊断链，却不是一条跨所有分支的全序：regular 的 F0 属于本次请求，USAP 的 F0 属于较早的补池；D0 专指 ordinary child，parent 自己的 `postForkCommon()` 不借用这个标号；wrapper 另有 pipe 完成边；child Zygote 又不经过普通 App 的 C0/B0/M0。后文会逐支映射，不能把表格从上到下直接画成一条线。
+
+本章交付 M0。`ActivityThread.main()` 内部怎样准备主 Looper、创建 `ActivityThread`、同步 attach，并与 Binder 回调和首批主线程消息排序，是第 208 章的问题。
+
+## 2. 八本账与 pid 的弱完成语义
+
+Zygote 启动链至少维护八种彼此不能替代的状态：
+
+| 账本 | 主要证据 | 回答的问题 |
+|---|---|---|
+| 命令账 | argc 行、argv 行、`ZygoteArguments`、`mRemainingArgs` | 请求被解释成了什么 |
+| 请求授权账 | `LocalSocket` peer pid/uid/gid、UID/wrapper/capability 检查 | 谁能要求什么身份与包装方式 |
+| fork 安全账 | Daemon 停止、单线程点、信号掩码、FD table | 模板是否处在可复制状态 |
+| 沙箱账 | mount、groups、gid、seccomp、scheduler、uid、capability、SELinux | child 怎样失去模板权限并取得目标约束 |
+| 父子分支账 | `fork()` 返回值、两侧清理、父侧 pid 回复 | 哪个进程正在推进哪条路径 |
+| Runtime 账 | `commonInit()`、target SDK、compat changes | Java 运行语义是否固定 |
+| Binder 启动账 | `nativeZygoteInit()`、`ProcessState::startThreadPool()` | pool 启动调用推进到哪里；不等于 worker ready |
+| Java 入口账 | start class、反射 `Method`、Runnable、`caller.run()` | 入口只是找到，还是已经调用 |
+
+`pid=24680` 在三种回包形态上的语义并不相同：
+
+| 回包形态 | pid 从哪里来 | 这份 pid 写回证据最多证明什么 |
+|---|---|---|
+| regular、无 wrapper | 本次 `fork()` 的父返回值 | Linux child 已产生，父侧 pid 写入已完成 |
+| wrapper 且 `usingWrapper=true` | 经 pipe 核验的后代 pid | direct child 已跨过 S0/D0 并进入 exec 分支；父侧接受了等于它或经 `/proc` 验证为其后代的 pid，但协议不认证写 pipe 的具体程序，也不硬证 inner B0 |
+| USAP | 池中既有未专门化进程的 pid | 一个池进程被分配给请求，随后才 specialize |
+
+因此在固定普通 App 的无 wrapper regular/USAP 场景中，system_server 已读到 pid 时可以倒推出 producer 侧 P0 已发生，却不能用读取时刻给 child 的并发进度设上界：
+
+```text
+pid已回复
+  ≠ child已完成SpecializeCommon
+  ≠ Java Daemon启动调用已发出
+  ≠ RuntimeInit.commonInit已完成
+  ≠ Binder pool启动调用已发生
+  ≠ ActivityThread类已初始化
+  ≠ ActivityThread.main已进入
+  ≠ attachApplication已发出
+```
+
+第 206 章还增加了一层约束：即使 system_server 收到 pid，也要用 `startSeq`、pending 表、pid 表和 Binder calling identity 收敛到正确一代。第 207 章解释请求怎样产生 pid，以及父侧回包之后 child 还能独立走到哪里；它不重复服务端账本的身份匹配。
+
+若从完整请求倒推，Q0 之前还在 framing/parser/policy，Q0 到 F0 是 regular 的 pre-fork 窗口；这两段用于解释 pid 怎样产生。固定现场已经观察到 P0，所以实际向前诊断从 child 自己的泳道开始：
+
+1. F0 到 S0：regular child 可能仍在 ForkCommon 清理或安全专门化；USAP 则从 P0 后才开始本次专门化；
+2. S0 到 D0：ART child hook 已完成，Java Daemon 的启动调用尚未发出；
+3. D0 到 C0：child 已离开 post-fork 恢复，尚在进入或执行通用 Java 初始化；
+4. C0 到 B0：通用 Java 环境已建立，Binder pool 启动调用尚未发生；
+5. B0 到 R0：Binder pool 启动调用已发生，入口参数解析、类加载或静态初始化仍可能失败；
+6. R0 到 M0：Runnable 已形成，仍要退出旧 Zygote 调用栈并执行 `caller.run()`。
+
+这些区间不能靠 pid 单点区分，需要结合日志、trace、墓碑、进程身份、线程与调用栈证据。
+
+## 3. 两种进程供给机制与三种 child 执行出口
+
+先把“供给机制”和“child 执行出口”两个维度画在同一张图里：
 
 ```mermaid
 flowchart TD
-  A["ZygoteServer.runSelectLoop"] --> B["ZygoteConnection.processOneCommand"]
-  B --> C["ZygoteArguments + peer凭据安全校验"]
-  C --> D["ZygoteHooks.preFork"]
-  D --> E["nativeForkAndSpecialize / fork"]
-  E -->|"父进程 pid>0"| F["handleParentProc"]
-  F --> G["回写pid + usingWrapper"]
-  G --> A
-  E -->|"子进程 pid=0"| H["SpecializeCommon"]
-  H --> I["handleChildProc"]
-  I --> J["ZygoteInit.zygoteInit"]
-  J --> K["RuntimeInit.applicationInit"]
-  K --> L["MethodAndArgsCaller"]
-  L --> M["ActivityThread.main"]
+    A[Zygote socket请求] --> B[framing / parse / peer policy]
+    B --> C{进程供给机制}
+    C -->|regular| D[preFork]
+    D --> E[本次 ForkCommon]
+    E -->|parent| F[postForkCommon / handleParentProc / pid reply]
+    E -->|child| G[SpecializeCommon末段含postForkChild]
+    G --> H[postForkCommon / handleChildProc]
+    C -->|USAP eligible| I[选择较早已 fork 的 USAP]
+    I --> J[本次先回已有 pid 并报告出池]
+    J --> K[nativeSpecializeAppProcess / postForkCommon]
+    K --> L[ordinary zygoteInit]
+    H --> X{child执行出口}
+    X -->|普通 App| L
+    X -->|wrapper| W[exec后由新app_process进入WrapperInit]
+    L --> M[commonInit]
+    M --> N[nativeZygoteInit 调用startThreadPool]
+    N --> O[applicationInit / findStaticMain]
+    O --> P[退出 server 调用栈 / caller.run]
+    P --> Q[ActivityThread.main]
+    X -->|start-child-zygote| R[childZygoteInit]
+    R --> S[直接 findStaticMain]
+    S --> T[AppZygoteInit.main]
+    T --> U[no-new-privs；enforcing时叠加UID/GID range seccomp的新ZygoteServer]
 ```
 
-## 4. Zygote 不是每次从零启动虚拟机
+这张图先按“怎样取得进程”分 regular/USAP，再按 regular child “取得后执行什么”分 ordinary、wrapper 与 child Zygote；两组概念不是同一层级。还要保留三条非对称性：
 
-Zygote 在开机时已启动 ART，预加载常用 framework 类、资源和 native library。App 子进程通过 fork 继承这些只读/尚未修改的页，随后才变成目标 UID 的应用进程。
+- 固定普通 App 的无 wrapper regular 请求会 fork；父、子在 F0 后并发，`P0` 与 `S0` 没有固定全序；
+- USAP 的 fork 发生在较早的 pool refill；USAP 线程本地是“P0 写完成 → S0”，客户端 read completion 却可能因调度落在 S0 前后任意位置；
+- child Zygote 不是普通 App 入口。它跳过 `commonInit()`、`nativeZygoteInit()` 与 `applicationInit()`，先运行孵化器 main，再建立新的受限 server。
 
-因此它同时解决启动复用和统一安全专门化，但共享页不是“父子永远共享所有 Java 对象”。写时复制后，父子各有自己的修改结果。
-
-## 5. Zygote main 的启动准备
-
-`ZygoteInit.main()`解析自身 ABI、socket 名、是否启动 system_server、是否 lazy preload；按配置预加载并执行一次 GC/finalization，再初始化 native Zygote 状态和 ZygoteServer。
-
-这属于 Zygote 自身生命周期，不是每个 App 启动都重复执行。
-
-## 6. socket 文件描述符来自 init
-
-ZygoteServer 调用 `createManagedSocketFromInitSocket()`，从 `ANDROID_SOCKET_<name>`环境变量取得 init 预先创建的 socket fd，再包装成 LocalServerSocket。
-
-也就是说，Java Zygote 接管的是 init 配置好的监听端点，不是在任意路径随意创建一个公网 socket。
-
-## 7. primary 与 secondary Zygote
-
-不同 ABI 配置可有 primary/secondary Zygote，各自声明支持的 abiList。ZygoteProcess 根据目标 ABI 选择连接哪个 socket。
-
-两个 Zygote 是不同进程/监听端，不能把一个 Zygote 内的对象或 Daemon 状态当成跨 ABI 全局单例。
-
-## 8. runSelectLoop 是父进程长期循环
-
-`ZygoteServer.runSelectLoop()`用 `Os.poll()`同时监听服务 socket、已接受的 session socket，以及启用 USAP 时的 event fd/报告 pipe。
-
-父 Zygote 正常情况下无限循环；只有 fork 出来的子进程会从循环提前返回一个 Runnable。
-
-## 9. 新连接与一条命令
-
-监听 fd 可读时先 `acceptCommandPeer(abiList)`产生 ZygoteConnection；session fd 可读时调用：
-
-```java
-Runnable command = connection.processOneCommand(this);
-```
-
-同一连接可承载命令，EOF 后父进程才移除并关闭它。
-
-## 10. socket framing 先读参数个数
-
-线协议核心为：
+普通主线更准确的偏序是：
 
 ```text
-第一行：argc
-随后argc行：每一项参数
+Q0 → preFork → F0
+               ├─ parent: postForkCommon → handleParentProc → P0 → 回select loop
+               └─ child : ForkCommon child cleanup
+                           → SpecializeCommon（末段postForkChild）→ S0
+                           → postForkCommon → D0
+                           → handleChildProc → zygoteInit
+                           → C0 → B0 → R0
+                           → 退出runSelectLoop与ZygoteInit.main的finally
+                           → caller.run → M0
 ```
 
-`readArgumentList()`拒绝非整数 argc、过大的参数数目和中途 EOF；客户端也拒绝参数中嵌入换行/回车，避免破坏逐行 framing。
+固定普通 App、无 wrapper 主线中，父分支的 `P0` 可能早于或晚于 child 的 S0。内核调度决定两侧何时运行；源码没有父进程等待 child 完成 specialize 的同步边。把流程写成“父回 pid，然后 child specialize”或“child specialize 完成，然后父回 pid”，都把偏序误画成了全序。
 
-## 11. ZygoteArguments 不是简单 split
+## 4. socket framing、参数分层与 peer 身份检查
 
-`new ZygoteArguments(args)`逐项识别 setuid/setgid/setgroups、runtime flags、targetSdk、seInfo、mount、ABI、nice name、package、数据隔离和剩余 RuntimeInit 参数。
+`ZygoteServer.runSelectLoop()` 用 `poll()` 同时等待 server socket、已经接受的 session socket，以及启用 USAP 后的 event/report FD。索引 0 是监听 socket；新连接会生成 `ZygoteConnection`，后续某个可读事件才执行一条 `processOneCommand()`。同一 session 可以连续发送多条命令，直到 EOF 或错误关闭连接。
 
-关键参数禁止重复，例如两次 setuid、seInfo 或 targetSdk 会抛异常，减少“前一个检查、后一个执行”的参数注入歧义。
+这是一个 Java 主线程上的同步服务循环，不是每个 session 配一条 fork worker。一次 `processOneCommand()` 或 wrapper pid 等待尚未返回时，同一 Zygote 不会同时从这个 loop 处理下一条普通命令；多个 fd 同时 ready 也不构成全局 FIFO 承诺。
 
-## 12. RemainingArgs 是下一阶段输入
+socket 由 init 创建并通过 `ANDROID_SOCKET_<name>` 文件描述符交给 Zygote。它是本地 UNIX domain socket；文件权限是第一层入口收缩，但不是解析器和运行时策略的替代品。
 
-Zygote 参数解析遇到 `--`或第一个非 Zygote option 后，把剩余部分保存为 `mRemainingArgs`。普通 App 典型语义为：
+一条请求采用逐行 framing：
 
 ```text
-android.app.ActivityThread
-seq=<startSeq>
+第一行：十进制 argc
+接下来：严格读取 argc 行参数
 ```
 
-第一项是 RuntimeInit 要找的 main 类，后续 `seq=`继续交给 ActivityThread。
+`readArgumentList()` 的边界很具体：首行 EOF 表示对端正常断开；argc 不是整数、超过 `MAX_ZYGOTE_ARGC`，或参数行中途 EOF 都是错误。它只建立字符串数组，不负责判断 UID、入口类或 wrapper 是否允许。
 
-## 13. socket 不只处理 fork 命令
+`new ZygoteArguments(args)` 再做第二层解释。解析器依次识别选项，遇到单独的 `--`，或第一项不被 Zygote option parser 识别的参数时停止；后者即使以 `--` 开头也会进入 `mRemainingArgs`。普通 Runtime 请求必须携带 `--runtime-args`；对 `P_B` 而言，余项是：
 
-`processOneCommand()`还可处理查询 ABI/PID、boot completed、lazy preload、USAP 开关、hidden API exemption/采样等控制命令。
+```text
+mRemainingArgs[0] = android.app.ActivityThread
+mRemainingArgs[1] = seq=410
+```
 
-这些分支处理完直接回响应，不进入 fork。看到 Zygote socket 流量不应一律计成新 App 进程。
+解析器会拒绝多种关键字段重复指定，例如 UID、GID、target SDK、`seInfo`、capabilities、supplementary groups、`invoke-with`、nice name 与 package name；但不能概括成“所有选项都只允许一次”。r48 中 runtime flags、mount external 等字段可能被后值覆盖，rlimit 还明确允许重复累积。语法成功只说明命令形状可解释。
 
-## 14. peer Credentials 是内核给出的身份
+`ZygoteConnection` 在接受 session 时保存 `LocalSocket.getPeerCredentials()` 的 pid/uid/gid。这份身份来自内核连接元数据，而不是 argv 自报。普通 spawn 继续按源码顺序执行：
 
-ZygoteConnection 构造时调用 `LocalSocket.getPeerCredentials()`，保存连接端 pid/uid/gid。后续安全策略以 peer 凭据为依据，而不是相信命令字符串自报“我是 system_server”。
+```text
+parse并先分流控制命令
+→ 拒绝客户端指定非零permitted/effective capabilities
+→ applyUidSecurityPolicy(peer credentials)
+→ applyInvokeWithSecurityPolicy(peer credentials)
+→ applyDebuggerSystemProperty
+→ applyInvokeWithSystemProperty
+→ 规划wrapper pipe与fork FD
+```
 
-这与上一章 attachApplication 使用 Binder callingUid 的思想相同：跨进程入口先取可信传输层身份。
+顺序本身就是安全语义：
 
-## 15. capability 参数不能由普通启动请求指定
+- system UID 在正常模式下不能显式要求 UID 小于 1000；没有显式 UID/GID 时才继承 peer 的值；
+- 非 root 的显式 `--invoke-with` 必须在请求原有 runtime flags 中已经可调试；它不能借助随后才叠加的全局 `ro.debuggable` 通过鉴权；
+- `wrap.<niceName>` 是之后由 Zygote 自己读取的受信系统属性来源，只在还没有显式 wrapper 时填入；
+- `seq=410` 不参与这些判断，它仍只是最终入口参数。
 
-普通 `processOneCommand()`若解析到 permitted/effective capabilities 非零，直接抛 ZygoteSecurityException。
+socket 上也不全是 fork 请求。ABI/PID 查询、boot-completed、preload、USAP 开关以及 hidden-API 配置可以在解析后直接回复或改变 server 状态。观察到 session 可读，只能说有一条命令；观察到 `processOneCommand()`，仍不能先验断言发生了 fork。
 
-App 能力由 native 端按目标身份计算和安全策略决定，不能让 socket 调用者随意要求 CAP_SYS_ADMIN 等高权限。
+“控制命令不直接 fork 目标 App”也不等于执行期间绝无 fork：USAP 状态或 hidden-API 状态变化可以清池并触发 refill，由此创建新的 USAP。另一个边界是 system_server：`ZygoteInit.forkSystemServer()` 在启动期直接构造参数并 fork，不经过普通 socket 的 `processOneCommand()`，所以它的 capability 来源不能套用这里“普通请求拒绝非零 capabilities”的结论。
 
-## 16. UID/GID 安全策略
+## 5. regular 的 preFork：把活跃模板压到可复制安全点
 
-`applyUidSecurityPolicy()`限制 SYSTEM_UID 在正常模式不能请求低于 system UID 的目标 UID；未显式给 uid/gid 时继承 peer uid/gid。
+Zygote 不是“永远没有线程”的空壳。它在进程启动期预加载 framework 类、资源与共享库，启动过运行时 Daemon；这些页让后续 child 借助 copy-on-write 复用内存。每个普通 spawn 的 `Zygote.forkAndSpecialize()` 仍必须先调用 `ZygoteHooks.preFork()`：
 
-它说明参数解析成功只是语法正确，仍必须结合发送者身份做语义授权。
+```text
+Daemons.stop()
+→ nativePreFork()
+→ 循环读取 /proc/self/task
+→ 只剩当前线程时返回
+```
 
-## 17. invoke-with 的安全门
+r48 的 `Daemons` 数组包含 HeapTask、ReferenceQueue、Finalizer 与 FinalizerWatchdog 四项。`stop()` 会要求各线程退出并 join，不是只发一个中断就继续。ART 的 `nativePreFork()` 又进入 `Runtime::PreZygoteFork()`，处理 JIT 线程、heap 与 native bridge 等 fork 前状态，并把当前 ART Thread 指针作为 token 带到 child hook。
 
-非 root peer 只有在目标 runtimeFlags 允许 JDWP/debuggable 时才可显式指定 wrapper；之后还可能从 `wrap.<niceName>`系统属性补出 invokeWith。
+最后一道 `/proc/self/task` 检查很重要：源码循环到 task 数量为 1，没有“等几秒后带着多线程强行 fork”的降级路径。`preFork()` 从这里返回时可以证明：**普通 fork 前，Zygote 已把 Java Daemon 停下，并在内核 task 视角收敛为单线程。** 它不证明所有 native 资源都天然 fork-safe；后续仍要专门处理锁、信号、allocator 与 FD。
 
-wrapper 会执行额外程序，改变 pid 返回和启动时间，必须比普通参数更严格。
+一次性 Zygote 启动准备与每次 fork 窗口必须分开：
 
-## 18. 全局 debuggable 属性也会修正参数
+| 阶段 | 代表动作 | 频率 |
+|---|---|---|
+| Zygote 生命周期准备 | `RuntimeInit.preForkInit()`、preload、GC/finalize、`initNativeState()` | 通常进程启动一次 |
+| 普通 App fork 窗口 | `ZygoteHooks.preFork()`、`nativeForkAndSpecialize()`、两侧 `postForkCommon()` | 每次 regular spawn |
+| USAP pool refill | 一次 `preFork()` 后连续 `forkUsap()` 若干次，父最后才 `postForkCommon()` | 每次补池批次 |
 
-`applyDebuggerSystemProperty()`在系统整体 debuggable 时给请求加 JDWP flag。
+因此“每个 App 都重新 preload framework”与“Zygote 从始至终只有一个线程”都不成立。预加载成果由 fork 继承；单线程只是受控窗口。
 
-最终 runtimeFlags 是 ProcessList 输入与 Zygote 本地系统政策共同作用的结果，不应只看 socket 原始文本。
+`postForkCommon()` 也不是 child 专属。它先让 ART 做 `PostZygoteFork`，再启动那四个 Java Daemon：
 
-## 19. wrapper pipe 的用途
+```text
+parent: preFork → fork → postForkCommon → 继续做Zygote server
+child : preFork → fork → SpecializeCommon内postForkChild → postForkCommon → 继续做App
+```
 
-存在 invokeWith 时，ZygoteConnection 先建 pipe。wrapper 最外层子进程可能再 exec/fork 出真正 App，后者通过 pipe 报告 inner pid。
+“调用并返回 `postForkCommon()`”最多证明 Daemon 启动调用已发出，不能推成每个 Daemon 已完成第一轮工作，更不能推成 Binder pool 启动调用已经发生。Binder 是稍后的另一条账。
 
-父 Zygote验证 inner pid 是直接 child 的后代后，才用它替换响应 pid，并返回 `usingWrapper=true`。
+## 6. ForkCommon：信号、FD、allocator 与 COW 的真实边界
 
-## 20. 为什么要显式管理 fd
+JNI `nativeForkAndSpecialize()` 在 fork 前按目标 UID/GID/groups 计算受控 capability 集，补齐需要 close/ignore 的 fd，然后调用 `ForkCommon(..., is_priority_fork=true)`。普通主线的 `true` 与 `isTopApp` 不是一回事：前者控制 fork child 的临时 native priority，后者稍后选择专门化的调度策略。
 
-fork 会复制调用进程的文件描述符表。若不处理，App 子进程可能继承 Zygote 服务 socket、其他 session socket、日志/统计 fd 或敏感文件，从而造成权限泄漏和生命周期引用泄漏。
+`ForkCommon()` 的关键顺序是：
 
-因此 fd 处理不是性能细节，而是进程隔离正确性的组成部分。
+```text
+安装Zygote信号处理
+→ block SIGCHLD
+→ 关闭Android log与stats socket
+→ 创建或restat open-FD table
+→ 保存fdsan级别
+→ mallopt(M_PURGE)
+→ fork
+```
 
-## 21. fdsToClose 包含哪些关键 socket
+block `SIGCHLD` 的直接原因很细：Zygote 的 child reaper 可能在 handler 中记日志，从而重新打开刚关闭的 logging fd，破坏 fork 前的 FD 一致性窗口。`M_PURGE` 尝试减少 allocator 元数据造成的 private dirty；调用出现在这里，不等于每一页都已回收或未来零 COW 成本。
 
-Java 层把当前命令 connection fd 与 Zygote 服务监听 fd 放入 `fdsToClose`；native 端还加入 USAP pipe/socket、system_server socket 等不应留给普通子进程的 fd。
+第一次 fork 建立 `FileDescriptorTable`，以后调用 `Restat()`。r48 不能被描述成“FD 集合从此绝不许变化”：消失的记录会删除，新 fd 经检查后可以加入，同一个编号换目标也会重建信息。真正的硬边界是受支持的 fd 类型、路径与 socket 规则；child 对 regular/character fd 按类型重开，socket detach 到 `/dev/null`，允许的单个 ART memfd 可原样保留，从而避免父子继续共享不合适的 open file description。
 
-关闭不是依赖 Java GC，而是在子进程降低权限前由 native 路径确定性完成。
+Java 为普通请求显式提供两组 fd：
 
-## 22. fdsToIgnore 不等于留给 App 使用
+| 集合 | `P_B` 主线中的成员 | native child 行为 |
+|---|---|---|
+| `fdsToClose` | 当前 session socket、Zygote listening socket | 用 `/dev/null` 通过 `dup3(..., O_CLOEXEC)` 替换原编号 |
+| `fdsToIgnore` | 无 wrapper 时为 null；wrapper 时是 pipe 两端 | 从 FD table 扫描/重开策略排除，后续仍按分支关闭或传递 |
 
-`fdsToIgnore`用于开放 fd 表一致性检查时忽略某些有意变化的描述符，例如 wrapper pipe；它与“子进程业务可合法使用”不是同一概念。
+JNI 还把 USAP report pipe、pool socket/event fd、system-server socket 等纳入相应计划。`fdsToIgnore` 只表示“不按普通 open-FD 基线处理”，绝不等于“允许业务 App 随意继承”。例如 wrapper child 只保留 write 端跨 exec 报告 inner pid，父进程关闭 write 端；两边都不会把 pipe 当作通用 App 能力。
 
-最终是否关闭、重开或保留还要结合 `fdsToClose`和 native FD table 处理。
+child 的 `ForkCommon()` 清理顺序大致是：
 
-## 23. fork 前第一步：停止运行时 Daemon
+1. 设临时优先级并执行 allocator 的 `PreApplicationInit()`；
+2. detach `fdsToClose`，清理复制来的 USAP table；
+3. 对其余 open fd 执行 `ReopenOrDetach()`；
+4. 恢复 fdsan，清空 child 中的 system-server socket 全局值；
+5. 解开 `SIGCHLD` 屏蔽并返回 0。
 
-Java 入口 `Zygote.forkAndSpecialize()`先调用：
+parent 不执行这些 child 清理；`pid != 0` 的分支会记录返回值，fork 失败的 `-1` 也落在这里，随后同样解除 `SIGCHLD` 屏蔽。child 此时仍暂时继承 Zygote 的 `SIGCHLD` handler，直到 `SpecializeCommon()` 后段才恢复默认处理；`SIGHUP` 则继续忽略。
+
+COW 的准确说法是：fork 时父子虚拟地址空间从同一物理页起步，某一侧写页后才产生私有副本。它不能保证“同一个 Java 对象永远共享”，也不能证明 preload 越多必然越省；预加载页的后续写入、重定位与 allocator 行为都会改变真实收益。
+
+## 7. SpecializeCommon：权限依赖决定顺序
+
+`ForkCommon()` 只复制出 child，尚未把它变成 UID 10123 的应用。`nativeForkAndSpecialize()` 只在 `pid==0` 的执行流调用 `SpecializeCommon()`；父 Zygote 永远不走这条降权路径。
+
+对固定场景，假定 SELinux enforcing、普通非 system-server、非 child Zygote。r48 的主顺序可压缩成五组：
+
+| 阶段 | 代表动作 | 为什么在这里 |
+|---|---|---|
+| 保留过渡能力 | `PR_SET_KEEPCAPS`、设 inheritable、drop capability bounding set | 为降 UID 后写入受控 current caps 留出过渡条件，同时封闭未来 exec 获得 bounding caps 的空间 |
+| 建资源视图 | mount emulated storage、可选 app-data/JIT profile 隔离、Android/data/obb bind、create process group | 需要 Zygote 身份或特权完成 namespace/cgroup 操作 |
+| 固定 POSIX 约束 | supplementary groups、rlimit、native bridge 预处理、`setresgid()` | 在失去 UID 特权前完成组与资源设置 |
+| 安装内核策略并降 UID | seccomp、scheduler/cpuset、`setresuid()` | seccomp 安装仍需要相应能力；saved UID 一并切到目标身份 |
+| 收尾安全域 | dumpable/debug/profile、内存策略、最终 caps、SELinux context、进程名、信号、post-fork hook | 将 remaining runtime/security 状态收敛为目标 child |
+
+把它展开成可核对的程序序列：
+
+```text
+EnableKeepCapabilities(targetUid != 0)
+→ SetInheritable(permitted)
+→ DropCapabilitiesBoundingSet()
+→ 判定native bridge
+→ MountEmulatedStorage及可选数据目录隔离/bind
+→ createProcessGroup（条件成立时）
+→ SetGids → SetRLimits
+→ PreInitializeNativeBridge（可选）
+→ setresgid
+→ SetUpSeccompFilter
+→ SetSchedulerPolicy / DropTaskProfilesResourceCaching
+→ setresuid
+→ dumpable / debugger / profileable / memory策略
+→ SetCapabilities(permitted, effective, permitted)
+→ 再关log/stats socket
+→ selinux_android_setcontext
+→ SetThreadName
+→ SIGCHLD恢复SIG_DFL
+→ child-Zygote或system-server专属收尾（若适用）
+→ Java postForkChild hook
+→ native priority恢复默认
+```
+
+这里有四个常见但危险的缩写：
+
+- `setresuid()` 是关键降权点，却不是完整 sandbox 完成点；最终 caps、SELinux domain 与运行时 hook 仍在后面；
+- `DropCapabilitiesBoundingSet()` 在 r48 遍历并 drop 可读的整个 bounding set，不是只删“本 App 不允许的若干项”；随后 `SetCapabilities()` 设置受控 current 集，二者并不矛盾；
+- seccomp 与 SELinux 是不同机制。r48 在 `gIsSecurityEnforced` 为 false 时跳过这处 seccomp 安装，不能把 permissive 分支也写成已经装载过滤器；
+- child 内的 `createProcessGroup(uid, pid)` 是 libprocessgroup/cgroup 操作，父分支稍后的 `setChildPgid()` 是 Unix process group 操作；名字相近，不是同一本账。
+
+不少关键 syscall 或 SELinux 转换失败会走 `ZygoteFailure`，通过 JNI fatal error 终止当前进程；但也有 best-effort 分支只记录错误，例如部分 process-group、命名、调试或优先级操作。不能把整段概括成“任一调用失败都继续”，也不能写成“任一调用失败都只杀 child”：若 native fatal error 发生在 fork 前，当前进程仍是父 Zygote，后果会更大。
+
+`SpecializeCommon()` 末段调用 Java `Zygote.callPostForkChildHooks()`，进入 ART 的 `postForkChild`：把 Runtime 标为 Zygote child，修复当前 Thread、heap、JIT、trace、native bridge 与 runtime flags，并重播 `Math` 随机种子。返回 Java 后，普通 `forkAndSpecialize()` 还会依据 groups 是否含 `INET_GID` 设置本进程网络允许状态，恢复 Java thread priority，然后执行 `postForkCommon()`。因此 S0、D0 是两个不同完成点。
+
+## 8. fork 返回值怎样拆开 parent reply 与 child 世界
+
+同一次 `fork()` 在两个地址空间返回不同值：parent 得到 `24680`，child 得到 0。之后双方只共享“fork 前内存快照的来源”，不共享 Java 对象状态，也不会通过 `mIsForkChild` 自动彼此同步。
+
+`Zygote.forkAndSpecialize()` 返回 Java 前，两边都恢复 Java priority 并执行 `postForkCommon()`；区别是 child 已先在 native 侧完成 `SpecializeCommon()` 与 `postForkChild`。回到 `processOneCommand()` 后才出现显式分叉：
+
+| 动作 | parent Zygote | `P_B` child |
+|---|---|---|
+| `pid` | `24680` | `0` |
+| `mIsForkChild` | 保持 false | 在自己的地址空间置 true |
+| server socket | 保持以继续服务 | 关闭 Java server 包装对象 |
+| session socket | 保留用于回包 | 在 `handleChildProc()` 中关闭 |
+| 后续方法 | `handleParentProc()` | `handleChildProc()` |
+| 命令返回值 | 始终 `null` | 普通分支返回入口 `Runnable` |
+
+无 wrapper 的 parent 先尝试把 direct child 放入 peer 所在 Unix process group，再写一个 int pid 与一个 boolean `usingWrapper=false`。fork 失败时 pid 为负，也由这套响应传回，客户端将其变成启动异常。
+
+有 wrapper 时，多了一条 pipe 协议：fork 前用 `pipe2(O_CLOEXEC)` 建 read/write 两端，清 child write 端的 close-on-exec；child 经 `WrapperInit.execApplication()` 执行配置的外部命令，常规 AOSP 链最终启动新的 `app_process` 并由 `WrapperInit.main()` 写回 inner pid；parent 最多等 30 秒，并沿 `/proc` 父链确认 inner pid 等于 direct child 或确是其后代，才用 inner pid 回包并置 `usingWrapper=true`。
+
+pipe 在 fork 前为空，而且 write 端只有 direct child 跨过 `SpecializeCommon()`、child `postForkCommon()` 与 `handleChildProc()` 并进入 exec 分支后才交给 wrapper 命令。因此 `usingWrapper=true` 至少硬证 direct child 已经过 S0/D0。常规 `WrapperInit` 链的 pipe 写入还发生在新 `app_process` 的 `RuntimeInit.main() → commonInit() → nativeFinishInit() → AppRuntime::onStarted() → startThreadPool()` 之后；不过 `invokeWith` 可以是外部命令，继承 write fd 的程序可能自行提前写一个后代 pid。父侧只验证数字和祖先链，不认证写者或 inner B0，所以不能把常规实现顺序升级成协议通则。
+
+这段等待发生在 Zygote 的单线程 `runSelectLoop()` 调用栈上，会占住该 server 的普通命令处理，并非后台异步检查。若超时、读取失败或后代关系不成立，parent 仍可回 direct child pid，但 `usingWrapper=false`。
+
+固定主线没有 wrapper，所以 P0 很简单：父侧已把 `24680,false` 写给 system_server。但 child 是否已经跨过 S0、D0、B0 或 M0，仍完全未知：
+
+```text
+parent: F0 → postForkCommon(parent) → setChildPgid → P0
+child : F0 → FD清理 → S0 → D0(child) → RuntimeInit → M0
+
+两行之间没有等待边。
+```
+
+这正是“pid 已回、attach 未到”可以正常短暂出现的根因之一，也是第 206 章必须容纳 attach-first 与 pid-first 竞争的底层来源。
+
+## 9. handleChildProc 的普通、wrapper 与 child-Zygote 分支
+
+child 先关闭从 Zygote 继承的 session Java 对象，必要时用 `Process.setArgV0()` 设置进程名，再结束 fork trace。随后有三个互斥出口：
+
+| 分支 | 行为 | 是否返回普通 App Runnable |
+|---|---|---|
+| wrapper | `WrapperInit.execApplication()` 替换进程镜像 | 正常不会返回 |
+| ordinary App | `ZygoteInit.zygoteInit(targetSdk, compat, remainingArgs, classLoader)` | 是 |
+| child Zygote | `ZygoteInit.childZygoteInit(...)` | 返回孵化器 main 的 Runnable |
+
+wrapper 外壳不走当前 child 的普通 `zygoteInit()`；新 `app_process` 稍后由 wrapper 的 RuntimeInit 路径调用 Binder pool 启动并进入目标入口。改变 Runtime 路线的是 `mInvokeWith` 分支；父侧响应中的 `usingWrapper` 只记录 inner pid 是否成功读出并通过后代检查。
+
+child Zygote 则故意走窄路径：
 
 ```java
-ZygoteHooks.preFork();
-```
-
-其实现停止 Java Daemons，调用 ART `nativePreFork()`取得 token，再等待 `/proc/self/task`只剩一个线程。
-
-## 24. 为什么多线程 fork 危险
-
-POSIX fork 后子进程只保留发起 fork 的线程，其他线程消失，但它们当时持有的用户态锁、allocator 状态或 runtime 状态会被复制。
-
-如果某把锁在 fork 瞬间由“消失的线程”持有，子进程可能永远无人解锁。因此 Zygote 要在可控的单线程点 fork。
-
-## 25. “Zygote 永远单线程”是错误说法
-
-Zygote 启动早期有禁止创建线程的窗口，预加载后会结束该限制；运行时 Daemon 也会存在。
-
-正确说法是：普通每次 fork 前 `preFork()`停 Daemon并等待 OS 线程退出，fork 后父子通过 post-fork hook 恢复各自需要的运行时服务。
-
-## 26. nativeForkAndSpecialize 的两段结构
-
-JNI 层先计算 capabilities，整理必须 close/ignore 的 fd，然后：
-
-```cpp
-pid_t pid = ForkCommon(...);
-if (pid == 0) {
-    SpecializeCommon(...);
+static final Runnable childZygoteInit(...) {
+    RuntimeInit.Arguments args = new RuntimeInit.Arguments(argv);
+    return RuntimeInit.findStaticMain(args.startClass, args.startArgs, classLoader);
 }
-return pid;
 ```
 
-`ForkCommon`负责安全 fork 现场；`SpecializeCommon`只在子进程把通用副本改造成目标身份。
+它不调用 `RuntimeInit.commonInit()`，不经 `nativeZygoteInit()` 启动普通 App Binder pool，也不通过 `applicationInit()` 固定 target SDK/compat 语义。入口 `AppZygoteInit.main()` 或 `WebViewZygoteInit.main()` 会继续解析 child socket 与 ABI，先设置 `PR_SET_NO_NEW_PRIVS`，再要求 range 的 start/end 都存在、start 不大于 end 且 start 不低于 `FIRST_APP_ZYGOTE_ISOLATED_UID`；`gIsSecurityEnforced` 为 true 时才安装限制该数值范围的 UID/GID seccomp 规则，随后运行新的 `ZygoteServer`。r48 没有在这里验证 range 上界必处于 isolated UID 区间。这是受限的新孵化器，不是 `P_B` 已 ready。
 
-## 27. ForkCommon 先处理信号
+USAP 的请求验证会拒绝 `--start-child-zygote` 和 wrapper 等不支持选项，因此不能把“USAP + child Zygote”拼成一条不存在的路径。
 
-它安装 SIGCHLD 处理并在 fork 周围临时 block SIGCHLD，防止 signal handler 写日志时重新打开本应检查/关闭的 fd；fork 后父子再 unblock。
+## 10. zygoteInit 的四阶段：从日志到入口 Runnable
 
-信号、日志 fd 和 fork 的顺序有关，不能把 signal mask 当作无关模板代码。
-
-## 28. open FD table 做什么
-
-第一次 fork 时创建当前开放 fd 的基线表，以后 fork 前 restat 检查是否发生非预期变化。子进程对剩余 fd 执行 reopen 或 detach，避免父子继续共享同一个 open file description 的状态。
-
-这是“白名单/基线 + 每次复核”的资源泄漏防线。
-
-## 29. fork 前清日志 fd 与 allocator 空闲页
-
-native 路径关闭 Android log/stats socket，再执行 `mallopt(M_PURGE)`回收未使用 native 内存，减少 allocator 元数据在子进程写时造成的 private dirty 页。
-
-前者服务 fd 一致性，后者服务 fork 后内存共享效率，目标不同。
-
-## 30. fork 的返回值决定世界分裂
-
-```text
-pid < 0：fork失败
-pid > 0：仍在父Zygote，值是child pid
-pid == 0：已经在子进程
-```
-
-同一行 `fork()`后父子从相同程序计数点继续，却拥有不同返回值和逐步分离的地址空间。
-
-## 31. 写时复制的准确含义
-
-父子初始页表可指向相同物理页，只读时共享；任一方写入页面会触发 copy-on-write，获得自己的私有副本。
-
-因此预加载越有共享价值，越应避免每个 App 启动后立刻改写大量继承对象；但“某个 Java 对象字段写一次就复制整个堆”也不准确，复制粒度由内存页等底层机制决定。
-
-## 32. child 的 ForkCommon 清理
-
-子进程先临时调高或调低 nice 以配合启动策略，执行 `PreApplicationInit()`标记 allocator 已成为 Zygote child；随后 detach 指定 fd、清 USAP table、重开或断开其余 fd，并恢复 fdsan error level。
-
-此时还没进入 ActivityThread，也未执行 Application 代码。
-
-## 33. parent 不执行 SpecializeCommon
-
-父 Zygote只记录“Forked child process”，解开 SIGCHLD，然后从 native 返回正 pid。它继续保持 Zygote 的 UID、SELinux domain、监听 socket和预加载内存。
-
-若父进程也执行 setuid 或切 SELinux，后续就无法安全孵化其他 App。
-
-## 34. specialize 为什么必须紧接 fork
-
-子进程刚复制自高权限 Zygote，拥有远超普通 App 的能力。它必须在运行 App main 和创建任意业务线程前完成 mount、groups、uid、seccomp、capabilities 与 SELinux 转换。
-
-这是一个“高权限、极短、顺序敏感”的收敛窗口。
-
-## 35. SpecializeCommon 先保留必要 capability
-
-当目标 uid 非 root 时先设置 keep capabilities，再设置 inheritable 和丢弃 capability bounding set。
-
-因为后面 `setresuid()`会改变权限；需要在降权前准备好最终能力集合，同时把不允许的能力从边界集中去掉。
-
-## 36. mount namespace 要在失去权限前建立
-
-`MountEmulatedStorage()`按 mount mode 建私有 mount namespace；需要时再隔离 App CE/DE 数据、JIT profile，并 bind mount Android/data/obb 可见目录。
-
-mount/unshare 要求特权，所以必须早于 setuid。它建立的是进程看到的文件系统视图，不是 Java Context 的目录映射。
-
-## 37. process group 也在 root 阶段创建
-
-普通 child 且 Zygote仍是 root 时，native 为 uid/pid 建 process group，用于后续 cgroup/accounting/整组回收。
-
-Framework 后面按 uid/pid 杀 process group，依赖启动阶段已有正确底层分组。
-
-## 38. supplementary groups 与 rlimit
-
-`SetGids()`设置附加组，`SetRLimits()`应用每个 `(resource, soft, hard)`元组。child Zygote 在未给 gids 时还会主动清掉父亲继承的 supplementary groups。
-
-组和资源上限都应在业务线程启动前固定，避免不同线程观察到不同安全阶段。
-
-## 39. native bridge 预初始化
-
-若目标 instructionSet 需要 native bridge，且 bridge 尚未初始化，会在降权和进入最终代码前准备 app data dir 与 bridge 环境。
-
-它服务跨 ISA native code，不等于普通 App 都经过模拟执行。
-
-## 40. 先 setgid，再安装 seccomp，再 setuid
-
-源码顺序为设置真实/有效/保存 GID，然后在仍拥有所需能力时安装目标 seccomp filter、设置调度策略，最后 `setresuid(uid, uid, uid)`。
-
-注释明确 seccomp 必须在失去 CAP_SYS_ADMIN 前完成；随意调换会造成过滤器无法安装或 SELinux 转换受损。
-
-## 41. seccomp 与 SELinux 不是一回事
-
-seccomp 限制允许的 syscall 集；SELinux 按 domain/type 和对象标签做强制访问控制。普通 App 同时受 UID/GID、capability、seccomp、SELinux 和 mount namespace 多层约束。
-
-任一层都不是其他层的简单替代品。
-
-## 42. 调度组要在降权前设置
-
-`SetSchedulerPolicy()`按 isTopApp 选择 top-app 或 default policy，并在失去写 cgroup/调度权限前设置。
-
-这只是初始启动提示；AMS 后续 OomAdjuster 仍会随组件状态更新 sched group 和 adj。
-
-## 43. setresuid 是关键降权点
-
-```cpp
-setresuid(uid, uid, uid)
-```
-
-把 real/effective/saved UID 都改为目标 UID，避免 App 之后借 saved UID 恢复 Zygote root 身份。
-
-降权之后的代码必须按普通 App 权限可执行来设计。
-
-## 44. dumpable 与调试标志
-
-UID/GID 改变可能重置进程 dumpable；native 根据平台环境、JDWP 和 profileable flag 再建立目标调试/采样行为，并控制 core dump。
-
-debuggable 是受启动策略约束的进程属性，不是 App 任意调用一个 API 就能获得的 root 调试能力。
-
-## 45. 内存调试策略也在这里消费
-
-SpecializeCommon 从 runtimeFlags 取 memory tagging level 与 GWP-ASan level，通过 allocator 控制接口设置，再清除已消费的 bit，避免把 native 专用位作为未知 ART flag继续传递。
-
-这说明同一个 runtimeFlags 可能由 native 和 ART 分层消费。
-
-## 46. 最终 capability 集
-
-完成 UID 切换后，代码写 permitted/effective/inheritable capability。普通应用通常不会因此获得广泛 root capability，特殊系统 UID/组按受控规则计算需要的位。
-
-capability 不是 Manifest permission 的同义词。
-
-## 47. SELinux domain 转换
-
-native 调用：
-
-```cpp
-selinux_android_setcontext(uid, isSystemServer,
-                           seInfo, niceName)
-```
-
-将子进程从 Zygote domain 切到目标 App domain。失败走 fatal error，不能在旧高权限 domain 下“凑合启动”。
-
-## 48. 进程和主线程名称
-
-niceName 存在时设置 native 主线程名称/日志默认 tag；Java child 路径稍后还调用 `Zygote.setAppProcessName()`设置 argv0 等可观测名称。
-
-`ps`中名字、Linux comm 和 packageName 相关但不必逐字符相同。
-
-## 49. child 信号与 ART post-fork hook
-
-SpecializeCommon 恢复子进程 SIGCHLD 默认处理，调用 `ZygoteHooks.postForkChild(runtimeFlags, ...)`让 ART 应用 child runtime flags、native bridge 等 post-fork 状态，并重新播种 Math random seed。
-
-父 Zygote 不执行 child 专用 hook。
-
-## 50. postForkCommon 父子都执行
-
-native 返回 Java 后，`forkAndSpecialize()`在父和子都把 Java thread priority 设为正常值，再调用：
+普通 child 在 D0 后进入 `ZygoteInit.zygoteInit()`。这个方法短，却串起四份不同职责：
 
 ```java
-ZygoteHooks.postForkCommon();
+RuntimeInit.redirectLogStreams();
+RuntimeInit.commonInit();
+ZygoteInit.nativeZygoteInit();
+return RuntimeInit.applicationInit(targetSdkVersion,
+        disabledCompatChanges, argv, classLoader);
 ```
 
-它通知 ART fork 已结束并启动 post-Zygote Daemons。父需要恢复服务下一次请求，子需要建立自己独立的运行时后台线程。
+四阶段的完成语义如下：
 
-## 51. 父分支怎样回应 system_server
+| 阶段 | 主要动作 | 完成后仍缺什么 |
+|---|---|---|
+| redirect | 关闭原 `System.out/err`，换成 Android log 输出流 | 通用 Java 环境、Binder、入口 |
+| common | 异常处理、时区、日志、HTTP user-agent、socket tagging 等 | Binder pool、target SDK、入口 |
+| native | 经 JNI 进入 `AppRuntime::onZygoteInit()`，调用 `startThreadPool()` | worker ready、`ActivityThread` 实例与主 Looper |
+| application | 固定退出/兼容语义，解析 start class，返回 Runnable | `main()` 尚未调用 |
 
-`processOneCommand()`看到 pid 非零，关闭 child pipe，调用 `handleParentProc()`：设置 child process group关系，必要时等待 wrapper inner pid，然后向 socket写 int pid 和 boolean usingWrapper。
+`redirectLogStreams()` 是进程级输出策略，不是把 Zygote 父进程的流全局改掉：它在 fork 后 child 自己的地址空间执行。
 
-之后父路径返回 null，runSelectLoop继续监听下一条命令。
+`zygoteInit()` 与 wrapper、child Zygote 不能混写。wrapper 会 exec 新进程镜像并从 `RuntimeInit.main()`/`nativeFinishInit()` 体系进入；child Zygote 直接找孵化器入口。相同的最终目标可能在某处都启动 Binder pool，但调用栈与完成点不同。
 
-## 52. fork 失败如何传播
+固定场景里若 tombstone/trace 表明 child 已进 `zygoteInit()` 却没有 B0，可以沿这四阶段向内缩小：日志重定向是否结束、`commonInit()` 是否卡住、JNI 是否进入 `onZygoteInit()`、还是 `applicationInit()` 找入口失败。pid 本身无法提供这种分辨率。
 
-pid 小于零也进入 parent handler，由响应把失败值送回 ZygoteProcess；客户端把负 pid 转成启动异常，ProcessList再执行第206章的 pending-start失败清理。
+## 11. commonInit 与 Binder pool 启动请求是两本账
 
-失败不会返回一个“半合法 ProcessRecord完成态”。
+`RuntimeInit.commonInit()` 建立普通 Java 进程共同需要的环境，包括默认 uncaught-exception 前后处理、时区 supplier、Android log handler、HTTP user-agent、network socket tagging，以及特定 emulator trace 开关。源码用 `initialized` 标记完成。这就是 C0，但它不创建 `ActivityThread`，也不启动主 Looper。
 
-## 53. child 为什么要关闭 ZygoteServer
-
-pid 为零时，child 设置 `mIsForkChild`，关闭 server socket和父端 wrapper pipe，再进入 `handleChildProc()`关闭当前 command LocalSocket包装对象。
-
-否则 App 继续持有监听 fd，会让 socket生命周期、权限边界和服务可用性都出错。
-
-## 54. runSelectLoop 返回 Runnable 的意义
-
-child 的 `processOneCommand()`返回主类 Runnable，runSelectLoop发现 `mIsForkChild`后立即 return；`ZygoteInit.main()`的 finally 关闭 server资源，最后才执行 `caller.run()`。
-
-这种 trampoline 先退掉 Zygote 命令处理栈，再进入 App main，异常栈和进程入口更干净。
-
-## 55. wrapper 分支不走普通 zygoteInit
-
-若 mInvokeWith 非空，child 调 `WrapperInit.execApplication()`执行 wrapper并传递 remaining args；正常情况下该方法不会返回。
-
-因此普通 `ZygoteInit.zygoteInit → RuntimeInit`顺序不能原样套在调试 wrapper 外壳上，真正 App 入口会在 exec 后的新映像/内层进程继续。
-
-## 56. 普通 child 进入 ZygoteInit.zygoteInit
-
-无 wrapper、非 child Zygote 时：
-
-```java
-return ZygoteInit.zygoteInit(
-        targetSdkVersion,
-        disabledCompatChanges,
-        remainingArgs,
-        null);
-```
-
-它返回的是最终 main Runnable，而不是在 handleChildProc 深层立即调用 ActivityThread.main。
-
-## 57. redirectLogStreams
-
-`zygoteInit()`先把 System.out/System.err 重定向到 Android log。App 后续标准输出不会继续沿用 Zygote 启动终端的传统 fd 语义。
-
-这发生在自定义 Application 和 Activity 之前。
-
-## 58. RuntimeInit.commonInit
-
-它安装未捕获异常预处理/默认处理器、Android 时区 supplier、java.util.logging 配置、默认 HTTP User-Agent、TrafficStats socket tagger，并按属性处理模拟器 trace。
-
-这是每个普通 App 子进程公共运行环境，不是 `Application.onCreate()`的工作。
-
-## 59. nativeZygoteInit 启动 Binder 线程池
-
-`ZygoteInit.nativeZygoteInit()`进入 `AndroidRuntime::onZygoteInit()`；app_process 的 AppRuntime 实现调用：
-
-```cpp
-ProcessState::self()->startThreadPool();
-```
-
-因此 App 能在 ActivityThread主 Looper启动前接收 Binder 调用。上一章的 ApplicationThread.attach 正依赖这个 Binder 基础设施。
-
-## 60. applicationInit 固定进程运行语义
-
-RuntimeInit 设置 `exitWithoutCleanup=true`，写入 VM targetSdk 和 disabled compat changes，再解析 remaining args。
-
-Android App 调 `System.exit()`不走传统完整 shutdown hook清理；Binder和其他线程环境不适合按普通桌面 Java 程序优雅关闭模型处理。
-
-## 61. findStaticMain 做什么
-
-它用 `Class.forName(className, true, classLoader)`加载并初始化入口类，反射查找 public static `main(String[])`，最后返回 `MethodAndArgsCaller`。
-
-对普通 App，className 就是 `android.app.ActivityThread`；`seq=N`成为其 main 参数。
-
-## 62. 入口类初始化与 main 调用是两个点
-
-`Class.forName(..., true, ...)`已触发 ActivityThread 类初始化；真正 `main()`直到外层执行 `caller.run()`才由反射调用。
-
-“找到 main 方法”和“main 已经运行”仍是两个完成边界。
-
-## 63. ActivityThread.main 接回第206章
-
-Runnable 最终调用 ActivityThread.main，它准备主 Looper、解析 `seq=`、创建 ActivityThread，并通过 `attachApplication(mAppThread, startSeq)`向 AMS 主动报到，然后进入 `Looper.loop()`。
-
-至此 Zygote 数据面与 AMS 启动账本闭环。
-
-## 64. Binder线程与主线程谁先存在
-
-nativeZygoteInit 已启动 Binder线程池；ActivityThread.main 随后在 fork 保留下来的当前线程上准备 main Looper。
-
-所以 App 进程既有 Binder入站线程，也有组件主线程；`bindApplication()`先在前者收到，再用 Handler切后者，正是第205章的线程模型。
-
-## 65. USAP 的核心不同点
-
-USAP pool refill 时，ZygoteServer 调一次 `ZygoteHooks.preFork()`，在单线程窗口连续 `forkUsap()`补足池，再由父 Zygote `postForkCommon()`恢复 Daemon。
-
-池中 child 先进入 `usapMain()`等待目标请求，此时还没有具体 App UID、seInfo 或 ActivityThread。
-
-## 66. USAP 收到请求后不再 fork
-
-USAP accept 专用 socket，解析并 `validateUsapCommand()`，取得 peer credentials，向 system_server回自己的既有 pid并报告池状态，然后调用 `specializeAppProcess()`。
-
-该方法只走 `nativeSpecializeAppProcess → SpecializeCommon`，不调用 `fork()`；最后同样进入 `ZygoteInit.zygoteInit()`。
-
-## 67. USAP 为什么仍然安全校验
-
-“进程已经预建”不代表任何调用者都可决定它变成谁。USAP仍按 peer应用 UID policy、调试属性，并限制不支持的命令/wrapper能力；specialize期间阻塞 SIGTERM，避免池清空与身份转换竞态。
-
-安全边界没有因优化而删除，只是 fork 时间提前。
-
-## 68. USAP pid 的完成语义
-
-USAP 回 pid 时进程已存在，但 specialize 和 RuntimeInit可能仍在继续；普通路径回 pid 时 child同样可能尚未 attach。
-
-两者都只能证明“目标启动已获得一个 pid”，不能证明 `ActivityThread.attach`、bindApplication或首帧完成。
-
-## 69. child Zygote 是另一种入口
-
-若 `--start-child-zygote`，参数必须包含 child socket name；child 分支调用 `childZygoteInit()`，刻意跳过普通 `nativeZygoteInit()`启动 Binder thread pool的路径，进入新的 Zygote main。
-
-App Zygote/WebView Zygote 是孵化者，不应当按普通最终 App 进程理解。
-
-## 70. 五层安全收敛
+下一句 `ZygoteInit.nativeZygoteInit()` 才沿 native 虚方法到：
 
 ```text
-socket peer UID/GID授权
-  → 参数语法与重复项检查
-  → fork fd/信号/线程安全
-  → UID/GID/capability/seccomp/mount/SELinux specialize
-  → App attach时Binder callingUid/pid/startSeq再校验
+ZygoteInit.nativeZygoteInit
+→ AndroidRuntime::onZygoteInit
+→ AppRuntime::onZygoteInit
+→ ProcessState::self()
+→ ProcessState::startThreadPool()
 ```
 
-Android 不把进程安全寄托在单一检查点。
+B0 的准确表述只是：Binder `ProcessState.startThreadPool()` 已被调用，并执行到设置 started flag、请求 `spawnPooledThread(true)`。r48 不等待 worker 进入 `joinThreadPool()`，`spawnPooledThread()` 对底层 `run()` 的 status 也不向上转成失败；所以 B0 不是“已有可工作的 Binder 线程”完成点，更不证明 system_server 已拥有一个可调用的 `IApplicationThread`。此时 `ActivityThread` 对象尚未在 `main()` 中 `new`；`mAppThread` 会随该实例创建，随后 `attach()` 才把这个既有对象通过 `ActivityManager.getService().attachApplication(mAppThread, seq)` 传给 AMS。
 
-## 71. 常见误解一：fork 后才加载全部 framework
+线程账要分成至少三类：
 
-大量 framework 类和资源已由 Zygote预加载并通过 COW共享；child仍需加载应用自身类、按需类和私有资源。
+| 线程/机制 | 启动位置 | 对 M0 的关系 |
+|---|---|---|
+| ART Java Daemon | `postForkCommon()` | 早于 `zygoteInit()` |
+| Binder pool 启动请求 | `nativeZygoteInit()` | 调用顺序早于 `applicationInit()` 与 M0 |
+| 主线程 Looper | `ActivityThread.main()` 内 | M0 之后，由第 208 章展开 |
 
-“完全不加载”和“全部重新加载”都不准确。
+所以固定普通路径的硬顺序是“Binder pool 启动请求早于主 Looper 准备”，不是“某条 Binder worker 必已先运行”。要让 AMS 随后发送 `bindApplication()`，还需要 `new ActivityThread()` 先带出 `mAppThread`，再由 `ActivityThread.attach()` 把这个既有 Binder 对象发布给 AMS。底层启动请求与上层 Binder 对象已发布，是两份证据。
 
-## 72. 常见误解二：specialize 只是 setuid
+这一先后对下一章很关键：child 在主线程建 Looper 前已经发出 Binder pool 启动请求，但 worker 是否已经运行、真正的反向回调何时可用还受线程创建和 attach 发布时机控制；回调最终怎样排入 `H` 的 MessageQueue，不能仅凭 B0 推断。
 
-实际还包括 mount namespace、App数据/JIT profile隔离、groups、rlimit、process group、native bridge、seccomp、scheduler、dumpable、allocator安全模式、capability、SELinux和ART hook。
+## 12. applicationInit 固定运行语义并解析入口
 
-setuid只是多层沙箱中的一个关键步骤。
+`RuntimeInit.applicationInit()` 先把“退出”定义成应用进程语义：调用 `nativeSetExitWithoutCleanup(true)`，让 `System.exit()` 直接终止，不运行可能关闭 Binder driver、干扰仍在运行线程的通用 shutdown hooks。接着把 `targetSdkVersion=30` 与 disabled compat changes 写进 `VMRuntime`。
 
-## 73. 常见误解三：Zygote 父进程也进入 App main
+这些值源自 Zygote 已通过的参数，但作用是在 child 中固定后续 runtime 行为。它们不是解析阶段的身份认证，也不能被 `seq=410` 替代。
 
-父进程从 `processOneCommand()`得到 null并继续 select loop；只有 child拿到非空 Runnable并执行入口类。
-
-同一 Java源码在 fork 返回值处分流，不能只看调用栈文本就忽略当前 pid 所在分支。
-
-## 74. 启动性能怎样分段
-
-- socket排队/解析：ZygoteServer与command connection；
-- preFork：Daemon停止、ART线程收敛；
-- ForkCommon：fd检查、malloc purge、fork；
-- SpecializeCommon：mount、身份、安全策略；
-- RuntimeInit：公共Java环境、Binder pool、类入口；
-- ActivityThread后：attach、bindApplication和组件启动。
-
-USAP主要提前消化 preFork/fork部分，不能消除所有后续成本。
-
-## 75. 异常边界
-
-父 Zygote的 pre-fork命令异常会记录并关闭该 session socket，继续服务其他连接；child在 post-fork、进入 main 前异常会记录后抛出，让该子进程退出。
-
-区分父/子异常非常重要：不能因为一个 App specialize失败就让父 Zygote带着错误身份继续运行。
-
-## 76. Mac 只读练习一：画父子分支
-
-```bash
-sed -n '110,290p' \
-  frameworks/base/core/java/com/android/internal/os/ZygoteConnection.java
-```
-
-在 `pid == 0`处画竖线：左边列 child关闭哪些资源、返回什么；右边列 parent回写什么、为何返回 null。
-
-## 77. Mac 只读练习二：核对 specialize 顺序
-
-```bash
-sed -n '1603,1815p' \
-  frameworks/base/core/jni/com_android_internal_os_Zygote.cpp
-```
-
-把 mount、setgroups、setgid、seccomp、scheduler、setuid、capability、SELinux、postForkChild 按源码排序，并为每个“必须在降权前”的步骤写原因。
-
-## 78. Mac 只读练习三：追到 ActivityThread.main
-
-```bash
-sed -n '985,1020p' \
-  frameworks/base/core/java/com/android/internal/os/ZygoteInit.java
-
-sed -n '390,430p' \
-  frameworks/base/core/java/com/android/internal/os/RuntimeInit.java
-
-sed -n '345,385p' \
-  frameworks/base/core/java/com/android/internal/os/RuntimeInit.java
-```
-
-依次找到 commonInit、nativeZygoteInit、applicationInit、findStaticMain和MethodAndArgsCaller，再接第206章 ActivityThread.main解析seq。
-
-## 79. 自测题
-
-1. 为什么普通 Zygote fork 前必须让线程收敛？
-2. fdsToClose 与 fdsToIgnore 有什么区别？
-3. `forkAndSpecialize()`中哪些逻辑只在 child执行？
-4. 为什么 mount、seccomp和scheduler设置要早于 setuid？
-5. `postForkChild`与`postForkCommon`分别在哪些进程执行？
-6. Binder线程池在哪个源码入口启动？
-7. USAP收到目标请求时为什么不再 fork？
-8. Zygote返回 pid为什么仍不等于 Application已创建？
-
-## 80. 本章结论
-
-Zygote 把一个经过预加载的高权限模板进程安全地转化成普通 App：socket协议先用 peer凭据和参数规则控制请求，preFork建立单线程安全点，ForkCommon管理信号、fd与COW现场，SpecializeCommon按严格顺序完成 mount、身份、seccomp、capability和SELinux降权，RuntimeInit再安装进程公共Java环境、Binder线程池并反射进入 ActivityThread.main。
-
-普通路径和 USAP 最终汇合在同一思想上：
+`RuntimeInit.Arguments` 在 `mRemainingArgs` 上再做一次更窄的切分：遇到单独的 `--` 就越过分隔符，否则无条件跳过所有以 `--` 开头的前导字符串，取第一个不以 `--` 开头的参数作为 `startClass`，其后所有项复制为 `startArgs`。它并不识别或校验这些前导字符串各自的含义。固定场景得到：
 
 ```text
-模板进程只负责提供可复用起点；
-每个child必须在执行应用代码前完成不可跳过的安全专门化；
-父Zygote与App child从fork返回起就是两个独立状态机；
-拿到pid只是启动中间态，不是应用就绪或首帧完成。
+startClass = android.app.ActivityThread
+startArgs  = ["seq=410"]
 ```
 
-下一章进入 `ActivityThread.main()`和主 Looper 建立过程，解释主线程为什么既能同步 attach AMS，又能在 Binder线程提前接收请求，以及 Handler消息怎样决定首批进程初始化顺序。
+这解释了三层参数边界：
+
+| 层 | 消费者 | 典型字段 |
+|---|---|---|
+| wire frame | `readArgumentList()` | argc 与完整字符串数组 |
+| spawn 参数 | `ZygoteArguments` | UID/GID、runtime flags、mount、`seInfo`、wrapper |
+| Java 入口参数 | `RuntimeInit.Arguments` | start class 与 `seq=410` |
+
+第二层还负责切出 remaining args；第三层不会重新验证 UID，也不会理解 `startSeq` 的 AMS 代际语义，只把字符串交给 `ActivityThread.main()`。
+
+完成参数拆分后，`applicationInit()` 结束 ZygoteInit trace 并调用 `findStaticMain()`。如果没有入口类参数，它会在 child 中抛出异常；这时已经有 pid，甚至 B0 已经成立，但 M0 永远不会到达。这正说明“Binder pool 启动调用已发生”仍不是“应用入口健康”。
+
+## 13. findStaticMain：类初始化先于 main 调用
+
+`findStaticMain()` 做的不是只保存一个类名。它依次：
+
+1. `Class.forName(className, true, classLoader)` 加载并初始化入口类；
+2. 用 `getMethod("main", String[].class)` 找方法；
+3. 检查方法同时是 `public` 与 `static`；
+4. 构造保存 `Method` 和 argv 的 `MethodAndArgsCaller`。
+
+第二个参数 `true` 意味着 R0 已经跨过入口类静态初始化。于是有三个必须分开的点：
+
+```text
+class找到并初始化
+→ public static main签名通过
+→ Runnable构造且findStaticMain返回     = R0
+→ Runnable沿Zygote栈返回并退出旧服务栈
+→ MethodAndArgsCaller.run执行invoke
+→ ActivityThread.main(["seq=410"])    = M0
+```
+
+类不存在、找不到符合签名的 main、访问检查失败或类初始化异常，都发生在 M0 之前。`InvocationTargetException` 则说明反射调用已经开始；`MethodAndArgsCaller.run()` 会取出 cause，若它是 `RuntimeException` 或 `Error` 就按原类型继续抛出。
+
+对 `ActivityThread` 而言，类初始化不是 `Application.onCreate()`，也不是应用组件加载。入口 `main()` 接下来才会处理 `seq=410`、建立主线程对象和 Looper、调用 attach。本文到 M0 立即停止，不把第 208 章的主消息队列时序提前算作本章完成。
+
+## 14. Runnable 怎样退完 Zygote 栈再交出 M0
+
+ordinary child 的 `handleChildProc()` 得到 `RuntimeInit.MethodAndArgsCaller` 后，控制权不是就地调用 `ActivityThread.main()`，而是沿旧服务栈逐层返回：
+
+```text
+findStaticMain返回Runnable                         = R0
+→ handleChildProc返回Runnable
+→ processOneCommand返回Runnable
+→ runSelectLoop看到本进程mIsForkChild=true并返回
+→ ZygoteInit.main的finally关闭server socket
+→ caller.run执行反射调用
+→ ActivityThread.main(String[])开始               = M0
+```
+
+这个 trampoline 的价值，是让入口 `main()` 不背着 `runSelectLoop()`、`processOneCommand()` 与 session 处理栈运行。parent 那份 `mIsForkChild` 永远是 false，它要求 `processOneCommand()` 返回 null 并继续 poll；只有 child 自己那份状态触发退栈。
+
+“退栈后才进入 main”不等于“退栈前没有做 App runtime 工作”。R0 前已经依次完成日志重定向、C0、B0 调用、应用运行语义设置、入口类初始化与 main 签名检查。若入口类静态初始化失败，根本拿不到 Runnable；若 `main()` 内抛错，则已经位于旧 Zygote loop 的 child catch 之外，不能归类成 `processOneCommand()` 的“fork 后命令异常”。
+
+`runSelectLoop()` 的 Java catch 以当前地址空间里的 `mIsForkChild` 为分界，不以 `fork()` 那一行自动分界：flag 为 false 时，它记录错误并关闭本副本的当前 session；在真实 parent 中，哪怕错误发生在 fork 后的 `handleParentProc()`，server 仍可继续。child 要到 `processOneCommand()` 从 `forkAndSpecialize()` 返回、调用 `setForkChild()` 后才把 flag 置 true；此后、返回 Runnable 前的异常会重抛。fork 后但 flag 尚未置位的极窄 child Java 窗口会落入前一种 catch 分类，却只修改 child 自己的地址空间，不能反向伤到已经独立的 parent。native fatal error、Zygote 进程级信号或 `caller.run()` 之后的入口异常，又不受这套 Java catch 概括。
+
+当现场是“pid 已回，attach 缺失”，可以用完成点避免错误归因：
+
+| 最后证据 | 合理调查方向 | 仍不该声称 |
+|---|---|---|
+| 只有 P0 | child 调度、fork 清理、specialize fatal、USAP 尚未 specialize | Zygote 已成功交付 Java 入口 |
+| 有 S0 | `postForkCommon()` 与 Java Daemon 启动调用 | D0 或 B0 已成立 |
+| 有 D0 | `zygoteInit()` 入口及 `commonInit()` 前后异常 | C0 或 B0 已成立 |
+| 有 C0 | `nativeZygoteInit()` 与 Binder 初始化 | B0 已成立 |
+| 有 B0 | `applicationInit()` 参数、入口类加载/初始化 | `ActivityThread.main()` 已执行 |
+| 有 R0 | trampoline 退栈或 `caller.run()` 附近 | attach 已发出 |
+| 有 M0 | 转入第 208 章检查 main 内顺序 | 主 Looper 或 attach 已完成 |
+
+## 15. USAP、child Zygote、异常与章节边界
+
+USAP 用“提前 fork、延后 specialize”换取请求时延。pool refill 的 parent 只调用一次 `preFork()`，可以连续建立多个 unspecialized app process；父 Zygote 补完整批次后才 `postForkCommon()`。USAP child 创建时不执行 `postForkChild()` 或 `postForkCommon()`，保持未专门化的单线程状态进入 `usapMain()` 等待请求。
+
+当 `P_B` 请求真正到来，USAP child：
+
+```text
+accept session
+→ block SIGTERM
+→ 取得peer credentials
+→ framing / ZygoteArguments / validateUsapCommand
+→ UID policy / debugger property
+→ 把已有pid=24680写给system_server并关闭session
+→ 关闭USAP pool socket
+→ 通过report pipe告诉Zygote自己已出池
+→ 关闭report write端
+→ nativeSpecializeAppProcess
+→ SpecializeCommon（末段postForkChild）→ S0
+→ postForkCommon
+→ zygoteInit → C0 → B0 → R0
+→ usapMain finally解除SIGTERM屏蔽
+→ 从fillUsapPool/runSelectLoop与外层finally退栈
+→ caller.run → M0
+```
+
+这条路径在 USAP 自己的线程上给出严格的“P0 socket write 完成 → S0”。socket write 不等待 system_server 的 `readInt()`，所以客户端真正读到 pid 时，USAP 可能尚未到 S0，也可能早已越过 S0 甚至 M0；这份 pid 证据本身不能区分。请求发生时没有新的 fork。固定普通 App 的无 wrapper regular 路径则只有同一次 F0，producer P0 与 child S0 无全序。两条路径最终都汇入 ordinary `zygoteInit()`，但前半段的性能点和失败边界不能共用一条直线。
+
+USAP 的 validator 拒绝 ABI/PID query、preload、hidden-API 调整、child-Zygote、wrapper 与 caller 指定的非零 permitted/effective capabilities 等不兼容选项；显式的 `--capabilities=0` 本身不会触发这项非零检查。它仍取得 peer credentials 并应用 UID policy；“提前有 pid”没有绕开目标身份检查。
+
+child Zygote 走的是另一种复用：先由普通 fork/specialize 建一个 `isZygote=true` 的受限进程，再经 `childZygoteInit()` 直接进入 App/WebView 孵化器 main。它自己的 `runZygoteServer()` 在解析 socket/ABI 后先启用 no-new-privs，再校验 range 参数存在、次序与 start 下界；仅在 security enforcing 时安装范围受限的 seccomp，然后接受后续 child。r48 不在这里验证 isolated range 上界。这个中间孵化器不具备普通 App 的 B0；它以后生成的最终 App child 才走完整 `zygoteInit()`。
+
+最后把失败与性能边界收成一张表：
+
+| 位置 | 典型结果 | 影响范围 |
+|---|---|---|
+| parent Java 命令处理且 child flag 为 false | 当前 session 关闭，select loop 通常继续；可发生在 fork 前，也可发生在 parent 的 fork 后回包 | 单次请求 |
+| native fatal、fork 前 | 当前仍是 Zygote，自身可能终止并由 init 重启 | 整个该 Zygote 服务窗口 |
+| fork 后 child 专门化/RuntimeInit | child 终止，parent 已独立继续 | 本次 child |
+| wrapper inner-pid 等待 | 最多占住单线程 server 约 30 秒 | 同一 Zygote 的其他命令延迟 |
+| USAP pool miss/refill | 退回 regular 或触发补池策略，依条件而定 | 启动时延与池容量 |
+| `caller.run()` 后入口异常 | 已离开旧 server catch，按 App 入口异常处理 | 本次进程 |
+
+第 206、207、208 章的交界由证据而不是文件名决定：
+
+```text
+第206章：system_server建启动账、发送命令、接pid/startSeq并等待attach
+第207章：Zygote接命令、fork/specialize、RuntimeInit，交付M0
+第208章：ActivityThread.main内部的Looper、attach、Binder回调与首批消息
+```
+
+回到唯一问题：system_server 只有 `pid=24680` 这份证据时，只能倒推出 producer 的 P0；child 可能仍在此前分出的 specialize 路径，也可能已经跨过 M0，pid 本身不给上界。只有另有 B0 证据，才能说 Binder pool 启动调用已发生；看到 R0 才能说入口类已初始化且 Runnable 已形成，看到 M0 才能把调查交给 `ActivityThread.main()`。没有 attach 并不自动说明 system_server 串账；它也可能是 child 尚未跨过本章某个中间完成点。
+
+## 16. 九组只读练习：重建供给与入口链
+
+下面的命令都只读取源码。默认在 Android 源码根目录运行；若当前目录不是源码根，可先把 `ANDROID_BUILD_TOP` 指向 `android-11.0.0_r48` 根目录。行号只用于当前快照定位，结论必须由方法和调用关系支撑。
+
+### 练习 1：划开 Zygote 一次性准备与长期 server
+
+```bash
+set -euo pipefail
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+F="$SRC/frameworks/base/core/java/com/android/internal/os/ZygoteInit.java"
+S="$SRC/frameworks/base/core/java/com/android/internal/os/ZygoteServer.java"
+test -f "$F" && test -f "$S"
+rg -n 'startZygoteNoThreadCreation|preload\(|gcAndFinalize|initNativeState|stopZygoteNoThreadCreation|forkSystemServer|runSelectLoop|caller\.run' "$F"
+rg -n 'runSelectLoop|mIsForkChild|processOneCommand|return command' "$S"
+```
+
+按源码排列 `ZygoteInit.main()` 的启动步骤，并回答：
+
+1. preload 为什么不是 `P_B` 的每次启动成本？
+2. `startZygoteNoThreadCreation()` 覆盖的窗口与每次 `ZygoteHooks.preFork()` 有何不同？
+3. 为什么父 Zygote 的 `runSelectLoop()` 正常情况下不返回，而 ordinary child 会带 Runnable 返回？
+
+完成标准：能把“Zygote 模板准备”“每次 regular fork”“最终入口调用”画成三个不重叠区段。
+
+### 练习 2：从 frame、parser 追到请求授权
+
+```bash
+set -euo pipefail
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+Z="$SRC/frameworks/base/core/java/com/android/internal/os/Zygote.java"
+C="$SRC/frameworks/base/core/java/com/android/internal/os/ZygoteConnection.java"
+A="$SRC/frameworks/base/core/java/com/android/internal/os/ZygoteArguments.java"
+test -f "$Z" && test -f "$C" && test -f "$A"
+rg -n 'readArgumentList|MAX_ZYGOTE_ARGC|Truncated request|applyUidSecurityPolicy|applyInvokeWithSecurityPolicy|applyDebuggerSystemProperty|applyInvokeWithSystemProperty' "$Z" "$C"
+rg -n 'mRemainingArgs|--runtime-args|Unexpected argument|Duplicate arg specified|--rlimit=' "$A"
+```
+
+把结果整理为四层：wire 完整性、Zygote option 语法、kernel peer identity、spawn policy。再解释：
+
+- 为什么 `mRemainingArgs=[ActivityThread, seq=410]` 不能证明入口类存在？
+- 为什么非 root 的显式 wrapper 不能只靠全局 debuggable 属性通过检查？
+- 哪些字段拒绝重复，哪些允许累计或以后值为准？
+
+完成标准：不再用“参数解析成功”代替“请求获得授权”。
+
+### 练习 3：证明 fork 前单线程与两类 post hook
+
+```bash
+set -euo pipefail
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+H="$SRC/libcore/dalvik/src/main/java/dalvik/system/ZygoteHooks.java"
+D="$SRC/libcore/libart/src/main/java/java/lang/Daemons.java"
+N="$SRC/art/runtime/native/dalvik_system_ZygoteHooks.cc"
+test -f "$H" && test -f "$D" && test -f "$N"
+rg -n 'preFork\(|Daemons\.stop|waitUntilAllThreadsStopped|/proc/self/task|postForkChild|postForkCommon|startPostZygoteFork' "$H" "$D"
+rg -n 'ZygoteHooks_nativePreFork|ZygoteHooks_nativePostForkChild|ZygoteHooks_nativePostZygoteFork|PreZygoteFork|PostZygoteFork' "$N"
+```
+
+画 parent/child hook 表：谁调用 `postForkChild()`，谁调用 `postForkCommon()`，哪个动作恢复四个 Java Daemon。说明 `/proc/self/task` 数量为 1 能证明什么，又不能证明什么。
+
+完成标准：把 D0 与 B0 分开；`postForkCommon()` 不能被标成 Binder-ready。
+
+### 练习 4：给每个 FD 标注 detach、ignore 或 reopen
+
+```bash
+set -euo pipefail
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+C="$SRC/frameworks/base/core/java/com/android/internal/os/ZygoteConnection.java"
+N="$SRC/frameworks/base/core/jni/com_android_internal_os_Zygote.cpp"
+U="$SRC/frameworks/base/core/jni/fd_utils.cpp"
+test -f "$C" && test -f "$N" && test -f "$U"
+rg -n 'fdsToClose|fdsToIgnore|pipe2|F_SETFD|handleParentProc|handleChildProc' "$C"
+rg -n 'DetachDescriptors|ReopenOrDetach|gOpenFdTable|AStatsSocket_close|M_PURGE|BlockSignal|UnblockSignal' "$N" "$U"
+```
+
+分别追 session socket、listening socket、wrapper pipe、普通文件与 ART memfd。回答：
+
+1. 为什么 `fdsToClose` 的底层编号先被 `/dev/null` 替换，Java 包装对象再关闭？
+2. 为什么 `fdsToIgnore` 不是“允许泄漏给 App”的白名单？
+3. r48 的 `Restat()` 怎样处理消失、新增或换目标的 fd？
+
+完成标准：对每个 fd 都能写出 parent 与 child 的最终所有权。
+
+### 练习 5：按权限依赖重排 SpecializeCommon
+
+```bash
+set -euo pipefail
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+N="$SRC/frameworks/base/core/jni/com_android_internal_os_Zygote.cpp"
+test -f "$N"
+rg -n 'SpecializeCommon|EnableKeepCapabilities|SetInheritable|DropCapabilitiesBoundingSet|MountEmulatedStorage|createProcessGroup|SetGids|SetRLimits|setresgid|SetUpSeccompFilter|SetSchedulerPolicy|setresuid|SetCapabilities|selinux_android_setcontext|UnsetChldSignalHandler|CallStaticVoidMethod' "$N"
+```
+
+不要照 API 名机械抄写；把结果分成“必须在降 UID 前”“降 UID 动作”“仍在降 UID 后收尾”三栏。然后回答：
+
+- `setresuid()` 后为什么还能写受控 current capability 集？
+- bounding set 已 drop 与 current permitted/effective caps 非空为何不矛盾？
+- seccomp、SELinux、UID 与 supplementary groups 分别是哪本安全账？
+
+完成标准：S0 必须放在 child post-fork hook 之后，不能放在 `setresuid()` 之后立刻结束。
+
+### 练习 6：证明无 wrapper regular 的 pid reply 与 specialize 没有全序
+
+```bash
+set -euo pipefail
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+J="$SRC/frameworks/base/core/java/com/android/internal/os/Zygote.java"
+C="$SRC/frameworks/base/core/java/com/android/internal/os/ZygoteConnection.java"
+N="$SRC/frameworks/base/core/jni/com_android_internal_os_Zygote.cpp"
+test -f "$J" && test -f "$C" && test -f "$N"
+rg -n 'forkAndSpecialize|postForkCommon|pid == 0|handleChildProc|handleParentProc|writeInt\(pid\)|setForkChild|setChildPgid' "$J" "$C"
+rg -n 'ForkCommon|fork\(\)|if \(pid == 0\)|SpecializeCommon|UnblockSignal' "$N"
+```
+
+为固定普通 App 的无 wrapper regular 分支画两条泳道，所有 parent 内的边按源码排列，所有 child 内的边也按源码排列；只在 `fork()` 处连接它们。尝试寻找 parent 等待 `SpecializeCommon()` 的 join、pipe 或 futex：找不到就是结论的一部分。wrapper pipe 是另一个分支，不能拿来给本题添加完成边。
+
+完成标准：既不画 `P0 → S0`，也不画 `S0 → P0`；只标二者都在 F0 之后。
+
+### 练习 7：拆开 commonInit、Binder pool、入口类与 main
+
+```bash
+set -euo pipefail
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+Z="$SRC/frameworks/base/core/java/com/android/internal/os/ZygoteInit.java"
+R="$SRC/frameworks/base/core/java/com/android/internal/os/RuntimeInit.java"
+A="$SRC/frameworks/base/cmds/app_process/app_main.cpp"
+T="$SRC/frameworks/base/core/java/android/app/ActivityThread.java"
+test -f "$Z" && test -f "$R" && test -f "$A" && test -f "$T"
+rg -n 'zygoteInit\(|redirectLogStreams|commonInit|nativeZygoteInit|applicationInit' "$Z" "$R"
+rg -n 'findStaticMain|Class\.forName|MethodAndArgsCaller|mMethod\.invoke|setTargetSdkVersion|setDisabledCompatChanges' "$R"
+rg -n 'onZygoteInit|startThreadPool' "$A"
+rg -n 'public static void main|seq=|attach\(' "$T"
+```
+
+把 C0、B0、R0、M0 标到调用链上。特别回答：`Class.forName(..., true, ...)` 与 `mMethod.invoke(...)` 各证明什么；B0 为什么还不能证明 AMS 已取得 `IApplicationThread`。
+
+完成标准：能解释“类已初始化但 main 尚未调用”这一真实中间态。
+
+### 练习 8：证明 USAP 是较早 fork、本次先回 pid
+
+```bash
+set -euo pipefail
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+S="$SRC/frameworks/base/core/java/com/android/internal/os/ZygoteServer.java"
+Z="$SRC/frameworks/base/core/java/com/android/internal/os/Zygote.java"
+test -f "$S" && test -f "$Z"
+rg -n 'fillUsapPool|preFork|forkUsap|postForkCommon|numUsapsToSpawn' "$S"
+rg -n 'usapMain|validateUsapCommand|writeInt\(pid\)|writeLong\(pid\)|specializeAppProcess|zygoteInit\(' "$Z"
+```
+
+画两个时间段：pool refill 与本次 `P_B` 请求。标出 USAP child 何时没有 Java Daemon、何时报告出池、何时才执行 `SpecializeCommon()` 与 `postForkCommon()`。
+
+完成标准：在 USAP 自己的线程图上写出严格的“P0 写完成 → S0”，另画 system_server read completion 为无固定相对位置，并注明“本次请求没有 fork”。
+
+### 练习 9：制作 regular、wrapper、USAP、child Zygote 对照表
+
+```bash
+set -euo pipefail
+SRC="${ANDROID_BUILD_TOP:-$PWD}"
+Z="$SRC/frameworks/base/core/java/com/android/internal/os/ZygoteInit.java"
+C="$SRC/frameworks/base/core/java/com/android/internal/os/ChildZygoteInit.java"
+A="$SRC/frameworks/base/core/java/com/android/internal/os/AppZygoteInit.java"
+G="$SRC/frameworks/base/core/java/com/android/internal/os/Zygote.java"
+N="$SRC/frameworks/base/core/java/com/android/internal/os/ZygoteConnection.java"
+W="$SRC/frameworks/base/core/java/com/android/internal/os/WrapperInit.java"
+R="$SRC/frameworks/base/core/java/com/android/internal/os/RuntimeInit.java"
+M="$SRC/frameworks/base/cmds/app_process/app_main.cpp"
+test -f "$Z" && test -f "$C" && test -f "$A" && test -f "$G" && test -f "$N" && test -f "$W" && test -f "$R" && test -f "$M"
+rg -n 'zygoteInit\(|childZygoteInit|findStaticMain|nativeZygoteInit' "$Z"
+rg -n 'runZygoteServer|PR_SET_NO_NEW_PRIVS|nativeInstallSeccompUidGidFilter|registerServerSocketAtAbstractName|runSelectLoop' "$C" "$A"
+rg -n 'validateUsapCommand|mStartChildZygote|mInvokeWith|specializeAppProcess' "$G"
+rg -n 'handleChildProc|handleParentProc|execApplication|writeInt\(Process\.myPid\(\)\)' "$N" "$W"
+rg -n 'public static final void main|commonInit|nativeFinishInit' "$R"
+rg -n 'onStarted|onZygoteInit|startThreadPool' "$M"
+```
+
+表格至少包含：fork 发生时机、是否 wrapper exec、是否执行 `commonInit()`、Binder pool 由哪条路径启动、入口 Runnable 指向什么、pid 回复位于 specialize 前后何处、最终产物是普通 App 还是新孵化器。
+
+完成标准：不能把 child Zygote 写成已经完成普通 App B0，也不能把 wrapper 或 child-Zygote 请求塞进 USAP。
+
+把九组结果合在一起，应能重建这条诊断句：**对固定普通 App 的无 wrapper regular/USAP 场景，读到 `pid=24680` 只能证明 producer 侧 P0 已发生，不能给 child 进度设上界；另有 child 证据依次覆盖 S0、D0、C0、B0、R0 与 M0 时，调查范围才从 Zygote 缩小到 `ActivityThread.main()`。**
+
+自测时只问五件事：
+
+1. 普通 fork 后，谁能建立 parent 与 child 的跨泳道先后？为什么源码没有这条边？
+2. `setresuid()` 已返回时，哪几项安全与 Runtime 工作还没完成？
+3. 为什么 USAP 的 pid 证据比 regular pid 更明确地早于 specialize？
+4. 为什么 B0 早于 M0，却仍不能说明 `bindApplication()` 已可送达？
+5. child Zygote 为什么跳过普通 RuntimeInit 三阶段，而它后来生成的最终 App 又必须重新汇入 `zygoteInit()`？
+
+若答案都能落到具体方法、分支和完成点，而不是“Zygote 把 App 启起来了”这句总括，本章的源码模型才算闭合。
