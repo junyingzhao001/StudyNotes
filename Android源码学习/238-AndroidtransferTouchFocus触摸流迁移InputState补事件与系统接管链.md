@@ -1,1098 +1,646 @@
 # 238 Android transferTouchFocus触摸流迁移、InputState补事件与系统接管链
 
 > 源码版本：Android 11 / `android-11.0.0_r48`  
-> 学习方式：macOS只读核源，不编译、不运行AOSP
+> 学习方式：macOS 只读核源；不编译、不修改 AOSP
 
-## 1. 本章要解决什么
+## 1. 本章问题：把“焦点”翻译成触摸流所有权
 
-第236章看到gesture monitor可用`pilferPointers()`取消普通窗口并保留监控者。本章研究另一种“当前手势中途换接收者”的机制：`transferTouchFocus(fromToken, toToken)`。
+`transferTouchFocus(fromToken, toToken)` 中的 focus，不是键盘焦点、View 焦点或 IME 编辑焦点。它的典型契约是：一条已经 `DOWN` 的 pointer 流，今后应由哪个窗口连接接收。
 
-需要回答：
-
-```text
-名字里的touch focus与键盘焦点是否相同？
-迁移为什么要同时修改TouchState与Connection.inputState？
-旧窗口收到CANCEL后，新窗口怎样凭空得到合法DOWN序列？
-两指非split与两窗口split时，补事件有什么不同？
-迁移会不会重新按坐标命中目标？
-目标窗口为空touchable region为何仍能接管现有流？
-拖拽、Task缩放和IME内联建议怎样使用它？
-它与pilferPointers、slippery和普通split touch有什么区别？
-返回true究竟保证到哪一步？
-```
-
-## 2. 一句总纲
-
-`transferTouchFocus()`不是改变键盘焦点，也不是把同一MotionEvent简单转发，而是一次原子化触摸流交接：
+普通触摸先在 `DOWN` 时命中窗口，后续 `MOVE/UP` 通常沿既有 `TouchState` 发送。系统拖放、自由窗移动/缩放或内联建议切入 IME 时，接管者是在手势中途出现的；仅把新窗口放到顶层，不能重写已经锁定的接收者。在非同 token、两窗口与两 Connection 有效且源端有 pointer memento 的典型完整路径中，该 API 会完成五件事：
 
 ```text
-在TouchState中把from窗口的未来路由条目换成to窗口
-→ 把from Connection已知的pointer memento合并到to Connection
-→ 给from合成ACTION_CANCEL清理旧端状态
-→ 给to补齐它尚未见过的DOWN/POINTER_DOWN序列
-→ 后续真实MOVE/UP沿新的TouchState继续
+显式选择 from / to
+→ 改写后续真实事件的路由
+→ 把新端尚未知晓的 pointer 状态合并过去
+→ 用 CANCEL 结束旧端视角
+→ 用 DOWN / POINTER_DOWN 建立新端视角
 ```
 
-两本状态账必须一起迁移，才能同时保证“未来发给谁”和“每个接收端看到的事件序列合法”。
+它不直接修改 `mFocusedWindowHandlesByDisplay`、`InputWindowInfo.hasFocus` 或 App 内部焦点，也不直接把后续 `KeyEvent` 路由给 `to`。但补出的首个 `DOWN` 仍会经过 `dispatchPointerDownOutsideFocus()`；若策略层能把 token 映射到可聚焦窗口，异步回调可能推动 WMS 调整 task focus。“不是键盘焦点转移”不等于“焦点绝无间接变化”。
 
-## 3. 总体链路
+本章要抓住三个结论：
 
-```mermaid
-flowchart LR
-    SYS["WMS / IMMS内部调用者"] --> IMS["InputManagerService"]
-    IMS --> JNI["nativeTransferTouchFocus"]
-    JNI --> ID["InputDispatcher.transferTouchFocus"]
-    ID --> CHECK["查from/to窗口、同Display、from在TouchState"]
-    CHECK --> TS["TouchState: 删除from，加入/合并to"]
-    TS --> MERGE["from.inputState → to.inputState合并pointer memento"]
-    MERGE --> CANCEL["from合成ACTION_CANCEL"]
-    CANCEL --> DOWN["to补DOWN / POINTER_DOWN"]
-    DOWN --> NEXT["后续真实MOVE/UP发给to"]
-```
+1. 迁移的是“窗口当前拥有的触摸份额”，不是某个可单独指定的 pointer ID。
+2. `TouchState` 与每个 `Connection.inputState` 是两本不同的账，缺一不可。
+3. 返回 `true` 不等于两个客户端都已处理完补偿事件，r48 甚至存在“路由已改、补偿未发仍返回成功”的边界。
 
-## 4. 源码地图
+## 2. 全链路：一个路由账本加两个连接账本
 
-native核心：
+典型完整主链可以先压缩成：
 
 ```text
-frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
-frameworks/native/services/inputflinger/dispatcher/InputDispatcher.h
-frameworks/native/services/inputflinger/dispatcher/InputState.cpp
-frameworks/native/services/inputflinger/dispatcher/InputState.h
-frameworks/native/services/inputflinger/dispatcher/TouchState.cpp
-frameworks/native/services/inputflinger/tests/InputDispatcher_test.cpp
+WMS / IMMS 等系统路径
+→ InputManagerService / InputManagerInternal
+→ nativeTransferTouchFocus()
+→ InputDispatcher::transferTouchFocus()
+   ├─ TouchState：from 条目删除，to 条目加入或合并
+   ├─ from.inputState → to.inputState：复制或追加 pointer memento
+   ├─ from Connection：合成 CANCEL / HOVER_EXIT
+   └─ to Connection：合成 DOWN / POINTER_DOWN
+→ 后续真实 MOVE / UP 按新 TouchState 分发
 ```
 
-Java/JNI入口与使用者：
+三处状态各自回答不同问题：
+
+| 状态 | 粒度 | 回答的问题 | 迁移时的动作 |
+|---|---|---|---|
+| `TouchState.windows` | 每个 Display 的当前 pointer 流 | 下一条真实事件发给哪些窗口 | 删除 `from`，加入或合并 `to` |
+| `fromConnection.inputState` | 单个 InputChannel | 旧端已被 InputDispatcher 承诺过哪些输入状态 | 保留到生成取消事件，再由入队跟踪消掉 |
+| `toConnection.inputState` | 单个 InputChannel | 新端已经知道哪些 pointer | 合并旧端快照，标出需要补起点的后缀 |
+
+这里的“已知”不是“App 主线程已经处理完成”。`enqueueDispatchEntryLocked()` 在把 `DispatchEntry` 放入 `outboundQueue` 前就调用 `trackMotion()`；所以 `InputState` 更准确地表示 dispatcher 已接受并承诺给该连接的协议状态。
+
+## 3. Java 与 JNI：token 如何抵达 InputDispatcher
+
+`InputManagerService` 有两个重载：
 
 ```text
-frameworks/base/services/core/java/com/android/server/input/InputManagerService.java
-frameworks/base/services/core/jni/com_android_server_input_InputManagerService.cpp
-frameworks/base/services/core/java/com/android/server/wm/WindowManagerInternal.java
-frameworks/base/services/core/java/com/android/server/wm/DragState.java
-frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
-frameworks/base/services/core/java/com/android/server/wm/TaskPositioningController.java
-frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
-frameworks/base/services/autofill/java/com/android/server/autofill/ui/RemoteInlineSuggestionViewConnector.java
+transferTouchFocus(InputChannel fromChannel, InputChannel toChannel)
+transferTouchFocus(IBinder fromChannelToken, IBinder toChannelToken)
 ```
 
-## 5. touch focus不是键盘focus
+`InputChannel` 重载取出两端 connection token；`IBinder` 重载供 `InputManagerService.LocalService` 等内部调用，这个内部类实现了 `InputManagerInternal`。JNI 只做三步：
 
-这里的focus表示“当前触摸流归哪个InputChannel所有”。
+1. 任一 Java token 为 `null` 时返回 `false`；
+2. 将 Java `IBinder` 转成 native `sp<IBinder>`；
+3. 调用 dispatcher，并把 `bool` 原样转成 JNI 布尔值。
 
-它不修改：
+这里有一个 r48 细节：`Objects.nonNull(fromChannelToken)` 只返回布尔值，忽略其返回值不会抛异常。因此 token 重载的 `@NonNull` 并未在 Java 层形成运行时拒绝，真正的 `null` 防线位于 JNI；而 `InputChannel` 重载对空对象调用 `getToken()`，会先在 Java 层触发空指针异常。非空但已 dispose、没有 native peer 的 `InputChannel` 则可由 `getToken()` 得到空 token，最终由 JNI 返回 `false`。
+
+这不是面向普通 App 的公开迁移接口。主要入口位于 system_server 的服务对象和 LocalServices。不过，不能因此推导出 native 自带调用者授权：迁移函数没有 owner UID、权限或 Binder 身份检查。尤其内联建议路径会把 renderer 侧上报的 source token 经 oneway Binder 回调送回 system_server；回调 Stub 随即 `mHandler.post()`，真正的 LocalServices 调用发生在后续 Handler turn，renderer 的 Binder calling identity 不能充当 transfer 的授权依据。调用链仍需审视 token 来源与上层校验。
+
+### 练习 1：钉住 Java、LocalService 与 JNI 边界
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'public boolean transferTouchFocus(@NonNull InputChannel fromChannel,' frameworks/base/services/core/java/com/android/server/input/InputManagerService.java
+grep -n -F 'return nativeTransferTouchFocus(mPtr, fromChannel.getToken(), toChannel.getToken());' frameworks/base/services/core/java/com/android/server/input/InputManagerService.java
+grep -n -F 'public boolean transferTouchFocus(@NonNull IBinder fromChannelToken,' frameworks/base/services/core/java/com/android/server/input/InputManagerService.java
+grep -n -F 'Objects.nonNull(fromChannelToken);' frameworks/base/services/core/java/com/android/server/input/InputManagerService.java
+grep -n -F 'public IBinder getToken() {' frameworks/base/core/java/android/view/InputChannel.java
+grep -n -F 'return nativeGetToken();' frameworks/base/core/java/android/view/InputChannel.java
+grep -n -F 'static jobject android_view_InputChannel_nativeGetToken(JNIEnv* env, jobject obj) {' frameworks/base/core/jni/android_view_InputChannel.cpp
+grep -n -F 'return 0;' frameworks/base/core/jni/android_view_InputChannel.cpp
+grep -n -F 'return InputManagerService.this.transferTouchFocus(fromChannelToken, toChannelToken);' frameworks/base/services/core/java/com/android/server/input/InputManagerService.java
+grep -n -F 'LocalServices.addService(InputManagerInternal.class, new LocalService());' frameworks/base/services/core/java/com/android/server/input/InputManagerService.java
+grep -n -F 'private final class LocalService extends InputManagerInternal {' frameworks/base/services/core/java/com/android/server/input/InputManagerService.java
+grep -n -F 'public abstract boolean transferTouchFocus(@NonNull IBinder fromChannelToken,' frameworks/base/core/java/android/hardware/input/InputManagerInternal.java
+grep -n -F 'static jboolean nativeTransferTouchFocus(JNIEnv* env,' frameworks/base/services/core/jni/com_android_server_input_InputManagerService.cpp
+grep -n -F 'if (fromChannelTokenObj == nullptr || toChannelTokenObj == nullptr) {' frameworks/base/services/core/jni/com_android_server_input_InputManagerService.cpp
+grep -n -F 'sp<IBinder> fromChannelToken = ibinderForJavaObject(env, fromChannelTokenObj);' frameworks/base/services/core/jni/com_android_server_input_InputManagerService.cpp
+grep -n -F 'sp<IBinder> toChannelToken = ibinderForJavaObject(env, toChannelTokenObj);' frameworks/base/services/core/jni/com_android_server_input_InputManagerService.cpp
+grep -n -F 'getDispatcher()->transferTouchFocus(' frameworks/base/services/core/jni/com_android_server_input_InputManagerService.cpp
+```
+
+读完后分别回答：两个重载的空值表现为何不同？哪一层开始出现 native token？哪一层都没有做 owner UID 判断？
+
+## 4. Native 前置条件：五类出口先定成功边界
+
+`InputDispatcher::transferTouchFocus()` 的控制流很短，出口却决定了整个 API 的语义。
+
+| 顺序 | 条件 | 结果 |
+|---|---|---|
+| 1 | `fromToken == toToken` | 立即 `true`，发生在加锁和有效性检查之前 |
+| 2 | 任一 token 找不到 `InputWindowHandle` | `false` |
+| 3 | 两个 handle 的 `displayId` 不同 | `false` |
+| 4 | 所有 `mTouchStatesByDisplay[*].windows` 中都找不到 `from` | `false` |
+| 5 | 找到 `from` | 改写状态，函数尾部 `true` |
+
+所以，相同的两个非空无效 token 也能走快速成功；JNI 入口则会在 token 为空时先返回 `false`。调用者不能用同 token 的 `true` 证明窗口存在。
+
+代码没有额外要求：
 
 ```text
-InputWindowInfo.hasFocus
-mFocusedWindowHandlesByDisplay
-WMS当前焦点窗口
-App的View焦点或IME编辑焦点
+from 带 FLAG_FOREGROUND
+命中的 TouchState 满足 state.down == true
+当前指针位于 to 的 frame / touchableRegion
+to 为 visible 且没有 FLAG_NOT_TOUCHABLE
+to 未 paused 且 responsive
+from / to ownerUid 相同
+两个 Connection 均存在且处于正常状态
 ```
 
-所以更不易误解的中文是“触摸流所有权迁移”。
+它先比较两个 handle 自身的 `displayId`，随后在 `mTouchStatesByDisplay` 全表中查找 `from`。全表搜索有正常用途：portal 路由以入口 Display 为 map key，却可把 portal 指向 Display 的目标 handle 存进该 `TouchState.windows`。transfer 会在命中的入口账本中原位替换，不会按 from/to handle 的 Display 重新建 key；“同 Display”约束只比较两个 handle。
 
-## 6. 为什么需要显式迁移
+循环容器是 `unordered_map`，找到第一份含 `from` 的 `TouchState` 后便 `goto Found`，而 API 没有 display 参数。若同一 handle 因 portal 或多入口路由同时出现在多份状态中，静态实现只替换迭代时先命中的那一份，也没有承诺是哪一份；这不能概括成“按 handle 所属 Display 精确选择状态”。
 
-普通手势在ACTION_DOWN时锁定窗口，后续MOVE不会重新hit-test。
+### 练习 2：列出 native 的真实成功与失败出口
 
-系统开始拖拽或窗口缩放时，希望后续MOVE交给系统专用InputChannel，而不是继续发给最初App；仅把新系统窗口放到最上层不够，因为手势所有权已经锁定。
-
-## 7. API不是普通App的公开Binder接口
-
-Android 11的主要入口位于`InputManagerService`及`InputManagerInternal.LocalService`。
-
-调用者是WMS、IMMS等system_server内部受信组件，不是让任意App拿两个token迁移别人的触摸流。
-
-## 8. 两种Java参数形式
-
-IMS提供：
-
-```text
-transferTouchFocus(InputChannel from, InputChannel to)
-transferTouchFocus(IBinder fromToken, IBinder toToken)
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'bool InputDispatcher::transferTouchFocus(const sp<IBinder>& fromToken, const sp<IBinder>& toToken) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (fromToken == toToken) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'std::scoped_lock _l(mLock);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'sp<InputWindowHandle> fromWindowHandle = getWindowHandleLocked(fromToken);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (fromWindowHandle == nullptr || toWindowHandle == nullptr) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (fromWindowHandle->getInfo()->displayId != toWindowHandle->getInfo()->displayId) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'for (std::pair<const int32_t, TouchState>& pair : mTouchStatesByDisplay) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'goto Found;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (!found) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'touchState->addPortalWindow(windowHandle);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'return findTouchedWindowAtLocked(portalToDisplayId, x, y, touchState,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mTouchStatesByDisplay[displayId] = tempTouchState;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (windowInfo->visible) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (!(flags & InputWindowInfo::FLAG_NOT_TOUCHABLE)) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'sp<Connection> fromConnection = getConnectionLocked(fromToken);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'sp<Connection> toConnection = getConnectionLocked(toToken);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (fromConnection != nullptr && toConnection != nullptr) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F -A 2 '// Wake up poll loop since it may need to make new input dispatching choices.' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
 ```
 
-最终都只向JNI传两个InputChannel connection token。
+把五类返回路径画成决策树，并特别标出“同 token 快返”与“找到 `from` 后连接缺失”不属于同一种成功。
 
-## 9. 为什么用InputChannel token
+## 5. TouchState：迁走的是 from 的整个窗口份额
 
-触摸最终发布到Connection/InputChannel，而不是Java Window对象。
-
-token让InputDispatcher能同时找到：
-
-```text
-InputWindowHandle：用于TouchState路由
-Connection：用于实际通道及per-connection InputState
-```
-
-## 10. JNI只做薄转换
-
-`nativeTransferTouchFocus()`：
-
-```text
-任一Java token为null → false
-Java IBinder → native sp<IBinder>
-调用InputDispatcher.transferTouchFocus
-bool原样转JNI_TRUE/JNI_FALSE
-```
-
-没有在JNI重建MotionEvent。
-
-## 11. 相同token的快速成功
-
-native第一句检查：
-
-```cpp
-if (fromToken == toToken) return true;
-```
-
-相同源与目标被视为无需工作的trivial transfer。
-
-## 12. 这个快速路径的边界
-
-它发生在加锁和窗口存在性检查之前。
-
-因此native直接调用时，即便同一个无效token也会true；正常Java JNI入口先拒绝null，但不会验证非null token是否注册。调用者不能把true一概理解为“完成了一次真实迁移”。
-
-## 13. 迁移在InputDispatcher锁内完成
-
-窗口查询、TouchState替换、Connection InputState合并、CANCEL与DOWN入队都在`mLock`保护下。
-
-这样正常分发线程看不到只改了一半的中间状态。
-
-## 14. from和to必须都在窗口快照中
-
-通过`getWindowHandleLocked(token)`找任一失败即返回false：
-
-```text
-Cannot transfer focus because from or to window not found.
-```
-
-仅注册InputChannel还不一定足够；InputDispatcher还要能把token映射到当前InputWindowHandle。
-
-## 15. 两窗口必须同Display
-
-若`fromWindowHandle.displayId != toWindowHandle.displayId`，返回false。
-
-Android 11此API不负责跨Display变换坐标、迁移TouchState map键或改变流的displayId。
-
-## 16. 不会按to窗口坐标重新命中
-
-代码不检查当前指针是否落在to的frame/touchableRegion。
-
-to是受信系统调用者显式指定的接管目标，这与DOWN时的普通窗口hit-test完全不同。
-
-## 17. to窗口可以touchableRegion为空
-
-DragState的系统拖拽InputWindowHandle明确把touchableRegion设空，注释写“cannot receive new touches”。transfer本身不检查Region，所以这不妨碍它接管已有流。
-
-但要注意r48实际命中条件：Drag窗口同时令`layoutParamsFlags=0`，InputDispatcher会把它视为touch-modal；touch-modal分支可不看Region直接命中。因此“空Region必然阻止任何新DOWN”不能仅凭这句注释成立，实际还依赖拖拽窗口只在当前手势期间短暂存在等时序约束。
-
-## 18. from必须真的出现在TouchState
-
-InputDispatcher遍历所有Display的TouchState及其中`state.windows`，查找windowHandle等于from。
-
-找不到时返回false，并记录“from window did not have focus”。
-
-这里说的focus仍是触摸所有权，不是`hasFocus`。
-
-## 19. 只迁移指定窗口条目
-
-找到from后只删除这一项：
-
-```cpp
-state.windows.erase(state.windows.begin() + i);
-```
-
-同一split手势中的其他窗口、wallpaper或其他保留目标不受影响。
-
-## 20. 保存旧flags与pointerIds
-
-删除前取出：
+找到 `TouchedWindow` 后，dispatcher 先保存：
 
 ```text
 oldTargetFlags
 pointerIds
 ```
 
-pointerIds表示split场景下from拥有的那部分指针集合。
-
-## 21. 新目标只继承三类flag
-
-代码保留：
-
-```cpp
-FLAG_FOREGROUND
-FLAG_SPLIT
-FLAG_DISPATCH_AS_IS
-```
-
-其他旧目标flag不会复制。
-
-## 22. 为什么不继承所有flag
-
-obscured、partially obscured、zero coords、outside、slippery等是针对旧窗口或当次分发模式计算的事实。
-
-把它们机械套到to窗口会把旧目标几何/角色污染到新目标。
-
-## 23. to已在TouchState中会合并
-
-`state.addOrUpdateWindow(to, flags, pointerIds)`发现to已存在时：
+随后从 `state.windows` 删除 `from`，并用下面的掩码构造要交给 `to` 的源侧 flags：
 
 ```text
-targetFlags按位OR
-pointerIds按位OR
+FLAG_FOREGROUND | FLAG_SPLIT | FLAG_DISPATCH_AS_IS
 ```
 
-这正是split场景“B已有id1，再把A的id0交给B”的处理方式。
+obscured、outside、zero-coordinates、slippery enter/exit 等一次性或旧窗口相关标志不会从 `from` 继承。注意“只继承三类”只描述源侧贡献：若 `to` 已在 `TouchState` 中，`addOrUpdateWindow()` 会把新 flags 与 `to` 原有 flags 做 OR，并把两端 `pointerIds` 做 OR；目标既有标志不会被清空。
 
-## 24. TouchState改写解决未来路由
+`pointerIds` 的含义还要分两种情况：
 
-迁移后，下一次真实MOVE/POINTER_UP/UP遍历的是更新后的`state.windows`。
+- 带 `FLAG_SPLIT` 时，它是该窗口拥有的 pointer ID 位图；迁移的是 `from` 的整个位图，没有参数只挑其中一个 ID。
+- 不带 `FLAG_SPLIT` 时，`TouchedWindow.h` 明确说该位图为零；窗口按完整 Motion 流接收，不能把零误解为“没有指针”。
 
-因此from不再收到后续真实流，to以合并后的pointerIds成为目标。
+其他 `state.windows` 条目（包括别的 split 目标与随流锁定的 wallpaper）、gesture monitor 和 portal window 都留在原状态中；代码不会依据 `to.hasWallpaper` 重建目标集合。它也不验证 `from` 必须带 `FLAG_FOREGROUND`：若命中的 `from` 本身是 wallpaper 条目，实现照样迁移它。因此“只迁当前前台窗口”是比源码更强的说法。
 
-## 25. 但只改TouchState仍不够
+transfer 也不会调用 `toWindowHandle->getInfo()->supportsSplitTouch()` 重新判断能力。源条目带 `FLAG_SPLIT` 时，这一位直接贡献给 `to`，即使目标窗口没有声明 split；源条目不带时，目标仅因自身支持 split 也不会从本次迁移新增该位。当然，`to` 若早已在 `TouchState` 中带 split，OR 合并会保留它。系统调用者必须保证显式目标与要承接的流相容。
 
-假设to从未收到DOWN，直接把下一次MOVE发给to：
+### 练习 3：验证删除、掩码与目标合并
 
-```text
-to Connection.inputState认为当前没有按下指针
-trackMotion会判MOVE序列不一致并丢弃
-App也无法理解没有DOWN的MOVE
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'int32_t oldTargetFlags = touchedWindow.targetFlags;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'BitSet32 pointerIds = touchedWindow.pointerIds;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'state.windows.erase(state.windows.begin() + i);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'InputTarget::FLAG_FOREGROUND | InputTarget::FLAG_SPLIT |' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'state.addOrUpdateWindow(toWindowHandle, newTargetFlags, pointerIds);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (targetFlags & InputTarget::FLAG_SPLIT) {' frameworks/native/services/inputflinger/dispatcher/TouchState.cpp
+grep -n -F 'touchedWindow.targetFlags |= targetFlags;' frameworks/native/services/inputflinger/dispatcher/TouchState.cpp
+grep -n -F 'touchedWindow.pointerIds.value |= pointerIds.value;' frameworks/native/services/inputflinger/dispatcher/TouchState.cpp
+grep -n -F 'BitSet32 pointerIds; // zero unless target flag FLAG_SPLIT is set' frameworks/native/services/inputflinger/dispatcher/TouchedWindow.h
+grep -n -F 'newTouchedWindowHandle->getInfo()->supportsSplitTouch()) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'targetFlags |= InputTarget::FLAG_SPLIT;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
 ```
 
-所以还要迁移每个Connection已经观察到的输入状态。
+手算两个场景：A 独占两指后迁给空的 B；A 持 id0、B 持 id1 后 A→B。分别写出迁移后的窗口条目和位图。
 
-## 26. Connection.inputState是什么
+## 6. InputState：为何改完路由还不能直接发 MOVE
 
-每个Connection有独立`InputState`，跟踪已成功排入该通道的：
+`TouchState` 只回答“下一条真实事件发给谁”。若 B 从未见过 `DOWN`，仅把下一条 `MOVE` 路由到 B，`InputState::trackMotion()` 找不到非 hover memento，会把该 `MOVE` 判为不一致并跳过；客户端自己的手势状态机也无法理解无起点的移动。
 
-```text
-Key mementos
-Motion mementos
-fallback key关系
-```
+每个 `Connection` 因此维护独立 `InputState`：
 
-它用于验证序列一致性，以及在窗口移除、ANR、迁移时合成CANCEL或补事件。
+- `KeyMemento`：按键、fallback 关系；
+- `MotionMemento`：pointer 或其他 Motion 流的当前快照；
+- dispatcher 已经承诺给当前连接的输入序列状态。
 
-## 27. TouchState与InputState不能混淆
+`MotionMemento` 保存 device、source、display、resolved flags、精度、cursor position、原始 `downTime`、pointer properties、最后一组 coords、hovering 和 policy flags。它不保存整段历史样本，也不保存原始事件的每个附属字段。
 
-```text
-TouchState：InputDispatcher全局按Display记“以后应发给哪些窗口”
-InputState：每个Connection记“这个接收端已经看过哪些DOWN/指针”
-```
+迁移只调用 `mergePointerStateTo()`，因此 Key memento 与 fallback key 不会转移。更需要注意的是，它遍历 `fromConnection` 中所有 `source & AINPUT_SOURCE_CLASS_POINTER` 的 Motion memento，没有按本次 `TouchState.pointerIds`、device 或 display 再过滤。正常窗口与手势生命周期让这些状态通常对应当前流；从静态实现看，连接上并存的其他 pointer-class 状态也在合并与随后取消的范围内。
 
-前者是路由账，后者是接收端协议账。
+由此形成一个范围不对称：路由层只替换全表搜索先命中的一份 `TouchedWindow`，连接层却合并并取消该 Connection 跨 device/source/display 的全部 pointer-class memento。常规系统调用依赖“目标 token 对应正在接管的那条流”等前提；函数本身没有用 display 参数把两层范围收窄到同一份状态。
 
-## 28. InputState的MotionMemento
+## 7. mergePointerStateTo：合并规则与 firstNewPointerIdx
 
-它保存：
-
-```text
-deviceId、source、displayId
-flags、precision、cursor position、downTime
-pointerCount
-每个PointerProperties与最后PointerCoords
-hovering、policyFlags
-firstNewPointerIdx
-```
-
-## 29. memento不是完整历史事件
-
-它只保存构造合法后续/取消事件所需的当前状态，不保存整条MOVE历史。
-
-所以迁移补出的DOWN不是重放原始事件字节流，而是依据当前memento重新合成协议起点。
-
-## 30. 何时执行Connection迁移
-
-TouchState找到并替换成功后，代码取得：
-
-```text
-fromConnection
-toConnection
-```
-
-只有两者都非null，才执行InputState合并、旧端CANCEL和新端DOWN补齐。
-
-## 31. mergePointerStateTo只迁移pointer类Motion
-
-源InputState遍历MotionMementos，只处理：
-
-```cpp
-source & AINPUT_SOURCE_CLASS_POINTER
-```
-
-不会迁移Key memento、fallback key或非pointer joystick/trackball状态。
-
-## 32. 为什么Key不迁移
-
-API目标是当前触摸流所有权，不是键盘焦点转移。
-
-把Key DOWN状态一并带走会让新通道凭空接管按键，与方法契约相悖。
-
-## 33. memento匹配键
-
-若to已有相同：
+对每个源 pointer memento，目标端按且仅按：
 
 ```text
 deviceId + source + displayId
 ```
 
-的MotionMemento，from的指针追加到其中。
+寻找匹配项。匹配键不含 `hovering`。
 
-这适配同一物理手势已因split分给两个窗口的情况。
-
-## 34. to原本没有流
-
-如果找不到匹配memento：
+若目标没有匹配项，代码先直接把源 memento 的字段写成：
 
 ```text
-from memento副本加入to
 firstNewPointerIdx = 0
 ```
 
-含义是：to对这些指针一个都不知道，稍后必须从第一个DOWN开始补。
+再把它复制进目标列表。这表示目标对其中每个 pointer 都未知，稍后要从首个 `DOWN` 补起；同时也意味着源对象暂时被写入了同样的分界。正常旧端 `CANCEL` 入队会删掉源 memento，但旧 Connection 已 broken 而取消 helper 跳过时，源侧可残留 `firstNewPointerIdx = 0`。
 
-## 35. to原本已有部分指针
-
-合并前记录：
+若目标已有匹配项且其 `firstNewPointerIdx < 0`，代码在第一次追加前记录：
 
 ```text
-firstNewPointerIdx = other.pointerCount
+firstNewPointerIdx = target.pointerCount
 ```
 
-旧pointer位于该index之前，新追加pointer位于之后；稍后只为新增部分合成POINTER_DOWN。
+已有有效分界时不会重写它；随后把源端所有 `PointerProperties/PointerCoords` 追加到目标数组。此时目标原有 memento 的 flags、精度、cursor、`downTime`、hovering 与 policy flags 保持不变；源端只贡献 pointer 数组。这一点在 split 汇流时很重要：补出的 `POINTER_DOWN` 使用目标既有流的外围元数据。
 
-## 36. 源InputState不会在merge中立即删除
+`firstNewPointerIdx` 不是 pointer ID，也不是编码后的 action index，而是数组分界：
 
-`mergePointerStateTo()`是复制/追加语义。
+```text
+[0, firstNewPointerIdx)       目标已知
+[firstNewPointerIdx, count)   刚追加、需要补起点
+```
 
-源端状态要留到下一步生成准确CANCEL；CANCEL进入源Connection时，`trackMotion()`再删除对应memento。
+merge 不删除源 memento：有匹配项时只追加到目标，无匹配项时先改源分界再复制。它也不去重 pointer ID、不单独做 `MAX_POINTERS` 容量检查。合法 split 状态依赖各窗口的 pointer 集合互斥，合并后总量仍不超过真实事件的 pointer 数；不能把这些调用前不变量误写成函数内部校验。
 
-## 37. 旧端怎样得到CANCEL
+### 练习 4：核对匹配键、追加内容与数组分界
 
-构造：
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'int32_t firstNewPointerIdx = INVALID_POINTER_INDEX;' frameworks/native/services/inputflinger/dispatcher/InputState.h
+grep -n -F 'void InputState::MotionMemento::mergePointerStateTo(MotionMemento& other) const {' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'if (other.firstNewPointerIdx < 0) {' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'other.firstNewPointerIdx = other.pointerCount;' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'other.pointerProperties[other.pointerCount].copyFrom(pointerProperties[i]);' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'other.pointerCoords[other.pointerCount].copyFrom(pointerCoords[i]);' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'other.pointerCount++;' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'memento.flags = flags;' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'memento.hovering = hovering;' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'memento.policyFlags = entry.policyFlags;' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'if (memento.source & AINPUT_SOURCE_CLASS_POINTER) {' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'memento.deviceId == otherMemento.deviceId &&' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'memento.source == otherMemento.source &&' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'memento.displayId == otherMemento.displayId) {' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'memento.mergePointerStateTo(otherMemento);' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'memento.firstNewPointerIdx = 0;' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+```
 
-```cpp
-CancelationOptions(CANCEL_POINTER_EVENTS,
+用“目标已有 id1、源端有 id0”走一遍数组。答案应是 `[id1, id0]`、分界为 1；数值较小的 id0 不会被排序到前面。
+
+## 8. 旧端收尾：CANCEL 从当前快照合成
+
+合并完成后，dispatcher 对旧连接构造：
+
+```text
+CancelationOptions(
+    CANCEL_POINTER_EVENTS,
     "transferring touch focus from this window to another window")
 ```
 
-然后对fromConnection调用`synthesizeCancelationEventsForConnectionLocked()`。
+这里没有设置 `deviceId` 或 `displayId` 过滤器。`shouldCancelMotion()` 会选中旧连接上的全部 pointer-class memento：非 hover 流合成 `ACTION_CANCEL`，hover 流合成 `HOVER_EXIT`。因此“只取消 `TouchedWindow.pointerIds` 中的指针”也比 r48 实现更窄。
 
-## 38. CANCEL使用最后已知指针快照
+合成事件来自 memento 的最后快照：
 
-InputState根据MotionMemento生成ACTION_CANCEL，包含当前pointerCount、properties和最后coords，并保留原downTime等关键流身份。
+- `eventTime = now()`，事件 ID 由 dispatcher 新生成；
+- 沿用 device/source/display、flags、精度、cursor、`downTime`、pointer 数组与 policy flags；
+- actionButton、metaState、buttonState、classification、edgeFlags、x/y offset 使用构造器给出的中性值。
 
-这让旧端所有GestureDetector/View pressed状态有机会统一清理。
+`mergePointerStateTo()` 没有删除旧状态。`synthesizeCancelationEvents()` 先生成事件列表；随后 `enqueueDispatchEntryLocked()` 对 `CANCEL/HOVER_EXIT` 调用 `trackMotion()`，匹配的旧 memento 才被移除。这样生成取消事件时仍能读到完整快照。
 
-## 39. CANCEL不是原始下一帧改写
+若旧 Connection 状态恰为 `STATUS_BROKEN`，helper 在生成事件前直接返回，旧端不会收到取消。该结果不会回传成 transfer 的 `false`。
 
-它以`now()`为eventTime并获得新的InputDispatcher event ID。
+## 9. 新端起步：DOWN/POINTER_DOWN 怎样补齐
 
-所以迁移是主动插入一条合成事件，不是等待下一次硬件MOVE再把它变成CANCEL。
+`synthesizePointerDownEvents()` 遍历目标端全部 pointer-class memento，但只处理 `firstNewPointerIdx >= 0` 的项。
 
-## 40. 新端怎样得到DOWN
+它不检查 memento 的 `hovering`。纯 hover 目标在普通分发收尾时不会作为 window 条目留在 `TouchState`，通常不能单独满足 from-in-TouchState；真正的静态边界是：迁移一条正在按下的 touch 时，`fromConnection` 若还并存其他 pointer-class hover memento，连接级全量 merge 也会把它带走。旧端取消 helper 为它生成 `HOVER_EXIT`，目标端这里却会按下面的规则补 `DOWN`。
 
-调用：
-
-```cpp
-synthesizePointerDownEventsForConnectionLocked(toConnection)
-```
-
-它从to.inputState的`firstNewPointerIdx`判断哪些指针尚未被to观察。
-
-## 41. to完全未知：先ACTION_DOWN
-
-若`firstNewPointerIdx == 0`，第一个新指针生成：
+它先复制目标已知的前缀，然后逐个加入未知后缀：
 
 ```text
-ACTION_DOWN
-pointerCount = 1
+加入后 pointerCount == 1
+→ ACTION_DOWN
+
+加入后 pointerCount > 1
+→ ACTION_POINTER_DOWN | (数组位置 << INDEX_SHIFT)
 ```
 
-第二、第三个新指针再依次生成POINTER_DOWN。
-
-## 42. 两指非split迁移
-
-from已拥有id0、id1，to原本没有任何memento：
+因此目标为空且源端有两指时，会依次得到：
 
 ```text
-from收到CANCEL(id0,id1)
-to收到DOWN(id0)
-to收到POINTER_DOWN(id0,id1; actionIndex=1)
+DOWN(pointerCount=1, actionIndex隐含为0)
+POINTER_DOWN(pointerCount=2, actionIndex=1)
 ```
 
-之后真实POINTER_UP/UP都发给to。
+目标已经知道一指、源端再追加一指时，不会重复 `DOWN`，只补一个 `POINTER_DOWN`。action index 来自合并后的数组位置，不来自 pointer ID 数值。
 
-## 43. to已有部分指针：只补新增POINTER_DOWN
+为某个 MotionMemento 生成完全部补事件后，代码把它的 `firstNewPointerIdx` 复位为 `INVALID_POINTER_INDEX`；整个函数先生成并复位各 memento，再把事件 vector 返回给 dispatcher 逐条入队。入队时 `trackMotion()` 用 `DOWN/POINTER_DOWN` 重建目标端正常状态，随后真实 `MOVE/UP` 才能通过一致性检查。
 
-split场景中B已经收到id1的局部DOWN，A拥有id0。
+若目标 Connection 已是 `STATUS_BROKEN`，helper 会在调用 `synthesizePointerDownEvents()` 前返回，分界也不会被消费；但 transfer 仍然返回 `true`。
 
-A迁移到B后，B的memento先保留已知id1，再追加id0并把`firstNewPointerIdx`设为旧count。
-
-## 44. split迁移的局部序列
-
-假设B已知指针数组位置0是id1，新追加位置1是id0：
-
-```text
-A收到CANCEL(id0)
-B不再补ACTION_DOWN
-B只收到POINTER_DOWN(id1,id0; actionIndex=1)
-```
-
-测试只断言动作index为1；理解时应以目标memento里的实际数组顺序为准，不假定pointer ID按数值排序。
-
-## 45. 三种迁移时间线
-
-```mermaid
-sequenceDiagram
-    participant HW as "真实触摸流"
-    participant A as "from窗口A"
-    participant ID as "InputDispatcher"
-    participant B as "to窗口B"
-    HW->>A: "DOWN(id0)"
-    Note over ID: "TouchState=A；A.inputState知道id0"
-    ID->>ID: "transferTouchFocus(A,B)"
-    ID->>ID: "TouchState A→B；merge memento"
-    ID->>A: "合成CANCEL(id0)"
-    ID->>B: "合成DOWN(id0)"
-    HW->>ID: "MOVE(id0)"
-    ID->>B: "真实MOVE(id0)"
-    HW->>ID: "UP(id0)"
-    ID->>B: "真实UP(id0)"
-```
-
-## 46. 补事件的eventTime与downTime
-
-合成DOWN/POINTER_DOWN使用当前`now()`作为eventTime，但沿用memento原始downTime。
-
-这表示“to从现在开始观察一条早已开始的手势”，不能把两者时间相等当作不变量。
-
-## 47. 补事件保留哪些内容
-
-主要保留：
-
-```text
-device/source/display
-policyFlags、部分flags
-precision、cursor position
-原downTime
-当前pointer properties/coords
-```
-
-## 48. 补事件重置哪些内容
-
-构造时明确使用：
-
-```text
-actionButton = 0
-metaState = AMETA_NONE
-buttonState = 0
-classification = NONE
-edgeFlags = NONE
-xOffset/yOffset = 0
-```
-
-它是序列修复事件，不保证复刻原始DOWN的每个附属字段。
-
-## 49. 坐标怎样适配to窗口
-
-合成事件Entry保存全局/原始pointer状态，入to Connection前创建InputTarget时按to窗口当前：
-
-```text
--frameLeft/-frameTop
-windowXScale/windowYScale
-globalScaleFactor
-```
-
-设置目标坐标变换。
-
-## 50. 补事件怎样更新to.inputState
-
-先生成EventEntry列表并把`firstNewPointerIdx`复位为INVALID，再逐个调用`enqueueDispatchEntryLocked()`。
-
-其内部`trackMotion()`按DOWN、POINTER_DOWN依次重建to的已知流，确保随后真实MOVE合法。
-
-## 51. 为什么先merge再CANCEL再DOWN
-
-逻辑依赖顺序：
-
-```text
-先merge：to获得当前pointer快照与“新增边界”
-再CANCEL：from用尚存memento合成完整取消
-再DOWN：to用合并状态补合法起点
-```
-
-调换顺序可能先清掉源状态或失去新指针边界。
-
-## 52. 旧端与新端的事件是否同步处理完
-
-否。
-
-函数只是把合成事件排入各Connection并启动dispatch cycle，没有等待客户端finished signal。
-
-## 53. 返回true的精确含义
-
-通常表示：
-
-```text
-窗口/Display/TouchState检查通过
-TouchState已改写
-若两Connection存在，迁移补偿事件已排队
-```
-
-不表示旧端已经处理CANCEL、新端已经处理DOWN或下一帧已经显示。
-
-## 54. Connection缺失的r48边界
-
-TouchState替换成功后，如果fromConnection或toConnection任一为空，代码跳过merge/CANCEL/DOWN，却仍走到最终true。
-
-因此返回值不是“两个通道已完成协议交接”的强保证；正常调用者应先建立并注册两端通道、同步窗口快照。
-
-## 55. Connection状态也没有先验全面校验
-
-迁移主函数没有要求两Connection都responsive、normal。
-
-后续合成函数会对broken状态做自身防护，但调用成功语义仍应保持保守。
-
-## 56. to是否paused/可触摸不在这里检查
-
-这是显式系统迁移，不走普通新手势目标筛选，因此没有复用paused、touchable region或新手势unresponsive窗口选择逻辑。
-
-调用者有责任选择已准备好的内部目标。
-
-## 57. 迁移不做ownerUid权限裁决
-
-`transferTouchFocus()`没有第237章的InjectionState/INJECT_EVENTS检查。
-
-这是因为入口是system_server内部控制面；若把它暴露给不受信调用者，单靠native实现本身并不提供按UID授权边界。
-
-## 58. 迁移后会唤醒Looper
-
-离开锁后调用：
-
-```cpp
-mLooper->wake();
-```
-
-让InputDispatcher及时推进新排入的CANCEL/DOWN及重新作出后续分发选择。
-
-## 59. 同一手势其他split窗口保持不变
-
-Java注释明确说：多个窗口可因`FLAG_SPLIT_TOUCH`同时拥有touch focus，本方法只迁移指定from窗口的那部分。
-
-其他窗口pointerIds和Connection状态不被取消。
-
-## 60. from的pointerIds整体迁移
-
-该API没有参数选择from窗口内部的某一个pointer ID。
-
-它把TouchedWindow条目携带的整个BitSet交给to；粒度是“窗口所拥有的指针集合”。
-
-## 61. to合并后可拥有全部指针
-
-若A持id0、B持id1，A→B后TouchState中B的BitSet变成`{id0,id1}`。
-
-后续splitMotionEvent对B裁剪时包含两者，相当于原本拆开的所有权重新汇聚。
-
-## 62. flags中的SPLIT会保留
-
-from目标带`FLAG_SPLIT`时，新目标也获得它。
-
-这让后续仍按pointerIds裁剪，而不是突然把整条全局MotionEvent的其他未拥有指针也交给to。
-
-## 63. FOREGROUND为何必须保留
-
-它确保to继续作为真正手势目标，参与正常前台分发、注入语义和完成计数，而不是退化成wallpaper/monitor式副本。
-
-## 64. AS_IS为何保留
-
-未来真实事件应以自身动作继续分发。
-
-旧目标若处于outside、hover或slippery一次性模式，不应把这些派生dispatch mode带到新目标。
-
-## 65. InputState merge为什么按device/source/display
-
-同一Connection可能跟踪不同设备或不同类型Motion流。
-
-只有三项身份一致才是同一可合并pointer stream；否则作为新的memento加入to。
-
-## 66. firstNewPointerIdx的核心意义
-
-它不是action index，也不是pointer ID。
-
-它是to memento数组中的分界：
-
-```text
-[0, firstNewPointerIdx) = to已知道
-[firstNewPointerIdx, pointerCount) = 刚从from合并、需要补DOWN
-```
-
-## 67. pointer数组顺序可能变化
-
-merge把from pointers追加在to pointers之后。
-
-因此迁移后的局部MotionEvent数组顺序可以不同于原始全局事件顺序；业务代码应按pointer ID识别指针，不要长期缓存index身份。
-
-## 68. 合成POINTER_DOWN action index
-
-每加入一个新pointer，action为：
-
-```cpp
-ACTION_POINTER_DOWN |
-    (i << ACTION_POINTER_INDEX_SHIFT)
-```
-
-其中`i`是当前memento数组位置。
-
-## 69. AOSP测试覆盖单指针
-
-测试验证：
-
-```text
-A先收DOWN
-transfer A→B
-A收CANCEL
-B收DOWN
-真实UP只到B
-```
-
-这是理解API的最小模型。
-
-## 70. AOSP测试覆盖两指非split
-
-测试验证B从未见过流时，补：
-
-```text
-DOWN
-POINTER_DOWN(index=1)
-```
-
-之后B接真实POINTER_UP和最终UP。
-
-## 71. AOSP测试覆盖两指split
-
-测试先让A、B各拥有一指：
-
-```text
-A对第二指DOWN只看到MOVE
-B看到自己的DOWN
-```
-
-transfer A→B后，A收CANCEL，B只补一个POINTER_DOWN，不重复补DOWN。
-
-## 72. 为什么测试比函数名更重要
-
-仅看`mergePointerStateTo()`很难确定合成动作序列。
-
-测试把外部可观察协议写得很清楚，源码学习应将实现与测试相互验证，而不是只按方法名推理。
-
-## 73. 系统拖拽的使用场景
-
-App在已有触摸流中调用`performDrag()`后，WMS创建专用drag InputChannel和覆盖Display的InputWindowHandle。
-
-然后把最初窗口的触摸流迁给drag receiver，后续MOVE用于更新drag shadow、目标窗口通知和DROP。
-
-## 74. 三类系统接管者
-
-```mermaid
-flowchart TD
-    CUR["App窗口持有当前触摸流"] --> KIND{"系统为何接管?"}
-    KIND -->|"startDragAndDrop"| DRAG["DragState InputChannel"]
-    KIND -->|"自由窗移动/缩放"| POS["TaskPositioner InputChannel"]
-    KIND -->|"内联建议转入IME"| IME["当前IME host input token"]
-    DRAG --> XFER["transferTouchFocus"]
-    POS --> XFER
-    IME --> XFER
-    XFER --> OLD["旧端CANCEL"]
-    XFER --> NEW["新端补DOWN后接真实MOVE/UP"]
-```
-
-## 75. Drag InputChannel pair
-
-DragState创建：
-
-```text
-server channel：注册给InputDispatcher，token写入InputWindowHandle
-client channel：DragInputEventReceiver在WMS线程读取
-```
-
-这与普通App窗口的server/client通道分工相同，只是接收者位于system_server。
-
-## 76. Drag窗口的空Region意图与实际边界
-
-源码注释的意图是用空touchableRegion避免它作为全屏顶层输入层截获新手势，当前拖拽则靠transfer进入。
-
-然而按第236章r48公式，flags为0的窗口属于touch-modal，普通命中可绕过Region。更稳妥的结论是：当前拖拽手势确定由transfer接管；“绝不命中新手势”还依靠它随当前拖拽快速创建/销毁，不能只归因于空Region。
-
-## 77. 为什么先syncInputWindows
-
-DragState显示input surface后执行：
-
-```text
-Transaction.syncInputWindows()
-apply(true)
-```
-
-注释明确说要确保InputWindowInfo在调用transfer之前已经送到InputDispatcher。
-
-否则toWindowHandle查找失败，迁移返回false。
-
-## 78. Drag注册失败怎样处理
-
-`WindowManagerInternal.IDragDropCallback.registerInputChannel()`先注册DragState，再调用transfer。
-
-返回false时`performDrag()`记录Unable to transfer touch focus并走失败清理，不继续假装拖拽已接管输入。
-
-## 79. TaskPositioner使用场景
-
-窗口自由形态移动/缩放开始时，WMS创建`TaskPositioner`专用InputChannel。
-
-它把当前触摸从App主窗口或同Activity上层当前焦点窗口迁给positioner，避免App继续处理缩放拖动。
-
-## 80. TaskPositioner失败回滚
-
-迁移失败时：
-
-```text
-记录Unable to transfer touch focus
-cleanUpTaskPositioner()
-return false
-```
-
-系统不会在输入仍属于App时启动一半窗口拖动状态。
-
-## 81. IME内联建议的使用场景
-
-远程inline suggestion View被触摸后，可请求把source input token的当前流迁到IME host input token。
-
-这让跨进程嵌入内容与IME窗口之间保持连续手势协议，而不是等待用户重新DOWN。
-
-## 82. IMMS的目标校验
-
-`transferTouchFocusToImeWindow(sourceToken, displayId)`在锁内要求：
-
-```text
-displayId == mCurTokenDisplayId
-mCurHostInputToken != null
-```
-
-然后通过InputManagerInternal迁移到当前IME host token。
-
-## 83. r48 IMMS留下的TODO
-
-源码写：
-
-```text
-TODO: Check if Input Token is valid.
-```
-
-当前代码检查IME display/host token，却没有在这层充分验证传入source token的归属；native最终仍要求它对应当前TouchState中的窗口。
-
-## 84. inline迁移失败怎样反馈
-
-Autofill UI连接器发现迁移false时记录错误并触发`mOnErrorCallback`。
-
-这说明调用者把bool当作控制流程结果，而不是忽略它。
-
-## 85. 与pilferPointers的共同点
-
-二者都可在手势中途：
-
-```text
-停止原窗口接收后续真实流
-向原窗口合成CANCEL
-保持整条硬件手势仍在进行
-```
-
-都不是等下一次DOWN才生效。
-
-## 86. 与pilferPointers的关键不同
-
-```text
-pilfer：调用者必须是已参与当前流的gesture monitor；清空state.windows，保留monitor集合
-transfer：明确指定from/to窗口；把一个TouchedWindow条目和pointerIds迁给to
-```
-
-transfer还会给to补合法DOWN序列；monitor本来已从首DOWN收到副本，pilfer无需补DOWN。
-
-## 87. 与slippery的不同
-
-slippery由单指MOVE坐标越出旧窗口触发，目标通过hit-test决定，并把当前MOVE派生为旧CANCEL/新DOWN。
-
-transfer由系统显式token调用，可处理多指和split，不依赖当前坐标，也不要求`FLAG_SLIPPERY`。
-
-## 88. 与普通split touch的不同
-
-split是在新pointer DOWN时按各自坐标自然分配pointerId。
-
-transfer是事后把某窗口已拥有的整个pointer集合迁给指定窗口，并用InputState补事件修复目标视角。
-
-## 89. 与键盘焦点转移的不同
-
-键盘焦点由WMS窗口状态、focused app/window和FocusEvent维护。
-
-transfer不会让to接收后续KeyEvent；Key仍按当时focused window选择。
-
-## 90. 与InputChannel转发的不同
-
-它不是在from进程读到MotionEvent后再通过Binder发给to。
-
-所有权在InputDispatcher内部切换，后续真实事件直接进入to Connection，少一层App参与，也能统一维护CANCEL/DOWN序列。
-
-## 91. 合成事件也要正常回执
-
-from的CANCEL、to的DOWN/POINTER_DOWN都成为正常DispatchEntry，进入outbound/waitQueue并要求finished signal。
-
-接管动作不会绕过上一章的连接响应性和输入ANR机制。
-
-## 92. 合成DOWN可能被HMAC签名
-
-第237章看到最终ACTION_DOWN会由InputDispatcher按VerifiedMotion字段签名。
-
-迁移补出的第一个DOWN走正常enqueue/publish链，可获得系统签发HMAC；POINTER_DOWN通常为INVALID_HMAC。
-
-## 93. 合成CANCEL通常不签Motion HMAC
-
-r48 Motion签名只覆盖最终ACTION_DOWN/UP。
-
-迁移给from的ACTION_CANCEL仍正常分发，但`verifyInputEvent()`通常返回null，不能把null误判为CANCEL伪造。
-
-## 94. 迁移与WAIT_FOR_FINISH没有直接调用关系
-
-transfer本身不是inject API，也不创建InjectionState等待调用者。
-
-InputState的MotionMemento不保存InjectionState，迁移新合成的CANCEL/DOWN也没有挂回原注入请求；它们不会扩展此前某次inject调用的`pendingForegroundDispatches`等待。本函数自身同样不提供同步等待模式。
-
-## 95. InputState只代表已排队观察状态
-
-`enqueueDispatchEntryLocked()`在真正publish前就调用`trackMotion()`并记memento。
-
-因此Connection.inputState表示InputDispatcher承诺给该连接的序列状态，不严格等价于App主线程已经处理完成的状态。
-
-## 96. 为什么这仍足以合成协议
-
-Connection内事件保持dispatch顺序。
-
-即使旧DOWN仍在waitQueue，后续排入CANCEL；客户端会按通道序列先看到DOWN再看到CANCEL。新端也按DOWN、POINTER_DOWN再到真实MOVE的顺序接收。
-
-## 97. 迁移不撤回已发布事件
-
-from在transfer前已经收到或排队中的DOWN/MOVE不会被删除重写。
-
-系统用CANCEL结束它们的语义，只改变transfer之后的所有权。
-
-## 98. Window移除竞态
-
-窗口快照可能在调用前后变化。
-
-锁内查找保证一次transfer内部一致；若to尚未同步或from已被移除则false。调用者如DragState必须先同步窗口并处理失败回滚。
-
-## 99. Channel断开竞态
-
-即使WindowHandle仍在，Connection也可能因通道生命周期已断开而为空。
-
-r48会更新TouchState但跳过补偿事件并返回true，这是诊断“迁移返回成功但目标没收到DOWN”时必须检查的边界。
-
-## 100. from==to为何不合成事件
-
-同token时任何CANCEL/DOWN都会无意义地中断并重启相同接收端。
-
-快速返回保持当前TouchState与InputState原样。
-
-## 101. 常见误解一：transfer会改变键盘焦点
-
-错误。
-
-它只操作触摸TouchState和pointer InputState，不修改focused window。
-
-## 102. 常见误解二：to必须在手指下面
-
-错误。
-
-显式迁移不hit-test；Drag窗口甚至故意拥有空touchableRegion。
-
-## 103. 常见误解三：只需修改TouchState
-
-错误。
-
-没有InputState merge和补DOWN，新Connection会看到不合法的MOVE/UP起点。
-
-## 104. 常见误解四：新端总会收到一个DOWN
-
-错误。
-
-若to在split流中已有指针DOWN，它只为从from新增的指针收到POINTER_DOWN，不重复首DOWN。
-
-## 105. 常见误解五：迁移一个pointer ID
-
-错误。
-
-API迁移from TouchedWindow拥有的整个pointerIds集合，没有单ID参数。
-
-## 106. 常见误解六：true表示客户端处理完成
-
-错误。
-
-true主要表示native控制面已接受/改写；CANCEL和DOWN仍异步经过InputChannel并等待回执。
-
-## 107. 常见误解七：transfer等同pilfer
-
-错误。
-
-pilfer保留已从DOWN开始观察的monitor并删除窗口目标；transfer明确建立新的窗口目标，还需要补齐它的事件起点。
-
-## 108. 常见误解八：合成DOWN等于重放原始DOWN
-
-错误。
-
-它使用当前pointer快照、当前eventTime和原downTime，并重置若干附属字段，只为重建合法接收端状态。
-
-## 109. 调试检查清单
-
-```text
-1. fromToken与toToken是否相同/null/已注册
-2. 两个InputWindowHandle是否已经同步到InputDispatcher
-3. 是否同Display
-4. from是否真的在当前TouchState.windows
-5. from携带哪些pointerIds/flags
-6. to是否已在TouchState中、已有哪些pointerIds
-7. 两端Connection是否存在且状态正常
-8. to.inputState firstNewPointerIdx如何设置
-9. from CANCEL和to DOWN是否进入outbound/waitQueue
-10. 后续真实MOVE/UP是否只到新目标
-```
-
-## 110. macOS只读练习一：追迁移主函数
+### 练习 5：从 memento 推导补事件
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '3947,4025p' \
-  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'synthesizeCancelationEventsForConnectionLocked(fromConnection, options);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'synthesizePointerDownEventsForConnectionLocked(toConnection);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'const int32_t action = memento.hovering ? AMOTION_EVENT_ACTION_HOVER_EXIT' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F ': AMOTION_EVENT_ACTION_CANCEL;' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'std::vector<EventEntry*> InputState::synthesizePointerDownEvents(nsecs_t currentTime) {' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'if (memento.firstNewPointerIdx < 0) {' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'const int32_t action = (pointerCount <= 1)' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F '? AMOTION_EVENT_ACTION_DOWN' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F ': AMOTION_EVENT_ACTION_POINTER_DOWN' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'memento.firstNewPointerIdx = INVALID_POINTER_INDEX;' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'case CancelationOptions::CANCEL_POINTER_EVENTS:' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'return memento.source & AINPUT_SOURCE_CLASS_POINTER;' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'action, 0 /*actionButton*/, memento.flags, AMETA_NONE,' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F '0 /*buttonState*/, MotionClassification::NONE,' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+grep -n -F 'if (connection->status == Connection::STATUS_BROKEN) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
 ```
 
-逐行标注六个失败/快速返回边界，并圈出TouchState改写和Connection补偿之间的分界。
+分别为“目标空、源端一指”“目标空、源端三指”“目标已有两指、源端一指”写出每条事件的 pointerCount 和 action index。
 
-## 111. macOS只读练习二：手算firstNewPointerIdx
+## 10. 三条时间线：单指、多指与 split 汇流
+
+第一条：单指、目标原本为空。
+
+```text
+真实：A ← DOWN(id0)
+迁移：A ← CANCEL(id0)
+      B ← DOWN(id0)
+真实：B ← UP(id0)
+```
+
+第二条：两指非 split、目标原本为空。
+
+```text
+真实：A ← DOWN(id0), POINTER_DOWN(id0,id1)
+迁移：A ← CANCEL(id0,id1)
+      B ← DOWN(id0), POINTER_DOWN(id0,id1; index=1)
+真实：B ← POINTER_UP, UP
+```
+
+第三条：两窗口 split 后汇流。测试让 A 的区域先得到 id0，再让 id1 落到 B：
+
+```text
+A 已知 [id0]；第二指按下时 A 看到局部 MOVE
+B 已知 [id1]；它把自己的第一指看成 DOWN
+A → B
+A ← CANCEL(id0)
+B ← POINTER_DOWN([id1,id0]; index=1)
+后续两个 pointer 都归 B
+```
+
+B 的数组原有 id1 在前，追加 id0 在后；源码与测试都没有按 pointer ID 排序。业务代码应以 ID 识别 pointer 身份，不应把 index 长期当作稳定身份。
+
+三条时间线只表达每个 Connection 内部必须成立的局部协议；把 A 的 `CANCEL` 写在 B 的补 `DOWN` 前，不声明两个客户端实际观察到它们的先后。跨连接顺序留到第 12 节结账。
+
+### 练习 6：让测试约束外部可观察协议
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '250,390p' \
-  frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'TEST_F(InputDispatcherTest, TransferTouchFocus_OnePointer) {' frameworks/native/services/inputflinger/tests/InputDispatcher_test.cpp
+grep -n -F 'TEST_F(InputDispatcherTest, TransferTouchFocus_TwoPointerNoSplitTouch) {' frameworks/native/services/inputflinger/tests/InputDispatcher_test.cpp
+grep -n -F 'TEST_F(InputDispatcherTest, TransferTouchFocus_TwoPointersSplitTouch) {' frameworks/native/services/inputflinger/tests/InputDispatcher_test.cpp
+grep -n -F 'mDispatcher->transferTouchFocus(firstWindow->getToken(), secondWindow->getToken());' frameworks/native/services/inputflinger/tests/InputDispatcher_test.cpp
+grep -n -F 'firstWindow->consumeMotionCancel();' frameworks/native/services/inputflinger/tests/InputDispatcher_test.cpp
+grep -n -F 'secondWindow->consumeMotionDown();' frameworks/native/services/inputflinger/tests/InputDispatcher_test.cpp
+grep -n -F 'secondWindow->consumeMotionPointerDown(1);' frameworks/native/services/inputflinger/tests/InputDispatcher_test.cpp
+grep -n -F 'firstWindow->consumeMotionMove();' frameworks/native/services/inputflinger/tests/InputDispatcher_test.cpp
+grep -n -F 'secondWindow->consumeMotionPointerUp(1);' frameworks/native/services/inputflinger/tests/InputDispatcher_test.cpp
+grep -n -F 'secondWindow->consumeMotionUp();' frameworks/native/services/inputflinger/tests/InputDispatcher_test.cpp
 ```
 
-分别计算：to为空、to已有id1而from有id0、to已有两指而from有一指时，会合成哪些DOWN动作与action index。
+将三组测试转成“迁移前状态—补偿事件—迁移后真实事件”表格。注意 native 测试关注事件协议，并未把客户端处理完成当作 transfer 返回条件。
 
-## 112. macOS只读练习三：用测试反证直觉
+## 11. 坐标与字段：补事件不是历史回放
+
+补出的事件不是原始 `DOWN` 的副本。它用“当前最后快照”重建协议起点：
+
+| 维度 | 目标无匹配 memento | 目标已有匹配 memento |
+|---|---|---|
+| pointer properties / coords | 从源 memento 复制 | 追加源 pointer 到目标数组 |
+| device/source/display | 复制源值 | 保留目标值；三者本来就是匹配键 |
+| flags、精度、cursor、`downTime`、policy flags | 复制源值 | 保留目标既有值 |
+| `eventTime` | 合成时的 `now()` | 合成时的 `now()` |
+| actionButton、meta、button、classification、edge | 中性值 | 中性值 |
+
+所以 `eventTime` 与 `downTime` 可以相差很久；迁移表达的是“目标从现在开始观察一条早已开始的流”。
+
+pointer coords 仍以 MotionEntry 快照保存。合成 helper 根据连接 token 重新取得目标窗口，并把 `-frameLeft/-frameTop`、`windowXScale/windowYScale` 与 `globalScaleFactor` 写入 `InputTarget`；发布时再把这些目标变换带给目标连接。transfer 本身不按坐标重新 hit-test，也不会把指针钳制进 `to.touchableRegion`。
+
+还要把两类 flags 分开：第 5 节的三位掩码只约束未来路由的 `TouchedWindow.targetFlags`；补事件的 Motion flags 来自 memento。目标无匹配项时，源端已解析的 flags 会随整个 memento 复制，其中可能包含旧窗口视角下的 obscured 位；目标已有匹配项时则沿用目标自己的 memento flags。合成路径不会按新窗口重新计算这些位。
+
+`hovering` 留在 memento 中供状态匹配与取消动作选择，却不是补 `MotionEntry` 的构造字段。目标已有匹配项时它仍保留在 memento，`synthesizePointerDownEvents()` 则完全不看它；不能把“memento 保留 hovering”写成“补事件携带 hovering”。
+
+与第 237 章的验证链相接：合成的首个 `ACTION_DOWN` 走正常 Motion 发布路径，resolved action 为 `DOWN` 时可以得到 dispatcher 的 HMAC；`POINTER_DOWN` 与 `CANCEL` 不在 r48 Motion 签名动作集合中。签名说明事件由输入系统封装，不会把这个合成 `DOWN` 变成硬件原始历史的重放。
+
+## 12. 入队、发布与回执：原子性止于哪里
+
+旧端与新端 helper 都构造只带 `FLAG_DISPATCH_AS_IS` 的 `InputTarget`，直接调用 `enqueueDispatchEntryLocked()`：
+
+```text
+create DispatchEntry
+→ trackMotion 更新 Connection.inputState
+→ push outboundQueue
+→ startDispatchCycleLocked 尝试 publish
+→ 成功后移入 waitQueue
+→ 客户端 finish signal 再释放
+```
+
+这带来四个边界。
+
+第一，`trackMotion()` 发生在 publish 之前；`InputState` 是 dispatcher 的连接协议账，不是客户端执行进度。
+
+第二，整个 TouchState 改写、merge、旧端合成以及新端合成都在 `mLock` 内。正常 dispatcher 线程看不到只完成一半的内部状态；而 helper 会在锁内立即尝试发布，不是等函数末尾的 `mLooper->wake()` 才开始。
+
+这把切换点定义在 dispatcher 的加锁处理顺序上，而不是硬件 `eventTime` 上。已经放进旧 Connection 的 outbound/wait 项不会被搜索、撤回或改写，合成取消排在该连接已有 outbound 项之后；反过来，一个时间戳更早、但仍在 inbound 阶段且尚未选目标的 MotionEntry，可以在 transfer 之后按新 `TouchState` 路由。
+
+第三，旧端 helper 先运行，新端 helper 后运行，只能保证 dispatcher 的调用顺序。两条事件进入不同 InputChannel，两个客户端何时调度、谁先处理，没有跨连接全序保证；每个连接内部仍保持自己的 FIFO。即使旧端 pipe 暂时阻塞，新端 helper 仍会继续执行，因此 B 可能先观察到补 `DOWN`，A 才稍后观察到 `CANCEL`。
+
+第四，函数不创建 `InjectionState`，也不提供 `WAIT_FOR_FINISH` 模式。合成目标 flags 没有 `FLAG_FOREGROUND`，不会挂接某次注入请求的 foreground pending 计数；但成功发布的普通 DispatchEntry 仍进入 `waitQueue`、需要 finish signal，也可能参与连接超时诊断。
+
+合成首个 `DOWN` 还有一条控制面副作用：`enqueueDispatchEntryLocked()` 会调用 `dispatchPointerDownOutsideFocus()`，后者在目标不是当前 focused token 时投递策略命令。策略回调解锁后进入 `onPointerDownOutsideFocus()`；WMS 若找到可接收按键的窗口，可把 Display 移到顶层并处理 task focus。这个异步分支不改变 transfer 的返回条件，却解释了为何“函数不直接改焦点”仍不能推导“焦点状态必定不变”。
+
+只有非同 token 且完成 TouchState 改写的分支会走到解锁后的 `mLooper->wake()`；同 token 快返和三个 `false` 出口都提前离开。两个 helper 在锁内已经调用 `startDispatchCycleLocked()`，所以 wake 既不是补事件存在的证明，也不是发布完成点；它只是让 loop 及时处理新的分发选择和已投递命令。
+
+### 练习 7：追到 outbound、publish 与 waitQueue
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '1250,1410p' \
-  frameworks/native/services/inputflinger/tests/InputDispatcher_test.cpp
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'enqueueDispatchEntryLocked(connection, cancelationEventEntry,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'enqueueDispatchEntryLocked(connection, downEventEntry,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'connection->inputState.trackMotion(motionEntry, dispatchEntry->resolvedAction,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'connection->outboundQueue.push_back(dispatchEntry.release());' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'void InputDispatcher::startDispatchCycleLocked(nsecs_t currentTime,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F '.publishMotionEvent(dispatchEntry->seq,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'connection->waitQueue.push_back(dispatchEntry);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'connection->inputPublisher.receiveFinishedSignal(&seq, &handled);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'd->finishDispatchCycleLocked(currentTime, connection, seq, handled);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (dispatchEntry->hasForegroundTarget()) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if ((actionMasked == AMOTION_EVENT_ACTION_UP) || (actionMasked == AMOTION_EVENT_ACTION_DOWN)) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'dispatchPointerDownOutsideFocus(motionEntry.source, dispatchEntry->resolvedAction,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F '&InputDispatcher::doOnPointerDownOutsideFocusLockedInterruptible);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mPolicy->onPointerDownOutsideFocus(commandEntry->newToken);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'handleTaskFocusChange(touchedWindow.getTask());' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
 ```
 
-把单指、两指非split、两指split三组期望事件写成表格，重点比较新端是否补ACTION_DOWN。
+沿一条合成 `DOWN` 标出“协议状态更新、outbound、实际 publish、waitQueue、finish”五个时点。分别对立即 publish、`WOULD_BLOCK`、无合成事件或 broken 三支定位 transfer 的返回，并说明为何不存在统一的客户端完成点。
 
-## 113. macOS只读练习四：追系统调用者准备工作
+## 13. 失败与竞态：true 不等于强交付
+
+最稳妥的返回值定义是：
+
+```text
+true =
+  from == to 的无操作快返
+  或
+  两个窗口存在且同 Display、from 条目被找到并完成 TouchState 改写
+```
+
+它不承诺补偿事件已送达。找到 `from` 后，代码才查询两个 Connection；只有两者都非空，才执行 merge、CANCEL 与 DOWN。任一为空时，三步全部跳过，路由不回滚，函数仍返回 `true`。
+
+即便两个 Connection 都存在，源端没有可迁移的 pointer memento 时，merge 为空，两个合成列表也可能为空；`true` 仍只描述前面的路由结果。入队阶段若 `trackMotion()` 判定事件不一致，也可能不产生对应 `DispatchEntry`。
+
+两者都存在也不是事务性强交付：
+
+- 源端存在 pointer-class memento 时，merge 会修改目标 `InputState`；无匹配分支还会先把该源 memento 的 `firstNewPointerIdx` 写成 0；
+- 目标补事件 vector 生成时已消费各 memento 的 `firstNewPointerIdx`，后续入队或发布失败不会自动恢复该分界；
+- 任一 Connection 为 `STATUS_BROKEN` 时，对应合成 helper 直接跳过；
+- pipe 写入失败可能在 `startDispatchCycleLocked()` 中把连接标为 broken；
+- paused、`responsive == false`、touchable region 与 owner UID 都不在这里预检；
+- 函数忽略 helper 的发布结果，没有回滚 TouchState 或另一连接已经排入的事件。
+
+窗口快照与连接表在本函数持锁期间不会被并发改一半，但调用前后仍有生命周期竞态：`to` 尚未同步到 dispatcher 会返回 `false`；window handle 仍在而 channel 已移除，则可能命中“路由改写成功、Connection 缺失”的 `true`。
+
+安全边界也要按证据表述。在非同 token 的实质迁移分支，native 要求 source token 能映射到当前窗口且确实存在于 `TouchState.windows`，并要求目标同 Display；它没有做调用者 UID 授权。IMMS 的 r48 实现验证目标是当前 Display 的非空 IME host token，却留有编号 `b/150843766` 的 source token 有效性检查注释。这个事实应写成“上层来源校验尚不完整”，不能脱离 token 可达性与其余检查直接推导攻击结论。
+
+## 14. 三类系统接管者：拖放、窗口定位与内联建议
+
+拖放路径先创建 `drag` InputChannel pair：server 端注册给 dispatcher，client 端交给 `DragInputEventReceiver`。`DragState` 创建对应 `InputWindowHandle`，把它挂到顶层 input surface，并调用 `syncInputWindows()` 后再 transfer。若迁移失败，`performDrag()` 返回失败，`finally` 路径关闭尚未进入进行态的 `DragState`。
+
+`DragState` 把 `touchableRegion` 设为空，并注释其不能接收新触摸；但 r48 的 hit-test 还要结合 flags。该窗口 `layoutParamsFlags = 0`，`findTouchedWindowAtLocked()` 会把它判断为 touch-modal，而 touch-modal 分支可绕过 region 命中。可靠结论是“当前流由 transfer 显式接管”；空 region 本身不足以排除普通新 `DOWN`，短生命周期和清理时序同样重要。
+
+`TaskPositioner` 也创建 server/client pair、注册专用 handle、显示并同步 input surface。`TaskPositioningController` 优先从主窗口迁移；若当前焦点是同一 Activity 的另一个窗口，则改从该窗口迁移。代码只比较 current focus、窗口身份与 `mActivityRecord`，没有在这里另做 Z-order 判断。失败时先清理 positioner，成功后才 `startDrag()`。
+
+内联建议路径更长：
+
+```text
+InlineSuggestionRoot 检测到 FLAG_WINDOW_IS_PARTIALLY_OBSCURED，或移动超过 touch slop
+→ 用 ViewRoot input token + displayId 回调
+→ Autofill system_server connector
+→ InputMethodManagerInternal
+→ 当前 IME host input token
+→ transferTouchFocus(source, host)
+```
+
+IMMS 拒绝 display 不等于当前 IME token display、或 host token 为空的请求；最终失败还会触发 Autofill UI 的 error callback。
+
+这里还有一个上层快照竞态：IMMS 在 `mMethodMap` 锁内检查并复制 `mCurHostInputToken`，释放锁后才调用 `mInputManagerInternal.transferTouchFocus()`。当前 IME host 可在两步之间变化；旧 token 若已从 dispatcher 移除，native 会失败，若仍有效则可能成为已经过期的接管目标。代码没有在调用后重新确认它仍是当前 host。
+
+### 练习 8：核对三个调用者的准备与失败路径
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '250,325p' \
-  frameworks/base/services/core/java/com/android/server/wm/DragState.java
-sed -n '165,205p' \
-  frameworks/base/services/core/java/com/android/server/wm/TaskPositioningController.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'InputChannel[] channels = InputChannel.openInputChannelPair("drag");' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mService.mInputManager.registerInputChannel(mServerChannel);' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mDragWindowHandle.layoutParamsFlags = 0;' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mDragWindowHandle.touchableRegion.setEmpty();' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mTransaction.syncInputWindows();' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'bool isTouchModal = (flags &' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (isTouchModal || windowInfo->touchableRegionContainsPoint(x, y)) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'return service.transferTouchFocus(source, state.getInputChannel());' frameworks/base/services/core/java/com/android/server/wm/WindowManagerInternal.java
+grep -n -F 'Slog.e(TAG_WM, "Unable to transfer touch focus");' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'if (mDragState != null && !mDragState.isInProgress()) {' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'mDragState.closeLocked();' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'final InputChannel[] channels = InputChannel.openInputChannelPair(TAG);' frameworks/base/services/core/java/com/android/server/wm/TaskPositioner.java
+grep -n -F 'mService.mInputManager.registerInputChannel(mServerChannel);' frameworks/base/services/core/java/com/android/server/wm/TaskPositioner.java
+grep -n -F 'mDragWindowHandle = new InputWindowHandle(mDragApplicationHandle,' frameworks/base/services/core/java/com/android/server/wm/TaskPositioner.java
+grep -n -F 'mService.mTaskPositioningController.showInputSurface(win.getDisplayId());' frameworks/base/services/core/java/com/android/server/wm/TaskPositioner.java
+grep -n -F 'mTransaction.syncInputWindows().apply();' frameworks/base/services/core/java/com/android/server/wm/TaskPositioningController.java
+grep -n -F 'if (!mInputManager.transferTouchFocus(' frameworks/base/services/core/java/com/android/server/wm/TaskPositioningController.java
+grep -n -F 'cleanUpTaskPositioner();' frameworks/base/services/core/java/com/android/server/wm/TaskPositioningController.java
+grep -n -F 'mCallback.onTransferTouchFocusToImeWindow(getViewRootImpl().getInputToken(),' frameworks/base/core/java/android/service/autofill/InlineSuggestionRoot.java
+grep -n -F 'mHandler.post(() -> handleOnTransferTouchFocusToImeWindow(sourceInputToken, displayId));' frameworks/base/services/autofill/java/com/android/server/autofill/ui/RemoteInlineSuggestionUi.java
+grep -n -F 'if (!inputMethodManagerInternal.transferTouchFocusToImeWindow(sourceInputToken,' frameworks/base/services/autofill/java/com/android/server/autofill/ui/RemoteInlineSuggestionViewConnector.java
+grep -n -F 'mOnErrorCallback.run();' frameworks/base/services/autofill/java/com/android/server/autofill/ui/RemoteInlineSuggestionViewConnector.java
+grep -n -F 'if (displayId != mCurTokenDisplayId || mCurHostInputToken == null) {' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'curHostInputToken = mCurHostInputToken;' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'return mInputManagerInternal.transferTouchFocus(sourceInputToken, curHostInputToken);' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
 ```
 
-解释为何先创建/register InputChannel、建立InputWindowHandle并同步窗口，再调用transfer；列出失败清理路径。
+为 Drag 与 TaskPositioner 各列出“创建通道—建立 handle—同步窗口—执行迁移—失败清理”五格。内联建议则列“source token 来源—host token 快照—display/空值检查—执行迁移—错误回调”，并写明它复用当前 IME host token。
 
-## 114. 复读后最容易不理解的地方
+## 15. 与 pilfer、slippery、split 的分界
 
-第一次读完最容易卡在三点：
+四种机制都会改变 pointer 的可见方式，但触发者和状态修复不同：
+
+| 机制 | 触发 | 新接收者怎样确定 | 旧端怎样结束 | 新端为何有合法起点 |
+|---|---|---|---|---|
+| `transferTouchFocus` | 系统显式传 from/to token | 指定 `to` 窗口 | touch memento 合成 `CANCEL`，hover memento 合成 `HOVER_EXIT` | merge 后补 `DOWN/POINTER_DOWN` |
+| `pilferPointers` | 已注册且已参与当前流的 gesture monitor 调用 | 该 monitor 已固定在 `gestureMonitors` | 逐个取消 `state.windows`，再 `filterNonMonitors()` | monitor 从最初 `DOWN` 就收到副本，无需补 |
+| slippery | 单指 `MOVE` 越出唯一 slippery 前台窗口 | 用当前坐标重新 hit-test | 同一真实 `MOVE` 派生 slippery exit / `CANCEL` | 同一 `MOVE` 派生 slippery enter / `DOWN` |
+| 普通 split touch | 新 pointer 按下 | 按新 pointer 坐标命中支持 split 的窗口 | 原窗口仍持有自己的 pointer | 新目标把自己的第一指看作局部 `DOWN` |
+
+transfer 不清空 gesture monitors，也不移除同一份 TouchState 中其他 split 窗口条目；其 Connection 级取消范围仍服从第 6 节的全 pointer-memento 边界。pilfer 则清空普通窗口和 portal 路由、保留 monitor 集合。transfer 不要求 `FLAG_SLIPPERY`、不依赖当前坐标，还能处理多指；slippery 的 r48 分支明确要求 `MOVE`、`pointerCount == 1` 和唯一 slippery foreground。
+
+### 练习 9：用源码条件区分四种改路由机制
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'status_t InputDispatcher::pilferPointers(const sp<IBinder>& token) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'findGestureMonitorDisplayByTokenLocked(token);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (!foundDeviceId || !state.down) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'state.filterNonMonitors();' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (maskedAction == AMOTION_EVENT_ACTION_MOVE && entry.pointerCount == 1 &&' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'tempTouchState.isSlippery()) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'findTouchedWindowAtLocked(displayId, x, y, &tempTouchState);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'InputTarget::FLAG_DISPATCH_AS_SLIPPERY_EXIT,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'InputTarget::FLAG_FOREGROUND | InputTarget::FLAG_DISPATCH_AS_SLIPPERY_ENTER;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (newGesture || (isSplit && maskedAction == AMOTION_EVENT_ACTION_POINTER_DOWN)) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'newTouchedWindowHandle->getInfo()->supportsSplitTouch()) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'MotionEntry* InputDispatcher::splitMotionEvent(const MotionEntry& originalMotionEntry,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
+
+给定“monitor 抢占”“单指越界”“新 pointer 按坐标进入另一 split 窗口”“A/B 已 split 后显式 A→B”四个日志场景，只依据触发条件、是否 hit-test、是否补 `DOWN` 判断使用了哪种机制。
+
+## 16. 调试闭环与本章结论
+
+遇到“transfer 返回成功但新端没有连续事件”时，按状态层级排查：
 
 ```text
-TouchState与Connection.inputState是两本不同层级的账
-firstNewPointerIdx是数组分界，不是pointer ID/action index
-补DOWN的目标是协议连续，不是复刻历史
+入口
+[ ] 两 token 是否 null、相同，是否拿的是 InputChannel connection token
+
+窗口与路由
+[ ] 两个 InputWindowHandle 是否已同步到 dispatcher
+[ ] handle 是否同 Display
+[ ] from 是否仍在某个 TouchState.windows
+[ ] from 的 flags / pointerIds 是什么，to 是否已有条目
+
+连接协议
+[ ] 两个 Connection 是否存在、是否 broken
+[ ] fromConnection 上实际有多少 pointer-class memento
+[ ] to 是否已有相同 device/source/display 的 memento
+[ ] firstNewPointerIdx 是 0、旧 count，还是无效值
+
+队列与客户端
+[ ] from 的 CANCEL 与 to 的 DOWN 是否进入各自 outbound/waitQueue
+[ ] 是否发生 pipe 错误、连接超时或客户端未 finish
+[ ] 后续真实 MOVE/UP 是否按新 TouchState 到达 to
 ```
 
-## 115. 复读修订一：所谓“原子”有边界
-
-TouchState改写与合成事件入队在同一native锁内，对InputDispatcher状态是原子的。
-
-但客户端异步处理CANCEL/DOWN，不存在跨两个进程“同一CPU时刻完成”的分布式原子性。
-
-## 116. 复读修订二：true不是强交付保证
-
-最容易写错的句子是“返回true说明迁移完成”。
-
-更准确：状态检查通过并完成native侧路由改写；r48甚至在Connection缺失时跳过补偿事件仍返回true，客户端完成需另看队列与回执。
-
-## 117. 复读修订三：split不是迁移障碍
-
-transfer保留from的SPLIT和pointerIds，并可与to已有memento/BitSet合并。
-
-它不会取消其他split窗口，只把指定from那一份所有权转给to。
-
-## 118. 复读修订四：空Region注释不能脱离modal条件
-
-Drag InputWindow“接管当前触摸”由transfer明确保证；“不能接收新触摸”则只是源码注释表达的意图，必须继续核对实际flags：
+最后把整章压成一句话：
 
 ```text
-transfer不检查touchableRegion，可直接接管当前流
-普通新DOWN仍要结合touch-modal flags与窗口短生命周期判断
+transferTouchFocus =
+  在 dispatcher 锁内迁移未来路由
+  + 用 Connection InputState 修复两端各自的 pointer 协议视角
 ```
 
-所以这里应保留“设计意图”和“实际r48条件”两层，而不能把空Region写成绝对安全门。
+“锁内”只保证 dispatcher 的状态变更与排队/发布尝试不被自身并发观察成半成品；它不保证两个进程同时看到事件，也不保证客户端已处理，更不为缺失或 broken 的 Connection 提供回滚。掌握这条边界，才能正确解释拖放与窗口定位为何先建通道、同步 InputWindowHandle，再把现有触摸流交给系统接管者。
 
-## 119. r48版本勘误与边界
-
-基于源码复核：
-
-```text
-IBinder重载写Objects.nonNull(...)但未使用返回值；真正null仍由JNI返回false
-from==to在窗口存在性检查前直接true
-TouchState成功替换后两Connection任一缺失，仍返回true且不补CANCEL/DOWN
-IMMS source token有效性仍有TODO
-补事件会重置meta/button/classification/edge等字段
-Drag窗口空Region的注释与flags=0所形成的touch-modal命中条件存在张力
-```
-
-这些是理解返回值和失败诊断的重要r48实现边界。
-
-## 120. 本章检查清单
-
-读完应能独立解释：
-
-```text
-[ ] touch focus与键盘焦点的区别
-[ ] TouchState与Connection.inputState分别解决什么
-[ ] from条目的flags/pointerIds怎样迁到to
-[ ] 单指与多指新端怎样补DOWN
-[ ] split时为何只补新增POINTER_DOWN
-[ ] 旧端CANCEL怎样清理memento
-[ ] Drag/TaskPositioner为何先建立并同步专用窗口
-[ ] transfer与pilfer/slippery/split的不同
-[ ] 返回true为何不等客户端完成
-[ ] r48 Connection缺失、source token TODO等边界
-```
-
-## 121. 本章小结
-
-`transferTouchFocus()`是一套维护事件流不变量的系统接管协议：
-
-```text
-显式token选择from/to，不重新hit-test
-→ TouchState迁移未来路由和pointerIds
-→ InputState合并每端已知pointer快照
-→ from以CANCEL合法结束
-→ to按未知指针边界补DOWN/POINTER_DOWN
-→ 后续真实事件直接流向to
-```
-
-它让drag、窗口positioning和跨进程IME嵌入内容能在不等待新手势的情况下接管当前触摸，同时不破坏App端MotionEvent序列。
-
-## 122. 下一章预告
-
-下一章进入系统拖放完整链：从`View.startDragAndDrop()`、ViewRoot/WMS `performDrag()`开始，追DragState、drag InputChannel、Surface拖影、跨窗口`DragEvent` ENTERED/LOCATION/EXITED/DROP分发、URI权限授予以及结束清理。
+下一章进入第 239 章：从 `View.startDragAndDrop()` 与 WMS `performDrag()` 出发，继续追 `DragState`、`DragEvent` 跨窗口分发、DROP 结果、URI 权限与结束清理。

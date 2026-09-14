@@ -1,651 +1,460 @@
 # 215 Android SurfaceFlinger Layer、Buffer latch、CompositionEngine 与硬件 present
 
-> 源码版本：Android 11 `android-11.0.0_r48`。  
-> 当前在 macOS 上只读源码，不启动SurfaceFlinger、不连接真实Composer HAL，也不宣称观察过设备present fence。
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`。
+>
+> 当前环境只能静态核对 AOSP：可以证明 Buffer 怎样进入 SurfaceFlinger、Layer 怎样 latch、CompositionEngine 怎样组织输出以及 fence 怎样传递；不能据此声称某台设备实际选择了哪种合成类型，也不能给出真实面板时延。
 
-## 1. 本章目标
+第 214 章停在 `Q_accept`：App RenderThread 已把首个窗口 Buffer 交给 producer 队列，WMS 的 show 控制事务则从另一条支线到达 SurfaceFlinger。现场最容易误判的一句话是“Buffer 已提交，所以首帧上屏了”。这中间至少还隔着队列通知、SF VSync、状态 commit、Buffer latch、可见性计算、HWC 策略协商、显示提交和 present fence signal。
 
-第214章已经把Activity首帧追到App进程的 `Surface::queueBuffer()`：RenderThread完成DisplayList回放，通过普通BufferQueue或BLAST适配路径把GraphicBuffer送出。
+本章只追一个问题：**一块已 queue 的普通窗口 Buffer，怎样与 show 状态在 SurfaceFlinger 汇合，成为某个 Display 的合成输入，并最终取得可归因的 present 证据？**
 
-本章进入SurfaceFlinger进程，回答：
+## 1. 固定一帧，用二十二个完成点拆开“上屏”
 
-- Android 11 BLAST首Buffer如何随Transaction到达SF；
-- `SurfaceControl`、SF `Layer`、`BufferStateLayer`是什么关系；
-- SF的current state、drawing state和Buffer latch分别何时发生；
-- INVALIDATE与REFRESH为何是两个阶段；
-- CompositionEngine如何计算可见层、选择client/device composition；
-- RenderEngine、client target与HWC各自负责什么；
-- acquire fence、release fence、present fence分别保护谁；
-- `presentDisplay()`返回与present fence signal为何又是两个时刻；
-- 首帧“真正显示”的源码证据应落在哪个边界。
+先固定 `F_target`，否则不同 Layer 类型、HWC 快慢路径与多 Display 会把一条主线撕成许多条件分支。
 
-## 2. 本章的一句话主线
+| 维度 | 固定值或前提 |
+|---|---|
+| 上游 | 沿用第 214 章普通首次可见 Activity 主窗口；r48 默认非 BLAST，目标内容进入 SF 侧 `BufferQueueLayer` |
+| Buffer | 第一块业务Buffer；非shared、非droppable；`onFrameAvailable()`在 `handlePageFlip()`冻结候选前完整返回；时间戳严格早于本轮 `expectedPresentTime`；acquire fence在latch前已signal |
+| 控制面 | WMS的show/alpha/crop等事务已ready，并在所选INVALIDATE前写入目标Layer current state，但尚未被更早的transaction pass提交到drawing；由所选INVALIDATE执行该commit；无并发hide、remove、resize、reparent或后继Buffer替换 |
+| latch | 无 pending refresh、deferred sync point、reject、sideband、auto-refresh 或 `updateTexImage()` 错误；目标层在线上 Layer 树且未被完全遮挡 |
+| Output | 已启用的 primary internal display，power mode 为 ON；无 hotplug、配置切换、VR handoff 或 backpressure early return |
+| 策略 | SF条件已令另一个可见层在validate前成为CLIENT候选；validate返回混合方案，SF暂存accept命令并应用本地最终视图；目标窗口层为DEVICE；present批次执行成功 |
+| client target | dequeue、RenderEngine draw、queue、FramebufferSurface acquire、`setClientTarget()`命令暂存及present时批量执行全部成功 |
+| present | HWC present与release-fence查询成功，返回有效且实现未声明不可靠的 present fence；signal 前没有另一帧替换目标内容 |
 
-```text
-App首Buffer queue到BLAST本地BufferQueue
-→ BLAST acquire BufferItem
-→ Transaction.setBuffer/acquireFence/apply
-→ Binder setTransactionState到SurfaceFlinger
-→ SF按desiredPresentTime与acquire fence决定立即应用或排队
-→ setClientStateLocked写BufferStateLayer current state并请求下次VSync
-→ INVALIDATE阶段handleTransaction把current提交为drawing
-→ handlePageFlip选择ready Layer并latch Buffer
-→ 若有新内容则发REFRESH
-→ CompositionEngine构建每Display可见OutputLayer
-→ HWC validate选择client/device composition
-→ 必要时RenderEngine先合成client target
-→ HWC presentDisplay并返回present/release fences
-→ present fence signal才是可靠设备上“开始显示/传输”的证据
-```
+二十二个完成点如下：
 
-## 3. 从 App Buffer 到显示硬件的时序图
-
-```mermaid
-sequenceDiagram
-  participant RT as "App RenderThread"
-  participant BQ as "App内BLAST BufferQueue"
-  participant TX as "SurfaceComposerClient Transaction"
-  participant SF_B as "SF Binder线程"
-  participant SF_M as "SF主线程"
-  participant CE as "CompositionEngine"
-  participant RE as "RenderEngine"
-  participant HWC as "Hardware Composer"
-  participant PANEL as "显示面板"
-
-  RT->>BQ: queueBuffer(buffer, acquireFence)
-  BQ->>TX: acquire + setBuffer/setAcquireFence
-  TX->>SF_B: setTransactionState(Binder)
-  alt 时间与fence已就绪
-    SF_B->>SF_B: applyTransactionState写Layer current state
-  else 尚未就绪
-    SF_B->>SF_B: 加入TransactionQueue
-  end
-  SF_B->>SF_M: request next VSync / INVALIDATE
-  SF_M->>SF_M: flush TX + current→drawing
-  SF_M->>SF_M: handlePageFlip / latchBuffer
-  SF_M->>CE: REFRESH / present(args)
-  CE->>HWC: validate/presentOrValidate
-  opt 有client composition
-    CE->>RE: drawLayers到client target
-    RE-->>CE: ready fence
-    CE->>HWC: client target + device layers
-  end
-  CE->>HWC: presentDisplay
-  HWC-->>CE: present fence + release fences
-  HWC->>PANEL: 扫描/传输本帧
-  PANEL-->>HWC: present fence signal
-```
-
-## 4. 先区分八个状态点
-
-一帧进入SF后仍不是一个原子动作：
-
-1. Transaction到达SF Binder入口；
-2. Transaction写入Layer current state；
-3. current state提交成drawing state；
-4. Buffer被Layer latch为活动Buffer；
-5. CompositionEngine选定合成策略；
-6. RenderEngine完成client target提交（若需要）；
-7. HWC接受present并返回fence；
-8. present fence signal，内容开始出现在物理显示或开始传入面板内存。
-
-“Transaction完成”“latch完成”“present调用完成”都不能自动代替第8点。
-
-## 5. 四个执行主体
-
-| 主体 | 进程/线程 | 本章职责 |
+| 点 | 精确定义 | 仍不能推出 |
 |---|---|---|
-| BLASTBufferQueue | App进程，queue/callback调用路径 | 把本地BufferQueue内容转为SurfaceControl Transaction |
-| SurfaceFlinger Binder入口 | surfaceflinger进程Binder线程 | 收Transaction、权限判断、写current state或排队 |
-| SurfaceFlinger主线程 | surfaceflinger主Looper | 在VSync节奏下commit、latch、启动composition |
-| HWC/Composer HAL | composer服务/厂商实现/显示硬件 | validate策略、device composition与present |
-
-RenderEngine通常也由SF通过GPU执行client composition，但不是App的RenderThread。
-
-## 6. 本章主线为何从 BLAST Transaction 开始
-
-Android 11的ViewRoot会请求BLAST，WMS允许时，App窗口的HWUI Surface连接到App内 `BLASTBufferQueue`。第214章看到producer queue后，本地 `BLASTBufferItemConsumer`收到frame available。
-
-所以BLAST主路径不是“App的queueBuffer直接唤醒SF的BufferQueue consumer”，而是先在App内完成一次producer→consumer交接。
-
-## 7. BLAST acquire BufferItem
-
-`BLASTBufferQueue::processNextBufferLocked()`调用：
-
-```cpp
-status_t status =
-        mBufferItemConsumer->acquireBuffer(&bufferItem, -1, false);
-```
-
-`BufferItem`带GraphicBuffer、frame number、timestamp、crop、transform和acquire fence。acquire只是BLAST取得本地队列中这帧的消费权，还未把它交给SF Layer。
-
-## 8. BLAST把Buffer写进SurfaceControl Transaction
-
-核心代码：
-
-```cpp
-t->setBuffer(mSurfaceControl, buffer);
-t->setAcquireFence(mSurfaceControl, bufferItem.mFence);
-t->setFrame(mSurfaceControl, {0, 0, mWidth, mHeight});
-t->setCrop(mSurfaceControl, computeCrop(bufferItem));
-t->setTransform(mSurfaceControl, bufferItem.mTransform);
-t->setDesiredPresentTime(bufferItem.mTimestamp);
-```
-
-这把内容、几何、同步和期望时间放进同一笔事务。
-
-## 9. SurfaceControl 在这里是什么
-
-App持有的 `SurfaceControl`是对SF图层控制对象的客户端句柄。Transaction通过它找到目标Layer，并描述该Layer状态如何改变。
-
-它不是GraphicBuffer，也不能被View.Canvas直接画；Buffer内容由 `setBuffer()`作为状态载荷附着。
-
-## 10. BLAST目标通常是 BufferStateLayer
-
-WMS为BLAST创建的SurfaceControl使用buffer-state类型，SF对应 `BufferStateLayer`。这种Layer不以SF侧传统BufferQueue为主要输入，而由Transaction直接设置Buffer状态。
-
-因此“BufferState”表示Buffer随状态事务提交，不表示Buffer像素被复制进一个普通C++结构体。
-
-## 11. Transaction.setBuffer 只修改客户端事务快照
-
-`SurfaceComposerClient::Transaction::setBuffer()`做的核心事情是：
-
-```cpp
-s->what |= layer_state_t::eBufferChanged;
-s->buffer = buffer;
-mContainsBuffer = true;
-```
-
-这时还没调用SurfaceFlinger；它只是把目标SurfaceControl的 `layer_state_t` 填好。
-
-## 12. setAcquireFence 与 setBuffer必须配套理解
-
-```cpp
-s->what |= layer_state_t::eAcquireFenceChanged;
-s->acquireFence = fence;
-```
-
-Buffer可能由App GPU异步写入。SF/HWC不得在acquire fence signal前把它当作可读完成内容。
-
-## 13. Transaction.apply 进入 Binder
-
-客户端整理 `ComposerState`、DisplayState、flags、desiredPresentTime、listener callbacks后调用：
-
-```cpp
-sf->setTransactionState(...);
-```
-
-`sf`是 `ISurfaceComposer` Binder接口。这里才跨进程到SurfaceFlinger。
-
-## 14. apply返回不等于事务已显示
-
-默认Transaction不是同步事务。Binder入口可以写入current state、设置flags并很快返回，实际commit/latch/compose等待SF主线程与VSync。
-
-即便显式同步，也主要等待事务“生效”的服务端协议，不应解释成物理面板已经显示。
-
-## 15. applyToken 维持同一客户端队列顺序
-
-Transaction使用TransactionCompletedListener的Binder作为apply token。SF的 `mTransactionQueues`按applyToken组织待处理事务。
-
-同一token前面已有pending事务时，后续事务不能越过它直接应用，否则客户端观察到的状态顺序会错乱。
-
-## 16. SF先缓存expected present time
-
-`setTransactionState()`在无前序pending时计算：
-
-```cpp
-mExpectedPresentTime =
-        calculateExpectedPresentTime(systemTime());
-```
-
-它是SF对当前/下一显示周期的预测，用于判断期望时间是否已经到达；不是硬件实际present时间。
-
-## 17. transactionIsReady 的第一道门：desiredPresentTime
-
-若期望时间尚未到，且没有离谱到超过未来1秒，SF返回not ready：
-
-```cpp
-if (desiredPresentTime >= expectedPresentTime
-        && desiredPresentTime < expectedPresentTime + s2ns(1)) {
-    return false;
-}
-```
-
-超过一秒的异常未来时间会为稳定性被忽略，避免Layer永久卡住。
-
-## 18. transactionIsReady 的第二道门：acquire fence
-
-SF遍历ComposerState：
-
-```cpp
-if (s.acquireFence
-        && s.acquireFence->getStatus()
-                == Fence::Status::Unsignaled) {
-    return false;
-}
-```
-
-BLAST BufferState事务因此通常在GPU写完成fence signal后才进入Layer current state。
-
-## 19. 这与传统 BufferQueue latch 检查有差异
-
-传统 `BufferQueueLayer`的Buffer可先排在队列里，SF在latch时再看头部fence/时间戳。BufferStateLayer的Transaction在更前面的apply阶段就按desired time和acquire fence排队。
-
-两条路径最终都要防止过早读Buffer，但门所在层次不同。
-
-## 20. not ready 时进入 mTransactionQueues
-
-```cpp
-mTransactionQueues[applyToken].emplace(...);
-setTransactionFlags(eTransactionFlushNeeded);
-return;
-```
-
-它不是丢弃事务。后续SF主线程在INVALIDATE中 `flushTransactionQueues()`，只要队头就绪就按顺序apply。
-
-## 21. 为什么只检查队头
-
-同一applyToken内事务有先后依赖。即使第二笔fence先signal，也不能跳过第一笔直接应用。
-
-这类“队头阻塞”是保证状态序列一致性的代价。
-
-## 22. ready 后进入 applyTransactionState
-
-`applyTransactionState()`遍历每个 `ComposerState`，调用：
-
-```cpp
-clientStateFlags |= setClientStateLocked(...);
-```
-
-这里会解析Layer句柄、权限和 `what` 位，分别设置position、crop、alpha、parent、buffer等状态。
-
-## 23. Buffer变化落到 BufferStateLayer.setBuffer
-
-当 `eBufferChanged`有效：
-
-```cpp
-layer->setBuffer(buffer, s.acquireFence,
-        postTime, desiredPresentTime, s.cachedBuffer);
-```
-
-`Layer`基类提供虚函数，BLAST目标由 `BufferStateLayer`实现。
-
-## 24. setBuffer 写的是 current state
-
-```cpp
-mCurrentState.frameNumber++;
-mCurrentState.buffer = buffer;
-mCurrentState.modified = true;
-setTransactionFlags(eTransactionNeeded);
-```
-
-current state表示最新客户端/系统请求；它还不是本轮CompositionEngine使用的稳定drawing快照。
-
-## 25. frame number 在这里推进
-
-BufferStateLayer每次接受新Buffer就增加自己的frame number，并把post/desired时间交给TimeStats与LayerHistory。
-
-它不是App Choreographer frameId，也不是HWC显示序号；跨层分析必须注明编号域。
-
-## 26. setTransactionFlags 唤醒的是下次 SF VSync
-
-SF把 `eTransactionNeeded/eTraversalNeeded` OR进原子flags；第一次从无到有时调用 `signalTransaction()`，最终：
-
-```cpp
-mEventQueue->invalidate();
-```
-
-`invalidate()`向Scheduler请求下一次VSync，而不是立刻在Binder线程完整合成。
-
-## 27. Binder线程为何不直接compose
-
-多个客户端事务、Buffer、显示刷新率和硬件present必须汇合到一致的帧节奏。若每个Binder调用都即时合成，会破坏批处理、Z顺序快照与显示时序。
-
-所以Binder线程主要更新current state和调度，SF主线程负责帧边界。
-
-## 28. MessageQueue 的两类消息
-
-Android 11 SF主队列区分：
-
-- `INVALIDATE`：在VSync到达时处理事务、latch Buffer、判断是否需要刷新；
-- `REFRESH`：真正调用CompositionEngine进行合成与present。
-
-两者可以在同一帧连续发生，但语义不能合并。
-
-## 29. VSync如何变成 INVALIDATE
-
-MessageQueue从DisplayEventReceiver读到VSync事件后：
-
-```cpp
-mHandler->dispatchInvalidate(
-        buffer[i].vsync.expectedVSyncTimestamp);
-```
-
-Handler把预测present时间交给 `SurfaceFlinger::onMessageInvalidate()`。
-
-## 30. INVALIDATE阶段总览
+| `Q_accept` | `BufferQueueProducer` 已把目标 slot 改成 QUEUED，并把 `BufferItem` 放入真实队列 | producer调用已返回，或SF已收到回调 |
+| `Q_notice` | `BufferQueueLayer::onFrameAvailable()` 已把目标项加入 SF shadow queue、增加 `mQueuedFrames`并请求 layer update | 主线程已开始 INVALIDATE |
+| `W_apply` | show等控制 patch 已写入目标 Layer current state并请求 transaction | 已进入 drawing state，或已有可见输出 |
+| `I_enter` | SF主线程进入所选 `onMessageInvalidate(expectedVSyncTime)` | 前一帧背压门已通过 |
+| `T_commit` | Layer内部状态与全局 Layer 树均已从请求态提交到本帧 drawing 视图 | Buffer已被 consumer acquire |
+| `K_select` | `handlePageFlip()`已把目标层冻结进本轮 `mLayersWithQueuedFrames` | latch一定成功 |
+| `L_acquire` | `updateTexImage()`已令真实 BufferQueue consumer acquire 目标项 | 它已成为CompositionEngine读取的活动Buffer |
+| `L_active` | `updateActiveBuffer()`已把目标 GraphicBuffer、slot与fence装入 `mBufferInfo` | Layer可见或已交给HWC |
+| `D_mark` | 首Buffer/几何变化已触发bounds重算，并把对应Output damage与后续geometry更新标脏 | 每个Output的visible region已计算 |
+| `R_post` | INVALIDATE确认有刷新工作，`signalRefresh()`已投递/合并REFRESH | CompositionEngine已开始 |
+| `E_pre` | `CompositionEngine::preComposition()`已完成，开始逐Output准备geometry | 目标层一定生成OutputLayer |
+| `O_visible` | primary Output已经为目标LayerFE保留可见 `OutputLayer` | 合成类型已经最终确定 |
+| `H_write` | 目标OutputLayer的候选状态、Buffer与acquire fence命令已写入Composer command stream | 命令已执行，或最终类型已经反映到SF本地视图 |
+| `V_stage_apply` | validate结果已读取，`ACCEPT_DISPLAY_CHANGES`已写入Composer command stream，Display已把类型/请求应用到本地最终视图 | 厂商Composer已执行accept命令，或CLIENT内容已画好 |
+| `C_lease` | SF已为client target取得可写Buffer及旧内容的fence依赖 | RenderEngine已完成写入 |
+| `C_draw` | `drawLayers()`已成功返回；有效ready fence表示绘制完成条件，`NO_FENCE`则表示同步finish后已可读 | client target已交给HWC |
+| `C_stage` | FramebufferSurface已调用 `setClientTarget()`，client target及acquire fence命令写入ComposerHal command writer | 命令已送达厂商Composer实现 |
+| `P_call` | 固定慢路径进入 `Composer::presentDisplay()`，追加PRESENT_DISPLAY并调用 `execute()`批量下发 | 调用已经返回，或present事件已发生 |
+| `P_return` | HWC `present()`已成功返回一个present fence，并取得本帧可用的per-layer release-fence map | 该fence在返回前、调用期间还是返回后signal |
+| `F_route` | Output与SF已把release/present fence分发给Layer、旧client target、统计和事务callback | callback已等待实际显示 |
+| `P_signal` | 可靠present fence按HAL语义signal；固定条件下可把该display frame归因到目标内容 | video-mode整屏扫描已经结束，或用户视觉反应已发生 |
+| `B_reuse` | 后续replacement/removal令目标Buffer的release fence满足，producer可安全复用它 | 与 `P_signal` 必然同一时刻 |
+
+固定路径有以下主干：
 
 ```text
-记录expected VSync/present时间
-→ handleMessageTransaction
-→ flush ready TransactionQueues
-→ handleTransaction current→drawing
-→ handleMessageInvalidate
-→ handlePageFlip/latchBuffer
-→ 计算bounds、damage
-→ 有新内容则signalRefresh
+Q_accept < Q_notice < K_select
+W_apply < I_enter < T_commit < K_select
+K_select < L_acquire < L_active < D_mark < R_post
+R_post < E_pre < O_visible < H_write < V_stage_apply
+V_stage_apply < C_lease < C_draw < C_stage < P_call < P_return < F_route
+P_call < P_signal
+L_active < B_reuse
 ```
 
-“PageFlip”是历史命名，里面做的是Layer Buffer latch与刷新判断。
+`W_apply`与 `Q_notice`在一般情况下没有固定先后：隐藏层可以先积累Buffer，show也可以先到而等待内容。固定条件只要求control state在所选INVALIDATE前已写入current，并要求Buffer callback在 `handlePageFlip()`冻结候选前完成。Binder线程完全可能在主线程已经进入 `I_enter`、但尚未到 `K_select`时完成 `Q_notice`，目标仍可赶上本轮；因此不能强加 `Q_notice < I_enter`。
 
-## 31. handleMessageTransaction 先flush待处理事务
+`P_return`与 `P_signal`没有规范保证的严格先后。HWC调用可能在目标VSync前返回一个pending fence，也可能跨过该VSync才返回一个已经signal的fence。函数返回本身不声明fence状态；拿到对象后必须查询它的signal状态/时间。`B_reuse`又属于某块Buffer的所有权时间线，不能与display级present点合并。
 
-它读取transaction flags并调用：
+`C_draw`不要求总能得到一个有效native fence：支持且flush成功时，`drawLayers()`返回的ready fence表示绘制完成条件；它在返回时可能仍pending，也可能已经signal，下游若观察到尚未signal就必须等待或遵守该依赖。不支持native fence或flush失败时，RenderEngine会同步 `finish()`，成功返回的 `NO_FENCE`表示client target此刻已经可读。
+
+## 2. 五类对象与四个执行语境：SF 看不到 App 的 View 树
+
+固定的非BLAST路径中，producer和consumer跨进程，但BufferQueue核心、consumer以及 `BufferQueueLayer`都在 surfaceflinger 进程。App拿到的是 `IGraphicBufferProducer`远端接口；`queueBuffer()`经Binder进入SF侧实现。回调则在SF进程内从BufferQueue直接进入Layer listener。
+
+```text
+App进程 / RenderThread
+  ANativeWindow → BpGraphicBufferProducer
+                    │ Binder queueBuffer
+                    ▼
+surfaceflinger进程 / Binder线程
+  BufferQueueProducer + BufferQueueCore
+                    │ 同进程 consumer callback
+                    ▼
+  BufferQueueLayer::onFrameAvailable
+                    │ request SF VSync
+                    ▼
+surfaceflinger进程 / 主线程
+  Layer drawing tree → CompositionEngine → Output
+                    │
+                    ▼
+Composer HAL / 厂商显示栈
+  validate / present / fences
+```
+
+另一条控制支线来自WMS持有的 `SurfaceControl.Transaction`。它通过 `ISurfaceComposer::setTransactionState()`改Layer current state；这与BufferQueue的 `onFrameAvailable()`不是同一个入口。两条支线只是在后续SF主线程帧边界汇合。
+
+五类核心对象不能互换：
+
+| 对象 | 归属 | 主要职责 | 它不是 |
+|---|---|---|---|
+| `GraphicBuffer` | 跨进程共享分配 | 承载像素存储描述 | Layer状态或一整帧屏幕 |
+| `BufferQueueLayer` | SF Layer树 | 消费传统BufferQueue、维护active buffer和Layer状态 | App内View树 |
+| `LayerFE` | CompositionEngine前端接口 | 暴露某Layer本轮几何、内容与Buffer快照 | 独立显示输出 |
+| `OutputLayer` | 某个Output | 表示一个Layer在该Display上的投影、可见区和合成状态 | 全局唯一Layer |
+| `RenderSurface` / client target | 某个Output | 承载SF把CLIENT层预合成后的整块输入 | App窗口自己的Buffer |
+
+一个Decor里的Button、TextView早已被HWUI画进窗口Buffer。SF只看到窗口层、SurfaceView、壁纸、系统栏、容器/效果层等可独立合成节点。同一SF Layer又可能投影到内屏、外屏或虚拟屏，因而拥有零个、一个或多个OutputLayer。
+
+四个执行语境也必须分清：App RenderThread生产窗口内容；SF Binder线程接收producer或事务调用；SF主线程按VSync提交Layer树并驱动合成；Composer服务/厂商实现再把状态交给显示硬件。SF的RenderEngine虽使用GPU，却不是App RenderThread。
+
+本章的最短源码地图是：
+
+```text
+frameworks/native/libs/gui/
+└── BufferQueueProducer.cpp
+
+frameworks/native/services/surfaceflinger/
+├── SurfaceFlinger.cpp
+├── Layer.cpp
+├── BufferLayer.cpp
+├── BufferQueueLayer.cpp
+├── BufferStateLayer.cpp
+├── CompositionEngine/src/{CompositionEngine,Output,OutputLayer,Display,RenderSurface}.cpp
+└── DisplayHardware/{HWComposer,FramebufferSurface}.cpp
+
+hardware/interfaces/graphics/composer/2.1/
+├── IComposer.hal
+└── IComposerClient.hal
+```
+
+WMS的版本门则在 `WindowManagerService`：`wm_use_blast_adapter`读取默认值为false；只有系统与窗口条件允许时，ViewRoot才启用BLAST adapter。本章固定默认false分支，不把一个可选实验开关写成所有r48窗口的事实。
+
+## 3. `queueBuffer()`回调先于返回：真实队列与shadow queue是两本账
+
+第214章已经证明 `Q_accept`发生在 `BufferQueueProducer::queueBuffer()`锁内：slot从DEQUEUED变为QUEUED，frame number递增，`BufferItem`进入 `mCore->mQueue`。离开BufferQueue主锁后，producer按ticket串行执行回调：
 
 ```cpp
-bool flushedATransaction = flushTransactionQueues();
+if (frameAvailableListener != nullptr) {
+    frameAvailableListener->onFrameAvailable(item);
+} else if (frameReplacedListener != nullptr) {
+    frameReplacedListener->onFrameReplaced(item);
+}
+
+if (connectedApi == NATIVE_WINDOW_API_EGL) {
+    lastQueuedFence->waitForever("Throttling EGL Production");
+}
 ```
 
-这使刚刚signal的acquire fence或到期时间能在本次VSync被重新检查。
+这段顺序带来两个反直觉结论。
 
-## 32. handleTransaction 把Layer请求变成drawing状态
+第一，回调在 `queueBuffer()`返回前同步发生；固定非BLAST队列的consumer就在SF进程，回调不需要再过一次跨进程Binder。因此 `Q_notice`甚至可以先于App RenderThread的 `Q_return`，SF的VSync请求也可在producer仍做EGL节流时发出。
 
-在全局锁内，`handleTransactionLocked()`遍历有 `eTransactionNeeded` 的Layer并调用 `doTransaction()`，计算可见区域/输入信息变化等。
+第二，BufferQueue主锁已释放，但callback lock仍保证callback ticket顺序。慢回调不会破坏Core锁内不变量，却会延长producer返回；“producer卡在queue”不自动等于Core互斥量被长期占用。
 
-随后 `commitTransactionLocked()`执行：
+`BufferQueueLayer::onFrameAvailable()`维护的是SF为选择帧准备的shadow queue：
+
+```cpp
+Mutex::Autolock lock(mQueueItemLock);
+mQueueItems.push_back(item);
+mQueuedFrames++;
+mLastFrameNumberReceived = item.mFrameNumber;
+mQueueItemCondition.broadcast();
+```
+
+退出该局部锁后，它调用 `signalLayerUpdate()`并把item通知给 `BufferLayerConsumer`。`mQueueItems`保存时间戳、frame number、fence和damage等选择信息；真正的slot所有权仍由 `BufferQueueCore`与consumer维护。shadow queue里“有一项”不等于consumer已经acquire它。
+
+frame number通常顺序到达；若回调乱序，Layer会等待前号，单次最多500 ms后记录错误并继续。这是诊断边界，不是一个可靠的帧重排算法。
+
+可丢尾帧还会走 `onFrameReplaced()`：真实队列最后一项被新 `BufferItem`覆盖，damage被合并，shadow queue对应项也被替换，而不是再增加 `mQueuedFrames`。固定首帧排除该支线；现场看到两个producer frame number也不能直接推导出SF积了两个可latch项。
+
+## 4. `signalLayerUpdate()`只请求SF VSync，INVALIDATE还可能提前返回
+
+`onFrameAvailable()`最终调用：
+
+```cpp
+void SurfaceFlinger::signalLayerUpdate() {
+    mScheduler->resetIdleTimer();
+    mPowerAdvisor.notifyDisplayUpdateImminent();
+    mEventQueue->invalidate();
+}
+```
+
+`MessageQueue::invalidate()`调用 `requestNextVsync()`；VSync事件到达后，event receiver才把预测的 `expectedVSyncTimestamp`封装成INVALIDATE消息。它不是立即在当前Binder调用栈运行 `handlePageFlip()`，也不是直接投一个REFRESH。
+
+进入 `onMessageInvalidate()`后，SF先缓存整帧统一使用的expected present time，并检查上一帧present fence：
+
+```cpp
+mExpectedPresentTime = expectedVSyncTime;
+const TracedOrdinal<bool> framePending = {
+        "PrevFramePending", previousFramePending(graceTimeForPresentFenceMs)};
+```
+
+若正在切换active config且前一帧仍pending，SF重新请求INVALIDATE并直接返回。启用backpressure传播时，满足对应条件也会 `signalLayerUpdate()`后返回。两种情况都发生在transaction处理和latch之前，所以“trace里出现INVALIDATE入口”仍不能证明 `T_commit`或 `L_active`。
+
+固定路径排除了这些early return。随后真正的顺序是：
+
+```cpp
+refreshNeeded = handleMessageTransaction();
+refreshNeeded |= handleMessageInvalidate();
+
+if (refreshNeeded && mBootStage != BootStage::BOOTLOADER) {
+    signalRefresh();
+}
+```
+
+`handleMessageTransaction()`先 `flushTransactionQueues()`，再按flags决定是否运行 `handleTransaction()`；`handleMessageInvalidate()`则调用 `handlePageFlip()`、必要时重算bounds，并把latched Layer区域写入对应Output的dirty region。
+
+因此一次INVALIDATE同时容纳两类工作，却没有把它们变成同一种对象：show事务走current/drawing提交；窗口Buffer仍走BufferQueue选择和consumer acquire。若只有一个未来时间戳Buffer，`shouldPresentNow()`会推迟latch并请求下个VSync；若只有几何事务，transaction本身也可以令 `refreshNeeded`为真而发REFRESH。
+
+REFRESH消息使用event mask合并；`signalRefresh()`先把 `mRefreshPending=true`，再直接向SF主Looper分发REFRESH。INVALIDATE和REFRESH常紧邻出现，但这是两条不同消息、两个不同入口。
+
+## 5. current、drawing与Layer树：show提交的是可见资格，不是像素
+
+WMS的show、alpha、position、crop、parent等变更通过 `setTransactionState()`进入SF。服务端 `setClientStateLocked()`按 `layer_state_t::what`位图只修改本次携带的字段，并在Layer current state上推进sequence、flags或派生状态。
+
+普通异步事务可在Binder线程写current state并很快返回。若desired present time或BufferState事务里的acquire fence尚未就绪，同一apply token的事务会进入FIFO；INVALIDATE中的 `flushTransactionQueues()`只从各队头开始应用，不能让后项越过前项。
+
+本章目标内容来自传统BufferQueue，所以它的Buffer不经过 `Transaction::setBuffer()`。不过WMS控制事务仍与BLAST `BufferStateLayer`共用Transaction基础设施。两条输入路径可概括为：
+
+| Layer类型 | Buffer进入SF的主入口 | 时间/fence主门 |
+|---|---|---|
+| `BufferQueueLayer` | producer `queueBuffer()` → consumer callback | `shouldPresentNow()`与latch前 `fenceHasSignaled()` |
+| `BufferStateLayer` | `Transaction.setBuffer()` → `setTransactionState()` | Transaction apply前的desired time/acquire fence；apply后仍过公共latch门 |
+
+主线程 `handleTransactionLocked()`先让BufferLayer通知本地sync points，再遍历有 `eTransactionNeeded` 的Layer：
+
+```cpp
+const uint32_t flags = layer->doTransaction(0);
+if (flags & Layer::eVisibleRegion) {
+    mVisibleRegionsDirty = true;
+}
+```
+
+`Layer::doTransaction()`会push/apply pending state、处理resize和派生几何，最后执行：
+
+```cpp
+commitTransaction(c);
+// Layer::commitTransaction
+mDrawingState = stateToCommit;
+```
+
+随后SF全局 `commitTransactionLocked()`才做：
 
 ```cpp
 mDrawingState = mCurrentState;
+mDrawingState.traverse([](Layer* layer) {
+    layer->commitChildList();
+});
 ```
 
-drawing state是接下来latch与composition使用的相对稳定快照。
+所以current/drawing不是唯一一对浅拷贝：SF有全局Layer树快照，每个Layer也有自己的请求态、drawing态、pending状态与child list。`T_commit`表示这些状态已形成供本帧继续使用的视图，不表示BufferQueue consumer已经acquire内容。
 
-## 33. current/drawing不是简单“两块全局内存”
+show只解除隐藏/alpha/父裁剪等控制门，使Layer获得“可以参与可见性计算”的资格。若没有active Buffer，普通BufferLayer仍没有可画内容；若已有Buffer但show还没进入drawing，它也可被latch却不出现在该Output。控制面 `W_apply`与数据面 `L_active`必须在可见合成点汇合。
 
-SF既有全局State的current/drawing，也有每个Layer内部的current/drawing字段和pending状态。`doTransaction()`负责逐Layer推进、计算派生几何，再由全局commit固定树结构。
+## 6. `handlePageFlip()`先冻结候选：时间戳决定是否赶本轮
 
-学习时用“请求态→本帧绘制态”理解即可，不要假设只有一次浅拷贝。
-
-## 34. Layer树与View树不是同一棵树
-
-SF Layer树描述窗口、SurfaceView、壁纸、状态栏等可独立合成图层及其parent/Z关系。它不认识App内部Button/TextView。
-
-App整个Decor通常已经被HWUI画进一个窗口Buffer；SF只看到对应窗口层及其他Surface层。
-
-## 35. BLAST层常位于WMS容器层之下
-
-WMS可持有容器/父SurfaceControl处理窗口层级、动画和裁剪，App Buffer附在BLAST BufferStateLayer子层。
-
-因此“一个WindowState等于一个唯一SF Layer”过度简化；窗口可能拥有父、buffer、bounds、动画等多个SurfaceControl节点。
-
-## 36. 传统 BufferQueueLayer 仍需认识
-
-非BLAST或其他producer可使用 `BufferQueueLayer`：SF侧有BufferQueue consumer，`onFrameAvailable`把BufferItem放入内部队列，latch时选择合适帧。
-
-本章首帧以BufferStateLayer为主，但公共 `BufferLayer::latchBuffer()`同时服务两类派生层。
-
-## 37. handlePageFlip先冻结待latch集合
-
-SF先遍历drawing Layer树，把ready且应在本周期present的Layer放进：
+`handlePageFlip()`先遍历drawing Layer树，不边遍历边acquire：
 
 ```cpp
-mLayersWithQueuedFrames
+mDrawingState.traverse([&](Layer* layer) {
+    if (layer->hasReadyFrame()) {
+        frameQueued = true;
+        if (layer->shouldPresentNow(expectedPresentTime)) {
+            mLayersWithQueuedFrames.push_back(layer);
+        } else {
+            layer->useEmptyDamage();
+        }
+    } else {
+        layer->useEmptyDamage();
+    }
+});
 ```
 
-源码特意先收集再latch，避免遍历期间producer继续进帧导致不同Layer互相等待或死锁。
+先冻结集合是并发安全策略。源码给出的反例是两个producer共享同一command stream：若latch Layer 0期间又接收Layer 0和Layer 1的新帧，再继续动态扩大遍历集合，display可能等待Layer 1，而Layer 1又排在等待display的Layer 0后，形成环。固定集合让本周期只处理遍历开始时的候选代际。
 
-## 38. hasReadyFrame 是候选条件
-
-BufferLayer统一判断：
+`BufferLayer::hasReadyFrame()`只回答是否有frame update、sideband变更或auto-refresh。传统 `BufferQueueLayer::shouldPresentNow()`再读取shadow queue头项：
 
 ```cpp
-return hasFrameUpdate()
-        || getSidebandStreamChanged()
-        || getAutoRefresh();
+const int64_t addedTime = mQueueItems[0].mTimestamp;
+const bool isPlausible =
+        addedTime < expectedPresentTime + s2ns(1);
+const bool isDue = addedTime < expectedPresentTime;
+return isDue || !isPlausible;
 ```
 
-对首个BufferStateLayer，current/drawing中有已修改Buffer即构成frame update。
+严格小于意味着timestamp恰好等于expected time时仍不算due；超过expected但少于未来1秒会推迟；更远的异常未来值反而为稳定性被视为implausible并放行，同时计入bad desired-present统计。不能把这里简化成“时间戳越大越晚显示”。
 
-## 39. BufferStateLayer.shouldPresentNow 为什么很简单
+若队列有帧却没有任何候选，或候选均未真正latch，结尾会再请求layer update。若Layer已经从线上树移入 `mOffscreenLayers`，SF另行执行 `latchAndReleaseBuffer()`，目的是持续回收producer slot；这种消费不会让内容进入屏幕。
 
-它基本返回 `hasFrameUpdate()`，不再次比较expectedPresentTime。因为BufferState事务在 `transactionIsReadyToBeApplied()`阶段已经按desired time排队。
+BLAST `BufferStateLayer::shouldPresentNow()`在r48只检查sideband/auto-refresh/`hasFrameUpdate()`，因为desired time和changed acquire fence主要已在Transaction ready门处理。把传统timestamp规则原样套到BLAST会重复甚至错置门的位置。
 
-传统BufferQueueLayer则在 `shouldPresentNow(expectedPresentTime)`检查队首timestamp是否到期。
+## 7. `latchBuffer()`是四道门，再由三步更新形成active buffer
 
-## 40. latchBuffer 的第一道门：已有refresh pending
+候选集合冻结后，SF在 `mStateLock`下逐层调用公共 `BufferLayer::latchBuffer()`。它并非看到 `mQueuedFrames>0`就无条件成功，而是依次检查：
 
-若上一Buffer已 `updateTexImage()`但尚未经历compositionComplete，`mRefreshPending`为true，本次跳过，避免连续更新纹理却没有对应合成完成。
+1. 当前确有ready frame；
+2. 上次 `updateTexImage()`没有仍卡在下一次pre-composition之前，即 `mRefreshPending=false`；
+3. acquire fence满足本Layer的latch规则；
+4. deferred transaction/local sync points已经满足。
 
-这保护RenderEngine/Buffer生命周期，不是“有新Buffer就无限吞”。
-
-## 41. latchBuffer 的第二道门：fenceHasSignaled
+核心门如下：
 
 ```cpp
+if (mRefreshPending) {
+    return false;
+}
 if (!fenceHasSignaled()) {
     mFlinger->signalLayerUpdate();
     return false;
 }
+if (!allTransactionsSignaled(expectedPresentTime)) {
+    mFlinger->setTransactionFlags(eTraversalNeeded);
+    return false;
+}
 ```
 
-BufferState主线通常已在Transaction apply前等过fence；传统BufferQueue或特殊配置仍使这道公共防线有意义。
+固定帧是非droppable且fence已signal，因此通过第三道门。一般情况却有两个旁路：`debug.sf.latch_unsignaled`首次读取后静态缓存，非零时允许继续；droppable头项也会被允许latch，以免不断被新帧替换而永远无法取得。两者都不等于GPU内容已完成，后续Layer/HWC状态仍携带acquire fence依赖。
 
-## 42. debug.sf.latch_unsignaled 是危险调试旁路
+真正推进内容需要三步都成功：
 
-`BufferLayer::latchUnsignaledBuffers()`读取 `debug.sf.latch_unsignaled`。启用时允许跳过正常fence门，主要用于调试，不是生产协议默认。
+```text
+updateTexImage()
+  → BufferLayerConsumer从真实BufferQueue选择/acquire目标项
+updateActiveBuffer()
+  → mBufferInfo取得GraphicBuffer、slot与acquire fence
+updateFrameNumber()
+  → current frame number与latch时间入账
+```
 
-不能用这个分支解释普通设备为何安全读取GPU Buffer。
+在固定的“头fence已signal”路径，传统 `updateTexImage()`还会限制可跳到的最大frame number：它从shadow queue头开始扫描连续已signal项，一遇后续pending fence就停止，再把最后连续ready的编号传给consumer，从而不让generic时间戳drop越过该后帧。若头项本身pending却因droppable或调试旁路获准latch，局部变量先初始化为最新received编号，这个cap不再提供同样的“不跨pending帧”保证；安全性仍要靠传下去的fence依赖，而不是这段扫描。
 
-## 43. latchBuffer 还要满足跨Layer同步点
+consumer可能按及时的后帧丢掉更老的显式时间戳帧；对应shadow项会被移除、damage合并、TimeStats记录清理。因此 `L_acquire`指最终被consumer选中的目标项，而不是调用前肉眼看到的队头必然原样胜出。
 
-`allTransactionsSignaled(expectedPresentTime)`检查defer transaction等本地sync point。关联Layer目标frame尚不可用或事务未应用时，本次不latch，并请求后续traversal。
+三步成功后，`gatherBufferInfo()`补齐格式和frame-latency状态，`mRefreshPending=true`。首个active Buffer会强制可见区域重算；crop、transform、scaling mode、inverse display或尺寸变化也可能重算。latch时间只证明SF已选中内容，不证明它未被遮挡、更不证明HWC已present。
 
-这支持“窗口移动与某个Buffer frame原子发生”等跨Layer协调。
+## 8. show、active buffer、visibility与damage在这里真正汇合
 
-## 44. updateTexImage 在 BufferStateLayer 做什么
-
-它校验Buffer尺寸/变换与当前Layer active尺寸，给transaction callbacks记录latchTime/frameNumber，并登记acquire fence与TimeStats。
-
-如果设备不用native fence sync，还可能在此把新Buffer绑定到GL纹理；现代native fence路径可推迟到真正client composition。
-
-## 45. updateActiveBuffer 才换活动内容
+`handlePageFlip()`把成功latch并需要刷新区域的Layer放入 `mLayersPendingRefresh`；随后 `handleMessageInvalidate()`在可见区域脏时先 `computeLayerBounds()`，再按每个pending Layer的screen bounds调用 `invalidateLayerStack()`。
 
 ```cpp
-mPreviousBufferId = getCurrentBufferId();
-mBufferInfo.mBuffer = s.buffer;
-mBufferInfo.mFence = s.acquireFence;
+for (auto& layer : mLayersPendingRefresh) {
+    Region visibleReg;
+    visibleReg.set(layer->getScreenBounds());
+    invalidateLayerStack(layer, visibleReg);
+}
 ```
 
-`mBufferInfo`是BufferLayer提供给CompositionEngine/HWC的活动Buffer信息。latch前的current state只是候选请求。
+`invalidateLayerStack()`只标记Layer所属display/layer stack对应Output的dirty region。它不是把像素拷入display framebuffer，也没有在此计算HWC最终类型。
 
-## 46. updateFrameNumber 记录 latch
+一般时序应画成两条支线：
 
-SF把 `mCurrentFrameNumber`推进到drawing state的frame number，并在FrameEventHistory记录latch时间。
+```text
+控制面：SurfaceControl show/alpha/crop → current → drawing ┐
+                                                       ├→ 可见LayerFE/OutputLayer
+数据面：BufferQueue item → select → latch → active Buffer ┘
+```
 
-latch time表示SF选中并接纳这帧，不是HWC开始扫描的时间。
+两条支线不是全局互斥事务：Buffer可以先在隐藏Layer上latch；show也可以先进入drawing而暂时显示空内容。固定路径中，二者赶上同一帧且没有后继变化，才可把后面的display frame归因到目标首Buffer。
 
-## 47. 第一块Buffer会使可见区域失效
+即使二者都到齐，Layer仍可能因为以下条件不生成可见OutputLayer：
 
-公共latch逻辑看到旧 `mBufferInfo.mBuffer == nullptr` 时：
+- Layer不属于该Output的layer stack，或只允许primary而当前不是primary；
+- hidden、alpha/父状态或裁剪令其不可见；
+- screen bounds落在Output bounds之外；
+- 上方不透明区域完全覆盖它；
+- transparent-region hint与可见非透明区域计算后为空。
+
+被半透明层覆盖的区域仍可能属于visible region，因为下层像素会参与blend；只有上方opaque coverage才能直接减掉下层区域。固定目标未被完全遮挡，所以会到达 `O_visible`。
+
+`handlePageFlip()`的返回条件是候选集合非空且至少有新数据latched。transaction本身、全量重绘或HWC请求也可能独立要求刷新。`R_post`只说明REFRESH已经排入SF Looper；它仍不是CompositionEngine完成点。
+
+## 9. REFRESH把drawing Layer变成每个Output的合成快照
+
+`onMessageRefresh()`先清SF全局的 `mRefreshPending`，再构造 `CompositionRefreshArgs`。其中既有当前所有Display对应的Output（Output自身稍后再检查是否enabled），也有drawing Layer树的LayerFE，以及本轮候选LayerFE集合、颜色配置、全量重绘与geometry标志：
 
 ```cpp
-recomputeVisibleRegions = true;
+for (const auto& [_, display] : mDisplays) {
+    refreshArgs.outputs.push_back(
+            display->getCompositionDisplay());
+}
+mDrawingState.traverseInZOrder([&](Layer* layer) {
+    if (auto layerFE = layer->getCompositionEngineLayerFE()) {
+        refreshArgs.layers.push_back(layerFE);
+    }
+});
 ```
 
-没有Buffer时BufferLayer通常不可见；首Buffer到来后必须重新计算它对屏幕覆盖、遮挡和damage的影响。
+它传的是本轮稳定LayerFE集合，而不是把SF `Layer`对象所有可变字段裸交给HWC。`layersWithQueuedFrames`则供released-layer/fence等逻辑识别本轮更新者；“在这个集合里”仍不等于最终在每个Output可见。
 
-## 48. crop/transform/size变化也触发几何重算
-
-新旧Buffer的crop、transform、scale mode、display inverse或尺寸不同，都会令visible regions dirty。
-
-即便SurfaceControl位置没变，Buffer自身元数据变化也可能改变屏幕占用范围。
-
-## 49. latch成功只把Layer内容准备好
-
-`latchBuffer()`返回true后，Layer进入 `mLayersPendingRefresh`，SF把对应屏幕区域标脏。
-
-这一步没有调用HWC present，也没有承诺该Buffer最终没被更上层不透明Layer遮住。
-
-## 50. offscreen Layer为何也要latch/release
-
-不可达/离屏Layer不参与当前显示，但producer仍可能不断提交。SF对offscreen Layer调用 `latchAndReleaseBuffer()`，避免producer因为没有slot回收而永久阻塞。
-
-消费并释放离屏Buffer不代表它曾出现在屏幕上。
-
-## 51. 有新数据才发 REFRESH
-
-`handlePageFlip()`返回：
-
-```cpp
-return !mLayersWithQueuedFrames.empty()
-        && newDataLatched;
-```
-
-onMessageInvalidate综合事务/重绘请求后调用 `signalRefresh()`，向主Looper投递REFRESH消息。
-
-## 52. REFRESH阶段入口
-
-`SurfaceFlinger::onMessageRefresh()`收集：
-
-- 所有Display对应的CompositionEngine Output；
-- drawing Layer树的LayerFE；
-- 本轮latch过Buffer的layersWithQueuedFrames；
-- 是否全量重绘、颜色、geometry/damage标志。
-
-然后调用：
-
-```cpp
-mCompositionEngine->present(refreshArgs);
-```
-
-## 53. CompositionEngine 不等于 GPU
-
-CompositionEngine是SF内组织合成的框架。它协调Layer前端状态、每Display Output、RenderSurface、RenderEngine和HWComposer。
-
-真正的client composition由RenderEngine/GPU执行；device composition交给HWC/HWC HAL。
-
-## 54. Layer、LayerFE、OutputLayer 三者
-
-| 类型 | 作用 |
-|---|---|
-| SF `Layer` | 全局图层树、Buffer与事务状态 |
-| `LayerFE` | CompositionEngine读取Layer前端快照的接口 |
-| `OutputLayer` | 某个Layer在某个Output/Display上的投影与合成状态 |
-
-同一Layer可能出现在多个Display Output上，因此可能对应多个OutputLayer。
-
-```mermaid
-flowchart LR
-  SC["App/WMS SurfaceControl"] -->|"Binder handle"| L["SF Layer / BufferStateLayer"]
-  GB["GraphicBuffer + acquire fence"] -->|"Transaction.setBuffer"| L
-  L --> FE["LayerFE composition snapshot"]
-  FE --> O1["内置屏 OutputLayer"]
-  FE --> O2["外接屏/镜像 OutputLayer"]
-  O1 --> CE["CompositionEngine"]
-  O2 --> CE
-```
-
-## 55. CompositionEngine.present 的骨架
+`CompositionEngine::present()`的骨架很短，却给出了严格阅读顺序：
 
 ```cpp
 preComposition(args);
-for (output) output->prepare(args, latchedLayers);
+for (const auto& output : args.outputs) {
+    output->prepare(args, latchedLayers);
+}
 updateLayerStateFromFE(args);
-for (output) output->present(args);
+for (const auto& output : args.outputs) {
+    output->present(args);
+}
 ```
 
-它先收集/准备几何快照，再让每个输出独立选择与执行合成。
+`preComposition()`给每个LayerFE记录refresh start。`BufferLayer::onPreComposition()`还会清该Layer自己的 `mRefreshPending`，允许后续VSync再latch下一项；如果它仍有ready frame，CompositionEngine会标记 `needsAnotherUpdate()`，本轮结束后SF再请求layer update。
 
-## 56. Output.prepare 重建可见Layer栈
+所有Output先完成geometry prepare，再统一更新LayerFE content/geometry快照，最后逐Output执行present。这可避免第一个Output处理时就破坏第二个Output所需的共享前端状态。`latchedLayers`也确保同一LayerFE的basic geometry每帧最多准备一次，但每个Output仍保留自己的OutputLayer与可见区域。
 
-geometry变化时，`rebuildLayerStacks()`从前到后/后到前计算：
+多个Output的 `present()`在SF主线程上依次调用，并不意味着两个物理显示在同一纳秒present。每个HWC-backed Display有自己的HWC display、client target和present fence；没有HWC display id的Output走基类client路径，不能凭空获得HWC present fence。默认Display的全局统计更不能代替外接屏或虚拟屏证据。
 
-- Layer是否属于该output的layer stack；
-- hidden、alpha、bounds与transform；
-- opaque、visible、covered、transparent、shadow region；
-- dirty与新暴露区域；
-- Z顺序和OutputLayer创建/复用。
+## 10. Output先算可见层、写HWC候选状态，随后才协商策略
 
-这一步决定“有哪些候选内容实际影响这个显示器”。
+`Output::prepare()`在Output enabled且本帧需要更新geometry时重建layer stack。它从前到后评估LayerFE：先检查layer stack归属和 `isVisible`，再计算opaque、covered、transparent、shadow与dirty region，最后把落在Output bounds内的非空结果保存成OutputLayer。
 
-## 57. 被完全遮挡的Layer可不进入输出
+```text
+LayerFE全局几何
+  → belongsInOutput / hidden门
+  → 屏幕footprint与透明提示
+  → 减去上方opaque coverage
+  → 与Output viewport/bounds求交
+  → 创建或复用OutputLayer
+```
 
-上层不透明区域会从下层visible region扣除。下层窗口即使成功latch Buffer，也可能因完全被遮挡而没有可见draw region。
+不更新geometry时，Output复用既有OutputLayer列表；后面的 `updateLayerStateFromFE()`仍可只刷新content。因此“prepare没有重建”不等于本帧没有新Buffer。
 
-因此“Layer latched”不等于“用户能看到该Layer像素”。
-
-## 58. Output.present 的固定阶段
+每个Output的正常骨架固定为八步：
 
 ```cpp
-updateColorProfile();
-updateAndWriteCompositionState();
-setColorTransform();
+updateColorProfile(refreshArgs);
+updateAndWriteCompositionState(refreshArgs);
+setColorTransform(refreshArgs);
 beginFrame();
 prepareFrame();
-finishFrame();
+devOptRepaintFlash(refreshArgs);
+finishFrame(refreshArgs);
 postFramebuffer();
 ```
 
-策略选择发生在 `prepareFrame()`，GPU client composition发生在 `finishFrame()`，HWC present/fence处理发生在 `postFramebuffer()`。
+`devOptRepaintFlash()`只在调试脏区闪烁配置启用时额外重绘、present、等待并重新prepare；固定生产路径未启用它，但阅读骨架时不能把这个真实阶段删掉。
 
-## 59. 先把每个OutputLayer状态写给HWC
+第二步会让每个OutputLayer更新候选composition state，并立即调用 `writeStateToHWC()`。对目标BufferLayer，LayerFE快照已经包含 `mBufferInfo.mBuffer`、buffer slot和acquire fence；这些DEVICE候选命令会在validate调用前写入Composer command stream，并由validate的 `execute()`连同验证请求一起送出，不是在RenderEngine完成client target后才首次出现。
 
-`updateAndWriteCompositionState()`计算displayFrame、sourceCrop、buffer transform、dataspace、blend、alpha、damage等，然后调用：
+`beginFrame()`用dirty、当前是否无可见层、上一帧是否也无可见层计算 `mustRecompose`。从有内容变成空屏时仍输出一次黑帧；连续空屏可以跳过重复重组。这个布尔值传给DisplaySurface，但后续HWC状态机仍可能继续，不能把“skip recompose”翻译成整个 `Output::present()`提前返回。
 
-```cpp
-layer->writeStateToHWC(...);
-```
+`prepareFrame()`才调用 `chooseCompositionStrategy()`，再把最终的CLIENT/DEVICE组合告诉RenderSurface。先写候选状态、后validate，是HWC协议要求：设备需要看到Layer属性、Buffer和fence，才能决定哪些输入能由自己合成。
 
-HWC只有看到完整候选状态，才能判断哪些Layer可由硬件直接处理。
+## 11. validate协商责任边界，`presentOrValidate`可能已经完成present
 
-## 60. client composition 与 device composition
+CLIENT和DEVICE是HWC视角的责任标签：
 
-- Client composition：SurfaceFlinger用RenderEngine/GPU把若干Layer画进一个client target；
-- Device composition：HWC直接拿Layer Buffer，使用overlay、display processor或其他厂商硬件组合。
+| 最终类型 | 谁合成该Layer | 最终进入HWC的输入 |
+|---|---|---|
+| CLIENT | HWC客户端，即SurfaceFlinger的RenderEngine | 该Layer先被画入client target |
+| DEVICE | HWC/厂商显示栈 | 原Layer Buffer、几何、blend与acquire fence |
+| 混合 | 两者各处理一部分 | 一个client target加若干DEVICE Layer |
 
-“client”这里指HWC的客户端SurfaceFlinger，不是应用进程。
+它不承诺DEVICE一定使用overlay，也不承诺厂商内部绝不调用GPU；源码能证明的是接口责任，不是具体硅片单元。
 
-## 61. 一帧可以混合合成
-
-例如：
-
-```text
-App窗口A → DEVICE
-视频Surface → DEVICE overlay
-模糊/复杂颜色层 → CLIENT
-CLIENT层先由RenderEngine合成到client target
-HWC再把client target与两个DEVICE层一起present
-```
-
-不是只能“全GPU”或“全HWC”二选一。
-
-```mermaid
-flowchart TD
-  A["可见 OutputLayers"] --> V["HWC validate / presentOrValidate"]
-  V --> D["DEVICE layers"]
-  V --> C["CLIENT layers"]
-  C --> RE["SF RenderEngine.drawLayers"]
-  RE --> CT["Client Target + ready fence"]
-  D --> H["HWC presentDisplay"]
-  CT --> H
-  H --> PF["Present fence"]
-  H --> RF["Per-layer release fences"]
-```
-
-## 62. 什么会强制 client composition
-
-源码可因下列条件设置 `forceClientComposition`：
-
-- 非secure output上出现secure内容；
-- 无效buffer transform；
-- Output颜色配置不支持该dataspace；
-- 背景模糊等必须由RenderEngine完成的效果；
-- 开发者强制禁用HWC或调试脏区。
-
-具体厂商HWC还可在validate时要求更多Layer改为CLIENT。
-
-## 63. chooseCompositionStrategy 与 HWC validate
-
-物理Display覆盖基类策略，调用：
+物理 `Display::chooseCompositionStrategy()`先把Output默认成client-only，再调用：
 
 ```cpp
 hwc.getDeviceCompositionChanges(
@@ -654,73 +463,59 @@ hwc.getDeviceCompositionChanges(
         &changes);
 ```
 
-HWC validate返回changed composition types、display requests、layer requests和client target属性，SF接受并更新每个OutputLayer。
+固定混合帧在validate前就已有候选CLIENT Layer，所以HWComposer走 `validate()`。成功后依次取得changed composition types、display requests、layer requests和client-target property，再调用 `acceptChanges()`。这里的 `Composer::acceptDisplayChanges()`只把 `ACCEPT_DISPLAY_CHANGES`写入command writer，并未执行队列；返回Display后，Display才把changed types与各类request应用到OutputLayer/Output。因此先发生的是accept命令暂存，接着是SF本地最终视图更新；厂商Composer真正执行accept命令，要等后面的 `presentDisplay()`调用 `execute()`，并按writer顺序与client target、present命令一起下发。
 
-## 64. validate不是实际显示
+这种协商并不对称：SF明确请求CLIENT时，HWC不能把它改回另一类型；SF提交DEVICE候选时，HWC可以在validate中要求它改为CLIENT。最终策略来自SF的初始/强制条件与HWC能力反馈共同收敛，不是HWC不受约束地自由选择。
 
-validate的作用是协商“这帧谁合成什么”。它可能要求SF把原计划DEVICE的Layer改成CLIENT，然后SF据此生成client target。
-
-即使validate成功，内容仍未必提交给显示面板。
-
-## 65. presentOrValidate 快路径
-
-当当前帧没有client composition时，SF先尝试：
+最终两个聚合布尔值来自所有OutputLayer：
 
 ```cpp
-hwcDisplay->presentOrValidate(...);
+state.usesClientComposition =
+        anyLayersRequireClientComposition();
+state.usesDeviceComposition =
+        !allLayersRequireClientComposition();
 ```
 
-若HWC确认无需重新validate，可直接完成present并返回present fence；否则退回正常validate→present流程。
+一帧完全可以二者都为true。固定目标窗口层最终为DEVICE；另一个效果层为CLIENT，于是RenderEngine绘制CLIENT内容，并可能执行非CLIENT层的clear-only request；目标窗口的DEVICE内容本身仍作为独立HWC Layer输入。
 
-## 66. fast path 不改变完成边界
+纯DEVICE候选有另一条重要分支。HWComposer先尝试 `presentOrValidate()`：
 
-presentOrValidate若直接present，只减少一次往返/validate成本。返回fence仍可能未signal；物理开始显示仍看fence信号语义。
+```text
+state == 1
+  → present已成功
+  → 保存present fence与release-fence map
+  → validateWasSkipped=true
 
-## 67. beginFrame 决定是否需要重组
+否则且validate结果可继续
+  → 读取changed types/requests
+  → 暂存ACCEPT_DISPLAY_CHANGES，并在Display本地应用changes
+  → 后面走普通present
+```
 
-Output根据dirty region、是否有可见层及上一帧是否为空计算 `mustRecompose`，再调用RenderSurface beginFrame。
+因此 `presentOrValidate`这个名字不能一概解释为“只做validate”。若 `state==1`，present已经发生在 `prepareFrame() → chooseCompositionStrategy()`内部；后面的 `postFramebuffer()`只执行pending command、检查缓存状态并复用fences，不会再调用一次HWC `present()`。若本来就有CLIENT候选，则不能在client target尚未绘制时尝试跳过validate。
 
-没有变化时可避免重复client composition，但HWC状态机或显示请求仍可能需要走后续步骤。
+validate出错时，Display记录错误并从策略函数返回；虽然Output级聚合布尔仍保留先前默认值，也不能据此宣称系统完成了一次可靠的“全GPU自动回退”。per-layer状态、client target准备和HWC状态机没有帧级回滚承诺。
 
-## 68. RenderSurface 是SF输出目标抽象
+还有一个r48局部实现缺口：`applyClientTargetRequests()`用 `auto outputState = editState()`取得副本，随后对dataspace的赋值不一定写回Output state；RenderSurface的pixel format/dataspace setter仍会执行。阅读现场值时应分别检查两本账。
 
-对物理显示，RenderSurface背后常由FramebufferSurface/BufferQueue连接到HWC client target。它承载的是SF GPU合成结果，不是App窗口自己的Surface。
+## 12. CLIENT层先画进SF client target，再把ready fence交给HWC
 
-不要把App GraphicBuffer和SF client target混成同一块Buffer。
-
-## 69. finishFrame 只在需要时执行GPU合成
+策略确定后，`finishFrame()`调用 `composeSurfaces()`。只要最终使用CLIENT composition，或HWC提出 `FLIP_CLIENT_TARGET`，SF就先从RenderSurface取得一块输出Buffer：
 
 ```cpp
-auto optReadyFence = composeSurfaces(...);
-if (!optReadyFence) return;
-mRenderSurface->queueBuffer(std::move(*optReadyFence));
+if (hasClientComposition || outputState.flipClientTarget) {
+    buf = mRenderSurface->dequeueBuffer(&fd);
+    if (buf == nullptr) {
+        return {};
+    }
+}
 ```
 
-若没有client composition，`composeSurfaces()`返回的是一个已构造、但内部fd无效的NO_FENCE语义值，而不是失败用的空optional；RenderEngine不画这些Layer，RenderSurface仍可完成本帧必要的状态机/queue步骤，device layers继续直接交HWC。
+这里的 `fd`保护client target的旧内容，RenderEngine必须在安全后才能重写；它不是App目标窗口Buffer的acquire fence。`C_lease`因此属于Output自己的BufferQueue。
 
-## 70. client composition 先 dequeue client target
+随后SF为 `requiresClientComposition()` 的OutputLayer生成实际内容绘制 `LayerSettings`。每笔请求可带source buffer/solid color、bounds、transform、clip、alpha、blend、dataspace、filter、rounded corner、shadow或blur；此外，HWC的clear-client-target request还可能为满足条件的非CLIENT不透明Layer生成只清理target、不重复绘制其DEVICE内容的请求。
 
-需要client composition或HWC要求flip client target时：
-
-```cpp
-buf = mRenderSurface->dequeueBuffer(&fd);
-```
-
-`fd`是该client target可安全重写的fence。SF也会受到显示输出BufferQueue的slot/consumer背压。
-
-## 71. generateClientCompositionRequests 生成RenderEngine输入
-
-SF只为 `requiresClientComposition()` 的OutputLayer生成LayerSettings，带：
-
-- source buffer/solid color；
-- boundaries、transform、clip；
-- alpha、blend、filtering；
-- dataspace、rounded corners、shadow/blur；
-- clear client target请求。
-
-DEVICE层通常不会重复画进client target，除非HWC要求清理/特殊混合。
-
-## 72. RenderEngine.drawLayers 执行SF GPU合成
+固定帧最终调用：
 
 ```cpp
 renderEngine.drawLayers(
@@ -732,310 +527,259 @@ renderEngine.drawLayers(
         &readyFence);
 ```
 
-这里的GPU工作发生在surfaceflinger侧RenderEngine，不是App HWUI RenderThread。
+RenderEngine提交并拿到有效native fence时，`readyFence`保护这块client target的新内容；它返回时可以pending，也可以已经signal。走同步 `finish()`时可返回 `NO_FENCE`，表示调用返回时已经可读。它与各App Layer自己的acquire fence角色相似，但资源身份不同：前者保护SF输出目标，后者保护单个Layer输入。
 
-## 73. readyFence 保护 client target
+`finishFrame()`再把ready fence交给 `RenderSurface::queueBuffer()`。物理Display的顺序是：
 
-RenderEngine可能异步写client target，`readyFence`告诉HWC何时可以读取这块合成结果。
-
-它在HWC语义中成为client target acquire fence，与App Layer各自的acquire fence作用相似，但保护的Buffer不同。
-
-## 74. RenderSurface.queueBuffer 提交 client target
-
-SF把client target及ready fence交给RenderSurface/HWC路径。此时HWC可把它作为一个整体层，与DEVICE composition的原始App Layer组合。
-
-因此GPU client composition不是最终物理present，只是为HWC准备一个输入。
-
-## 75. DEVICE composition 也不是“无GPU成本”承诺
-
-DEVICE表示合成交给HWC。具体使用overlay、2D硬件、display processor还是厂商GPU实现，由HAL/硬件决定。
-
-源码层只能断言责任边界，不能凭composition type推断功耗和硬件单元。
-
-## 76. postFramebuffer 进入最终present阶段
-
-```cpp
-mRenderSurface->flip();
-auto frame = presentAndGetFrameFences();
+```text
+ANativeWindow queue client target + ready fence
+→ DisplaySurface::advanceFrame()
+→ FramebufferSurface::nextBuffer()
+→ consumer acquire该target
+→ HWComposer::setClientTarget(slot, buffer, acquireFence, dataspace)
 ```
 
-对物理Display，`Display::presentAndGetFrameFences()`调用HWComposer present并取回present/release fences。
+最后一步 `HWComposer::setClientTarget()`仍不是一次立即的厂商调用：r48 `Composer::setClientTarget()`只把slot、buffer、acquire fence和dataspace写进 `mWriter`后返回。随后 `Composer::presentDisplay()`再追加PRESENT_DISPLAY并调用 `execute()`，把积累的client-target命令批量送给Composer服务/厂商实现。于是 `C_stage`只证明命令已暂存；到present执行阶段，CLIENT预合成结果才与已validate的DEVICE Layer状态在同一显示提交中汇合。
 
-## 77. HWC presentDisplay 的前置条件
+HWC最终看到的不是“RenderEngine画整屏后再覆盖DEVICE层”，而是client target和DEVICE输入由显示策略统一组合。
 
-正常慢路径必须先成功validate并接受changed types。随后 `HWComposer::presentAndGetReleaseFences()`调用：
+三个边界经常被忽略：
+
+- 只有 `FLIP_CLIENT_TARGET`而没有CLIENT Layer时，代码仍可dequeue/queue一块target，却不调用RenderEngine绘制；
+- `FramebufferSurface::nextBuffer()`若得到 `NO_BUFFER_AVAILABLE`，会沿用当前target cache并返回成功，不再次调用 `setClientTarget()`；
+- client-composition request cache命中同一output buffer与完整请求时，可以复用已有结果，`readyFence`为空而不再draw。
+
+固定路径排除了这三种复用。RenderEngine draw失败只会移除request cache项，并没有撤销整帧；`advanceFrame()`失败主要记录日志；物理Display queue client target失败则会触发fatal，虚拟Display改为cancel。故现场必须同时看draw、queue、advance与HWC setClientTarget，不能只靠一个“GPU composition”slice判成功。
+
+## 13. HWC present返回的是未来完成条件，不是已经亮到屏幕上
+
+`Output::postFramebuffer()`先清dirty region并调用 `mRenderSurface->flip()`。这里的 `flip()`只增加page-flip计数；真正显示提交发生在 `Display::presentAndGetFrameFences()`。
+
+固定慢路径调用：
 
 ```cpp
-hwcDisplay->present(&lastPresentFence);
+hwcDisplay->present(&displayData.lastPresentFence);
 hwcDisplay->getReleaseFences(&releaseFences);
 ```
 
-fast path若已由presentOrValidate present，则这里只flush command buffer并复用已经取得的fences。
+`present()`成功表示HWC接受/安排了本display frame，并给SF一个代表该present事件的fence；随后查询本帧可用的per-layer release fences。HAL只要求为本帧收到新Buffer内容的DEVICE Layer返回release fence；某层缺项按规范表示上一帧Buffer已可写，不能假设每个DEVICE Layer必有一条。present返回时其fence可以pending，也可以已经signal，所以 `P_return`只能证明协议成功返回和fence可被检查，不能独自证明 `P_signal`发生或未发生。
 
-## 78. present() 返回表示什么
+纯DEVICE快路径若早先 `presentOrValidate(state==1)`已经present，`presentAndGetReleaseFences()`改为执行Composer pending commands、检查缓存状态，然后直接返回已有的present/release结果。r48名为 `presentError` 的字段实际接收紧随直达present之后 `getReleaseFences()`的结果，这个命名也不应被扩大成另一轮present。把两条路径都画成“validate → RenderEngine → postFramebuffer → presentDisplay”会凭空制造一次调用。
 
-它表示HWC接受/安排了本帧present，并把未来会signal的fence交回SF。函数返回时面板通常还没到目标VSync。
+HWC 2.1对present fence的定义按输出类型不同：
 
-所以trace中的HWC `present` slice结束不是物理上屏完成时间。
+| Output | fence signal的规范语义 |
+|---|---|
+| video-mode物理面板 | 本帧合成结果在某次VSync开始出现在display |
+| command-mode物理面板 | 本帧开始传入panel memory |
+| virtual display | output buffer写入完成，外部可以安全读取 |
 
-## 79. present fence 的规范语义
+对物理屏，signal不是“整屏最后一行已经扫描结束”，也不是“光子已被人眼感知”。它仍是AOSP可获得的最靠后的结构化显示证据之一，远强于queue、latch、validate或present函数返回。
 
-HWC 2.1接口说明：
+能力 `PRESENT_FENCE_IS_NOT_RELIABLE`允许Composer声明该fence不能准确表示实际present time。SF据此不把 `DISPLAY_PRESENT`列为受支持frame timestamp，并让相关启动配置知道present timestamp不可依赖；VR composer或无sync framework时，Scheduler也可忽略present fences。没有有效fence时，部分Layer/动画统计会回退到HWC refresh timestamp，这个替代值不能冒充一条可靠sync fence。
 
-- video-mode物理面板：在本帧合成结果开始出现在显示器的VSync时signal；
-- command-mode面板：在内容开始传入面板内存时signal；
-- virtual display：输出Buffer写完成、可安全读取时signal。
+present fence属于display frame，而非自动属于某个Layer。只有在固定的“目标已visible、参加该frame、无后继replacement、fence可靠”条件下，才可由 `P_signal`推断目标内容已经到达该显示完成点。现实trace中若中间又latch了下一Buffer，必须用frame number、buffer id与timestamps重新归因。
 
-它是系统可获得的实际present时间证据，但“开始出现”不等于整屏扫描已经结束。
+## 14. release与postComposition闭合所有权，callback仍不等待fence signal
 
-## 80. present fence 也可能不可靠或不存在
+取得frame fences后，Output先调用 `RenderSurface::onPresentDisplayCompleted()`。对FramebufferSurface，这会用本帧present fence保护上一块client target并把旧slot release回它的BufferQueue；当前target仍由显示路径持有，等待后续帧替换。
 
-Composer capability `PRESENT_FENCE_IS_NOT_RELIABLE`明确允许实现声明present fence不能准确代表实际present时间；无sync framework或特殊VR composer也会让SF忽略它。
+随后 `Output::postFramebuffer()`为每个OutputLayer构造release fence：
 
-源码还在无有效present fence时用HWC refresh timestamp回退。因此诊断前必须检查能力与fence有效性。
+1. 若有HWC Layer，先查本帧per-layer release fence；
+2. 只要Output本帧使用CLIENT composition，就再与当前client-target acquire fence合并；
+3. 调用 `LayerFE::onLayerDisplayed(releaseFence)`；
+4. 对已不在当前OutputLayer列表、却需要释放的Layer，只能保守地给present fence。
 
-## 81. release fence 的规范语义
+第二步看似多余，是因为r48没有精确追踪上一帧client-target acquire fence，源码选择总与当前target fence合并。它是保守近似，不表示每个Layer都实际被RenderEngine读取。
 
-HWC为Layer返回release fence，表示显示系统已经不再读取此前提交的Buffer，producer之后可以安全复用/重写相应slot。
+传统 `BufferQueueLayer::onLayerDisplayed()`把fence交给 `BufferLayerConsumer::setReleaseFence()`。CompositionEngine返回后，SF `postComposition()`先对 `mLayersWithQueuedFrames`调用 `releasePendingBuffer()`；consumer此时释放的是被新active Buffer替换的旧pending项。目标首Buffer本身要等未来另一帧替换或Layer移除，才到 `B_reuse`。
 
-它保护Buffer生命周期，不是“这一帧开始显示”的时间戳。
-
-## 82. 三类 fence 对照
-
-| Fence | 谁产生 | 谁等待/使用 | signal含义 |
-|---|---|---|---|
-| App Layer acquire fence | App GPU/HWUI | SF/RenderEngine/HWC | App完成该Buffer写入，可读 |
-| Layer release fence | HWC/SF | App producer/BLAST | 显示系统不再读旧Buffer，可复用 |
-| Display present fence | HWC | SF统计/Scheduler/回调 | 本帧开始显示或开始传入面板 |
-
-同一个fd在跨层传递时可能被dup/merge，概念角色仍应按被保护的资源区分。
-
-## 83. Output.postFramebuffer 分发 release fence
-
-SF先取得HWC每个device Layer的release fence；只要整个Output本帧使用了client composition，源码就保守地把各OutputLayer的release fence与当前client target acquire fence合并（它没有精确跟踪上一帧client target fence），再调用：
-
-```cpp
-layer->getLayerFE().onLayerDisplayed(releaseFence);
-```
-
-这样BufferStateLayer能把旧Buffer何时可释放反馈给BLAST客户端。
-
-## 84. 为什么release通常对应“前一块Buffer”
-
-当前帧新Buffer成为显示输入后，release fence通常描述被它替换的上一Buffer何时不再被读。新Buffer自己的最终release要等后续帧替换或Layer移除。
-
-首Buffer没有同Layer的前一块业务Buffer，因此相关previous release可为空/NO_FENCE。
-
-## 85. SurfaceFlinger.postComposition 做收尾
-
-CompositionEngine present返回后，SF：
-
-- 让latched Layer `releasePendingBuffer()`；
-- 取得默认Display的present fence；
-- 记录GPU composition done与present时间；
-- 调用每个Layer `onPostComposition()`；
-- 给TransactionCompletedThread添加present fence并发送callbacks；
-- 把fence交Scheduler/TimeStats。
-
-这里仍通常只是持有未signal的present fence。
-
-## 86. Transaction completed callback 如何回到 BLAST
-
-BLAST在Transaction中注册completion callback。SF将latchTime、presentFence、SurfaceControlStats、previousReleaseFence等经 `ITransactionCompletedListener`回给App。
-
-App `TransactionCompletedListener`再调用 `BLASTBufferQueue::transactionCallback()`。
-
-## 87. callback到达不必等待present fence signal
-
-SF在postComposition拿到fence后即可发送callback；fence对象本身可以仍是pending。客户端若需要实际present时间，必须观察/等待fence signal，而不是把callback执行时刻当present。
-
-## 88. BLAST callback负责释放上一Buffer
-
-BLAST保存pending release item，从SurfaceStats取 `previousReleaseFence`，再：
-
-```cpp
-mBufferItemConsumer->releaseBuffer(
-        pendingItem,
-        previousReleaseFence);
-```
-
-只有fence允许时该GraphicBuffer slot才真正安全回到producer循环。
-
-## 89. BLAST还能继续处理影子队列
-
-transaction callback释放旧Buffer、更新frame timestamps后调用 `processNextBufferLocked(false)`，继续提交积压的下一帧。
-
-这形成：App RenderThread producer→本地BLAST consumer→SF Transaction→HWC fences→BLAST release的闭环。
-
-## 90. WMS finishDrawing 与 SF首Buffer的关系
-
-第214章看到App在HWUI frame-complete后调用WMS `finishDrawing()`；它让WMS把窗口从DRAW_PENDING推进并提交show事务。
-
-SF同时需要收到窗口首Buffer和show/alpha/layer事务。最终可见结果由这两类控制面/数据面状态在SF帧边界汇合，不是单靠任一调用。
-
-## 91. WindowState HAS_DRAWN 仍早于present fence signal
-
-WMS的draw state描述客户端绘制协议和窗口可show资格。SurfaceFlinger latch/compose/HWC present属于之后的图形管线。
-
-所以“WMS显示窗口”“windowsDrawn回调”“屏幕光子已变化”必须按具体API与fence证据区分。
-
-## 92. 首帧完成点总表
-
-| 观察点 | 能证明 | 不能证明 |
-|---|---|---|
-| App `queueBuffer`返回 | producer已提交Buffer | SF已latch |
-| SF `latchBuffer`成功 | Layer选中活动Buffer | Layer可见或已present |
-| HWC validate成功 | 合成责任已协商 | 已提交显示 |
-| `presentDisplay`返回 | HWC接受present并给fence | fence已signal |
-| reliable present fence signal | 本帧开始显示/传输到面板 | 整屏扫描完全结束 |
-
-## 93. Buffer会不会被跳过
-
-可能。传统BufferQueue的droppable/async模式可以用新帧替换旧队尾；timestamp尚未到的帧延后；fence太晚会错过本VSync；Layer离屏时Buffer可被消费后直接释放。
-
-“App每queue一帧，面板就逐帧展示”不是BufferQueue保证。
-
-## 94. Late acquire 如何导致错过本周期
-
-acquire fence未signal时，Transaction或latch暂缓，SF请求下一次layer update。本轮可能继续显示旧Buffer。
-
-这避免读半成品，但增加输入到显示的延迟，并可能被统计为latch skipped/late acquire。
-
-## 95. desiredPresentTime 如何避免过早显示
-
-App/HWUI给Buffer timestamp，BLAST转成Transaction desired present time。SF在预计present时间尚早时把Transaction留在队列。
-
-它是调度目标，不保证一定精准命中；系统负载、fence、HWC和VSync都可能使实际present更晚。
-
-## 96. 背压如何向App传播
-
-显示消费慢时：
+`postComposition()`还会：
 
 ```text
-HWC/panel迟迟不release旧Buffer
-→ BLAST consumer不能release slot
-→ producer可用slot减少
-→ App RenderThread dequeueBuffer阻塞
-→ syncAndDrawFrame/下一帧UI可能等待更久
+取默认Display的client-target acquire fence作为GPU composition done证据
+→ 取HWComposer保存的默认Display present fence
+→ Layer.onPostComposition记录latch帧的ready/present时间线
+→ TransactionCompletedThread挂入present fence并发送callbacks
+→ 条件满足时把present fence交Scheduler
+→ 更新TimeStats与composition类型计数
 ```
 
-这是图形流水线保持有限内存和有序所有权的自然结果。
+事务callback在这里拿到的是fence对象，不会先等待它signal。于是callback收到pending fence很正常；若HWC调用较慢，它也可能收到已经signal的fence。WMS事务完成、BLAST transaction callback或应用监听器被调用，都不能单凭回调时刻判断画面是否已present，必须检查fence状态/时间与帧归因。
 
-## 97. 多Display时不能只看默认屏
+BLAST对照路径还要避免另一种误解。`BufferStateLayer::releasePendingBuffer()`会finalize callback handles，callback把 `previousReleaseFence`带回App内BLAST。BLAST随后可以立即调用本地consumer `releaseBuffer(item, previousReleaseFence)`：slot逻辑上变FREE并保存这个仍可能pending的fence，producer下一次dequeue可取得slot与fence，再等它后安全写。故“release fence未signal”不必然等于 `releaseBuffer()`或 `dequeueBuffer()`函数本身一直阻塞；真正背压还取决于有限slot、outstanding acquire、callback消费速度以及producer何时等待返回的fence。
 
-CompositionEngine为每个Output构建OutputLayer并独立present。同一Layer可投影到多个输出，合成类型、颜色空间、fence与实际时序可能不同。
+三类fence可这样结账：
 
-`SurfaceFlinger::postComposition()`中的部分全局统计以默认Display为主，不能外推所有虚拟/外接屏。
+| fence | 保护的资源 | signal后允许什么 | 不能代替 |
+|---|---|---|---|
+| Layer acquire fence | 某个App/producer的新Layer Buffer | SF/RE/HWC安全读取 | Layer可见或display present |
+| Layer/client-target release fence | 上一代Layer Buffer或旧client target | producer安全覆盖/复用相应分配 | 当前display frame实际显示时间 |
+| display present fence | 一次Output frame | 证明到达该Output定义的present点 | 每个Buffer精确release与整屏扫描结束 |
 
-## 98. secure/protected 内容会改变合成选择
+## 15. 从症状倒推断点，并用九组只读练习自证
 
-受保护GraphicBuffer不能随意被普通GPU上下文读取；CompositionEngine检查output secure属性与RenderEngine protected support，必要时使用受保护上下文或强制特定路径。
+先按完成点定位，不要先猜“GPU慢”或“HWC坏了”：
 
-非secure输出上的secure Layer可能被强制CLIENT，随后由protected-content能力和安全输出策略决定能否取样、合成或被替代；不能只凭这一处分支断言一定正常显示或一定黑屏。
+| 现象 | 优先核对 | 还要排除 |
+|---|---|---|
+| App queue已返回，SF迟迟没latch | `Q_notice`、下次INVALIDATE、timestamp、late acquire、sync point | callback先于producer返回，不能只按线程slice排序 |
+| show已提交仍黑 | show是否进drawing、是否有active Buffer、Layer是否属于Output/被覆盖 | WMS draw state不等于SF visibility |
+| latch有记录但无目标OutputLayer | bounds、hidden/alpha、layer stack、opaque coverage | latch本身没有可见承诺 |
+| validate后没有RenderEngine draw | 最终是否纯DEVICE、flip-only或request-cache复用 | validate成功不要求GPU工作 |
+| RenderEngine draw有记录但显示未变 | target queue/advance/setClientTarget、HWC present及fence | SF client target不是最终present |
+| present调用结束仍看不到 | present fence是否有效、可靠、已signal，frame归因是否被替换 | 函数返回本身不证明fence是否已signal |
+| producer复用变慢 | free slot数、outstanding acquire、release fence等待与callback消费 | pending release fence未必阻塞逻辑release/dequeue返回 |
+| 多屏结果不一致 | 每个OutputLayer、composition type、present fence | 默认Display统计不可外推 |
 
-## 99. “Hardware Composer”不一定亲自画所有像素
+以下命令只读本地 `android-11.0.0_r48` 源码；每组都把问题限制到少数文件，Bash 3.2与Zsh 5.9均可运行。
 
-HWC是合成策略与显示提交接口。它可以让SF GPU生成client target，也可以让overlay硬件直出Layer，还可混合两者。
-
-它的核心价值是把显示硬件能力暴露给SF，而不是保证“所有合成都不用GPU”。
-
-## 100. macOS只读练习一：追 BLAST Transaction
+### 练习 1：证明queue回调位于producer返回之前
 
 ```bash
 cd /Users/ninebot/androidSource
-rg -n "processNextBufferLocked|setBuffer\(|setAcquireFence|setTransactionState" \
-  frameworks/native/libs/gui/{BLASTBufferQueue.cpp,SurfaceComposerClient.cpp} \
+rg -n 'mSlots\[slot\]\.mBufferState\.queue|onFrameAvailable\(item\)|Throttling EGL Production|return NO_ERROR' \
+  frameworks/native/libs/gui/BufferQueueProducer.cpp
+```
+
+按源码顺序标出 `Q_accept`、consumer callback、EGL节流与函数返回，并说明哪个调用发生在BufferQueue主锁外。
+
+### 练习 2：区分真实队列与BufferQueueLayer shadow queue
+
+```bash
+cd /Users/ninebot/androidSource
+rg -n 'mQueueItems\.push_back|mQueuedFrames\+\+|signalLayerUpdate|onBufferAvailable|onFrameReplaced' \
+  frameworks/native/services/surfaceflinger/BufferQueueLayer.cpp
+```
+
+解释shadow queue保存什么、谁仍管理slot所有权，以及replacement为何不等于再增加一个pending slot。
+
+### 练习 3：找出INVALIDATE的两个early return
+
+```bash
+cd /Users/ninebot/androidSource
+rg -n 'mSetActiveConfigPending|framePending && mPropagateBackpressure|handleMessageTransaction|handleMessageInvalidate|signalRefresh' \
   frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
 ```
 
-标出App本地BufferQueue、Binder边界和SF Layer setBuffer三个阶段。
+回答哪些条件会让SF在transaction/latch前退出，以及INVALIDATE怎样决定是否再发REFRESH。
 
-## 101. macOS只读练习二：追 transaction ready 与 latch
+### 练习 4：核对Layer与全局current/drawing提交
 
 ```bash
 cd /Users/ninebot/androidSource
-rg -n "transactionIsReadyToBeApplied|flushTransactionQueues|handlePageFlip|latchBuffer|updateActiveBuffer" \
-  frameworks/native/services/surfaceflinger/{SurfaceFlinger.cpp,BufferLayer.cpp,BufferStateLayer.cpp}
+rg -n 'notifyAvailableFrames|layer->doTransaction|commitTransaction\(c\)|mDrawingState = mCurrentState|commitChildList' \
+  frameworks/native/services/surfaceflinger/{SurfaceFlinger.cpp,Layer.cpp}
 ```
 
-分别写出desiredPresentTime、acquire fence、sync point、active buffer四道门。
+画出Layer内部commit和全局Layer树commit，解释为何show transaction返回不能代替 `T_commit`。
 
-## 102. macOS只读练习三：对比 CLIENT/DEVICE 合成
+### 练习 5：对比两类Layer的present与fence门
 
 ```bash
 cd /Users/ninebot/androidSource
-rg -n "chooseCompositionStrategy|getDeviceCompositionChanges|composeSurfaces|drawLayers|presentAndGetFrameFences" \
-  frameworks/native/services/surfaceflinger/CompositionEngine/src/{Output.cpp,Display.cpp} \
+rg -n 'shouldPresentNow|fenceHasSignaled|mIsDroppable|lastSignaledFrameNumber|transactionIsReadyToBeApplied' \
+  frameworks/native/services/surfaceflinger/{BufferQueueLayer.cpp,BufferStateLayer.cpp,SurfaceFlinger.cpp}
+```
+
+分别写出传统BufferQueueLayer和BufferStateLayer在哪一层检查时间/fence，并指出droppable旁路仍保留什么依赖。
+
+### 练习 6：追踪latch到可见OutputLayer
+
+```bash
+cd /Users/ninebot/androidSource
+rg -n 'handlePageFlip|updateTexImage|updateActiveBuffer|collectVisibleLayers|ensureOutputLayerIfVisible' \
+  frameworks/native/services/surfaceflinger/{SurfaceFlinger.cpp,BufferLayer.cpp,BufferQueueLayer.cpp} \
+  frameworks/native/services/surfaceflinger/CompositionEngine/src/Output.cpp
+```
+
+找出consumer acquire、active buffer、visible region与OutputLayer创建四个不同边界。
+
+### 练习 7：证明HWC有慢路径与直达present路径
+
+```bash
+cd /Users/ninebot/androidSource
+rg -n 'getDeviceCompositionChanges|presentOrValidate|state == 1|validateWasSkipped|acceptChanges|presentAndGetReleaseFences' \
   frameworks/native/services/surfaceflinger/DisplayHardware/HWComposer.cpp
 ```
 
-画出纯DEVICE、纯CLIENT和混合三种输入到HWC的形态。
+分别画出有CLIENT候选、纯DEVICE且直达、纯DEVICE但仍需validate三条路径。
 
-## 103. macOS只读练习四：核对 fence 语义
+### 练习 8：追踪SF client target的完整所有权链
 
 ```bash
 cd /Users/ninebot/androidSource
-rg -n "SET_PRESENT_FENCE|SET_RELEASE_FENCES|PRESENT_FENCE_IS_NOT_RELIABLE" \
-  hardware/interfaces/graphics/composer/2.1/{IComposer.hal,IComposerClient.hal}
+rg -n 'dequeueBuffer|drawLayers|queueBuffer|advanceFrame|setClientTarget|presentDisplay|Error Composer::execute\(\)|NO_BUFFER_AVAILABLE' \
+  frameworks/native/services/surfaceflinger/CompositionEngine/src/{Output.cpp,RenderSurface.cpp} \
+  frameworks/native/services/surfaceflinger/DisplayHardware/{FramebufferSurface.cpp,ComposerHal.cpp}
 ```
 
-用自己的话写出acquire、release、present三个fence的生产者、消费者和signal含义，不把present fence写成“整屏扫描结束”。
+说明dequeue fence、RenderEngine ready fence、FramebufferSurface current fence分别从谁的视角命名，并标出 `setClientTarget()`暂存命令与 `presentDisplay()`批量execute之间的边界。
 
-## 104. 自测题
+### 练习 9：把present、release与callback分开结账
 
-1. BLAST路径中App queueBuffer后谁直接消费BufferQueue？
-2. `Transaction.setBuffer()`何时真正跨进程？
-3. desiredPresentTime和acquire fence在哪一步阻止Transaction过早应用？
-4. SF current state和drawing state分别表示什么？
-5. INVALIDATE与REFRESH各做什么？
-6. BufferStateLayer与BufferQueueLayer的时间/fence门有何差异？
-7. latchBuffer成功能否证明用户已经看到？
-8. Layer、LayerFE、OutputLayer有什么区别？
-9. CLIENT与DEVICE composition中的“client/device”指谁？
-10. client target是谁生成、给谁消费？
-11. present()返回与present fence signal有什么区别？
-12. acquire、release、present fence分别保护什么？
+```bash
+cd /Users/ninebot/androidSource
+rg -n 'SET_PRESENT_FENCE|SET_RELEASE_FENCES|PRESENT_FENCE_IS_NOT_RELIABLE' \
+  hardware/interfaces/graphics/composer/2.1/{IComposer.hal,IComposerClient.hal}
+rg -n 'onPresentDisplayCompleted|onLayerDisplayed|releasePendingBuffer|addPresentFence|sendCallbacks' \
+  frameworks/native/services/surfaceflinger/{SurfaceFlinger.cpp,BufferQueueLayer.cpp} \
+  frameworks/native/services/surfaceflinger/CompositionEngine/src/{Output.cpp,RenderSurface.cpp}
+```
 
-## 105. 自测答案
+用自己的话定义三类fence，并解释为什么callback到达、present返回和present fence signal是三个时刻。
 
-1. App内BLASTBufferItemConsumer先消费，再用Transaction把Buffer交给SF BufferStateLayer。
-2. setBuffer只写客户端快照，Transaction.apply调用ISurfaceComposer.setTransactionState时跨Binder。
-3. SF `transactionIsReadyToBeApplied()`；未就绪事务按applyToken排队。
-4. current是最新请求态；drawing是本帧commit后供latch/composition使用的稳定快照体系。
-5. INVALIDATE处理事务、latch和damage；REFRESH调用CompositionEngine合成并present。
-6. BufferState事务apply前已按时间/fence排队；传统BufferQueue常在队列选择/latch时检查。
-7. 不能；还要可见区域、策略、HWC present和可靠present fence signal。
-8. Layer是全局SF图层；LayerFE是合成前端快照接口；OutputLayer是该Layer在具体Display上的实例。
-9. CLIENT指HWC客户端SurfaceFlinger/RenderEngine；DEVICE指HWC负责。
-10. SF RenderEngine把CLIENT层合成到client target，HWC再与DEVICE层一起提交显示。
-11. present返回表示已安排并取得fence；fence signal才表示按HAL语义开始显示/传输。
-12. acquire保护新Buffer写完成，release保护旧Buffer可复用，present标记显示提交实际生效时点。
+## 16. 结论：先汇合控制与内容，再协商责任，最后等显示证据
 
-## 106. 本章结论
+本章的完整主线是：
 
-Android 11的BLAST首帧在App内完成一次BufferQueue消费，再将GraphicBuffer、acquire fence、crop/transform和desired present time组成SurfaceControl Transaction。SurfaceFlinger Binder入口不会直接把它画到屏幕，而是按时间、fence和applyToken顺序写入BufferStateLayer current state；SF主线程在VSync对应的INVALIDATE阶段把请求提交为drawing状态并latch活动Buffer，首Buffer还会触发可见区域和damage重算。
+```text
+传统producer queue Buffer
+→ BufferQueueLayer收到callback并请求SF VSync
+→ INVALIDATE提交show等current state
+→ handlePageFlip按时间/fence/sync point选择并latch
+→ active Buffer与drawing可见状态汇合
+→ REFRESH建立LayerFE与每Display OutputLayer
+→ 候选DEVICE状态/Buffer/fence先写入Composer command stream
+→ validate结果与SF本地应用收敛出CLIENT、DEVICE或混合责任
+→ CLIENT层由RenderEngine画成client target
+→ client target与DEVICE Layer在HWC汇合
+→ 慢路径present或早先presentOrValidate直达
+→ release/present fences回传并分发
+→ 查询可靠present fence的signal time并完成目标帧归因
+```
 
-REFRESH阶段，CompositionEngine为每个Display构建OutputLayer，HWC validate决定CLIENT、DEVICE或混合合成。CLIENT层由SF RenderEngine先画进client target，HWC再把client target与DEVICE层一起present。`presentDisplay()`返回只说明HWC接受本帧并返回fence；在实现可靠时，present fence signal才表示内容开始出现在video-mode面板或开始传入command-mode面板。它仍不等于整屏扫描完全结束。
+应带走十二条结论：
 
-## 107. 复读后的边界修订
+1. r48普通窗口主线默认仍可走非BLAST `BufferQueueLayer`；BLAST是独立的Transaction-buffer路径，不能混成一次接收。
+2. `queueBuffer()`的SF consumer callback发生在producer函数返回前，且已经离开BufferQueue主锁。
+3. shadow queue服务于Layer选帧；真实队列和slot状态仍由BufferQueue consumer/core维护。
+4. `signalLayerUpdate()`只请求SF VSync；INVALIDATE还可能被配置切换或背压提前截断。
+5. show进入drawing只提供可见资格，Buffer latch只提供活动内容；二者必须在Output可见性计算中汇合。
+6. 传统Layer在 `shouldPresentNow()`和latch检查时间/fence；BufferState事务把主要门前移到Transaction ready阶段。
+7. droppable或调试旁路允许先latch未signal fence，但不会抹掉后续安全读取依赖。
+8. Layer、LayerFE、OutputLayer是全局状态、合成快照接口和每输出投影，不是三个同义名称。
+9. DEVICE候选Layer命令在validate前已暂存，并由validate执行后参与协商；RenderEngine之后只补出CLIENT层的client target。
+10. `presentOrValidate(state==1)`已经present，后段不会再无条件调用一次HWC present。
+11. release fence解决Buffer何时可安全复用；present fence描述display frame，事务callback不会先等它signal。
+12. 只有可靠present fence signal加上正确的Layer/frame归因，才能把目标内容推进到本章的 `P_signal`；它仍不是整屏扫描结束或人眼感知证明。
 
-- 不把BLAST路径写成App `queueBuffer`直接触发SF侧BufferQueueLayer；App内BLAST consumer先acquire，再通过Transaction设置BufferStateLayer。
-- 不把 `SurfaceControl`、SF Layer和GraphicBuffer当成同一对象；前者是控制句柄，中间是服务端图层状态，后者承载像素。
-- 不把 `Transaction.setBuffer()`当跨进程；真正Binder边界在apply→`setTransactionState()`。
-- 不把Transaction apply返回当事务已latch、已compose或已present。
-- 不忽略applyToken队头顺序、desiredPresentTime和acquire fence三类Transaction ready条件。
-- 不把全局current/drawing和Layer内部current/drawing简化成唯一一次浅拷贝；它们共同形成请求态→本帧绘制态。
-- 不把INVALIDATE与REFRESH混成同一回调；前者commit/latch，后者composition/present。
-- 不把传统BufferQueueLayer的timestamp/fence选择规则原样套给BufferStateLayer；后者在Transaction apply前已有一道门。
-- 不把latch称为“上屏”；它只把Buffer选为Layer活动内容。
-- 不把Layer树当View树；SF不知道窗口内部TextView/Button。
-- 不把CompositionEngine当GPU，也不把HWC DEVICE类型断言为具体overlay硬件。
-- 不把CLIENT解释为App客户端；它是HWC视角下由SurfaceFlinger/RenderEngine完成合成。
-- 不把SF client target与App窗口Buffer混成一块Buffer。
-- 不把HWC validate当present，也不把present函数返回时刻当fence signal时刻。
-- 不把present fence signal写成整屏扫描完成；规范是开始显示或开始传入面板，且实现可声明不可靠。
-- 不把release fence当present时间；它解决旧Buffer何时可复用。
-- 不把Transaction completed callback到达时间当实际present；callback可以携带仍pending的present fence。
-- 不把当前Mac静态推演写成设备实际选择了CLIENT/DEVICE、具体fence时间或首帧耗时。
+自测：
 
-下一章将回到帧节奏源头，精读Choreographer、DisplayEventReceiver、app/SF VSync phase、callback队列与Android 11的FrameInfo/jank时间戳，解释UI线程为何在某个时刻开始一帧，以及“掉帧”究竟掉在哪一段；不把Android 12以后更完整的FrameTimeline机制倒灌到r48。
+1. 为什么 `Q_notice`可能早于App的 `queueBuffer()`返回？
+2. show已进入drawing、但目标层没有active Buffer，会发生什么？
+3. timestamp恰好等于 `expectedPresentTime`时，传统Layer本轮是否due？
+4. droppable头帧fence未signal，为什么仍可能latch而又不破坏同步协议？
+5. 为什么首Buffer通常触发geometry/visible-region重算？
+6. latch成功后，哪些条件仍可能让目标没有OutputLayer？
+7. CLIENT中的“client”是谁？client target与App窗口Buffer有何区别？
+8. `presentOrValidate`何时省掉后续HWC present？
+9. HWC为什么必须在RenderEngine draw前先看到Layer候选状态？
+10. callback携带一个pending present fence时，能证明什么、不能证明什么？
+11. pending release fence为何不必然阻塞逻辑release/dequeue返回？
+12. 多Display场景为何不能只拿默认屏的present fence给所有Output下结论？
+
+答案依次是：consumer callback在producer return前同步执行；只有可见资格而没有内容；严格小于才due；Layer仍把fence传给后续读者；空内容变有内容会改变覆盖关系；layer-stack、hidden/alpha、bounds、opaque coverage等仍可淘汰它；client是SurfaceFlinger，target是SF整合CLIENT层的Output Buffer；`state==1`；HWC要据Buffer/几何/能力协商责任；只证明callback已取得未来条件，不能证明fence已signal；slot可先变FREE并携带fence，真正写入仍须等待；每个Output独立建OutputLayer、client target、策略和present时间线。
+
+下一章进入Choreographer、DisplayEventReceiver、App/SF VSync phase与callback队列，把“谁请求下一次VSync、哪个时间是预测目标、UI与SF为什么错相唤醒、掉帧证据落在哪条时间线”串成一条帧节奏链；仍以Android 11 r48为边界，不引入后续版本完整FrameTimeline模型。

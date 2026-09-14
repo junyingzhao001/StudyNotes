@@ -1,171 +1,133 @@
-# 217 Android应用冷启动首帧时间线与耗时分段
+# 217 Android 应用冷启动首帧时间线与耗时分段
 
-> 源码版本：Android 11 `android-11.0.0_r48`。  
-> 当前仅在macOS上只读源码，本章的耗时数字仅用于手算示例，不宣称已编译、安装或在真机实测。
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`。
+>
+> 当前环境只能静态核对 AOSP：可以证明服务端计时、进程创建、客户端生命周期、WMS drawn 协议与 `am start -W` 怎样汇合；不能据此声称某台设备的实际毫秒数，也不能把 `Displayed` 文本出现的时刻当成 HWC present 时刻。
 
-## 1. 为什么要再单独讲一次冷启动
+第 216 章已经解释一次 UI 帧如何从 Choreographer 进入 RenderThread。现在把镜头拉回应用启动：同一个“冷启动 300 ms”，可能指 shell 等了 300 ms、WMS 在 300 ms 认定窗口 drawn、App 在 300 ms 主动报告内容可用，甚至只是 300 ms 后 logcat 才打印一行文字。
 
-第201章已经建立从Launcher点击到首Buffer显示的总链，第202至215章又将Activity、进程、Window、View、RenderThread和SurfaceFlinger逐层展开。
+本章只追一个问题：**一次 `am start -W` 发起的普通冷启动，怎样从 ActivityMetricsLogger 的起点穿过进程、Activity、Window 与首帧，并形成彼此不能相加的 `StartingWindowDelay`、`BindApplicationDelay`、`TransitionDelay`、`TotalTime` 与 fully-drawn 时间？**
 
-本章不是把那条链路简单复制一遍，而是专门回答“启动耗时到底从哪里算到哪里”：
+## 1. 先固定一次冷启动，用二十六个完成点拆开“应用打开了”
 
-- 系统启动计时的起点在哪里；
-- cold、warm、hot是怎样分类的；
-- starting window drawn、transition starting、windows drawn分别表示什么；
-- logcat `Displayed ...` 是否就是像素已上屏；
-- `reportFullyDrawn()` 为什么既重要又不完全可信；
-- `am start -W` 的 `WaitResult.totalTime` 等的是什么；
-- 如何把冷启动拆成可定位的耗时段。
+不先锁定现场，cold/warm/hot、Splash/Snapshot、普通 BufferQueue/BLAST、单 Activity/跳板 Activity 会被拼成一条并不存在的总时序。本章主线 `L_cold` 固定如下。
 
-## 2. 一句话主线
+| 维度 | 固定值或前提 |
+|---|---|
+| 入口 | 一个 `am start -W`，只有一个 waiter；显式目标可正常 resolve，返回 `START_SUCCESS` |
+| 目标 | 默认 display 上的普通 standard Activity；目标进程与 `WindowProcessController` 均不存在，目标不是 `noDisplay`，此前不可见、未 drawn |
+| 合并 | 没有跳板、重定向、同 display 活跃 launch、多 display 并发或另一笔 shell wait |
+| 进程 | 普通 app Zygote 路线；为固定图关闭 USAP 分流，无 wrapper、isolated entry point、WebView Zygote 或 app Zygote |
+| 生命周期 | attach、`bindApplication` 与 Activity transaction 均成功；无 Provider 异常、进程死亡、pause 抢占或配置 relaunch |
+| Window | 系统创建并画出 Splash starting window；它让 app transition 在真实内容窗口 drawn 之前开始，无 transition timeout |
+| 首帧 | 一个真实主窗口，无额外 interesting window；硬件渲染、非空 Skia 帧、`prepareTextures=true`，默认非 BLAST adapter；swap/queue 成功且 `didSwap=true` |
+| 完成 | WMS 正常认定真实窗口 drawn；App 在此后稍晚只调用一次 `reportFullyDrawn()`，ActivityRecord 与 launch 账本仍可匹配 |
 
-```text
-ActivityStarter尽早记notifyActivityLaunching的elapsedRealtimeNanos
-→ resolve/launch decision确认目标
-→ ActivityMetricsLogger根据进程与Activity附着状态分cold/warm/hot
-→ 冷启动继续经ProcessList/Zygote/attach/bindApplication/launch Activity
-→ Activity创建Window、ViewRoot、Surface并完成首次draw
-→ WMS根据interesting windows的drawn状态调onWindowsDrawn
-→ windowsDrawnDelay = drawn timestamp - transition start
-→ WaitResult被唤醒，后台输出Displayed日志和APP_START_OCCURRED
-→ App数据真正可用时再调reportFullyDrawn
-```
+完成点是诊断坐标，不是 AOSP 内置 trace 名：
 
-## 3. 启动时间线全图
+| 点 | 精确定义 | 仍不能推出 |
+|---|---|---|
+| `S_shell` | system_server 的 shell-command 请求线程已用 `uptimeMillis()`记录本地调用前时刻 | ActivityStarter 已收到请求 |
+| `S0` | `notifyActivityLaunching()`已保存 `elapsedRealtimeNanos()` | Intent 已 resolve |
+| `P_post` | cold 分支已把 `startProcess` Message 放入 ATMS Handler | 新进程已经创建 |
+| `C_cold` | `notifyActivityLaunched()`已建立 COLD `TransitionInfo` | Handler 已执行进程创建 |
+| `P_req` | ProcessList 已向 Zygote 发送普通进程创建请求 | child 已 attach |
+| `P_child` | child 已进入 `ActivityThread.main()` | Application 已创建 |
+| `P_attach` | child 正在同步调用 AMS `attachApplication()` | bind 请求已发出 |
+| `B_mark` | AMS 调 `preBindApplication()`，logger 已记 bind delay | App 已执行 `Application.onCreate()` |
+| `B_submit` | AMS 已提交 oneway `bindApplication` | App 主线程已处理该 Message |
+| `L_submit` | ATMS 已提交含 `LaunchActivityItem` 与最终 `ResumeActivityItem` 的 transaction | `onResume()` 已返回 |
+| `A_create` | 客户端已完成目标 Activity `onCreate()` | ViewRoot 已 attach |
+| `A_resume` | 客户端已完成 `onResume()`并进入 add-window 路线 | 首帧已 queue |
+| `SW_drawn` | WMS 认为 Splash starting window `isDrawnLw()`，记 starting delay | Splash 已由 HWC 显示 |
+| `T_start` | AppTransitionController 已通知 transition starting，记 reason/delay | 真实内容窗口已 drawn |
+| `U_release` | RenderThread 完成同步并因 `prepareTextures=true`释放 UI 线程 | RT 的 draw/swap 已完成 |
+| `Q_return` | 固定非空帧的 producer swap/queue 已成功返回 | SF 已 latch |
+| `F_callback` | RT 已写 FrameCompleted 并调用 frame-complete callback | UI Handler runnable 已执行 |
+| `W_finish` | WMS 已把主窗口 `DRAW_PENDING`改为 `COMMIT_DRAW_PENDING` | `isDrawnLw()`为 true |
+| `W_ready` | surface placement 已把主窗口推进到 `READY_TO_SHOW` | HWC present fence 已 signal |
+| `W_report` | reported-visibility 重算检测到 `nowDrawn`，采样时间戳并进入 `ActivityRecord.onWindowsDrawn(true)` | Metrics 聚合账已完成 |
+| `M_drawn` | logger 已记 windows-drawn delay并移除该 Activity | 后台日志已打印 |
+| `M_join` | transition-start 与 pending-draw 两道门均满足，`done(false)`进入 | shell 已返回 |
+| `R_fill` | ActivityStackSupervisor 已填写并 `notifyAll()` 唤醒 WaitResult | logcat 已输出 `Displayed` |
+| `S_return` | `startActivityAndWait()`已返回，shell 记录第二个 uptime | 输出格式化已完成 |
+| `F_full` | system_server 已处理晚到的 `reportFullyDrawn()`并取 fully-drawn delay | 对应内容 Buffer 已 present |
+| `P_signal` | 可靠 present fence 已 signal，接近该合成帧真正显示 | 用户已认为业务内容可用 |
 
-```mermaid
-sequenceDiagram
-  participant C as "Launcher/调用者"
-  participant AS as "ActivityStarter"
-  participant ML as "ActivityMetricsLogger"
-  participant Z as "ProcessList/Zygote"
-  participant AT as "App ActivityThread"
-  participant VR as "ViewRootImpl/Choreographer"
-  participant WMS as "WMS ActivityRecord"
-  participant SF as "SurfaceFlinger/HWC"
-
-  C->>AS: startActivity
-  AS->>ML: notifyActivityLaunching()
-  Note over ML: transitionStartTimeNs
-  AS->>AS: resolve + task/lifecycle decision
-  AS->>ML: notifyActivityLaunched(result, activity)
-  ML->>ML: classify cold/warm/hot
-  opt cold launch
-    AS->>Z: startProcess
-    Z-->>AT: fork + ActivityThread.main
-    AT-->>WMS: attachApplication
-    WMS->>ML: notifyBindApplication()
-    WMS-->>AT: bindApplication
-  end
-  WMS-->>AT: LaunchActivityItem/ResumeActivityItem
-  AT->>AT: Application/Provider/Activity onCreate/onResume
-  AT->>VR: addView + first traversal
-  VR->>SF: RenderThread queue first Buffer
-  VR->>WMS: finishDrawing/reportDrawFinished
-  WMS->>WMS: interesting windows all drawn
-  WMS->>ML: notifyWindowsDrawn(timestamp)
-  ML-->>C: WaitResult wakeup
-  ML->>ML: log Displayed + APP_START_OCCURRED
-  SF->>SF: latch/compose/HWC present
-  opt app content usable later
-    AT->>WMS: reportFullyDrawn()
-    WMS->>ML: log fully drawn
-  end
-```
-
-## 4. 这张图中最重要的错位
-
-WMS收到并确认window drawn，会触发系统启动耗时的主要终点；而App的首Buffer还要经SurfaceFlinger latch、composition和HWC present。
-
-所以“Displayed耗时”与“物理像素开始显示耗时”很接近但不是同一个源码完成点。
-
-## 5. 启动度量的中心类
-
-Android 11 r48中，`ActivityMetricsLogger` 的类注释直接把它称为activity metrics的source of truth，它为Tron/MetricsLogger、logcat、EventLog、statsd与 `WaitResult` 提供数据。
-
-这意味着要理解r48的系统启动口径，先读它，不要只凭外层shell输出猜测。
-
-## 6. 一次典型launch的五个通知
-
-类注释给出典型顺序：
+固定主线中可以写出的关键偏序是：
 
 ```text
-notifyActivityLaunching
-→ notifyActivityLaunched
-→ notifyStartingWindowDrawn（可选）
-→ notifyTransitionStarting
-→ notifyWindowsDrawn
+S_shell < S0 < P_post < C_cold
+C_cold < P_req < P_child < P_attach < B_mark < B_submit < L_submit
+L_submit < A_create < A_resume < U_release < Q_return < F_callback
+F_callback < W_finish < W_ready < W_report < M_drawn < M_join
+M_join < R_fill < S_return
+W_report < F_full
+SW_drawn < T_start < M_join
 ```
 
-starting window不一定存在，transition starting与windows drawn的先后也有容错逻辑；这个列表是常见顺序，不是每个异常分支都必然通过的五道门。
+`SW_drawn`所在的 starting-window 分支与 `P_req … A_resume`所在的 app 进程分支没有通用全序；固定现场只额外保证 `SW_drawn < T_start < W_report`。`Q_return`之后，WMS draw-state路线与 SF latch/compose 路线分开；WMS没有读取 present fence，所以不能从 `W_report`或 `M_drawn`倒推出 `P_signal`。
 
-## 7. 起点为什么叫“earliest possible point”
+## 2. 四个执行语境、三只时钟，先决定哪些数能相减
 
-`notifyActivityLaunching()` 的注释说，它在尽可能早的Activity启动点通知tracker。
+同一次 launch 至少跨四种执行语境：
 
-`ActivityStarter.execute()` 在进入resolve之前就调它，因此这个起点不是 `Activity.onCreate()`，也不是“Zygote fork完成”。
+| 执行语境 | 关键对象 | 本章责任 |
+|---|---|---|
+| 外部命令进程 | `/system/bin/am`包装脚本、原生`cmd`客户端 | 把`activity` shell command经 Binder交给AMS，并在服务端结束后接收返回；不在内部`WaitTime`区间 |
+| system_server shell-command请求线程 | `ActivityManagerShellCommand`、`ActivityStarter`、`ActivityMetricsLogger`、ActivityStackSupervisor | 解析内部命令、记录`S_shell/S_return`、本地调用ATMS、resolve、分类、等待、聚合并格式化输出 |
+| system_server 其他线程 | ATMS Handler、AMS attach Binder 线程、BackgroundThread | 真正启动进程、bind/attach、异步写日志 |
+| App UI 与 RenderThread | `ActivityThread`、`ViewRootImpl`、HWUI | Application/Activity生命周期、首个 traversal、producer swap/queue、draw-finished 回报 |
 
-## 8. 起点使用elapsedRealtimeNanos
+三只常见单调时钟也不能只因单位都是纳秒或毫秒就混减：
+
+| 时钟 | 本章出现位置 | suspend 时是否继续 | 合法用途 |
+|---|---|---:|---|
+| `elapsedRealtimeNanos()` | ActivityMetricsLogger 的 `S0`与各 metric 端点 | 是 | 同一 launch 账本内计算累计 delay |
+| `uptimeMillis()` | shell `WaitTime`、部分 Activity/WMS 状态时间 | 否 | 同一 uptime 域内计算调用等待 |
+| `System.nanoTime()` / MONOTONIC | Choreographer、HWUI FrameInfo | 否 | 同一渲染时钟域内分析一帧 |
+
+因此 `TotalTime=180 ms`与 `WaitTime=188 ms`看起来可以相减，不代表源码授权把 8 ms命名为 Binder 开销。设备若在区间内 suspend，两者甚至没有同一计时口径；即使没有 suspend，也要先找到两个端点并排除异步输出、调度与别的 launch。
+
+本章把“时间字段的值”与“打印这行字段的墙上时刻”分开。BackgroundThread 晚打印一行 `Displayed ... +180ms`，其中 180 ms仍来自更早的 `W_report`附近，不是打印线程运行到该行时重新计时。
+
+## 3. `S0` 在 ActivityStarter 里很早，但不是整条 shell 命令的零点
+
+固定的 shell 路线进入 `ActivityStarter.execute()`后，先拒绝带文件描述符的 Intent，再在 ATMS global lock 内调用：
 
 ```java
-final long transitionStartTimeNs =
-        SystemClock.elapsedRealtimeNanos();
-```
+launchingState = mSupervisor.getActivityMetricsLogger()
+        .notifyActivityLaunching(mRequest.intent, caller);
 
-它是包含设备休眠时间的monotonic elapsed clock，不受用户调整日历时间影响。本类后续drawn时间也使用 `elapsedRealtimeNanos()`，可相减得到稳定delay。
-
-## 9. 起点在Intent resolve之前
-
-`ActivityStarter.execute()` 的简化顺序是：
-
-```java
-launchingState = metrics.notifyActivityLaunching(intent, caller);
 if (mRequest.activityInfo == null) {
     mRequest.resolveActivity(mSupervisor);
 }
+
 res = executeRequest(mRequest);
-metrics.notifyActivityLaunched(
+mSupervisor.getActivityMetricsLogger().notifyActivityLaunched(
         launchingState, res, mLastStartActivityRecord);
 ```
 
-所以常见路径的windows-drawn delay包含Intent resolve和后续Task/权限/生命周期决策时间。
+`notifyActivityLaunching()`立即取 `SystemClock.elapsedRealtimeNanos()`。所以固定路径的 `S0`：
 
-## 10. notifyActivityLaunching还不知道启动一定成功
+- 晚于外部`am/cmd`分发与进入AMS的shell-command Binder调用，也晚于`ActivityManagerShellCommand`参数处理、`S_shell`和file-descriptor拒绝门；
+- 早于尚未完成的 Intent resolve；
+- 早于权限、Task、可见性、生命周期与进程决策；
+- 不是 Zygote fork、`Application.onCreate()`或首帧开始时刻。
 
-这一步只创建 `LaunchingState`。Intent可能无法resolve，可能被拒绝，可能最后没有一个Activity需要绘制。
+`LaunchingState`只表示“启动意图已进入度量”，并不证明会得到窗口。接口注释要求调用方随后走 `notifyActivityLaunched()`；固定普通路径满足这一约束。heavy-weight switcher早返回、异常出口等边缘并非都能闭合通知，不能把注释要求误当成所有实际出口的不变量；目标为空时的 `abort(null)`也不会顺手取消一个复用 `LaunchingState`所关联的旧账本。
 
-因此调用者必须保证后续调 `notifyActivityLaunched()`，让logger或者建立正式TransitionInfo，或者abort。
-
-## 11. LaunchingState和TransitionInfo不是同一阶段
-
-`LaunchingState` 表示“Intent已开始，成功与否尚不确定”；`TransitionInfo` 表示“已确认一个可跟踪的Activity launch”。
-
-前者保留当前起点，后者把首次起点、launch type、process state、pending draw activities和各类delay组成正式账本。
-
-## 12. 连续启动可以被合并
-
-如果调用者Activity已在活跃transition中，或callingUid命中最近活跃transition，新launch可以沿用原 `LaunchingState`。
-
-这为跳板Activity、连续重定向等情况提供一次用户感知launch event，而不是每个中间Activity都强行生成一份完整Displayed账。
-
-## 13. 合并时保留哪个起点
-
-`TransitionInfo.mTransitionStartTimeNs` 由构造时 `LaunchingState.mCurrentTransitionStartTimeNs` 写入，用作该transition的标识和耗时起点。
-
-后续合并launch会更新LaunchingState的current start，但已创建TransitionInfo的final start不会因为新跳板就被改成最后一次时间。
-
-## 14. 哪些start result能创建TransitionInfo
-
-`TransitionInfo.create()` 只接受：
+还有一个容易忽略的调用顺序：cold 的 `startSpecificActivity()`在 `executeRequest()`深处先调用 `startProcessAsync()`，将工作投给 Handler；`executeRequest()`返回后才执行 `notifyActivityLaunched()`并分类。因此字面顺序是：
 
 ```text
-START_SUCCESS
-START_TASK_TO_FRONT
+S0 → executeRequest内P_post → executeRequest返回 → C_cold
 ```
 
-其他result返回null并abort tracking。因此不要将所有 `startActivity()` 返回都当成一个有windows-drawn delay的完整冷启动。
+它并不造成“进程已经存在所以被错分 warm”。该 Message 正是为避免持有 ATMS lock 回调 AMS而异步投递；`notifyActivityLaunched()`仍在这把锁内完成。Handler即使已经开始执行，也要在 `onProcessAdded()`把新 WPC写入ATMS进程表时取得同一 global lock；分类完成前看不到已注册的目标进程。`am start -W`随后 `wait()`释放 monitor，进程创建路线才可继续越过这道门。
 
-## 15. cold、warm、hot的r48源码定义
+## 4. cold/warm/hot 是分类；processSwitch、合并与 pending draw 是另外三把门
+
+真正调用 `TransitionInfo.create()`时，它只接受 `START_SUCCESS`与 `START_TASK_TO_FRONT`。分类只看服务端进程记录与目标 Activity 是否 attach：
 
 ```java
 if (processRunning) {
@@ -176,841 +138,478 @@ if (processRunning) {
 }
 ```
 
-`WaitResult` 文档则用更口语的方式表达：
+由此可得：
 
-- cold：新进程启动；
-- warm：复用进程，但Activity需要创建/附着；
-- hot：复用进程且Activity已附着，主要拉到前台。
+| 现场 | r48 分类 | 不能用来替代它的判断 |
+|---|---|---|
+| 找不到目标进程的 `WindowProcessController` | COLD | Recents中是否还有 Task 卡片 |
+| 进程存在，目标 ActivityRecord 未 attach | WARM | 进程是否因 Service/Provider 存活 |
+| 进程存在，目标 ActivityRecord 已 attach | HOT | Activity是否刚执行过某个生命周期回调 |
 
-## 16. processRunning是怎样得到的
+`processSwitch = !processRunning || !processRecord.hasStartedActivity(launchedActivity)`是独立维度，而且是在 `notifyActivityLaunched()`分类时计算，不是 `S0`快照。r48 的 `hasStartedActivity(target)`排除目标本身，再检查其他 ActivityRecord 的 `stopped == false`；方法名里的 started不能机械等同于某个精确 `ActivityState.STARTED`枚举。它决定 MetricsLogger、statsd与 LaunchObserver 是否把事件当作值得记录的启动切换，不改变 cold/warm/hot。一个 launch仍可能跟踪到 windows drawn，却因为 `processSwitch=false`而不输出 `APP_START_OCCURRED`。
 
-logger先看 `launchedActivity.app`，没有时再用processName和uid到ATMS查 `WindowProcessController`。找到就认为process running。
+另外三条边界必须保留：
 
-这是系统服务端的进程账本判断，不是App自己用某个静态变量猜测“我可能还活着”。
+1. 若目标已经 `mDrawn && isVisible()`，logger直接终止，因为从新 `S0`等不到有意义的首次 draw。
+2. 连续启动可按 caller Activity 或 calling UID关联到活跃 `LaunchingState`；同 display 时只更新 latest Activity，并把尚未 drawn的 Activity加入 pending list，不重建类型与原始 `TransitionInfo`起点。这个分支在调用 `TransitionInfo.create()`之前返回，因此也绕过它对 result code 的校验。
+3. `setLatestLaunchedActivity()`只在 `!r.noDisplay && !r.mDrawn`时加入 pending draw。透明 Activity不等于 `noDisplay`；是否有窗口与主题是否透明不能互换。
 
-## 17. 进程存在不一定是hot
+合并还有一个精细后果：新的 `notifyActivityLaunching()`会更新 `LaunchingState.mCurrentTransitionStartTimeNs`，但已经构造的 `TransitionInfo.mTransitionStartTimeNs`是 final 字段，不会被后来的跳板改写。本章排除跳板，确保所有数字都属于同一目标和同一初始账本。
 
-只有目标 `ActivityRecord` 已 `attachedToProcess()` 才分为hot。进程可能因Service、Provider或其他Activity而存活，但目标Activity仍要新建，这属warm。
+## 5. cold 进程段：先投递创建，再在 attach 中记录“准备调用 bind”的时刻
 
-## 18. Task存在不一定是warm/hot
-
-源码特别注释：Task可能还在，`START_TASK_TO_FRONT` 也可能对应进程已不存在；这种情况仍当cold launch。
-
-所以不能用“最近任务列表里看得到卡片”代替processRunning判断。
-
-## 19. processSwitch是另一个维度
-
-```java
-processSwitch = !processRunning
-        || !processRecord.hasStartedActivity(launchedActivity);
-```
-
-它表示目标进程在launch开始时没有started Activity，系统认为这种情况的cache更可能被清，首帧耗时更值得记录。
-
-## 20. launch type与processSwitch不是同一个boolean
-
-launch type分cold/warm/hot；processSwitch决定该transition是否对MetricsLogger/StatsLog/LaunchObserver“interesting”。
-
-一个transition可以被跟踪到windows drawn，但因无process switch而不向所有observer输出同等的启动事件。
-
-## 21. 已经drawn且visible的Activity不能重新算一次draw delay
-
-`notifyActivityLaunched()` 如果看到 `mDrawn && isVisible()`，直接abort，因为无法从这个新起点等到一个有意义的首次windows drawn。
-
-这也说明logger不是每次点击都无条件制造一条`Displayed` 日志。
-
-## 22. 同一display的跳板Activity如何合并
-
-已有active transition且新Activity在同一DisplayContent时，logger只更新latest launched activity，并把尚未drawn且非noDisplay的Activity加到pending draw list。
-
-这个transition要等所有pending draw activities移除，才算all drawn。
-
-## 23. noDisplay Activity不会成为draw等待对象
-
-`setLatestLaunchedActivity()` 只在 `!r.noDisplay && !r.mDrawn` 时加pending list。
-
-透明跳板或无界面Activity可以参与launch决策，但不能永久阻塞一个永远不会有window drawn的账本。
-
-## 24. 冷启动的进程段包含什么
-
-对cold launch，transition start之后通常要经过：
-
-1. AMS/ATMS创建ProcessRecord/WindowProcessController账本；
-2. ProcessList整理uid/gid/ABI/runtime flags等参数；
-3. 选Zygote socket并fork/specialize；
-4. 父进程收pid，子进程进 `ActivityThread.main()`；
-5. App反向attach到AMS/ATMS；
-6. system_server安排bindApplication与Activity launch。
-
-这些都发生在首次View draw之前。
-
-## 25. notifyBindApplication记的是哪个时刻
-
-ActivityMetricsLogger的注释是：系统将要对client调 `bindApplication` 之前立即通知。
-
-```java
-info.mBindApplicationDelayMs =
-        info.calculateCurrentDelay();
-```
-
-所以bindApplication delay终点是system_server发出客户端bind命令的前夕，不是App已经执行完 `Application.onCreate()`。
-
-## 26. notifyBindApplication如何匹配transition
-
-此时App还未必已附加到 `ActivityRecord.app`，所以logger遍历active transitions，用 `ApplicationInfo` 对象身份匹配latest launched activity。
-
-这是一个特定启动阶段的关联方法，不是通用的跨进程唯一ID。
-
-## 27. bindApplication delay包含fork之前与attach汇合的时间
-
-从transition start到system_server准备bind之间，可包含解析、Task/生命周期、Zygote通信、fork/specialize、ActivityThread.main与attach等待。
-
-但它不能细分这些内部子段；若bind delay大，还需Perfetto/trace或更细源码埋点定位。
-
-## 28. App bind阶段又包含哪些工作
-
-`ActivityThread.handleBindApplication()` 普通r48路径包含：
-
-- 进程环境和compat/StrictMode初始化；
-- LoadedApk/Context/ClassLoader/Resources准备；
-- NetworkSecurityConfig、Instrumentation准备；
-- `Application` 构造与 `attachBaseContext()`；
-- Provider `attachInfo()/onCreate()` 并统一发布；
-- `Instrumentation.onCreate()`；
-- `Application.onCreate()`。
-
-它们发生在bind通知之后、Activity首帧之前。
-
-## 29. Provider自启动耗时为什么会进Displayed账本
-
-普通初始Application绑定中，Provider安装和 `onCreate()` 早于 `Application.onCreate()`。如果Provider做大量主线程I/O，Activity launch Message就要继续等待。
-
-因为ActivityMetricsLogger的起点更早，这段时间自然会出现在最终windows-drawn delay中。
-
-## 30. Activity创建不是一个时间点
-
-客户端Activity阶段还要分：
+`ActivityStackSupervisor.startSpecificActivity()`先找目标 `WindowProcessController`。有进程且有 thread 时可直接 `realStartActivityLocked()`；固定 cold 现场没有，于是：
 
 ```text
-LaunchActivityItem进主Looper
-→ performLaunchActivity
-→ Context/Activity实例化
-→ Activity.attach/PhoneWindow
-→ performCreate/onCreate
-→ Start/Resume lifecycle item
-→ onStart/onResume
-→ Decor加到WindowManagerGlobal
+startSpecificActivity
+→ ActivityTaskManagerService.startProcessAsync
+→ ATMS Handler: ActivityManagerInternal.startProcess
+→ ProcessList / Process.start
+→ Zygote socket
+→ child ActivityThread.main
+→ ActivityThread.attach
+→ AMS.attachApplication
 ```
 
-某个 `onCreate()` 返回不等于window drawn，也不等于最终数据可用。
+“Zygote 创建进程”也不是永远等于“现场 fork”。r48 `ZygoteProcess`先判断 `shouldAttemptUsapLaunch()`：USAP pool 已支持、已启用、策略允许且参数兼容时，会把参数交给预先 fork 的 unspecialized process，再由它执行 `specializeAppProcess()`；否则才走 Zygote connection 的 `forkAndSpecialize()`。固定图关闭 USAP，正文结论则保留两条分支。
 
-## 31. setContentView为什么不是首帧终点
+App child 在 `ActivityThread.main()`准备主 Looper后调用同步 `mgr.attachApplication()`。AMS 的正常 attach 顺序是：
 
-`setContentView()` 主要安装Decor系统骨架并inflate应用View对象。此时还可能没有ViewRootImpl、WMS WindowState、Surface或任何Buffer。
-
-将setContentView自己计时很有价值，但它只是Displayed链中的一个子段。
-
-## 32. onResume为什么也不是Displayed
-
-Activity服务端可先进RESUMED，客户端再执行 `onResume()`。两者之后才有首次Traversal、Surface建立、draw和WMS drawn回报。
-
-所以“生命周期已resume”只是Activity可交互资格的一部分，不是像素完成证据。
-
-## 33. 首次Traversal从哪里被安排
-
-`WindowManagerGlobal.addView()` 创建 `ViewRootImpl`，`setView()` 在同步 `addToDisplay()` 之前就调 `requestLayout()`，最终通过 `scheduleTraversals()` 投递Choreographer TRAVERSAL callback。
-
-它可与WMS addWindow返回、Activity resume及主Looper其他Message相互编排。
-
-## 34. 首次Traversal的主要子段
-
-第213章已经证明它不是只调一遍 `measure/layout/draw`，而是包含：
-
-- dispatchAttached和初始Insets；
-- 用addWindow frame提示首次measure；
-- 同步relayout向WMS提交尺寸/可见性；
-- WMS计算frame、Insets、Configuration并建Surface；
-- App拿最终结果必要时补measure；
-- layout、pre-draw与draw。
-
-## 35. 首次draw为什么可能被PreDraw取消
-
-ViewTreeObserver pre-draw listener可返回false，此轮Traversal就不进真正draw，而是再安排一次。
-
-因此measure/layout已执行不保证当轮会产生首Buffer或触发windows drawn。
-
-## 36. UI线程draw不等于Buffer queue
-
-硬件加速路径中，UI线程主要记录/更新DisplayList，`syncAndDrawFrame()` 把工作交给RenderThread。
-
-RenderThread还要prepare tree、提交Skia/GPU命令、swap/queue Buffer。这些是UI draw后的另一段渲染链。
-
-## 37. ViewRoot如何向WMS报draw finished
-
-首次需要report next draw时，`performDraw()` 完成后进 `reportDrawFinished()`，通过IWindowSession `finishDrawing()` 回到WMS。
-
-这个回报表示App/WMS窗口draw state可以向前推进，不是HWC present fence反向回报。
-
-## 38. WMS的drawn不是只看一个boolean
-
-ActivityRecord会统计关联WindowState中的interesting与drawn数量。主App window是重要等待对象，其他 `isInteresting()` 窗口也可纳入。
-
-只有 `numInteresting > 0 && numDrawn >= numInteresting` 才得到activity-level `nowDrawn=true`。
-
-## 39. starting window不计入真实app window的allDrawn数量
-
-`updateDrawnWindowStates()` 对 `w != startingWindow` 才计interesting/drawn；starting window如果drawn，只调 `notifyStartingWindowDrawn()` 并置 `startingDisplayed=true`。
-
-所以starting window可以让用户更早看到启动过渡，但不会伪装成真实App content windows drawn。
-
-## 40. StartingWindowDelay的确切口径
-
-`notifyStartingWindowDrawn()` 首次调用时：
-
-```java
-info.mStartingWindowDelayMs =
-        info.calculateDelay(
-                SystemClock.elapsedRealtimeNanos());
+```text
+记录 bindApplicationTimeMillis
+→ mAtmInternal.preBindApplication(wpc)
+→ ActivityMetricsLogger.notifyBindApplication(appInfo)
+→ thread.bindApplication(...)
+→ app.makeActive(...)
+→ mAtmInternal.attachApplication(wpc)
+→ RootWindowContainer.attachApplication
+→ realStartActivityLocked
 ```
 
-它是transition start→starting window drawn。没有starting window时保持 `INVALID_DELAY=-1`，不应自动填0。
+所以 `BindApplicationDelay` 的端点 `B_mark`是 system_server **即将调用客户端 `bindApplication`之前**，不是 Binder 返回、`handleBindApplication()`结束或 `Application.onCreate()`结束。logger按 `ApplicationInfo`引用身份扫描所有活跃匹配账本，重复通知还会覆写该累计值；它本身并不证明 Binder提交成功。这个 delay累计包含 `S0`之后的 resolve、启动决策、进程请求、Zygote/USAP、child bootstrap、同步 attach 回程以及此前 AMS 准备。
 
-## 41. starting window快只代表过渡反馈快
+`IApplicationThread`整体声明为 `oneway`。`B_submit`只表示请求已提交；客户端稍后才在主线程处理 `BIND_APPLICATION`。同理，AMS 在 `makeActive()`后通过 ATMS attach桥接到 `realStartActivityLocked()`，提交 Activity transaction。这两笔提交的程序顺序是 bind 在前、Activity transaction在后。
 
-一张theme splash/starting surface很快drawn，能减少用户面对空白屏的时间。
+## 6. 客户端不是收到 bind 就有首帧：Application、Activity、ViewRoot 各自有完成点
 
-但真实Activity仍可能在Provider/Application/Activity初始化、inflate或首次Traversal卡住。因此starting delay与windows drawn delay必须分开看。
+固定正常路径中，App 主 Looper先完整处理 `handleBindApplication()`，再处理 Activity transaction。bind阶段包含的关键工作是：
 
-## 42. onFirstWindowDrawn会处理starting window
-
-第一个真实window drawn时，ActivityRecord置 `firstWindowDrawn=true`，移除dead placeholders，必要时取消真实window自身动画，然后remove starting window并更新reported visibility。
-
-这是“过渡窗口让位给App真实窗口”的WMS边界。
-
-## 43. ActivityRecord.updateReportedVisibilityLocked的drawn计算
-
-```java
-boolean nowDrawn = numInteresting > 0
-        && numDrawn >= numInteresting;
-if (nowDrawn != reportedDrawn) {
-    onWindowsDrawn(nowDrawn,
-            SystemClock.elapsedRealtimeNanos());
-    reportedDrawn = nowDrawn;
-}
+```text
+创建 LoadedApk / class loader 等运行环境
+→ makeApplication（构造 Application）
+→ 安装启动所需 ContentProvider
+→ Instrumentation.onCreate
+→ Instrumentation.callApplicationOnCreate
 ```
 
-这个elapsed timestamp传给ActivityMetricsLogger，与启动起点使用同一clock。
+这解释了为什么 Provider自动初始化、Application同步 I/O 或类加载都会推迟 Activity创建，却不能从 `B_mark`直接看出其中哪一项慢。`B_mark`是入口前的累计点，缺少“bind完成”的配对 metric。
 
-## 44. nowDrawn与reportedDrawn为什么分开
+服务端 transaction显式添加 `LaunchActivityItem`，最终 lifecycle request 是 `ResumeActivityItem`。客户端执行 callback时 `performLaunchActivity()`构造 Activity并调 `onCreate()`；TransactionExecutor为到达最终 RESUMED状态合成 `ON_START`，最后才由 Resume item进入 `onResume()`。不能把它描述成服务端显式发送了一个独立 `StartActivityItem`。
 
-`nowDrawn` 是本轮基于窗口统计得到的当前结果，`reportedDrawn` 是上次已经向ActivityRecord状态机报告的结果。
+`handleResumeActivity()`随后取得（必要时才创建）Decor，再通过 WindowManager `addView()`建立 ViewRoot。若`onCreate()`里的`setContentView()`已触发`PhoneWindow.installDecor()`，此处取得的是既有Decor。再往后才有：
 
-只有变化时才调 `onWindowsDrawn()`，避免每轮SurfacePlacement重复完成同一账本。
-
-## 45. 窗口暂时不再drawn时有保持逻辑
-
-Activity尚未nowGone时，若本轮不再drawn/visible，代码可以保留已有reportedDrawn/reportedVisible，避免在正常过渡中无谓反复。
-
-因此drawn是Activity/WMS状态机的稳定语义，不是每个Surface刹那状态的完整快照。
-
-## 46. notifyWindowsDrawn先检查active transition
-
-如果Activity不在active transition，或pending draw list已空，返回null。
-
-这意味着平时窗口因配置变化重画或从隐藏恢复drawn，不一定都会生成新的App start metric。
-
-## 47. WindowsDrawnDelay如何计算
-
-```java
-info.mWindowsDrawnDelayMs =
-        info.calculateDelay(timestampNs);
+```text
+首次 relayout / Surface
+→ Choreographer traversal
+→ measure / layout / draw
+→ ThreadedRenderer同步DisplayList
+→ RenderThread draw与producer swap/queue
 ```
 
-`calculateDelay()` 是：
+`setContentView()`、`onCreate()`、`onResume()`都只是上游点。它们返回不证明 ViewRoot 已完成 traversal，更不证明 Buffer已被 SurfaceFlinger latch。
 
-```java
-(int) NANOSECONDS.toMillis(
-        timestampNs - mTransitionStartTimeNs)
+## 7. Splash 与 app transition 是一条旁路，不是 App 内容首帧
+
+starting window由系统侧为启动过渡提供即时反馈。固定现场使用 Splash；Snapshot是另一种 reason，starting window被转移则还有 `startingMoved`分支。
+
+在 surface placement 中，`ActivityRecord.updateDrawnWindowStates()`遇到 starting window且 `isDrawnLw()`时：
+
+```text
+ActivityMetricsLogger.notifyStartingWindowDrawn(activity)
+→ mStartingWindowDelayMs = nowElapsed - S0
+→ startingDisplayed = true
 ```
 
-也就是常说的系统窗口首次drawn耗时主口径。
+它没有把 starting window计入真实 app window的 drawn 数量。`StartingWindowDelay`只说明 WMS draw-state已到 READY/HAS；它不读取该 Splash 的 present fence，也不代表目标 Activity内容已出现。
 
-## 48. 多Activity合并时delay会被更新
+`AppTransitionController.transitionGoodToGo()`对 opening Activity接受三类就绪条件：
 
-每个pending Activity报drawn时，`mWindowsDrawnDelayMs` 都先用该timestamp更新，再从pending list移除它。
+```text
+ActivityRecord.allDrawn && !isRelaunching()
+或 startingDisplayed
+或 startingMoved
+```
 
-因此最终all-drawn transition的windows delay通常对应最后一个必须等待的Activity drawn，不是最早跳板页面的短暂drawn。
+若由固定 Splash放行，reason是 `APP_TRANSITION_SPLASH_SCREEN`；snapshot则是 `APP_TRANSITION_SNAPSHOT`；真实窗口全 drawn可记 `APP_TRANSITION_WINDOWS_DRAWN`。`TransitionInfo.mReason`虽然初值是`APP_TRANSITION_TIMEOUT`，但controller的timeout shortcut会跳过逐Activity填reason map；随后用空map通知并不会替任何账本打开transition-start门，不能把默认字段值当成真实的`T_start`。正常的非空通知才让logger写入`TransitionDelay = T_start - S0`，且同一账本只记第一次。
 
-## 49. transition starting和all drawn是两道完成门
+固定场景有 `SW_drawn < T_start < W_report`。一般场景不能背这个顺序：没有 starting window时可能由真实窗口 allDrawn放行；代码还特意允许 `notifyWindowsDrawn()`先到、transition starting后到，再由第二道门完成聚合。
 
-`notifyWindowsDrawn()` 只有在 `mLoggedTransitionStarting && allDrawn()` 时调 `done()`。
+## 8. 首帧从 producer queue 到 WMS drawn：固定顺序明确，present 边界仍在外面
 
-`notifyTransitionStarting()` 反过来也检查：如果窗口已先all drawn，它在记录transition reason/delay后立即 `done()`。
+首次需要报告的硬件 draw中，ViewRoot令 `mReportNextDraw=true`并注册 frame-complete callback。固定的非空成功路径是：
 
-这允许两种事件顺序不完全固定，但两个条件都到齐才完成transition账本。
+```text
+UI ThreadedRenderer.draw()
+→ DrawFrameTask同步树状态
+→ prepareTextures=true，先释放UI线程
+→ RenderThread CanvasContext.draw()
+→ pipeline swapBuffers / producer queue返回
+→ FrameInfo.markFrameCompleted()
+→ RT调用frame-complete callback
+→ callback向UI Handler队首post Runnable
+→ pendingDrawFinished()
+→ reportDrawFinished()
+→ IWindowSession.finishDrawing()
+```
 
-## 50. TransitionDelay不是WindowsDrawnDelay
+因此在本章严格前提下，`Q_return < F_callback < W_finish`。但这不是“任意 FrameCompleted 都有新 Buffer”的定理：dirty为空且允许 skip-empty时，CanvasContext会不 swap也调用 callback；`canDrawThisFrame=false`、swap失败、软件渲染、SurfaceHolder异步重绘又各有不同门。
 
-`mCurrentTransitionDelayMs` 计 `transition start → notifyTransitionStarting`，并记录transition reason。
+默认 `wm_use_blast_adapter=false`时，本章走普通 BufferQueue。若启用 WMS-requested BLAST sync，RT transaction可先合入 `mSurfaceChangedTransaction`，再随 `finishDrawing`交给WMS；不能把默认路径的 producer/WMS关系照搬到该分支。
 
-`mWindowsDrawnDelayMs` 计 `transition start → windows drawn`。两者可以都从同一起点开始，但终点和分析意义不同。
+服务端 draw-state协议还要经过：
 
-## 51. 一次启动的平行delay账本
+```text
+ViewRoot reportDrawFinished
+→ Session.finishDrawing
+→ WMS.finishDrawingWindow
+→ WindowStateAnimator: DRAW_PENDING → COMMIT_DRAW_PENDING
+→ 下一次surface placement: READY_TO_SHOW
+→ 条件允许时performShowLocked / HAS_DRAWN
+```
 
-| delay | 起点 | 终点 | 是否可选 |
+`WindowState.isDrawnLw()`只认 `READY_TO_SHOW`或 `HAS_DRAWN`，不认刚进入的 `COMMIT_DRAW_PENDING`。第一个非 starting window进入 `performShowLocked()`时会调用 `onFirstWindowDrawn()`，移除 starting window并更新 reported visibility；实际 Surface show、transaction提交、SF latch、compose与HWC present仍在后续图形管线。
+
+两条结论可以同时成立：
+
+- 固定普通成功帧中，producer queue 返回严格早于 WMS接受 `finishDrawing`；
+- `W_finish/W_ready/W_report`均不等待或读取 SF/HWC present fence，因此 `Displayed`不能当作物理显示时间戳。
+
+## 9. 三套名字相近的 drawn 账本，不能互相代称
+
+r48同一 Activity周围至少有三套“都画好了吗”的判断：
+
+| 账本 | 核心状态 | 统计规则 | 主要消费者 |
 |---|---|---|---|
-| startingWindowDelay | notifyActivityLaunching | starting window drawn | 是，无starting window为-1 |
-| bindApplicationDelay | notifyActivityLaunching | system_server即将bind client | 是，通常冷启动才有；warm/hot可为-1 |
-| transitionDelay | notifyActivityLaunching | app transition starting | 通常记录 |
-| windowsDrawnDelay | notifyActivityLaunching | pending Activity windows drawn | 主Displayed口径 |
-| fullyDrawnDelay | notifyActivityLaunching | App reportFullyDrawn或系统推迟点 | 必须由App调用 |
+| transition/show 准备 | `ActivityRecord.allDrawn`、`mNumInterestingWindows/mNumDrawnWindows` | `updateDrawnWindowStates()`经 `mightAffectAllDrawn()`、`isInteresting()`统计；还要求所有 child 已评估、非 relaunch | AppTransitionController、布局/show与freeze处理 |
+| Activity reported visibility | `reportedDrawn`与 `mDrawn` | 每次重算局部 `UpdateReportedVisibilityResults`；Window排除 freezing、非VISIBLE、STARTING、destroying，drawn数达标后调 `onWindowsDrawn()` | 启动计时、WaitResult、Activity drawn状态 |
+| Metrics多 Activity聚合 | `TransitionInfo.mPendingDrawActivities` | 每个被纳入launch的 Activity完成或不再需要时从链表移除；`allDrawn()`只是链表为空 | ActivityMetricsLogger 的完成门 |
 
-## 52. 这些delay不能简单相加
+第一套的 `allDrawn`不等于第二套的 `reportedDrawn`。特别是第二套 `WindowState.updateReportedVisibility()`并不调用第一套的 `WindowState.isInteresting()`；两者排除规则相似但不是同一个计数器。
 
-它们大多都从同一transition start计到不同终点，是平行的累计延迟，不是五段互不重叠的切片。
-
-要得到子段，应用后一累计点减前一累计点，且先确认两个点在当次启动中都有效。
-
-## 53. done(false)做了什么
-
-正常完成时：
-
-- 停止launch trace；
-- 对interesting transition通知LaunchObserver finished；
-- 对TransitionInfo快照；
-- 把Metrics/Stats/EventLog/logcat工作投到BackgroundThread；
-- 如果早到的fully-drawn尚在pending，现在运行它；
-- 清pending list并从active transition list移除。
-
-所以日志输出可以比计时终点本身更晚，但日志内duration仍使用先前快照的drawn delay。
-
-## 54. 为什么要先做TransitionInfoSnapshot
-
-ActivityRecord、process record和launch token等都可以在后续继续变化。在持有系统状态的当前时刻复制不变快照，再丢到BackgroundThread输出，可避免日志线程读到半更新对象。
-
-这是Android system_server中常见的“锁内取快照，锁外做慢I/O”模式。
-
-## 55. `Displayed package/activity: +Nms` 从哪里打印
-
-`logAppDisplayed()` 只对warm和cold launch输出EventLog `WM_ACTIVITY_LAUNCH_TIME` 和logcat：
+第二套中：
 
 ```java
-sb.append("Displayed ");
-sb.append(shortComponentName);
-sb.append(": ");
-TimeUtils.formatDuration(windowsDrawnDelayMs, sb);
+nowDrawn = numInteresting > 0 && numDrawn >= numInteresting;
+nowVisible = numInteresting > 0
+        && numVisible >= numInteresting && isVisible();
 ```
 
-hot launch不走这条 `Displayed` 日志输出分支。
+drawn只要求相关窗口达到 `isDrawnLw()`；visible还要求窗口不在 transition/parent animation并满足 Activity可见性。于是 `onWindowsDrawn()`可以早于 `onWindowsVisible()`，`Displayed`也不要求 `nowVisible=true`。
 
-## 56. Displayed表示“WMS windows drawn”
+starting window在前两套都被排除：第一套单独记 `startingDisplayed`，第二套看到 `TYPE_APPLICATION_STARTING`直接返回。Splash再快也不会替真实内容 Activity清空 Metrics pending list。
 
-日志名叫Displayed，但数据来自 `windowsDrawnDelayMs`，其timestamp在ActivityRecord根据WindowState drawn统计中产生。
+## 10. ActivityMetricsLogger 有两道完成门；WaitResult 与后台日志再从这里分叉
 
-更严谨的学习语句是：“系统认定该启动所需App windows已drawn的耗时”。
+reported-visibility重算检测到`nowDrawn`后，会先采样timestamp并进入`ActivityRecord.onWindowsDrawn(true, timestamp)`；该回调先调用logger：
 
-## 57. Displayed不是SurfaceFlinger present fence
+```text
+找到活跃TransitionInfo
+→ mWindowsDrawnDelayMs = timestamp - S0
+→ 从mPendingDrawActivities移除当前Activity
+→ 创建TransitionInfoSnapshot
+→ 若mLoggedTransitionStarting && pending为空，则done(false)
+```
 
-WMS window draw state向前推进后，App的Buffer仍需通过BLAST/Transaction到SF，然后latch、validate/compose、HWC present。
+完成条件不是单个名为 allDrawn 的布尔值，而是：
 
-因此Displayed可作为启动首帧的系统Framework指标，但不是对“面板像素已经开始更新”的fence级直接证据。
+```text
+Gate A: notifyTransitionStarting 已发生
+Gate B: TransitionInfo pending Activity list 已为空
+M_join = A && B
+```
 
-## 58. Displayed也不表示业务数据已可用
+两门谁后到，谁调用 `done(false)`。固定 Splash路径中 A先到，所以 `notifyWindowsDrawn()`完成B并进入done；源码也允许B先到，再由后续非空`notifyTransitionStarting()`完成A。timeout本身不是这种正常反序：它可绕过reason-map填充而让A保持未满足，账本还需其他事件或取消路径收口。
 
-Activity可以先draw出skeleton、loading、空列表或占位图，然后异步加载数据。WMS看到window drawn即可记Displayed，它不理解业务上“首页已可用”的含义。
+`done(false)`停止launch trace；interesting launch会先把finished事件投给`LaunchObserverRegistryImpl`的Handler，真正observer回调异步执行，不能与后续日志、waiter建立全序。随后调用`logAppTransitionFinished()`，制作一份为后台记录复制主要标量与字符串的浅快照；其中仍持有`ApplicationInfo`与`WindowProcessController`引用，不能泛称完全不可变。快照还复制`ActivityInfo.launchToken`并清空源字段；这个instant-app度量字符串不是fully-drawn调用使用的Activity Binder token。接着：
 
-这就是 `reportFullyDrawn()` 存在的原因。
+- 仅 interesting launch向 BackgroundThread投递 `logAppTransition()`，其中写 MetricsLogger与 `APP_START_OCCURRED`；
+- 所有正常完成的 transition都投递 `logAppDisplayed()`，但该方法只为 COLD/WARM打印 `WM_ACTIVITY_LAUNCH_TIME`与 `Displayed`；
+- 若有缓存的 fully-drawn请求，同步运行其 Runnable；
+- 最后active list会被清理；用于晚报fully drawn的`mLastTransitionInfo`项在正常done时不删除，但同一`ActivityRecord`后续被接受的launch可用`put()`覆盖它，否则保留到Activity移除。
 
-## 59. reportFullyDrawn是App对“可用”的主动申明
+logger返回 snapshot后，`ActivityRecord`才调用 `ActivityStackSupervisor.reportActivityLaunchedLocked()`写 `who/totalTime/launchState`并 `notifyAll()`。所以 Metrics本身不直接唤醒 shell。
 
-Activity API文档要求：在首次launch中，当UI已完全绘制并填充重要数据时调用。
+固定场景是 `M_join → 日志任务入队 → R_fill`；BackgroundThread何时真正打印与 `R_fill/S_return/P_signal`没有全序。若 B先于A，ActivityRecord甚至会先 `R_fill`，以后 `notifyTransitionStarting()`才完成join并投递日志。合并 launch有多个 pending Activity时，较早一个 `onWindowsDrawn()`也可能先填掉全局 WaitResult，而 `Displayed`要等最后一个 pending被移除并与transition-start汇合。
 
-系统自己只能判断window首次drawn/displayed，不知道数据库、网络结果、首页列表和业务缓存哪些才算用户可用。
+字段赋值还晚一步：`onWindowsDrawn()`返回后，`updateReportedVisibilityLocked()`才执行`reportedDrawn = nowDrawn`。所以本章的`W_report`特指“检测并进入回调”的计时点，而不是字段已经翻转；固定路径实际还有`M_drawn < M_join < R_fill < reportedDrawn字段翻转`。另有visibility检查会在移除pending后异步确认并写`APP_START_CANCELED`再abort；普通abort不走正常`Displayed`，也不直接唤醒全局`START_SUCCESS` waiter，后者可能最终由idle timeout解除。
 
-## 60. Activity端只会成功上报一次
+## 11. 五个启动 delay 都从 `S0`累计，绝不能直接求和
+
+ActivityMetricsLogger 的核心字段可写成：
+
+| 字段 | 起点 | 终点 | 可缺省 | 它没有证明什么 |
+|---|---|---|---:|---|
+| `StartingWindowDelay` | `S0` | WMS第一次确认starting window drawn | 是，初值 `-1` | starting像素已present |
+| `BindApplicationDelay` | `S0` | AMS准备调用 `bindApplication`之前 | 是，初值 `-1` | `Application.onCreate()`已完成 |
+| `TransitionDelay` | `S0` | AppTransitionController通知starting | 正常账本会写 | 真实内容窗口已drawn |
+| `WindowsDrawnDelay` / 正常 `TotalTime` | `S0` | Activity reported-drawn时间戳 | 正常完成会写 | SurfaceFlinger/HWC已present |
+| fully-drawn delay | `S0` | system_server处理App报告；早报时钳到windows drawn | 是 | App选择的内容有统一客观定义 |
+
+它们是平行的累计读数：
+
+```text
+D_starting = SW_drawn - S0
+D_bind     = B_mark   - S0
+D_trans    = T_start  - S0
+D_drawn    = W_report - S0
+D_full     = F_full   - S0     // 晚报
+```
+
+因此 `D_starting + D_bind + D_trans + D_drawn`会重复计算同一前缀四次。只有 trace已证明两个端点属于同一 launch、同一 clock且先后明确时，才可派生区间。
+
+例如某次固定现场得到：
+
+```text
+StartingWindowDelay = 34 ms
+TransitionDelay     = 39 ms
+BindApplicationDelay= 86 ms
+WindowsDrawnDelay   = 182 ms
+FullyDrawnDelay     = 310 ms
+```
+
+这五项不能相加。因为该次证据另外证明 `T_start < B_mark < W_report < F_full`，才可手算：transition→bind为47 ms、bind→windows-drawn为96 ms、windows-drawn→fully-drawn为128 ms。换一个 starting/attach交错现场，前两个端点可能倒置，公式必须重画。
+
+多 Activity合并时还要更谨慎：每次 `notifyWindowsDrawn()`都会覆写 `mWindowsDrawnDelayMs`，最终保留最后一个 pending Activity完成的累计值。它不是某个固定 Activity类名天然拥有的属性。
+
+## 12. `reportFullyDrawn()` 是 App 语义完成点，而且 Activity 端至多尝试一次
+
+`Activity.reportFullyDrawn()`用于 App声明“首屏重要数据与 UI 已达到可用状态”。r48没有从 View树自动推导业务可用；调用位置属于产品语义，应覆盖首启真正重要的同步与异步内容，又不应故意拖延以粉饰数字。
+
+Activity端逻辑是：
 
 ```java
 if (mDoReportFullyDrawn) {
     mDoReportFullyDrawn = false;
-    ActivityTaskManager.getService()
-            .reportActivityFullyDrawn(...);
-    VMRuntime.getRuntime().notifyStartupCompleted();
+    try {
+        ActivityTaskManager.getService()
+                .reportActivityFullyDrawn(mToken, mRestoredFromBundle);
+        VMRuntime.getRuntime().notifyStartupCompleted();
+    } catch (RemoteException e) {
+    }
 }
 ```
 
-后续重复调用会被Activity本地flag忽略。所以它不适合当一个每次刷新数据都上报的通用性能事件。
+标志在 Binder前就清零，pause与stop也会清零。因此准确说法是“Activity至多尝试一次”，不是“保证服务端成功收到一次”。若同步 Binder抛 `RemoteException`，同一 Activity不重试，且同一 `try`后面的 VMRuntime通知也不会执行。
 
-## 61. reportFullyDrawn走Binder回ATMS
+服务端先用 Activity token找 `ActivityRecord`，再用它从 `mLastTransitionInfo`找账本：
 
-Activity传自mToken和 `mRestoredFromBundle`，ATMS按token找ActivityRecord，再调 `reportFullyDrawnLocked()`。
+- 找不到 ActivityRecord或映射时，服务端不产生对应 fully-drawn metric；客户端的一次机会仍已消耗。
+- 本章无跳板，映射稳定；同 display跳板只更新 latest Activity而不必为新 Activity补一条 map，不能把 token到launch账本说成无条件一一对应。
+- 若 Metrics pending Activity仍非空且尚未缓存请求，保存一个 Runnable；正常 `done(false)`时再执行，并把 fully-drawn delay钳为 `mWindowsDrawnDelayMs`。
+- 若窗口已drawn，直接用当前 elapsed时间减 `S0`；它甚至可以在“windows已drawn但transition-start门仍未到”的短窗口内先记录。
+- abort、记录已移除或无法匹配不保证替缓存请求补记结果。
 
-token使系统把上报关联到当前ActivityRecord/transition，而不是只按packageName归到一个可能包含多Activity的粗粒度账本。
+无论早报还是晚报，它都不等待该业务状态对应 Buffer的 HWC present fence。TTID/TTFD可作为现代性能术语帮助交流，但分析 r48时必须落回这里真实存在的 windows-drawn与App主动报告实现，不能把后续平台的 FrameTimeline字段反向套进本版本。
 
-## 62. 太早reportFullyDrawn不能超车windows drawn
+## 13. `am start -W` 有三种等待分支，`TotalTime` 与 `WaitTime`不是同一个量
 
-`logAppTransitionReportedDrawn()` 看到transition还未all drawn时，不立即记fully-drawn duration，而是把一个 `mPendingFullyDrawn` Runnable存起来。
-
-等windows drawn使transition正常done时，`logAppTransitionFinished()` 再运行这个pending Runnable。
-
-## 63. 早报时fully-drawn delay如何取值
+system_server里的`ActivityManagerShellCommand`在本地同步调用周围记录：
 
 ```java
-startupTimeMs = info.mPendingFullyDrawn != null
-        ? info.mWindowsDrawnDelayMs
-        : now - info.mTransitionStartTimeNs;
+long startTime = SystemClock.uptimeMillis();
+result = startActivityAndWait(...);
+long endTime = SystemClock.uptimeMillis();
 ```
 
-如枟App在window drawn前调用，最终fully drawn时间被推到windows-drawn delay，不会记成一个比首次窗口drawn更短的“可用”时间。
+`WaitTime = endTime - startTime`，整个区间都在system_server的shell-command请求线程。它包括`S_shell`之后的options构造、对本进程ATMS对象的Java调用、WaitResult等待以及结果填好后返回到`endTime`的尾部；不包括外部`am/cmd → AMS.onShellCommand`的Binder请求与回复、不包括内部命令解析和`S_shell`之前的输出，也不包括`endTime`之后的结果格式化。不能把这段本地`startActivityAndWait()`说成又跨了一次AMS Binder。
 
-## 64. 晚报时fully-drawn delay如何取值
+ActivityStarter按 start result走三种分支：
 
-如果windows已all drawn，此时才report，就用当前elapsed realtime减transition start。
+| start result | 等待对象 | `totalTime` | `launchState` |
+|---|---|---:|---|
+| `START_SUCCESS` | 加入全局 `mWaitingActivityLaunched`，在 global lock上wait，直到 who/timeout或结果被改成task-to-front | 正常为 Metrics windows-drawn delay；idle timeout为 `-1` | 正常 snapshot给 COLD/WARM/HOT；timeout可为 `-1` |
+| `START_DELIVERED_TO_TOP` | 不等后续draw，立即填 who | `0` | 没有赋值，Java默认0，shell打印 `UNKNOWN (0)` |
+| `START_TASK_TO_FRONT` | 已visible且RESUMED则立即完成；否则进入按component匹配的 `mWaitingForActivityVisible` | 立即为0；后续为最近drawn delay或 `-1` | attached为HOT，否则COLD；这里没有WARM |
 
-所以它可以包含首帧后的异步数据加载、第二次布局和内容绘制。
+代码注释还说明 task-to-front的 visible wait当前不会设置 timeout变量。普通 success的 idle timeout则会通过 `reportActivityLaunchedLocked(true, ..., INVALID_DELAY, -1)`解除等待。
 
-## 65. 为什么不能故意很晚报
+两类 waiter的数据结构不同：
 
-Activity API文档明确说过早或过晚虚报可能降低启动和应用性能，系统可能利用该边界调整启动前工作的优先级和优化。
+- `mWaitingActivityLaunched`是全局列表；`reportActivityLaunchedLocked()`与跳板修正会倒序移除所有尚未完成项，并不按component匹配。本章只允许一个 shell waiter。
+- `mWaitingForActivityVisible`保存 `WaitInfo(ComponentName, WaitResult)`，用 `w.matches()`按component完成。
 
-它是一个性能语义契约，不是用来让指标看起来更好的自由按钮。
+`mGlobalLock.wait()`阻塞的是 system_server正在服务该同步请求的线程，并释放 monitor让启动继续；它不阻塞 App主线程。r48 `WaitResult`只有 `result/timeout/who/totalTime/launchState`，没有一些旧资料常写的 `thisTime`字段。`totalTime < 0`时shell不会打印 `TotalTime`行。
 
-## 66. restoredFromBundle为什么被记录
+## 14. 诊断时先找第一个分叉点，不要拿一个数字包办整条链
 
-fully-drawn metric区分带saved state bundle和不带bundle的report type。恢复状态可以影响Activity初始化工作和可用时间，统计上需要知道这个上下文。
+静态源码给出的最好方法不是先猜“Application太重”，而是按完成点寻找第一处分叉：
 
-它不改变“终点仍由App报告”这一本质。
-
-## 67. Fully drawn不是物理present时间
-
-App通常在UI业务状态就绪后调report，系统记的是Binder上报被处理的elapsed timestamp，或被推迟后的windows-drawn delay。
-
-它并没有等此业务内容对应Buffer的HWC present fence signal后再上报。
-
-## 68. 可以用TTID/TTFD帮助理解，但要对齐r48实现
-
-现在常用TTID（Time To Initial Display）和TTFD（Time To Full Display）表述启动。在本章r48源码中，可将windows-drawn delay视为TTID的Framework主口径，fully-drawn delay视为TTFD类语义。
-
-但两者都要带上本章的边界：windows drawn不是present fence，fully drawn又依赖App正确上报。
-
-## 69. `WaitResult` 是什么
-
-`startActivityAndWait()` 创建 `WaitResult`，把它交给ActivityStarter，启动线程在system_server的global lock wait/通知协议中等待结果。
-
-关键字段是：
-
-- `result`：START_* result；
-- `timeout`：是否超时；
-- `who`：最终组件；
-- `totalTime`：对应等待终点的耗时；
-- `launchState`：cold/warm/hot。
-
-## 70. START_SUCCESS时WaitResult等什么
-
-ActivityStarter把WaitResult加入 `mWaitingActivityLaunched`，直到：
-
-- result变为START_TASK_TO_FRONT；
-- timeout为true；
-- 或 `who != null`。
-
-ActivityRecord `onWindowsDrawn()` 会通过 `reportActivityLaunchedLocked()` 填who、totalTime和launchState并notifyAll。
-
-## 71. START_DELIVERED_TO_TOP为什么totalTime是0
-
-这个result表示Intent发给已在top的Activity，没有一条新的窗口首次drawn链要等。代码立即填component并置 `totalTime=0`。
-
-这0不表示业务处理 `onNewIntent()` 与后续UI更新没有耗时，只是该WaitResult不建新launch-drawn账。
-
-## 72. START_TASK_TO_FRONT有两种等待分支
-
-若Activity已 `nowVisible && RESUMED`，立即返回，totalTime=0；否则把目标component包装成 `WaitInfo` 加入 `mWaitingForActivityVisible`可见等待表，等ActivityRecord的drawn/visible路径唤醒。
-
-这又说明`am start -W`不是一个无视start result、每次都等同一终点的简单stopwatch。
-
-## 73. WaitResult.totalTime不是从shell进程自己开始计时
-
-windows-drawn路径填入的totalTime来自ActivityMetricsLogger的windowsDrawnDelayMs，起点是 `notifyActivityLaunching()`。
-
-shell命令自身启动、Binder前处理和输出格式化可以影响用户体感的端到端wall time，但不一定都在 `totalTime` 里。
-
-## 74. 旧教程中的ThisTime/TotalTime要以当前版本为准
-
-Android不同版本的shell输出和WaitResult字段有调整。r48 `WaitResult.java` 的主要耗时字段是 `totalTime`，没有在该Java类中定义一个 `thisTime`字段。
-
-阅读其他版本命令截图时，不要将字段不加核对地倒灌回r48源码。
-
-## 75. stopWaitingForActivityVisible也能填totalTime
-
-`onWindowsDrawn()` 在有valid transition info或当前Activity是top running时，既调 `reportActivityLaunchedLocked()`，又调 `stopWaitingForActivityVisible()`。
-
-后者用component匹配visible wait list，填timeout=false、who和totalTime，然后notifyAll。这服务于TASK_TO_FRONT等可见等待情况。
-
-## 76. “等待完成”不是Activity线程被阻塞
-
-wait发生在处理 `startActivityAndWait()` 的system_server调用线程协议上。App主线程仍必须正常处理bindApplication、LaunchActivityItem、生命周期和Choreographer帧消息。
-
-如枟把App主线程也等住，窗口就无法drawn，当然不能完成WaitResult。
-
-## 77. 从Displayed账本看冷启动六大段
-
-```mermaid
-flowchart LR
-  A["A. 系统启动决策<br/>notifyLaunching→process request"] --> B["B. 进程准备<br/>Zygote/fork/attach"]
-  B --> C["C. App bind<br/>ClassLoader/Provider/Application"]
-  C --> D["D. Activity创建<br/>onCreate/onStart/onResume"]
-  D --> E["E. 首次View/Window<br/>addWindow/measure/layout/draw"]
-  E --> F["F. 渲染与WMS drawn<br/>RT/finishDrawing/all interesting drawn"]
-  F -. "Displayed在WMS drawn账本终止" .-> G["G. SF/HWC物理显示<br/>需另外证据"]
-  F --> H["H. 业务数据可用<br/>reportFullyDrawn"]
-```
-
-## 78. A段：启动决策慢的常见证据点
-
-这一段包含Intent resolve、权限/URI grant/后台启动检查、Task复用和launch mode决策、前Activity pause门等。
-
-仅看App `onCreate()` 中的trace会完全漏掉这一段，因为它早于目标App进程执行任何业务代码。
-
-## 79. B段：进程准备慢怎么分
-
-可用第206至208章的边界：
-
-```text
-startProcess请求
-→ Zygote socket发参数
-→ fork/specialize
-→ pid返system_server
-→ ActivityThread.main
-→ Binder attachApplication
-→ bindApplication准备
-```
-
-`bindApplicationDelay` 只给这整条的累计终点，要找具体慢在fork还是attach，需更细trace slice。
-
-## 80. C段：App bind慢的主要后果
-
-bindApplication Message在App主Looper中执行时，后面的Activity launch不会穿过这个同步处理主体。Provider、Application、ClassLoader/静态初始化太重，会直接推迟Activity生命周期。
-
-这是冷启动与热启动差异最集中的区域之一。
-
-## 81. D段：Activity业务代码慢怎么看
-
-对 `onCreate()`、`onStart()`、`onResume()` 分别放trace，同时继续拆：
-
-- `setContentView()` 的XML解析与反射构造；
-- 同步数据库/磁盘读取；
-- 大图decode；
-- 第三方SDK初始化；
-- 主线程Binder同步调用；
-- 锁竞争和Class initialization。
-
-不要只把整个 `onCreate()` 打一个粗标签就停止定位。
-
-## 82. E段：Window/View慢的特征
-
-如Activity生命周期已快速返回，但Displayed仍很晚，要看：
-
-- Decor何时加入WindowManagerGlobal；
-- addWindow/relayout Binder耗时；
-- 首次measure是否反复多轮；
-- layout中是否又requestLayout；
-- PreDraw listener是否持续返回false；
-- 软件绘制/硬件绘制路径是否与预期一致。
-
-## 83. F段：UI已draw但WMS还未all drawn
-
-可能原因包括：
-
-- RenderThread忙于前帧，UI等sync；
-- 首次DisplayList或shader/纹理准备很重；
-- Buffer dequeue/queue阻塞；
-- finishDrawing回WMS尚未处理；
-- 同Activity还有其他interesting window未drawn；
-- transition-start与all-drawn两道门尚有一道未满足。
-
-## 84. G段：Displayed后视觉仍慢怎么办
-
-如Framework windows-drawn delay很好，但物理观感仍慢，继续追：
-
-```text
-App queue Buffer
-→ BLAST Transaction
-→ SF apply/current→drawing
-→ latch
-→ CompositionEngine validate
-→ RenderEngine client target（如需）
-→ HWC present
-→ reliable present fence signal
-```
-
-这部分不能通过调整 `reportFullyDrawn()` 解决，因为两者根本不是同一完成边界。
-
-## 85. H段：首帧快但fully drawn慢
-
-这通常表示App很快显示骨架/缓存内容，但重要数据加载、列表首页构建或第二次绘制很慢。
-
-要把“网络服务器慢”、“本地解析慢”、“主线程更新View慢”分开，fully-drawn只给一个总终点。
-
-## 86. 一组手算示例
-
-假设累计delay：
-
-```text
-starting window drawn = 80 ms
-bindApplication = 140 ms
-Activity onCreate start = 230 ms
-Activity onResume end = 330 ms
-first Choreographer doFrame = 350 ms
-WMS windows drawn = 520 ms
-reportFullyDrawn = 910 ms
-```
-
-可初步切成：
-
-```text
-启动起点→bind前 = 140 ms
-bind前→onCreate start = 90 ms
-Activity create/resume段 ≈ 100 ms
-resume end→首doFrame = 20 ms
-首doFrame→WMS drawn = 170 ms
-WMS drawn→fully drawn = 390 ms
-```
-
-但starting window 80 ms是一条平行用户反馈路径，不能再与上述切片相加。
-
-## 87. 为什么子段不能只凭日志名猜
-
-`notifyBindApplication` 记的是发client命令前，不是handleBind完成；`onResume end` 是App自己trace，与ATMS service state的RESUMED时间不同；`windows drawn` 是WMS窗口统计，不是SF present。
-
-两个时间点做减法前，必须先写出它们的调用者、线程、clock和源码完成语义。
-
-## 88. elapsedRealtime、uptime、nanoTime不能无条件混减
-
-ActivityMetricsLogger的启动duration使用elapsedRealtimeNanos；Choreographer/FrameInfo主要使用System.nanoTime/CLOCK_MONOTONIC；部分Handler和Activity状态用uptimeMillis。
-
-普通短时启动中它们数值趋势接近，但不应将不同clock的原始绝对值不加转换直接相减。
-
-## 89. 启动计时中为什么选elapsed realtime
-
-启动是用户观察的端到端经过时间，设备即使因某些原因进入休眠，用户等待也没有凭空消失。
-
-`elapsedRealtime` 包含deep sleep，而uptime排除deep sleep；这也是为什么需要忠实使用该类选择的clock。
-
-## 90. LaunchObserver为什么要保证顺序
-
-ActivityMetricsLogger注释说全局只有一个并发launch sequence，observer调用必须在同一线程按顺序发生，才满足happens-before。
-
-这让intent started、activity launched、launch finished/cancelled、fully drawn可以用开始timestamp相互关联，而不是多线程乱序通知。
-
-## 91. abort不是启动崩溃的同义词
-
-metrics `abort()` 表示这次跟踪不再能/不需等一个有效windows-drawn transition，原因可以是Intent失败、Activity已drawn visible、无可识别launch result或目标变为invisible。
-
-它不必然意味着App process crash或ANR。
-
-## 92. 可见性变化如何避免永久等drawn
-
-如pending Activity不再visible requested或正在finishing，logger把它从pending draw list移除。对latest launched activity，还会异步检查Task中是否还有会draw的Activity。
-
-如果没有，就cancel/abort transition，而不是让一个永远不会出现的窗口占着active metrics。
-
-## 93. 常见误解一：冷启动就是 `Application.onCreate()` 耗时
-
-冷启动系统账本在Application之前已包含resolve、Task/lifecycle、进程启动与attach，之后还有Activity、View/Window、RenderThread和WMS drawn。
-
-`Application.onCreate()` 很重要，但只是其中一段。
-
-## 94. 常见误解二：Displayed日志就是屏幕present
-
-该duration终点是ActivityRecord windows drawn。它与首帧显示强相关，但不是SF/HWC present fence的timestamp。
-
-## 95. 常见误解三：Starting window已drawn就是App首页已好
-
-starting window是系统为启动过渡显示的窗口，它有独立delay、不计入真实app windows allDrawn。
-
-## 96. 常见误解四：reportFullyDrawn越早越好
-
-早于windows drawn会被系统推迟到windows-drawn delay；过早也违反“重要内容已填充”的API契约。
-
-## 97. 常见误解五：Warm launch表示Activity对象仍在
-
-r48 logger中，process running但目标Activity未attached为warm；已attached才是hot。warm恰恰可以需要新建Activity。
-
-## 98. 常见误解六：Task在Recents就不是cold
-
-Task账本可存在而App进程已死亡。此时TASK_TO_FRONT仍可触发新进程，logger分cold。
-
-## 99. 常见误解七：WaitResult.totalTime就是完整shell wall time
-
-totalTime主要由windows-drawn delay或特定start result分支填入，它不自动包含shell进程从准备命令到打印结果的每一微秒。
-
-## 100. 常见误解八：只要onResume快，启动就快
-
-onResume之后的ViewRoot addWindow/relayout、多轮measure/layout、PreDraw、DisplayList/RenderThread和WMS all-drawn都可以很慢。
-
-## 101. 启动证据金字塔
-
-| 证据 | 能回答 | 不能单独回答 |
+| 现象 | 已知边界 | 下一步证据重点 |
 |---|---|---|
-| App自定义trace | 业务函数/阶段耗时 | system_server/Zygote/SF时间 |
-| Displayed日志 | windows-drawn累计耗时 | 哪个子阶段慢、物理present |
-| WaitResult | start result、who、launch state、等待耗时 | 所有内部trace slice |
-| ActivityMetricsLogger fields | starting/bind/transition/windows/fully口径 | UI/RT内部细分 |
-| Perfetto/atrace | 跨线程、跨进程子段和调度 | 未采集或被截断的真实设备数据 |
-| present fence/Display trace | 硬件显示边界 | App业务上是否“可用” |
+| `StartingWindowDelay`已高 | 连系统占位反馈都晚 | `S0→SW_drawn`间的启动决策、WMS/系统进程调度与starting-surface路线 |
+| starting快、`BindApplicationDelay`高 | 占位反馈正常，App进程尚未到pre-bind门 | ProcessList/Zygote或USAP、child bootstrap、attach与AMS准备 |
+| bind较早、`WindowsDrawnDelay`高 | 已准备向App发bind，但真实窗口晚 | handleBind、Provider/Application、Activity生命周期、主线程、traversal、RT与finishDrawing |
+| `Displayed` duration小，肉眼内容仍晚 | WMS reported-drawn早 | SF latch、GPU/acquire、composition、HWC present、显示扫描；同时检查首帧是否只是空壳内容 |
+| windows-drawn快、fully-drawn高 | 框架首窗早，App业务完成声明晚 | 数据加载、首屏状态转换及报告点语义 |
+| `WaitTime`与`TotalTime`差异异常 | 两字段本就跨 uptime/elapsed clock | suspend、Binder前后、waiter分支、并发launch与返回尾部；禁止直接给差值命名 |
 
-## 102. 不要用单个数字代替时间线
+`Displayed`文字早或晚出现都只是日志线程调度现象；真正有价值的是文字携带的 duration及其服务端来源。反过来，producer queue、HWUI `FrameCompleted`也只到图形提交附近；要证明物理显示，应追 SF/HWC `presentAndGetFrameFences()`及其 fence，并注意 HAL可声明 `PRESENT_FENCE_IS_NOT_RELIABLE`。
 
-两次启动都是520 ms Displayed，可以分别是：
+实践中可把证据分三层对齐：
 
-- A：fork/attach慢，Activity/View很快；
-- B：进程启动很快，但inflate/首次measure很慢。
-
-优化点完全不同。所以先拆累计里程碑，再对慢段追trace，才是源码学习能带来的价值。
-
-## 103. 冷启动优化的第一原则：把工作放到正确边界
-
-不是所有工作都应异步，也不是所有工作都应赶在首帧前。先问：
-
-- 没有它能否安全创建Application？
-- 没有它能否draw出有意义的初始UI？
-- 它属于用户首次交互前必需，还是后台预热？
-- 推迟它会不会造成首帧后明显卡顿？
-
-优化是重排必需工作和延迟工作的依赖图，不是把同步代码全部套一层线程。
-
-## 104. 冷启动优化的第二原则：不牺牲正确性
-
-将Provider初始化、数据库migration、权限状态读取等移出首帧前，必须确保消费者不会提前读未就绪状态。
-
-指标变快但用户首次操作崩溃、闪烁或读到错数据，不是成功优化。
-
-## 105. 冷启动优化的第三原则：不将耗时偷渡到fully drawn之后
-
-快速draw一个空壳可以改善Displayed，但若随后主线程被大量延迟任务占满，用户仍无法滚动、点击或看到关键内容。
-
-因此要同时看windows drawn、fully drawn、首帧后主线程占用和交互可用性。
-
-## 106. macOS只读练习一：找启动起点
-
-```bash
-sed -n '458,580p' \
-  frameworks/base/services/core/java/com/android/server/wm/ActivityMetricsLogger.java
-
-sed -n '630,710p' \
-  frameworks/base/services/core/java/com/android/server/wm/ActivityStarter.java
+```text
+服务端：ActivityStarter / ActivityMetricsLogger / WMS trace与事件
+客户端：ActivityThread / Choreographer / ViewRoot / HWUI slice
+显示端：BufferQueue或BLAST / SF latch / composition / HWC present fence
 ```
 
-请回答：
+先问“第一个比健康样本晚的完成点是哪一个”，再检查它与前一点之间的线程、锁、Binder或队列；不要因 `onResume()`耗时看起来短，就跳过它之前的bind与之后的首帧。
 
-1. timestamp在resolve前还是后？
-2. 什么时候才知道processRunning？
-3. 哪两种start result能创建TransitionInfo？
-4. Activity已drawn/visible时为什么abort？
+## 15. 九组 macOS 只读源码练习
 
-## 107. macOS只读练习二：对齐drawn终点
+以下命令都从 AOSP 根目录执行，只读文件，不要求编译或设备。每组先定位调用点，再按正文中的完成点手画偏序；不要把 `rg`命中行号本身当成运行时先后。
 
-```bash
-sed -n '5425,5480p' \
-  frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
-
-sed -n '590,665p' \
-  frameworks/base/services/core/java/com/android/server/wm/ActivityMetricsLogger.java
-```
-
-把 `numInteresting/numDrawn → onWindowsDrawn → notifyWindowsDrawn → calculateDelay` 画成四个节点，并在图后写一句：“这里为什么没有SurfaceFlinger present fence”。
-
-## 108. macOS只读练习三：验证reportFullyDrawn防早报
+### 练习 1：钉住命令入口、system_server的两只钟与输出字段
 
 ```bash
-sed -n '2675,2720p' \
-  frameworks/base/core/java/android/app/Activity.java
-
-sed -n '917,990p' \
-  frameworks/base/services/core/java/com/android/server/wm/ActivityMetricsLogger.java
+test -f frameworks/base/cmds/am/am
+rg -n -F -e 'cmd activity "$@"' frameworks/base/cmds/am/am
+rg -n -F -e 'IBinder::shellCommand' frameworks/native/cmds/cmd/cmd.cpp
+rg -n -F -e 'void onShellCommand' -e 'new ActivityManagerShellCommand' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+test -f frameworks/base/services/core/java/com/android/server/am/ActivityManagerShellCommand.java
+rg -n -F -e 'mWaitOption = true' -e 'final long startTime = SystemClock.uptimeMillis()' -e 'startActivityAndWait' -e 'LaunchState:' -e 'TotalTime:' -e 'WaitTime:' frameworks/base/services/core/java/com/android/server/am/ActivityManagerShellCommand.java
+rg -n -F -e 'public long totalTime' -e 'public @LaunchState int launchState' -e 'launchStateToString' frameworks/base/core/java/android/app/WaitResult.java
 ```
 
-请分别写出：
+回答：外部`am/cmd`怎样进入system_server？`S_shell/S_return`各在哪一行？为什么`TotalTime`与`WaitTime`不能直接相减？确认r48是否存在`thisTime`。
 
-- Activity本地防重flag；
-- windows未drawn时pending Runnable的保存条件；
-- 早报与晚报的 `startupTimeMs` 取值分支；
-- fully drawn与VMRuntime startup completed通知的关系。
-
-## 109. macOS只读练习四：追WaitResult
+### 练习 2：证明 `S0`、resolve、cold Message 与分类的字面顺序
 
 ```bash
-sed -n '1,135p' \
-  frameworks/base/core/java/android/app/WaitResult.java
-
-sed -n '780,830p' \
-  frameworks/base/services/core/java/com/android/server/wm/ActivityStarter.java
-
-sed -n '545,635p' \
-  frameworks/base/services/core/java/com/android/server/wm/ActivityStackSupervisor.java
+test -f frameworks/base/services/core/java/com/android/server/wm/ActivityStarter.java
+rg -n -F -e 'int execute()' -e 'notifyActivityLaunching' -e 'mRequest.resolveActivity' -e 'executeRequest' -e 'notifyActivityLaunched' -e 'waitForResult' frameworks/base/services/core/java/com/android/server/wm/ActivityStarter.java
+rg -n -F -e 'startSpecificActivity' -e 'hasThread()' -e 'startProcessAsync' frameworks/base/services/core/java/com/android/server/wm/ActivityStackSupervisor.java
+rg -n -F -e 'ActivityManagerInternal::startProcess' frameworks/base/services/core/java/com/android/server/wm/ActivityTaskManagerService.java
+rg -n -F -e 'mService.mAtmInternal.onProcessAdded' frameworks/base/services/core/java/com/android/server/am/ProcessList.java
+rg -n -F -e 'void onProcessAdded' -e 'synchronized (mGlobalLockWithoutBoost)' frameworks/base/services/core/java/com/android/server/wm/ActivityTaskManagerService.java
 ```
 
-用表格对比 `START_SUCCESS` / `START_DELIVERED_TO_TOP` / `START_TASK_TO_FRONT`的等待条件和totalTime来源。
+回答：为何已经投递的Handler不能让分类看到已注册的WPC，且固定路线的`P_req`仍在global lock释放之后？列出`S0`明确不包含的命令前缀。
 
-## 110. 自测问题
+### 练习 3：独立验证 launch type、processSwitch、合并与 pending draw
 
-1. windows-drawn delay的起点是 `onCreate()` 吗？
-2. process已存在为什么还可能是warm？
-3. starting window drawn为什么不能代替App windows drawn？
-4. transition starting和all drawn为什么要双门汇合？
-5. Displayed日志的duration是在BackgroundThread打印时重新计算吗？
-6. 为什么早调reportFullyDrawn不会得到比windows drawn更短的值？
-7. WaitResult totalTime为0是否意味着App任何工作都没有耗时？
-8. Displayed很快但用户还在等数据，应看哪个指标？
+```bash
+test -f frameworks/base/services/core/java/com/android/server/wm/ActivityMetricsLogger.java
+rg -n -F -e 'elapsedRealtimeNanos()' -e 'static TransitionInfo create' -e 'processRunning' -e 'attachedToProcess()' -e 'hasStartedActivity' -e 'mTransitionStartTimeNs' frameworks/base/services/core/java/com/android/server/wm/ActivityMetricsLogger.java
+rg -n -F -e 'mCurrentTransitionStartTimeNs' -e 'mAssociatedTransitionInfo' -e 'setLatestLaunchedActivity' -e '!r.noDisplay && !r.mDrawn' -e 'launched activity already visible' frameworks/base/services/core/java/com/android/server/wm/ActivityMetricsLogger.java
+```
 
-## 111. 自测答案要点
+回答：Task存在为何仍可能COLD？`processSwitch`为何不是第四种 launch type？合并后哪个起点会变、哪个不会变？
 
-1. 不是，常见execute路径在Intent resolve前就记 `notifyActivityLaunching()`。
-2. 目标Activity尚未attached到该进程时分warm；已attached才hot。
-3. 它是过渡窗口，有独立delay且被排除在真实App interesting windows allDrawn计数外。
-4. 这两个事件可能前后交错，logger需要既有transition原因/起动记录，又确认所有pending windows drawn。
-5. 不是，drawn delay已在系统状态线程取快照，BackgroundThread只格式化/输出。
-6. 未drawn时只存pending Runnable，完成后取 `mWindowsDrawnDelayMs`。
-7. 不是，DELIVERED_TO_TOP或已visible/resumed的TASK_TO_FRONT不新建windows-drawn wait，但onNewIntent/UI刷新仍可耗时。
-8. 主要看语义正确的fully-drawn耗时，再对数据加载、主线程更新和交互可用性做子段trace。
+### 练习 4：区分普通 Zygote fork 与 USAP specialization
 
-## 112. 源码导航
+```bash
+test -f frameworks/base/core/java/android/os/ZygoteProcess.java
+rg -n -F -e 'usesWebviewZygote()' -e 'usesAppZygote()' -e 'Process.start' frameworks/base/services/core/java/com/android/server/am/ProcessList.java
+rg -n -F -e 'shouldAttemptUsapLaunch' -e 'attemptUsapSendArgsAndGetResult' -e 'attemptZygoteSendArgsAndGetResult' frameworks/base/core/java/android/os/ZygoteProcess.java
+rg -n -F -e 'processOneCommand' -e 'forkAndSpecialize' -e 'handleChildProc' frameworks/base/core/java/com/android/internal/os/ZygoteConnection.java
+rg -n -F -e 'usapMain' -e 'specializeAppProcess' frameworks/base/core/java/com/android/internal/os/Zygote.java
+```
 
-| 主题 | Android 11 r48文件 |
-|---|---|
-| launch起点与决策入口 | `frameworks/base/services/core/java/com/android/server/wm/ActivityStarter.java` |
-| cold/warm/hot、delay与日志 | `frameworks/base/services/core/java/com/android/server/wm/ActivityMetricsLogger.java` |
-| Activity windows drawn/visible统计 | `frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java` |
-| startActivityAndWait | `frameworks/base/services/core/java/com/android/server/wm/ActivityTaskManagerService.java` |
-| WaitResult等待表 | `frameworks/base/services/core/java/com/android/server/wm/ActivityStackSupervisor.java` |
-| WaitResult数据结构 | `frameworks/base/core/java/android/app/WaitResult.java` |
-| reportFullyDrawn App API | `frameworks/base/core/java/android/app/Activity.java` |
-| App bind过程 | `frameworks/base/core/java/android/app/ActivityThread.java` |
-| 首次Traversal | `frameworks/base/core/java/android/view/ViewRootImpl.java` |
-| 帧调度/FrameInfo | `frameworks/base/core/java/android/view/Choreographer.java` |
-| SF首Buffer与present | `frameworks/native/services/surfaceflinger/` |
+回答：哪些条件才尝试USAP？为什么“每次冷启动现场都由Zygote新fork”在r48过强？
 
-## 113. 本章结论
+### 练习 5：闭合 attach、pre-bind 与 Activity transaction
 
-Android 11 r48的App启动计时不是在Activity里临时开一个stopwatch，而是system_server在ActivityStarter尽可能早地记下transition start，再用ActivityMetricsLogger跨越resolve、Task/生命周期、进程创建、App bind、Activity/View/Window和drawn状态维护一本账。
+```bash
+test -f frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+rg -n -F -e 'attachApplicationLocked' -e 'mAtmInternal.preBindApplication' -e 'thread.bindApplication' -e 'app.makeActive' -e 'mAtmInternal.attachApplication' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+rg -n -F -e 'notifyBindApplication' -e 'mBindApplicationDelayMs' frameworks/base/services/core/java/com/android/server/wm/ActivityTaskManagerService.java frameworks/base/services/core/java/com/android/server/wm/ActivityMetricsLogger.java
+rg -n -F -e 'oneway interface IApplicationThread' -e 'void bindApplication' frameworks/base/core/java/android/app/IApplicationThread.aidl
+rg -n -F -e 'sendMessage(H.BIND_APPLICATION' -e 'handleBindApplication' -e 'makeApplication' -e 'installContentProviders' -e 'mInstrumentation.onCreate' -e 'callApplicationOnCreate' frameworks/base/core/java/android/app/ActivityThread.java
+rg -n -F -e 'realStartActivityLocked' -e 'LaunchActivityItem.obtain' -e 'ResumeActivityItem.obtain' frameworks/base/services/core/java/com/android/server/wm/ActivityStackSupervisor.java
+rg -n -F -e 'handleStartActivity' -e 'handleResumeActivity' frameworks/base/core/java/android/app/servertransaction/TransactionExecutor.java
+```
 
-`Displayed` 的主数字是windows-drawn delay：它比 `onCreate()`、`onResume()`或starting window drawn更接近“用户看到App初始界面”，但源码终点仍是WMS的interesting windows drawn，没有一直跟到SurfaceFlinger/HWC present fence。
+回答：`B_mark`为何不等于 `Application.onCreate()`结束？`ON_START`由谁补齐？服务端显式final lifecycle item是哪一个？
 
-`reportFullyDrawn()` 补足了系统无法理解业务“可用”的缺口，但它依赖App按契约上报，且早报会被推迟到windows drawn。因此真正的启动优化不能只追一个数字，而应用系统起点、bind、Activity lifecycle、首doFrame、windows drawn、fully drawn和present边界组成时间线，找到第一个真正过慢的分段。
+### 练习 6：从 frame-complete callback 追到 WMS draw-state
 
-## 114. 复读后的易混点修订
+```bash
+test -f frameworks/base/core/java/android/view/ViewRootImpl.java
+rg -n -F -e 'setFrameCompleteCallback' -e 'pendingDrawFinished' -e 'reportDrawFinished' -e 'mWindowSession.finishDrawing' frameworks/base/core/java/android/view/ViewRootImpl.java
+rg -n -F -e 'swapBuffers' -e 'markFrameCompleted' -e 'mFrameCompleteCallbacks' frameworks/base/libs/hwui/renderthread/CanvasContext.cpp
+rg -n -F -e 'public void finishDrawing' -e 'mService.finishDrawingWindow' frameworks/base/services/core/java/com/android/server/wm/Session.java
+rg -n -F -e 'void finishDrawingWindow' -e 'win.finishDrawing(postDrawTransaction)' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+rg -n -F -e 'finishDrawingLocked' -e 'COMMIT_DRAW_PENDING' -e 'READY_TO_SHOW' -e 'HAS_DRAWN' frameworks/base/services/core/java/com/android/server/wm/WindowStateAnimator.java
+rg -n -F -e 'isDrawnLw' -e 'performShowLocked' -e 'onFirstWindowDrawn' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+rg -n -F -e 'WM_USE_BLAST_ADAPTER_FLAG' -e 'ADD_FLAG_USE_BLAST' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+```
 
-初稿完成后重新对照r48源码，做了以下纠正和限定：
+回答：在本章固定条件下证明 `Q_return < W_finish < W_ready`。再列出至少两个不能把该顺序推广到所有draw的例外。
 
-1. 把启动起点从常被误认的`onCreate()`前移到ActivityStarter的 `notifyActivityLaunching()`，并明确常见execute路径中它早于resolve；
-2. 严格按 `processRunning + attachedToProcess` 区cold/warm/hot，不用Recents中是否有Task卡片猜测；
-3. 把launch type与processSwitch/interesting维度分开，避免把是否记observer event与是否cold混为一个boolean；
-4. 把starting window delay明确写成可选平行指标，无starting window为-1，且它不计入真实App allDrawn窗口；
-5. 把bindApplication delay终点限定为system_server即将向client发bind命令，不误写成 `Application.onCreate()` 已完成；
-6. 把Displayed终点限定为ActivityRecord interesting windows drawn，不误写成SF latch、HWC present或present fence signal；
-7. 核对 `notifyTransitionStarting()` 和 `notifyWindowsDrawn()` 的双向汇合，不强行声称两者在所有容错分支中只能固定顺序；
-8. 核对reportFullyDrawn早报时先存pending Runnable，最终startupTime取windows-drawn delay，不允许TTFD早于系统首draw；
-9. 核对r48 `WaitResult.java` 只有 `totalTime`耗时字段，不将其他版本教程中的`thisTime`字段倒灌进来；
-10. 把TTID/TTFD作为帮助理解的现代术语，但仍以r48 windows-drawn/fully-drawn实现为准，不把术语当作新源码机制。
+### 练习 7：把三套 drawn 账本与两道 Metrics 门分别圈出
 
-## 115. 下一章预告
+```bash
+test -f frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F -e 'updateDrawnWindowStates' -e 'updateAllDrawn' -e 'allDrawnStatesConsidered' -e 'mNumInterestingWindows' -e 'startingDisplayed' frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F -e 'updateReportedVisibilityLocked' -e 'reportedDrawn' -e 'onWindowsDrawn' -e 'onWindowsVisible' -e 'reportActivityLaunchedLocked' frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F -e 'TYPE_APPLICATION_STARTING' -e 'results.numInteresting' -e 'results.numDrawn' -e 'results.numVisible' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+rg -n -F -e 'mPendingDrawActivities' -e 'removePendingDrawActivity' -e 'boolean allDrawn()' -e 'mLoggedTransitionStarting' -e 'notifyWindowsDrawn' -e 'notifyTransitionStarting' -e 'done(false' frameworks/base/services/core/java/com/android/server/wm/ActivityMetricsLogger.java
+```
 
-第218章将沿着这条冷启动时间线，专门深入Android启动窗口（starting window）：它的theme背景、Snapshot/StartingSurface选择、WindowState创建、何时认定drawn、如何在真实App首窗口绘制后移除，以及为什么“白屏/黑屏”不能只归因于App `onCreate()`。
+回答：哪一套服务 transition/show，哪一套触发 `ActivityRecord.onWindowsDrawn()`，哪一套只判断 pending Activity list为空？
+
+### 练习 8：验证 fully drawn 的一次尝试、早报钳位与映射边界
+
+```bash
+test -f frameworks/base/core/java/android/app/Activity.java
+rg -n -F -e 'mDoReportFullyDrawn' -e 'reportFullyDrawn()' -e 'reportActivityFullyDrawn' -e 'notifyStartupCompleted' -e 'performPause()' -e 'performStop(' frameworks/base/core/java/android/app/Activity.java
+rg -n -F -e 'reportActivityFullyDrawn' -e 'reportFullyDrawnLocked' frameworks/base/services/core/java/com/android/server/wm/ActivityTaskManagerService.java frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F -e 'mLastTransitionInfo' -e 'mPendingFullyDrawn' -e 'mWindowsDrawnDelayMs' -e 'logAppTransitionReportedDrawn' -e 'windowsFullyDrawnDelayMs' -e 'logAppFullyDrawn' -e 'launchedActivityLaunchToken' -e 'launchToken = null' frameworks/base/services/core/java/com/android/server/wm/ActivityMetricsLogger.java
+```
+
+回答：远端异常后为什么不会重试？早报在哪个正常完成点被执行？Activity token为何不保证总能找到 launch账本？
+
+### 练习 9：核对 WaitResult 三分支、日志异步与 present 边界
+
+```bash
+test -f frameworks/base/services/core/java/com/android/server/wm/ActivityStackSupervisor.java
+rg -n -F -e 'case START_SUCCESS' -e 'mWaitingActivityLaunched.add' -e 'mGlobalLock.wait()' -e 'case START_DELIVERED_TO_TOP' -e 'case START_TASK_TO_FRONT' -e 'LAUNCH_STATE_HOT : LAUNCH_STATE_COLD' frameworks/base/services/core/java/com/android/server/wm/ActivityStarter.java
+rg -n -F -e 'mWaitingActivityLaunched' -e 'mWaitingForActivityVisible' -e 'w.matches' -e 'result.totalTime = totalTime' -e 'reportActivityLaunchedLocked' frameworks/base/services/core/java/com/android/server/wm/ActivityStackSupervisor.java
+rg -n -F -e 'logAppTransitionFinished' -e 'BackgroundThread.getHandler().post' -e 'APP_START_OCCURRED' -e 'WM_ACTIVITY_LAUNCH_TIME' -e 'Displayed ' frameworks/base/services/core/java/com/android/server/wm/ActivityMetricsLogger.java
+rg -n -F -e 'presentAndGetFrameFences' -e 'getPresentFence' frameworks/native/services/surfaceflinger/CompositionEngine/src/Display.cpp frameworks/native/services/surfaceflinger/CompositionEngine/src/Output.cpp
+rg -n -F -e 'PRESENT_FENCE_IS_NOT_RELIABLE' hardware/interfaces/graphics/composer/2.1/IComposer.hal
+```
+
+回答：为什么 delivered-to-top显示 `UNKNOWN (0)`？全局waiter与按component waiter如何区分？`Displayed`日志内容、日志实际打印与可靠 present fence各对应哪个完成点？
+
+## 16. 把本章压成一张可复核的冷启动账本
+
+先记住四条不变量：
+
+1. `S0`是ActivityStarter内部尽早的elapsed起点，早于常见resolve，却晚于外部`am/cmd`分发、shell-command Binder入口与system_server内部命令前缀。
+2. cold/warm/hot只由进程存在与 Activity attach状态分类；`processSwitch`、同display合并与 pending draw各有独立用途。
+3. WMS至少有 transition `allDrawn`、Activity `reportedDrawn`、Metrics pending-list三套账；`Displayed`与正常 `WaitResult.totalTime`落在第二套触发的时间戳上。
+4. starting、bind、transition、windows-drawn与fully-drawn全是从同一 `S0`出发的累计读数，不能相加；shell `WaitTime`还属于另一只时钟。
+
+固定主线可压缩为：
+
+```text
+shell uptime起点
+→ ActivityMetrics elapsed S0
+→ cold进程Message先投递、TransitionInfo随后分类
+→ Zygote fork或USAP specialization
+→ child同步attach
+→ preBind记累计点
+→ oneway bind + Activity transaction
+→ Application/Provider/Activity/ViewRoot
+→ producer queue
+→ WMS finish/READY，检测nowDrawn并进入onWindowsDrawn
+→ Metrics与transition-start双门汇合
+→ WaitResult填写；日志异步打印
+→ App按业务语义reportFullyDrawn
+```
+
+看到“首帧慢”时，先问具体是哪一个完成点慢；看到“Displayed很快”时，再问证据有没有走到 SF/HWC；看到多个毫秒字段时，先画端点与时钟，再做减法。这样才能把一个启动数字还原成可验证、可定位、不会跨层越界的时间线。
+
+下一章继续放大starting-window支线：Android Starting Window、Splash、Task Snapshot与首窗口交接。

@@ -15,7 +15,8 @@ void printTask(const Task* task) { // 仅借用
 int main() {
     auto owner = std::make_unique<Task>("Learn ownership");
     printTask(owner.get());
+    Task* borrowed = owner.get();
     auto nextOwner = std::move(owner);
     std::cout << std::boolalpha << "old owner empty: " << (owner == nullptr) << '\n';
-    printTask(nextOwner.get());
+    printTask(borrowed);
 }

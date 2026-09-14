@@ -1,216 +1,138 @@
-# 241 Android触摸Region、Touchable Insets、Task裁剪与Surface坐标变换链
+# 241 Android 触摸 Region、Touchable Insets、Task 裁剪与 Surface 坐标变换链
 
 > 源码版本：Android 11 / `android-11.0.0_r48`  
-> 学习方式：macOS只读核源，不编译、不运行AOSP
+> 学习方式：macOS 只读核源，不编译、不运行 AOSP
 
-## 1. 本章要解决什么
+## 1. 主问题：一块局部 Region 怎样完成正向命中与坐标回程
 
-第240章已经知道，WMS会把输入窗口信息附着到Surface事务，再由SurfaceFlinger生成最终窗口快照。
-
-这一章只盯住其中最容易出错的“几何”问题：
+第 240 章已经把输入窗口表从 `WindowState` 追到 InputDispatcher。本章只放大其中的几何闭环：
 
 ```text
-App怎样声明窗口只有一部分可触摸？
-FRAME、CONTENT、VISIBLE、REGION究竟是什么？
-Region最初相对谁，什么时候变成屏幕坐标，又何时变回Surface局部坐标？
-Task/Stack为什么既有Java Region裁剪，又有Surface crop裁剪？
-Surface被缩放后，命中区域和App收到的getX()怎样保持一致？
-getRawX()为什么通常仍保留原始屏幕点？
-tap exclude是不是系统导航手势排除区？
+一块由 App 在窗口局部坐标声明的可触摸区域，
+怎样经 WMS 的 frame 与策略运算、SurfaceFlinger 的 Layer 几何变成屏幕命中区；
+命中以后，屏幕上的 pointer 坐标又怎样变回 App 看到的局部 getX()/getY()？
 ```
 
-## 2. 一句总纲
+这不是“把一个矩形平移两次”那么简单。沿途至少有四类对象：
 
-Android 11的触摸几何不是一次算完，而是分层归一化：
+| 对象 | 能表达什么 | 不能偷换成什么 |
+|---|---|---|
+| `Rect` | 一个轴对齐、右下边界不包含的整数矩形 | 任意曲线或逐像素蒙版 |
+| `Region` | 多个轴对齐矩形的并、交、差，可不连续、可有洞 | 单一外接矩形 |
+| window / Layer frame | 某一阶段的坐标原点与外接范围 | 永远不变的“窗口位置” |
+| transform | Layer 局部到屏幕的几何映射 | r48 对 Region 已完整应用的任意矩阵 |
+
+主线只讨论 Android 11 r48 的普通 pointer 窗口路径。公开的 system gesture exclusion 是第 242 章的主题；本章只解释名字相近但用途不同的 WMS tap-exclude。旋转、翻转、portal、clone 和零缩放会在相应边界处单列，不能拿纯轴向缩放算例替代源码行为。
+
+读完后，应能对一个具体点同时回答三件事：它是否落在 Dispatcher 的最终 Region 中，目标保存了什么 offset/scale，以及客户端的 `getRawX()` 与 `getX()` 各从哪份值计算。
+
+## 2. 先建坐标账：Region 正向链与触点坐标回程
+
+把 App 声明的形状记为 `Rapp`，把一次普通触点记为 `p`。一条完整账本如下：
+
+| 阶段 | 主要载体 | 坐标口径 | 关键动作 |
+|---|---|---|---|
+| App 声明 | `InternalInsetsInfo` | App 窗口局部 | 选择 FRAME/CONTENT/VISIBLE/REGION |
+| 跨 Binder 前 | `Rect` / `Region` 参数 | 仍相对窗口；compat translator 可能先改单位尺度 | 只在值变化或 insets pending 时发送 |
+| WMS 保存 | `mGiven*`、`mTouchableInsets` | WindowState 使用的尺度，Region 仍相对 frame | 必要时乘 `mGlobalScale` |
+| WMS 策略 | 临时 `Region` | Display 全局 | nonmodal 才按 frame 解释 App 声明；modal 改用系统范围，再做 Task/tap-exclude 运算 |
+| Surface 事务 | `InputWindowHandle.touchableRegion` | 关联 Surface 的局部 | 减 `mFrame.left/top`，特定 size-compat 再逆缩放 |
+| SF 输出 | native `InputWindowInfo` | Display 屏幕 | Layer 轴向 scale、最终 frame 平移、crop/replace/clone |
+| Dispatcher 目标 | `InputTarget` / `DispatchEntry` | 屏幕命中结果加回程参数 | 先 contains，再保存 final frame 负偏移与 window scale |
+| App 事件 | `PointerCoords` 加 `mXScale/mYScale/mXOffset/mYOffset` | 保存坐标与窗口局部读数并存 | raw 读保存值，local 再应用 scale/offset |
+
+因此“局部”至少有两种：App 监听器填写的逻辑局部坐标，以及 WMS 为某个 Surface 准备的局部 Region。中间可能已经经过 compatibility 与 size-compat 尺度处理，不能只看数值相同就认为坐标系相同。
+
+对通过全部 Region 裁剪后仍幸存的触点，在最简单的正、非零轴向 `scale + translate` 场景，坐标回程可以写成：
 
 ```text
-App在窗口局部坐标声明InternalInsetsInfo
-→ WMS把它换算成全局Region，并施加Task与tap-exclude策略
-→ WMS再把Region平移回Surface局部坐标，随Layer事务提交
-→ SurfaceFlinger应用Layer缩放、屏幕位置和Surface crop，得到最终屏幕Region/frame
-→ InputDispatcher用屏幕点命中，并给目标附上frame负偏移与逆缩放
-→ MotionEvent保留raw点，以scale+offset计算窗口局部getX()/getY()
+screenPoint = finalFrameOrigin + appLocalPoint × layerScale
+appLocalPoint = (storedRawPoint - finalFrameOrigin) × windowScale
+windowScale = 1 / layerScale
 ```
 
-## 3. 全链路图
+这组等式要求：没有 per-pointer 归一化、没有零坐标保护、没有额外事件变换，`storedRawPoint` 确实还是该 Display 点。后文会逐项拆掉这些假设。
 
-```mermaid
-flowchart LR
-    APP["ViewTreeObserver监听器"] --> INFO["InternalInsetsInfo 窗口局部"]
-    INFO --> VR["ViewRootImpl performTraversals"]
-    VR --> BINDER["IWindowSession.setInsets"]
-    BINDER --> WMS["WindowState given insets"]
-    WMS --> REGION["全局touchable Region"]
-    REGION --> LOCAL["平移为Surface局部Region"]
-    LOCAL --> SF["SurfaceFlinger transform/crop"]
-    SF --> SCREEN["屏幕坐标Region与frame"]
-    SCREEN --> HIT["InputDispatcher命中"]
-    HIT --> EVENT["MotionEvent scale/offset"]
+## 3. App 入口：四种模式共享一次完整声明
+
+`ViewTreeObserver.InternalInsetsInfo` 是隐藏接口，包含 `contentInsets`、`visibleInsets`、`touchableRegion` 和 `mTouchableInsets`。前两项是从 frame 四边向内扣除的距离；`touchableRegion` 是相对 window frame 原点的形状；最后一项决定 WMS 采用哪组值：
+
+| 模式 | 值 | WMS 的几何种子 |
+|---|---:|---|
+| `TOUCHABLE_INSETS_FRAME` | 0 | 整个 `mFrame` |
+| `TOUCHABLE_INSETS_CONTENT` | 1 | frame 扣 `contentInsets` |
+| `TOUCHABLE_INSETS_VISIBLE` | 2 | frame 扣 `visibleInsets` |
+| `TOUCHABLE_INSETS_REGION` | 3 | `touchableRegion` 平移到 frame 原点 |
+
+CONTENT 与 VISIBLE 都不是 View 树或 Surface 透明像素的自动扫描结果。它们是监听器写入、客户端上报、WMS 保存的四边声明；模式只决定稍后选哪一组。
+
+每次派发监听器前，ViewRoot 都调用 `reset()`：三个几何值清空，模式恢复 FRAME。多个监听器按数组顺序收到同一个 `inoutInfo`，后一个监听器能继续修改前一个的结果，框架不会自动替它们求并集。回调因此必须描述本轮完整状态，不能依赖上轮 Region 残留。
+
+`isEmpty()` 也有严格含义：三组几何为空且模式为 FRAME 才算空。只把模式设为 REGION、却留下空 `touchableRegion`，仍是一份非默认声明；在 nonmodal 的 `getTouchableRegion()` 路径中，它得到空显式 Region，而不是自动退回 FRAME。modal 的 surface 路径会在后文另行扩张。
+
+### 练习 1：验证 reset、共享对象与空 REGION
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'public final static class InternalInsetsInfo {' frameworks/base/core/java/android/view/ViewTreeObserver.java
+grep -n -F 'public final Rect contentInsets = new Rect();' frameworks/base/core/java/android/view/ViewTreeObserver.java
+grep -n -F 'public final Region touchableRegion = new Region();' frameworks/base/core/java/android/view/ViewTreeObserver.java
+grep -n -F 'public static final int TOUCHABLE_INSETS_FRAME = 0;' frameworks/base/core/java/android/view/ViewTreeObserver.java
+grep -n -F 'public static final int TOUCHABLE_INSETS_REGION = 3;' frameworks/base/core/java/android/view/ViewTreeObserver.java
+grep -n -F 'mTouchableInsets = TOUCHABLE_INSETS_FRAME;' frameworks/base/core/java/android/view/ViewTreeObserver.java
+grep -n -F '&& mTouchableInsets == TOUCHABLE_INSETS_FRAME;' frameworks/base/core/java/android/view/ViewTreeObserver.java
+grep -n -F 'access.get(i).onComputeInternalInsets(inoutInfo);' frameworks/base/core/java/android/view/ViewTreeObserver.java
 ```
 
-## 4. 源码地图
+设监听器 A 选择 REGION 并写入 `[0,0,100,100] ∪ [200,0,300,100]`，监听器 B 从同一个 Region 减去 `[50,0,250,50]`。画出 B 收到的输入与最终输出；再分别判断“什么都不写”和“只设 REGION 模式”是否会让 `isEmpty()` 返回真。最后说明为什么下一轮开始时 A 必须重新写入两个岛。
+
+## 4. Traversal 与 Binder：删除最后一个监听器仍会再清一次
+
+`performTraversals()` 不是只有“当前存在监听器”才计算 internal insets。它的门是：
 
 ```text
-frameworks/base/core/java/android/view/ViewTreeObserver.java
-frameworks/base/core/java/android/view/ViewRootImpl.java
-frameworks/base/core/java/android/view/IWindowSession.aidl
-frameworks/base/services/core/java/com/android/server/wm/Session.java
-frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
-frameworks/base/services/core/java/com/android/server/wm/WindowState.java
-frameworks/base/services/core/java/com/android/server/wm/InputMonitor.java
-frameworks/base/core/java/android/view/InputWindowHandle.java
-frameworks/native/services/surfaceflinger/Layer.cpp
-frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
-frameworks/native/libs/input/InputTransport.cpp
-frameworks/native/libs/input/Input.cpp
-frameworks/base/core/java/android/view/MotionEvent.java
-```
-
-## 5. 先分清四个几何对象
-
-```text
-Rect：一个轴对齐矩形
-Region：多个矩形经并、交、差形成的区域，可有洞、可不连续
-frame：窗口或Layer在某坐标系中的外接矩形
-transform：把Layer局部坐标映射到屏幕坐标的变换
-```
-
-Region不是任意曲线路径。Android底层Region以一组轴对齐矩形表达。
-
-## 6. Region为什么比Rect重要
-
-一个输入窗口可能只有左右两个按钮可触摸，中间透明洞要把事件漏给后窗：
-
-```text
-可触摸： [左按钮]          [右按钮]
-不可触摸：        中间空洞
-```
-
-一个Rect不能同时表达两个孤立岛，Region可以。
-
-## 7. InternalInsetsInfo是App侧入口
-
-`ViewTreeObserver.InternalInsetsInfo`包含：
-
-```java
-public final Rect contentInsets = new Rect();
-public final Rect visibleInsets = new Rect();
-public final Region touchableRegion = new Region();
-int mTouchableInsets;
-```
-
-它是`@hide`接口，普通第三方App不能把它当作稳定公开API。
-
-## 8. 四种Touchable Insets模式
-
-```text
-TOUCHABLE_INSETS_FRAME   = 0
-TOUCHABLE_INSETS_CONTENT = 1
-TOUCHABLE_INSETS_VISIBLE = 2
-TOUCHABLE_INSETS_REGION  = 3
-```
-
-模式决定WMS以后取哪组数据计算命中区域。
-
-## 9. FRAME模式
-
-FRAME表示整个WindowState frame可触摸。
-
-它是`reset()`后的默认值；监听器什么也不改时，窗口通常按frame命中。
-
-## 10. CONTENT模式
-
-CONTENT不是“content view真实可见像素”，而是frame扣掉App上报的四边`contentInsets`：
-
-```text
-left   = frame.left   + inset.left
-top    = frame.top    + inset.top
-right  = frame.right  - inset.right
-bottom = frame.bottom - inset.bottom
-```
-
-## 11. VISIBLE模式
-
-VISIBLE同理，只是使用`visibleInsets`。
-
-它表达“窗口中后方内容被认为可见的内部边界”，不是SurfaceFlinger逐像素透明度检测结果。
-
-## 12. REGION模式
-
-REGION直接采用`touchableRegion`。
-
-源码注释明确：这个Region相对窗口frame原点，而不是天然的屏幕坐标。
-
-## 13. 这里的Insets不是WindowInsets
-
-最常见误解是把两者混为一谈：
-
-```text
-InternalInsetsInfo.contentInsets/visibleInsets
-    用于老式窗口内部布局与可触摸区域声明
-
-WindowInsets / InsetsSource
-    描述状态栏、导航栏、IME、cutout等系统占用
-```
-
-两者可能在某些窗口产生关联，但类型、传输链和语义都不同。
-
-## 14. 监听器何时执行
-
-ViewRootImpl在`performTraversals()`里判断：
-
-```java
 hasComputeInternalInsetsListeners()
-        || mHasNonEmptyGivenInternalInsets
+或 mHasNonEmptyGivenInternalInsets
 ```
 
-即使监听器刚被删除，只要旧值非空，也要再算一次把WMS中的旧值清回默认。
+第二项解决一个容易遗漏的撤销场景：最后一个监听器刚被删除时，WMS 仍保存旧的非空值；ViewRoot 还需经历一轮 reset、无监听器派发和差异比较，把服务端清回默认。
 
-## 15. 为什么先reset
+首次布局或可见性改变时，`insetsPending` 可随 relayout 发给 WMS。它表示客户端的最终 internal insets 尚未算完，避免服务端暂时把未经计算的 frame 内容用于其他窗口布局。随后正式计算会因为 pending 或值变化进入 `setInsets()`；WMS 收到后清掉 `mGivenInsetsPending`。
 
-每次派发前：
+比较发生在 translator 之前：`mLastGivenInsets` 保存 App 侧本轮声明。确需发送时，compatibility translator 分别取得 content、visible 与 touchable area 的转换副本；对 Region 主要是尺度转换，仍没有替它加 window frame 原点。
 
-```java
-insets.reset();
-dispatchOnComputeInternalInsets(insets);
+`IWindowSession.setInsets()` 在 r48 的 AIDL 中没有 `oneway`，所以这是同步 Binder 调用。`Session` 只转发；WMS 在全局锁内保存字段、请求 display layout 并执行一次 surface placement。不过 Binder 返回只证明这段服务端调用返回，不证明第 240 章的 SurfaceFlinger→InputDispatcher 快照链已经完成。
+
+### 练习 2：给“撤销旧声明”画出两条完成线
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F '|| mAttachInfo.mHasNonEmptyGivenInternalInsets;' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'insetsPending = computesInternalInsets && (mFirst || viewVisibilityChanged);' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'insets.reset();' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'mAttachInfo.mTreeObserver.dispatchOnComputeInternalInsets(insets);' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'if (insetsPending || !mLastGivenInsets.equals(insets)) {' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'touchableRegion = mTranslator.getTranslatedTouchableArea(insets.touchableRegion);' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'mWindowSession.setInsets(mWindow, insets.mTouchableInsets,' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'void setInsets(IWindow window, int touchableInsets, in Rect contentInsets,' frameworks/base/core/java/android/view/IWindowSession.aidl
+grep -n -F 'mService.setInsetsWindow(this, window, touchableInsets, contentInsets,' frameworks/base/services/core/java/com/android/server/wm/Session.java
+grep -n -F 'w.mGivenInsetsPending = false;' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+grep -n -F 'mWindowPlacerLocked.performSurfacePlacement();' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+grep -n -F 'mInputTransaction.setInputWindowInfo(' frameworks/base/services/core/java/com/android/server/wm/InputMonitor.java
+grep -n -F 'transaction->setInputWindowInfo(ctrl, *handle->getInfo());' frameworks/base/core/jni/android_view_SurfaceControl.cpp
+grep -n -F 'mInputFlinger->setInputWindows(inputHandles,' frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
+grep -n -F 'mDispatcher->setInputWindows(handlesPerDisplay);' frameworks/native/services/inputflinger/InputManager.cpp
 ```
 
-这意味着监听器每次都应描述完整当前状态，不能假设上次Region还留着。
+场景：上一轮是非空 REGION，本轮开始前删除最后一个 listener；本轮不是首次布局、可见性未变，因此 `insetsPending=false`。第一条线画到 `setInsets()` 同步返回，第二条线画到 Dispatcher 真正换表；标出 `reset`、`equals`、translator、Binder、surface placement 和第 240 章后续事务边界。解释为何第一条线不能替代第二条线。
 
-## 16. 多个监听器共享一个对象
+## 5. WMS 保存的是声明，不是最终命中区域
 
-监听器按注册数组顺序收到同一个`InternalInsetsInfo`。
-
-后一个监听器能看到并修改前一个监听器的结果；框架不会自动做Region并集。
-
-## 17. 只有变化才跨进程
-
-ViewRootImpl比较`mLastGivenInsets.equals(insets)`。
-
-当值未变化且没有`insetsPending`时，不重复调用WMS，避免每次Traversal都触发Surface placement。
-
-## 18. Compatibility Translator
-
-兼容模式下，ViewRootImpl先通过`mTranslator`转换content、visible和touchable area。
-
-所以跨Binder的值未必还是App逻辑像素；可能已按兼容缩放转换。
-
-## 19. Binder边界
-
-调用链是：
-
-```text
-ViewRootImpl
-→ IWindowSession.setInsets(oneway接口定义之外的普通Binder调用)
-→ Session.setInsets
-→ WindowManagerService.setInsetsWindow
-```
-
-Session只是把调用转给WMS，并未计算Region。
-
-## 20. WMS保存四组状态
-
-WindowState保存：
+`WindowManagerService.setInsetsWindow()` 找到 `WindowState` 后，覆盖四份长期状态：
 
 ```text
 mGivenContentInsets
@@ -219,784 +141,453 @@ mGivenTouchableRegion
 mTouchableInsets
 ```
 
-这些是“客户端给出的声明”，还不是InputDispatcher最终看到的Region。
+若 `mGlobalScale != 1`，三份几何声明会立即按该比例缩放。这个服务端 size-compat 尺度与客户端 `CompatibilityInfo.Translator` 是两个独立检查点；不能把两者都笼统叫作“系统自动换成屏幕坐标”，也不能假定任意窗口一定同时经过两次。
 
-## 21. globalScale提前作用于given值
+字段写入后，WMS 调用 `setDisplayLayoutNeeded()` 和 `performSurfacePlacement()`，并通知 accessibility controller 窗口区域可能变化。这说明 touchable 声明不只是 InputDispatcher 的私有输入：它也会影响需要观察窗口几何的服务端消费者。
 
-若`mGlobalScale != 1`，WMS会缩放三组given值。
+此时 `mGivenTouchableRegion` 仍相对 frame，content/visible 仍是四边 inset。真正把它们变成 Display 全局 Region 的是后续 `WindowState.getTouchableRegion()`；真正交给输入事务的又是 `getSurfaceTouchableRegion()`。调试时若只打印 `mGiven*`，还看不到 modal 扩张、Task 裁剪、tap-exclude、Layer crop 或最终 frame。
 
-这一步处理size compatibility一类窗口逻辑尺寸与WMS尺寸的差异。
-
-## 22. 更新为什么触发布局
-
-保存后WMS调用：
+三个动作也有不同完成含义：
 
 ```text
-setDisplayLayoutNeeded()
-performSurfacePlacement()
+保存 mGiven*             客户端声明已进入 WindowState
+performSurfacePlacement  WMS 开始把新事实写进 Surface 事务
+Dispatcher 换表          新 Region 才成为后续命中的 native 快照
 ```
 
-因为可触摸Region变化要进入下一份InputWindowInfo，并可能影响辅助功能窗口区域观察。
+## 6. 四种模式先变成 Display 全局 Region
 
-## 23. 从声明到全局Region
-
-`WindowState.getTouchableRegion()`以当前`mFrame`为锚点。
-
-FRAME直接复制frame；CONTENT/VISIBLE在frame内缩；REGION先复制given Region，再加frame左上角。
-
-## 24. applyInsets的真实含义
-
-核心公式是：
-
-```java
-outRegion.set(
-    frame.left + inset.left,
-    frame.top + inset.top,
-    frame.right - inset.right,
-    frame.bottom - inset.bottom);
-```
-
-因此四个inset值是“从各边向内扣多少”，不是四条绝对坐标。
-
-## 25. REGION为何只做translate
-
-App给出的Region已经描述局部形状。
-
-WMS只需加`frame.left/top`，把窗口局部位置换成Display全局位置；兼容缩放此前已经处理。
-
-## 26. 第一组数值例子
-
-假设：
+`getTouchableRegion(outRegion)` 以当前 `mWindowFrames.mFrame` 为锚。设 frame 为 `[L,T,R,B]`，四边 inset 为 `[l,t,r,b]`：
 
 ```text
-frame = [100, 200, 500, 700]
-contentInsets = [20, 30, 40, 50]
+FRAME   = [L, T, R, B]
+CONTENT = [L+l, T+t, R-r, B-b]
+VISIBLE = 同式，但使用 mGivenVisibleInsets
+REGION  = mGivenTouchableRegion + (L,T)
 ```
 
-CONTENT结果：
+这里的右、下 inset 是从 `R`、`B` 向内减，不是相对左上角的坐标。REGION 则保留多岛、洞和差集；把它先退化成 bounds 会永久丢失形状。
 
-```text
-[120, 230, 460, 650]
-```
+四选一只是几何种子。随后函数无条件尝试 `cropRegionToStackBoundsIfNeeded()`，再尝试 `subtractTouchExcludeRegionIfNeeded()`。所以在这条 nonmodal 路径里，App 声明只是后续取交集或做差的上界；modal 的 surface 路径会改用更大的系统范围，不能套用“只会收窄”。
 
-注意右边是`500 - 40`，不是`100 + 40`。
+还要把模式与窗口 flags 分开。`TOUCHABLE_INSETS_*` 回答“显式区域长什么样”；`FLAG_NOT_TOUCHABLE`、modal 与 native 准入回答“这份区域是否、怎样参与目标选择”。空 Region 的意义也必须结合普通 WMS 路径是否已显式加上 `FLAG_NOT_TOUCH_MODAL` 判断。
 
-## 27. REGION数值例子
-
-若局部Region是：
-
-```text
-[10,20,110,120] ∪ [250,300,350,400]
-```
-
-加frame原点后成为：
-
-```text
-[110,220,210,320] ∪ [350,500,450,600]
-```
-
-两个岛仍然分离。
-
-## 28. getTouchableRegion还不是最终Region
-
-紧接着会做：
-
-```text
-cropRegionToStackBoundsIfNeeded
-subtractTouchExcludeRegionIfNeeded
-```
-
-所以“App声明可触摸”不等于“系统最终允许它接收触摸”。
-
-## 29. touch modality是另一维度
-
-`getTouchableRegion()`只计算显式区域，不负责完整modal语义。
-
-`getEffectiveTouchableRegion()`才会把touch-modal窗口视为Display范围，再做Stack crop和exclude。
-
-## 30. normal input snapshot的modal编码
-
-正常WindowState走`getSurfaceTouchableRegion()`时，modal窗口会：
-
-```text
-输出flags加FLAG_NOT_TOUCH_MODAL
-显式Region扩大到Activity dim/letterbox/Stack范围，或系统窗口的大Display范围
-```
-
-这样native最终统一按Region命中。
-
-## 31. 为什么区域要再减tap exclude
-
-某些Window区域不应触发：
-
-```text
-切换焦点到该窗口
-把该窗口所在Display移到顶层
-把触摸发送给该窗口
-```
-
-WMS把这些局部区域从窗口touchable Region中做`DIFFERENCE`。
-
-## 32. tap exclude的坐标
-
-`mTapExcludeRegion`由窗口坐标提供。
-
-`getTapExcludeRegion()`先把它裁到窗口本地bounds，再平移到屏幕坐标；注释说明无需在这里缩放，native层会处理。
-
-## 33. tap exclude不是导航手势排除
-
-名称相近但不能混用：
-
-```text
-Tap exclude：WMS内部窗口/Display点击、聚焦与路由排除机制
-System gesture exclusion：App通过View API声明边缘返回手势排除，并受长度限制/策略约束
-```
-
-本章分析的是前者。后者应沿`systemGestureExclusionRects`与DisplayPolicy单独学习。
-
-## 34. Region差集可能产生洞
-
-设窗口Region是`[0,0,400,500]`，exclude是中间`[100,100,300,300]`。
-
-差集不是一个较小Rect，而是包围中间洞的多个矩形条带。
-
-## 35. Task裁剪的第一层：Java Region
-
-`cropRegionToStackBoundsIfNeeded()`要求：
-
-```text
-窗口有Task
-task.cropWindowsToStackBounds()为true
-存在ActivityStack
-Stack不是由TaskOrganizer创建
-```
-
-满足时，Region与Stack dim bounds求交。
-
-## 36. 为什么TaskOrganizer跳过Java裁剪
-
-当`stack.mCreatedByOrganizer`时，Java这里不把Region静态裁到dim bounds。
-
-组织器管理的Surface几何可能由Layer crop动态决定，旧Java bounds不一定是权威视觉边界。
-
-## 37. Task裁剪的第二层：Surface crop引用
-
-`setTouchableRegionCropIfNeeded()`可把Stack的SurfaceControl放进InputWindowHandle。
-
-SurfaceFlinger拿到后，使用该Layer最终`mScreenBounds`裁剪输入Region。
-
-## 38. 两层裁剪不是简单重复
-
-```text
-Java裁剪：基于WMS当前Stack dim bounds，尽早约束Region
-Surface裁剪：基于应用事务后的真实Layer screen bounds，贴近最终视觉状态
-```
-
-它们服务于不同的状态来源和时序。
-
-## 39. freeform为什么特殊
-
-freeform窗口不设置Stack Surface crop；Java还可能向外扩`RESIZE_HANDLE_WIDTH_IN_DP`。
-
-这样阴影/调整尺寸手柄附近仍可被命中，而不是严格截在内容矩形。
-
-## 40. modal Activity使用什么范围
-
-优先顺序大体是：
-
-```text
-letterbox inner bounds
-→ Task dim bounds
-→ RootTask dim bounds
-```
-
-然后考虑freeform扩展与Stack裁剪。
-
-## 41. WMS为何平移回Surface局部
-
-完成全局Region、Task crop和exclude后：
-
-```java
-region.translate(-frame.left, -frame.top);
-```
-
-这是因为InputWindowInfo被附着到一个会移动/缩放的Surface；携带局部Region，SF才能随Layer变换重建最终屏幕位置。
-
-## 42. 看似绕路其实在划分职责
-
-```text
-App局部 → WMS全局：方便与Task/exclude等Display策略求交
-WMS全局 → Surface局部：让Region随Layer事务一起变换
-SF局部 → 屏幕全局：按真实Layer树生成命中快照
-```
-
-每次转换都有明确的运算对象。
-
-## 43. size-compat临时逆缩放
-
-Android 11源码带有TODO：size-compat下frame已经post-scaling，旧逻辑又会让SF再缩放Region。
-
-因此`getSurfaceTouchableRegion()`会在特定条件下先乘`mInvGlobalScale`，避免双重缩放。
-
-## 44. 不要把TODO当通用公式
-
-这段逆缩放只在：
-
-```text
-mActivityRecord.hasSizeCompatBounds()
-且 mGlobalScale != 1
-```
-
-成立时执行，不能概括成“所有窗口交给SF前都逆缩放”。
-
-## 45. SurfaceFlinger复制DrawingState
-
-`Layer::fillInputInfo()`先复制：
-
-```cpp
-InputWindowInfo info = mDrawingState.inputInfo;
-```
-
-后续修改的是本次输出快照，不是回写WMS Java对象。
-
-## 46. Layer transform的缩放分量
-
-SF读取：
-
-```cpp
-ui::Transform t = getTransform();
-const float xScale = t.sx();
-const float yScale = t.sy();
-```
-
-当缩放不为1时，它同时处理命中Region和返回客户端的逆比例。
-
-## 47. Region向屏幕视觉尺寸缩放
-
-```cpp
-info.touchableRegion.scaleSelf(xScale, yScale);
-```
-
-Layer放大2倍，局部可触摸岛也必须放大2倍，否则视觉按钮与命中区域错位。
-
-## 48. windowXScale取逆数
-
-```cpp
-info.windowXScale *= 1.0f / xScale;
-info.windowYScale *= 1.0f / yScale;
-```
-
-Surface在屏幕上放大2倍，App局部坐标应缩回一半，所以事件端使用`0.5`。
-
-## 49. 零缩放的防护
-
-当scale为0时，源码把对应window scale设为0，而不是除零。
-
-这种Layer在几何上退化；不要用正常可交互窗口直觉推导它。
-
-## 50. surfaceInset也随Layer缩放
-
-`surfaceInset`先乘x/y scale并四舍五入，再被限制到Layer宽高的一半以内。
-
-它用于从变换后的Layer bounds内缩输入frame，避免阴影或额外Surface边缘被当作内容原点。
-
-## 51. frame由Layer bounds重建
-
-SF取得buffer size；无效时退到cropped buffer size，再用transform映射到屏幕。
-
-应用surfaceInset后，这个矩形成为最终：
-
-```text
-frameLeft/frameTop/frameRight/frameBottom
-```
-
-因此WMS先前填的frame会在这里按Layer真实几何重建。
-
-## 52. Region重新平移到屏幕
-
-SF执行：
-
-```cpp
-info.touchableRegion =
-        info.touchableRegion.translate(info.frameLeft, info.frameTop);
-```
-
-到这一步，Region重新成为InputDispatcher可直接与屏幕触点比较的坐标。
-
-## 53. crop的两种模式
-
-若有crop Layer：
-
-```text
-replaceTouchableRegionWithCrop = false
-    原Region ∩ crop Layer屏幕bounds
-
-replaceTouchableRegionWithCrop = true
-    忽略原Region，直接使用crop Layer屏幕bounds
-```
-
-后者常用于输入消费者等特殊Surface，不是普通WindowState默认路径。
-
-## 54. null crop在replace模式下的含义
-
-`replaceTouchableRegionWithCrop(null)`并非“没有范围”。
-
-源码语义是使用当前Layer自身`mScreenBounds`替换Region。
-
-## 55. clone还要再裁一次
-
-若Layer是clone，SF把输入Region再与cloned root的屏幕bounds求交。
-
-防止镜像/克隆画面外侧产生幽灵触摸区域。
-
-## 56. SF阶段的几何图
-
-```mermaid
-flowchart TD
-    R0["WMS提交的Surface局部Region"] --> SCALE["按Layer x/y scale缩放"]
-    SCALE --> POS["加最终frameLeft/frameTop"]
-    BUF["buffer或cropped buffer bounds"] --> TRANSFORM["Layer transform"]
-    TRANSFORM --> INSET["应用缩放后的surfaceInset"]
-    INSET --> FRAME["最终屏幕frame"]
-    FRAME --> POS
-    POS --> CROP{"crop策略"}
-    CROP -->|"intersect"| FINAL["最终屏幕Region"]
-    CROP -->|"replace"| FINAL
-    CROP -->|"clone intersect"| FINAL
-```
-
-## 57. 命中测试只看最终屏幕事实
-
-InputDispatcher前到后遍历窗口，触点`(x,y)`与`touchableRegionContainsPoint(x,y)`比较。
-
-此处x/y和Region都在Display屏幕坐标，因此无需知道App最初选择了CONTENT还是REGION。
-
-## 58. touch-modal的native条件仍存在
-
-native代码仍写着：
-
-```cpp
-isTouchModal = !(NOT_FOCUSABLE | NOT_TOUCH_MODAL);
-```
-
-但普通WindowState的modal语义已在WMS转换成NOT_TOUCH_MODAL加大Region；手工构造的InputWindowHandle仍可能走native modal分支。
-
-## 59. 命中与坐标投递是两步
-
-找到目标窗口后，Dispatcher才调用`addWindowTargetLocked()`生成目标坐标参数。
-
-“点是否落在窗口里”和“App收到什么坐标”不可混成同一次Region变换。
-
-## 60. InputTarget的偏移
-
-普通窗口目标使用：
-
-```cpp
-xOffset = -windowInfo->frameLeft;
-yOffset = -windowInfo->frameTop;
-```
-
-即先把屏幕原点平移到窗口frame左上角。
-
-## 61. InputTarget的缩放
-
-同时携带SF计算后的：
-
-```text
-windowXScale
-windowYScale
-globalScaleFactor
-```
-
-每个pointer ID都能保留自己的目标窗口偏移与缩放，支持split多指进入不同窗口。
-
-## 62. publish时偏移也要乘scale
-
-Dispatcher计算：
-
-```cpp
-xScale = dispatchEntry->windowXScale;
-xOffset = dispatchEntry->xOffset * xScale;
-```
-
-所以客户端局部坐标公式是：
-
-```text
-localX = rawX × windowXScale + (-frameLeft × windowXScale)
-       = (rawX - frameLeft) × windowXScale
-```
-
-## 63. 第二组完整数值例子
-
-设最终SF frame左上角为`(100,200)`，Surface视觉缩放2倍，屏幕触点为`(300,500)`。
-
-```text
-windowXScale = windowYScale = 0.5
-xOffset = -100 × 0.5 = -50
-yOffset = -200 × 0.5 = -100
-```
-
-应用局部坐标：
-
-```text
-getX = 300 × 0.5 - 50  = 100
-getY = 500 × 0.5 - 100 = 150
-```
-
-## 64. InputTransport传什么
-
-`publishMotionEvent()`把原始pointer coordinates连同：
-
-```text
-xScale/yScale
-xOffset/yOffset
-global scale影响后的必要坐标副本
-```
-
-写进InputMessage，通过InputChannel发送给App进程。
-
-## 65. InputConsumer怎样恢复MotionEvent
-
-App侧`InputConsumer::initializeMotionEvent()`原样读出参数，传给native `MotionEvent::initialize()`。
-
-并不是在Java层创建事件后再调用`offsetLocation()`。
-
-## 66. raw与local同时存在的关键
-
-native MotionEvent保存：
-
-```text
-原始PointerCoords
-mXScale/mYScale
-mXOffset/mYOffset
-```
-
-读取不同API时选择是否应用后两组参数。
-
-## 67. getRawX的公式
-
-`getRawAxisValue()`直接读取raw PointerCoords轴值。
-
-对常规屏幕触摸，它通常就是窗口变换前的Display触点，例如上例中的`300`。
-
-## 68. getX的公式
-
-`getAxisValue(AXIS_X)`执行：
-
-```cpp
-return rawValue * mXScale + mXOffset;
-```
-
-因此上例`getX()`为100，而`getRawX()`仍为300。
-
-## 69. globalScale为何特殊
-
-若存在globalScaleFactor，Dispatcher会缩放传输的PointerCoords，但对X/Y暂不叠加window scale。
-
-注释明确：window scale会作为参数送回客户端，在请求相对坐标时再应用，避免raw坐标被窗口比例污染或X/Y重复缩放。
-
-## 70. 触摸面积轴的处理
-
-`PointerCoords::scale()`中：
-
-```text
-X/Y使用windowXScale/windowYScale
-TOUCH_MAJOR/MINOR、TOOL_MAJOR/MINOR使用globalScaleFactor
-pressure、size不缩放
-```
-
-因为pressure/size是归一化量，触摸椭圆尺寸却带空间尺度。
-
-## 71. 多指split下的坐标归一化
-
-不同pointer可能属于不同窗口，因而拥有不同offset/scale。
-
-创建单个DispatchEntry时，Dispatcher选第一个pointer的坐标系为规范坐标系，并先把其他pointer从各自窗口坐标归一到这一坐标系。
-
-## 72. 为什么每pointer保存几何
-
-如果A窗口缩放1倍，B窗口缩放2倍，而两根手指后来因目标合并要进入同一事件，只有每pointer保留原目标几何才能正确换算。
-
-只在整个TouchState存一组scale是不够的。
-
-## 73. 旋转为何不能只看sx/sy
-
-`fillInputInfo()`使用完整`Transform`映射Layer bounds，但r48对touchable Region的显式处理主要是scale再translate/crop。
-
-阅读复杂旋转、翻转或非轴对齐变换时，不能把本章的纯缩放公式当作任意矩阵的完整数学证明。
-
-## 74. Region本身仍是轴对齐集合
-
-即使视觉Layer旋转，最终供InputDispatcher查询的Region仍需落在屏幕轴对齐Region表达中。
-
-边界可能通过变换后的bounds或矩形集合近似/裁剪，不能等同于GPU逐像素命中蒙版。
-
-## 75. surfaceInset不是contentInset
-
-```text
-surfaceInset：Surface几何边缘与输入frame相关，SF参与计算
-contentInsets：窗口frame内部的客户端声明，WMS用于CONTENT模式
-```
-
-名字都有inset，但作用层、来源和坐标阶段完全不同。
-
-## 76. frame也有多个阶段
-
-```text
-WindowState mFrame：WMS布局阶段的屏幕窗口框
-InputWindowHandle frame：WMS填入事务的基础值
-SF fillInputInfo frame：按buffer、transform、surfaceInset重建的最终屏幕框
-MotionEvent局部原点：最终frameLeft/frameTop经逆缩放得到
-```
-
-说“frame就是窗口位置”信息不够，必须说明是哪一阶段。
-
-## 77. 一个带Region和缩放的完整推演
-
-初始条件：
-
-```text
-WMS frame = [100,200,300,400]
-App局部Region = [20,30,120,130]
-Layer scale = 2
-最终SF frame左上角 = [100,200]
-```
-
-WMS先得到全局`[120,230,220,330]`，策略裁剪后减frame原点，提交局部`[20,30,120,130]`。
-
-SF缩放为`[40,60,240,260]`，再加最终frame原点，命中Region为`[140,260,340,460]`。
-
-## 78. 推演命中点
-
-屏幕点`(300,400)`落在最终Region内，因此命中窗口。
-
-事件参数为scale `0.5`，offset `(-50,-100)`：
-
-```text
-localX = 300×0.5-50  = 100
-localY = 400×0.5-100 = 100
-```
-
-局部点`(100,100)`也恰在App最初Region内。
-
-## 79. 几何不变量图
-
-```mermaid
-flowchart LR
-    P0["App局部点 (100,100)"] -->|"Layer放大2倍"| P1["相对屏幕frame (200,200)"]
-    P1 -->|"加frame原点 (100,200)"| P2["屏幕raw点 (300,400)"]
-    P2 -->|"命中最终屏幕Region"| TARGET["选中窗口"]
-    P2 -->|"减frame后乘0.5"| P3["MotionEvent getX/Y (100,100)"]
-```
-
-## 80. 常见错误一：用视觉透明度推断命中
-
-Surface某像素透明，不代表该处自动穿透。
-
-输入只看InputWindowInfo flags、Region、遮挡信任等规则；除非窗口主动声明Region洞或系统扣除，否则透明像素仍可能接收触摸。
-
-## 81. 常见错误二：REGION写屏幕坐标
-
-`InternalInsetsInfo.touchableRegion`要求窗口局部坐标。
-
-若App把frame.left/top提前加进去，WMS还会再平移一次，命中区会整体错位。
-
-## 82. 常见错误三：把空Region都理解成不可触摸
-
-对普通已转换成NOT_TOUCH_MODAL的窗口，空Region通常不能命中。
-
-但若某手工InputWindowHandle仍是touch-modal，native可因modal条件在Region外也选中；必须同时检查flags和构造路径。
-
-## 83. 常见错误四：把getRawX当物理传感器坐标
-
-`getRawX()`文档称窗口调整前的屏幕位置，但它已经经过InputReader设备校准、方向映射、Display viewport等上游处理。
-
-它不是触摸控制器未经校准的raw ABS_X数值。
-
-## 84. 常见错误五：认为InputDispatcher改写唯一坐标副本
-
-常规路径主要保留raw PointerCoords，再附带scale/offset。
-
-客户端`getX()`按参数计算局部值，因此raw与local能同时从一个MotionEvent读取。
-
-## 85. 常见错误六：Task crop等于窗口frame
-
-Task/Stack crop来自容器Surface或dim bounds；窗口frame来自具体窗口/Layer。
-
-子窗口可以大于容器，最终输入Region仍被容器裁掉。
-
-## 86. 调试时先找哪份事实
-
-建议按顺序核对：
-
-```text
-App listener输出的InternalInsetsInfo
-WindowState mGiven*与mTouchableInsets
-WindowState getTouchableRegion结果
-SurfaceFlinger最终InputWindowInfo frame/Region/scale
-InputDispatcher dumpsys中的窗口快照
-App日志中的rawX与x
-```
-
-只看任意一层都可能漏掉后续裁剪或变换。
-
-## 87. 只读验证命令：App到WMS
+### 练习 3：手算四种模式、Task 交集与一个洞
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '220,330p' frameworks/base/core/java/android/view/ViewTreeObserver.java
-sed -n '2985,3025p' frameworks/base/core/java/android/view/ViewRootImpl.java
-sed -n '2025,2055p' \
-  frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'private static void applyInsets(Region outRegion, Rect frame, Rect inset) {' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'case TOUCHABLE_INSETS_FRAME:' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'case TOUCHABLE_INSETS_CONTENT:' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'case TOUCHABLE_INSETS_VISIBLE:' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'case TOUCHABLE_INSETS_REGION: {' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'outRegion.translate(frame.left, frame.top);' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'cropRegionToStackBoundsIfNeeded(outRegion);' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'subtractTouchExcludeRegionIfNeeded(outRegion);' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'region.op(mTmpRect, Region.Op.INTERSECT);' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'touchableRegion.op(touchExcludeRegion, Region.Op.DIFFERENCE);' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
 ```
 
-## 88. 只读验证命令：WMS Region
+给定 `frame=[100,200,500,700]`、`contentInsets=[20,30,40,50]`、`visibleInsets=[0,80,0,120]`、局部 Region 为 `[10,20,110,120] ∪ [250,300,350,400]`。分别算四种全局结果；再假定 Java Stack crop 门已开启、stack 不是 organizer 创建，与 bounds `[150,250,480,650]` 求交，并从结果减去屏幕 Region `[200,300,260,360]`。保留 Region 的分块结果，不得只写外接矩形。
 
-```bash
-cd /Users/ninebot/androidSource
-sed -n '2579,2668p' \
-  frameworks/base/services/core/java/com/android/server/wm/WindowState.java
-sed -n '3420,3518p' \
-  frameworks/base/services/core/java/com/android/server/wm/WindowState.java
-```
+## 7. modal 有三种口径，输入快照只走其中一条
 
-## 89. 只读验证命令：SF与Dispatcher
+源码里有三个名字相近的入口：
 
-```bash
-cd /Users/ninebot/androidSource
-sed -n '2368,2465p' frameworks/native/services/surfaceflinger/Layer.cpp
-sed -n '1999,2035p' \
-  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
-```
+| 方法 | 主要使用者 | modal 时怎样处理 |
+|---|---|---|
+| `getTouchableRegion()` | accessibility、IME、Display 内部逻辑等 | 不主动扩大，只算四种模式并裁剪/做差 |
+| `getEffectiveTouchableRegion()` | r48 的 system gesture exclusion 计算 | 先用 Display bounds，再做 Stack crop 与 tap-exclude |
+| `getSurfaceTouchableRegion()` | `InputMonitor.populateInputWindowHandle()` | 把普通 modal 编成显式大 Region，并给 flags 加 `NOT_TOUCH_MODAL` |
 
-## 90. 只读验证命令：MotionEvent
+`getSurfaceTouchableRegion()` 以传入 flags 同时不含 `FLAG_NOT_TOUCH_MODAL` 与 `FLAG_NOT_FOCUSABLE` 作为 modal。这个分支不先调用 `getTouchableRegion()`，也就不会先消费 App 的四种模式或给其 Region 加 frame 原点；它直接重设系统范围。Activity 窗口先尝试 letterbox inner bounds；为空且 `task != null` 时只取该 Task dim bounds，只有 `task == null && getRootTask() != null` 才取 root-task dim bounds，并不存在“Task 结果为空再退到 root”的二次回退。freeform 会把所得矩形向外扩一个 resize-handle 宽度，之后仍可能做 Java Stack 交集。
 
-```bash
-cd /Users/ninebot/androidSource
-sed -n '1177,1200p' frameworks/native/libs/input/InputTransport.cpp
-sed -n '404,448p' frameworks/native/libs/input/Input.cpp
-```
+没有 `ActivityRecord` 的 modal 系统窗口不会简单使用当前 frame。r48 以 Display 宽高构造一个足够大的 Region，目的是窗口移动后仍覆盖 Display；随后再减 tap-exclude。
 
-## 91. macOS只读练习一：手算四种模式
+完成显式化后，WMS 把 `FLAG_NOT_TOUCH_MODAL` 写回输出 flags。于是普通 `WindowState` 到 native 时通常统一按 Region 命中。Dispatcher 里保留的 native modal 分支仍然重要，但主要覆盖手工构造、未经过这次转换的 handle，不能反推普通窗口会忽略其 Region。
 
-给定：
+`getEffectiveTouchableRegion()` 的 Display-bounds modal 口径并不是输入快照的替代实现。它服务于另一位调用者；第 242 章会用它解释 system gesture exclusion 为什么只能发生在有效可触摸范围内。
+
+## 8. tap-exclude 同时做局部裁剪、全局登记与 Region 差集
+
+本章的 `mTapExcludeRegion` 主要由 `TaskEmbedder` 一类宿主通过 `IWindowSession.updateTapExcludeRegion()` 更新。WMS 接口注释给它三项效果：区域内的 DOWN 不切换焦点到宿主窗口、不把其 Display 移到顶层，也不把触摸发送给宿主窗口。
+
+传入 Region 以宿主窗口局部坐标解释。`getTapExcludeRegion()` 先用 `[0,0,frame.width,frame.height]` 裁掉窗口外部分，再加 `frame.left/top` 变成屏幕坐标。`subtractTouchExcludeRegionIfNeeded()` 用 `Region.Op.DIFFERENCE` 从该窗口的全局 touchable Region 中减去它；差集可以留下多个条带或洞。
+
+同一局部声明还会被 union 进 `DisplayContent.mTouchExcludeRegion`，交给 `TaskTapPointerEventListener`。后者只在 DOWN 不位于这份 Display exclude Region 时调用 `handleTapOutsideTask()`。这条“任务点击/resize/focus”观察链与窗口自身的 InputWindowInfo Region 是两份消费者，不要只验证其中一份。
+
+它也不是公开的 system gesture exclusion：
 
 ```text
-frame=[100,200,500,700]
-contentInsets=[20,30,40,50]
-visibleInsets=[0,80,0,120]
-localRegion=[10,20,110,120]∪[250,300,350,400]
+tap-exclude
+    IWindowSession.updateTapExcludeRegion → WindowState.mTapExcludeRegion
+    影响宿主窗口命中与 TaskTapPointerEventListener
+
+system gesture exclusion
+    View.setSystemGestureExclusionRects → WindowState / DisplayContent 的另一组状态
+    参与左右系统手势边缘限制与策略仲裁
 ```
 
-分别算出FRAME、CONTENT、VISIBLE、REGION的全局结果，再假设Stack bounds为`[150,250,480,650]`求交。
+名字都有 exclusion，并不代表可以共用 API、长度限制或策略结论。
 
-## 92. macOS只读练习二：追监听器清空
+### 练习 4：追一块嵌入区域的两份去向
 
 ```bash
-cd /Users/ninebot/androidSource
-rg -n "computesInternalInsets|mHasNonEmptyGivenInternalInsets|setInsets\(" \
-  frameworks/base/core/java/android/view/ViewRootImpl.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'session.updateTapExcludeRegion(window, tapExcludeRegion);' frameworks/base/core/java/android/window/TaskEmbedder.java
+grep -n -F 'void updateTapExcludeRegion(IWindow window, in Region region);' frameworks/base/core/java/android/view/IWindowSession.aidl
+grep -n -F 'mTapExcludeRegion.set(region);' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'outRegion.op(mTmpRect, Region.Op.INTERSECT);' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'outRegion.translate(mWindowFrames.mFrame.left, mWindowFrames.mFrame.top);' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'touchableRegion.op(touchExcludeRegion, Region.Op.DIFFERENCE);' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'amendWindowTapExcludeRegion(mTouchExcludeRegion);' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'win.getTapExcludeRegion(region);' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'mTapDetector.setTouchExcludeRegion(mTouchExcludeRegion);' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'if (!mTouchExcludeRegion.contains(x, y)) {' frameworks/base/services/core/java/com/android/server/wm/TaskTapPointerEventListener.java
+grep -n -F 'mSystemGestureExclusion = new Region();' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'if (modal) {' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'updateRegionForModalActivityWindow(region);' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'if (task != null) {' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F '} else if (getRootTask() != null) {' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'region.set(-dw, -dh, dw + dw, dh + dh);' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
 ```
 
-回答：删除最后一个listener后，为什么还可能再调用一次`setInsets()`？
+设 `mGlobalScale=1`、无其他 crop，宿主 frame 为 `[100,200,500,700]`，窗口局部 tap-exclude 为 `[-10,50,150,250]`，原全局 touchable Region 为整个 frame。先裁到窗口局部 bounds，再平移并从 touchable Region 做差；同时说明同一屏幕区域如何进入 TaskTapPointerEventListener 的 Display exclude 集。最后列出它与 system gesture exclusion 的状态字段和消费者差异，并用 modal 分支锚点说明为什么 modal 不先消费这份 App touchable Region。
 
-## 93. macOS只读练习三：手算缩放闭环
+## 9. Task 裁剪不是“两层总会同时开启”
+
+Task/Stack 对 touchable Region 有三个独立门，不能简化为“Java 裁一次，SF 再裁一次”。
+
+第一门是 `task.cropWindowsToStackBounds()`。top-most 的 HOME/RECENTS 在特定条件下返回 false，其余路径最终看 `isResizeable()`；所以“窗口属于 Task”本身不保证裁剪。
+
+第二门是 Java Region 交集。只有第一门为真、存在 stack 且 `stack.mCreatedByOrganizer == false` 时，才取得 stack dim bounds 并求交。freeform 没有跳过这一步，而是先把 dim bounds 向外扩 `RESIZE_HANDLE_WIDTH_IN_DP`，为阴影和 resize handle 留出命中带。
+
+第三门是 `InputWindowHandle` 的 Surface crop 引用。第一门为真且存在 stack、窗口又不是 freeform 时，WMS 保存 stack `SurfaceControl`；仅当 replace 位为 false，SF 才用该 Layer 的 `mScreenBounds` 与 Region 求交。freeform 在这里清空 stack crop handle：从未 replace 的普通 handle 会保留 Java 结果，已有 sticky replace 的 handle 则会改用当前输入 Layer 自己的 bounds。
+
+organizer 还引入两组不同条件：
+
+- `stack.mCreatedByOrganizer` 让 Java dim-bounds 交集直接跳过；
+- `child.getTask().isOrganized()` 让 `InputMonitor` 在 populate 后调用 `replaceTouchableRegionWithCrop(null)`，把 crop handle 改成 null 并把 replace 位设为 true，SF 最终改用该输入 Layer 自己的 `mScreenBounds`。
+
+后一条 replacement 会覆盖先前算出的 App REGION、modal 范围、tap-exclude 差集和 stack crop 引用；在后续有效 clone-root 交集之前，几何以当前 Layer bounds 为准。`mCreatedByOrganizer` 与 `isOrganized()` 不是同一个字段。更不能把 replace 当成本轮临时开关：helper 只把 `replaceTouchableRegionWithCrop` 置为 true，普通 `setTouchableRegionCrop()` 不会复位。读长期复用的 handle 时要把这个 sticky 位纳入状态。
+
+### 练习 5：填完 Java crop、Surface crop 与 replace 矩阵
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '2380,2455p' frameworks/native/services/surfaceflinger/Layer.cpp
-sed -n '2495,2555p' \
-  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'boolean cropWindowsToStackBounds() {' frameworks/base/services/core/java/com/android/server/wm/Task.java
+grep -n -F 'if (isActivityTypeHome() || isActivityTypeRecents()) {' frameworks/base/services/core/java/com/android/server/wm/Task.java
+grep -n -F 'return isResizeable();' frameworks/base/services/core/java/com/android/server/wm/Task.java
+grep -n -F 'if (stack == null || stack.mCreatedByOrganizer) {' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'adjustRegionInFreefromWindowMode(mTmpRect);' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'region.op(mTmpRect, Region.Op.INTERSECT);' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'if (stack == null || inFreeformWindowingMode()) {' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'handle.setTouchableRegionCrop(stack.getSurfaceControl());' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'if (child.getTask() != null && child.getTask().isOrganized()) {' frameworks/base/services/core/java/com/android/server/wm/InputMonitor.java
+grep -n -F 'inputWindowHandle.replaceTouchableRegionWithCrop(null' frameworks/base/services/core/java/com/android/server/wm/InputMonitor.java
+grep -n -F 'replaceTouchableRegionWithCrop = true;' frameworks/base/core/java/android/view/InputWindowHandle.java
+grep -n -F 'touchableRegionSurfaceControl = new WeakReference<>(bounds);' frameworks/base/core/java/android/view/InputWindowHandle.java
 ```
 
-自行设定frame、xScale=1.5、raw点，验证Region视觉放大与`getX()`逆缩放能回到同一App局部点。
+先假定 handle 从未 replace、相关 stack 均存在。为下列互斥行填写五列：`cropWindowsToStackBounds`、Java 交集、最终 crop handle、replace 位、SF 使用原 Region 还是 bounds：①无 Task；②可 resize、非 HOME/RECENTS、普通 stack、非 freeform、child Task 未 organized；③与②相同但 freeform；④crop 门为真、`stack.mCreatedByOrganizer=true`、child Task 未 organized、非 freeform；⑤crop 门为真、普通 stack、`child.getTask().isOrganized()=true`、非 freeform。再增加第⑥行：同一 handle 曾经走过 replace，后来只调用普通 crop helper，会发生什么。
 
-## 94. macOS只读练习四：验证raw/local公式
+## 10. 回到 Surface 局部，以及 size-compat 的一次定向补偿
+
+无论 modal 还是非 modal，WMS 都先在 Display 全局坐标完成 Task 交集与 tap-exclude 差集，随后执行：
+
+```text
+region.translate(-mFrame.left, -mFrame.top)
+```
+
+这不是无效绕路。全局阶段适合与 stack dim bounds、Display bounds 和 screen-space exclude 运算；Surface 局部阶段则让 Region 可以随关联 Layer 的 position、scale 与 crop 一起提交。若窗口只移动，WMS 不必把每个局部小矩形都手工改成最终屏幕坐标。
+
+r48 对 size-compat 有一个条件严格的补偿：只有存在 `ActivityRecord`、`hasSizeCompatBounds()` 为真且 `mGlobalScale != 1`，才在提交前把 Region 乘 `mInvGlobalScale`。源码理由是 `mFrame` 已经 post-scaled，而 SF 还会再次应用 Layer scale；不先逆一次会让 Region 被重复放大。
+
+这不是“所有 Region 交给 SF 前都逆缩放”。普通动画缩放、系统窗口或没有 size-compat bounds 的窗口不走该分支。`InputMonitor` 另把 `scaleFactor=1/mGlobalScale` 写入 handle，JNI 将它复制成 `globalScaleFactor`；Dispatcher 发布时，这个字段直接调节 touch/tool major/minor，X/Y 的局部回程则依靠 SF 给出的 window scale 与 offset。它不能和提交前的 Region 补偿合并成一个字段。
+
+以 `mGlobalScale=1.5` 为例，若给定局部 Region 已在 WMS 中变为 `[15,30,165,180]`，满足该 size-compat 条件时，提交前先以 `2/3` 还原为 `[10,20,110,120]`；SF 的 Layer 轴向 scale 再把它变回视觉尺度。实际整数 Region 会经过各层取整，所以非整数边缘还要以源码输出为准。
+
+## 11. SurfaceFlinger 先定 frame，再把局部 Region 放到屏幕
+
+`Layer::fillInputInfo()` 复制 `mDrawingState.inputInfo` 后才改本次输出。几何顺序是：
+
+1. 取 `t.sx()`、`t.sy()`；若不是 1，按这两个分量缩放 Region，并把 `windowXScale/windowYScale` 分别乘其倒数。分量为 0 时，对应 window scale 被设为 0。
+2. 同一轴向分量缩放 `surfaceInset` 并四舍五入。
+3. 普通 Layer 从 drawing buffer size 取 `layerBounds`，无效时退到 cropped buffer size；portal 则用当前 touchable Region 的 bounds。
+4. 对 `layerBounds` 应用完整 `Transform`，得到屏幕轴对齐外接矩形。
+5. 把非负 surface inset 限制在各轴尺寸一半以内，并从四边内缩；结果写成最终 frame。
+6. 把已轴向缩放的 Region 加 `frameLeft/frameTop`，随后才进入 crop/replace/clone。
+
+`surfaceInset` 与 content inset 不同。InputMonitor 在 r48 只取 `attrs.surfaceInsets.left` 这个标量；SF 将同一初值分别按 x/y scale 得到两轴 inset。它缩小并移动最终 frame 原点，却不先从 touchable Region 做一个同形差集，因而影响后续事件 offset 的坐标原点。
+
+还要正视一处实现边界：frame 的四个角走完整矩阵，Region 在本函数中只显式走 `scaleSelf(t.sx(), t.sy())` 再平移。这里没有把 Region 的每个矩形套入任意旋转或 shear 矩阵；甚至 `sx()/sy()` 就是矩阵对角元素。纯轴向算例可以闭合，但不能把它推广成 r48 对旋转命中形状的完整证明。
+
+源码注释说 Region 应与 layer bounds 匹配，但这段函数在平移后没有无条件执行“Region ∩ final frame”。真正可见的进一步改写或约束来自 crop handle、replace 与 clone 分支；其中 replace 甚至可能把 Region 放大或移位。调试一个超出 frame 的 Region 时，应读实际运算，而不是把注释当作隐含的 intersect。
+
+### 练习 6：手算 surfaceInset、最终 frame 与正向 Region
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '404,448p' frameworks/native/libs/input/Input.cpp
-sed -n '2655,2715p' frameworks/base/core/java/android/view/MotionEvent.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'InputWindowInfo info = mDrawingState.inputInfo;' frameworks/native/services/surfaceflinger/Layer.cpp
+grep -n -F 'const float xScale = t.sx();' frameworks/native/services/surfaceflinger/Layer.cpp
+grep -n -F 'info.windowXScale *= (xScale != 0.0f) ? 1.0f / xScale : 0.0f;' frameworks/native/services/surfaceflinger/Layer.cpp
+grep -n -F 'info.touchableRegion.scaleSelf(xScale, yScale);' frameworks/native/services/surfaceflinger/Layer.cpp
+grep -n -F 'xSurfaceInset = std::round(xSurfaceInset * xScale);' frameworks/native/services/surfaceflinger/Layer.cpp
+grep -n -F 'Rect layerBounds = info.portalToDisplayId == ADISPLAY_ID_NONE' frameworks/native/services/surfaceflinger/Layer.cpp
+grep -n -F 'layerBounds = t.transform(layerBounds);' frameworks/native/services/surfaceflinger/Layer.cpp
+grep -n -F 'std::min(xSurfaceInset, layerBounds.getWidth() / 2)' frameworks/native/services/surfaceflinger/Layer.cpp
+grep -n -F 'info.frameLeft = layerBounds.left;' frameworks/native/services/surfaceflinger/Layer.cpp
+grep -n -F 'info.touchableRegion = info.touchableRegion.translate(info.frameLeft, info.frameTop);' frameworks/native/services/surfaceflinger/Layer.cpp
+grep -n -F 'return mMatrix[0][0];' frameworks/native/libs/ui/Transform.cpp
+grep -n -F 'Region& Region::scaleSelf(float sx, float sy) {' frameworks/native/libs/ui/Region.cpp
 ```
 
-写出`getRawX()`与`getX()`各自读取的字段和公式，并说明raw为何不等于evdev原始ABS值。
+假定非 portal、无 crop/clone，初始 `windowXScale=windowYScale=1`。给定 buffer bounds `[0,0,200,100]`、Surface 局部 Region `[10,20,110,80]`、`surfaceInset=10`，Layer 只做 `x×2、y×1.5` 并平移到 `(100,200)`。算出 transform 后 bounds、两轴 inset、最终 frame、最终屏幕 Region 与 `windowXScale/windowYScale`。然后把 transform 换成 90° 旋转，只说明源码分别怎样处理 frame 与 Region，不用纯缩放公式伪造一个旋转后 Region。
 
-## 95. 复读后最容易不理解的地方
+## 12. intersect、replace 与 clone 决定最终改写
+
+SF 尝试把 Java 弱引用提升为 crop Layer。三条分支按固定顺序执行：
 
 ```text
-InternalInsetsInfo是窗口局部声明，不是WindowInsets
-WMS曾把Region变成全局，又为了绑定Surface事务平移回局部
-SF一边放大命中Region，一边给事件保存逆缩放
-InputDispatcher命中使用屏幕坐标，客户端getX使用窗口局部坐标
-rawX是窗口变换前的Display坐标，不是触控芯片原始读数
+replace == true 且 crop Layer 存在
+    Region = crop Layer.mScreenBounds
+
+replace == true 且 crop Layer 为空
+    Region = 当前输入 Layer.mScreenBounds
+
+replace == false 且 crop Layer 存在
+    Region = 原屏幕 Region ∩ crop Layer.mScreenBounds
+
+replace == false 且 crop Layer 为空
+    保留原屏幕 Region
 ```
 
-## 96. 复读修订一：content/visible不是自动测量结果
+replace 会完全丢弃 App 声明、modal 扩张和前面的 Region 形状；intersect 才保留其洞与多岛。null 的含义依赖 replace 位，绝不能固定解释成“不裁剪”。
 
-更准确地说，它们是客户端经internal-insets监听链上报、由WMS保存的四边inset。
+只有 `isClone()` 为真且 `getClonedRoot()` 返回非空 Layer，SF 才在上述分支之后再与 cloned root 的 `mScreenBounds` 求交。这是最后一层防止克隆区域外出现命中的保护；若 clone 找不到 root，本段不会凭空制造一个空裁剪。它仍是 bounds 交集，而不是视觉像素透明度蒙版。
 
-WMS不会扫描View树或Surface透明像素自动推导CONTENT/VISIBLE命中形状。
-
-## 97. 复读修订二：裁剪顺序要区分坐标阶段
-
-Java阶段先在全局坐标对Stack bounds求交并减tap exclude；随后Region转回Surface局部。
-
-SF阶段再根据最终Layer screen bounds做crop或replace。不能把两次裁剪写成同一份Region上的连续静态Rect运算。
-
-## 98. 复读修订三：纯缩放算例有边界
-
-本章的`(raw-frame)×inverseScale`适合解释常见平移+轴向缩放。
-
-r48遇到旋转、clone、portal、size-compat TODO和退化transform时还存在额外规则，应以最终`fillInputInfo()`输出为准。
-
-## 99. 复读修订四：tap exclude命名边界
-
-本章`mTapExcludeRegion`是窗口/Display点击路由排除，不等同于公开的系统手势排除矩形。
-
-因此第240章中笼统写成“系统手势、导航或其他策略”的表述，读到这里应收紧为WMS tap-exclude机制；导航手势仲裁需要另章分析。
-
-## 100. Android 11 r48版本边界
+设前一节得到 Region `[140,245,340,335]`，crop Layer bounds 为 `[160,230,320,320]`：
 
 ```text
-InternalInsetsInfo仍为@hide老式接口
-size-compat Region双缩放以临时inverse-scale TODO规避
-SF fillInputInfo显式处理scale、frame、surfaceInset与crop
-TaskOrganizer创建的Stack跳过Java dim-bounds裁剪
-普通WindowState modal被编码为NOT_TOUCH_MODAL+显式Region
-MotionEvent用raw coords加scale/offset并存方式提供raw/local坐标
+intersect → [160,245,320,320]
+replace   → [160,230,320,320]
 ```
 
-## 101. 本章检查清单
+如果 clone root bounds 再给出 `[180,250,300,310]`，两条结果最终都还要与它求交。边界点恰好等于 right 或 bottom 时不在该 `Rect` 内。
+
+### 练习 7：证明 null crop 的语义取决于 sticky replace 位
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'public void replaceTouchableRegionWithCrop(@Nullable SurfaceControl bounds) {' frameworks/base/core/java/android/view/InputWindowHandle.java
+grep -n -F 'setTouchableRegionCrop(bounds);' frameworks/base/core/java/android/view/InputWindowHandle.java
+grep -n -F 'replaceTouchableRegionWithCrop = true;' frameworks/base/core/java/android/view/InputWindowHandle.java
+grep -n -F 'public void setTouchableRegionCrop(@Nullable SurfaceControl bounds) {' frameworks/base/core/java/android/view/InputWindowHandle.java
+grep -n -F 'auto cropLayer = mDrawingState.touchableRegionCrop.promote();' frameworks/native/services/surfaceflinger/Layer.cpp
+grep -n -F 'if (info.replaceTouchableRegionWithCrop) {' frameworks/native/services/surfaceflinger/Layer.cpp
+grep -n -F 'info.touchableRegion = Region(Rect{mScreenBounds});' frameworks/native/services/surfaceflinger/Layer.cpp
+grep -n -F 'info.touchableRegion = Region(Rect{cropLayer->mScreenBounds});' frameworks/native/services/surfaceflinger/Layer.cpp
+grep -n -F 'info.touchableRegion = info.touchableRegion.intersect(Rect{cropLayer->mScreenBounds});' frameworks/native/services/surfaceflinger/Layer.cpp
+grep -n -F 'if (isClone()) {' frameworks/native/services/surfaceflinger/Layer.cpp
+grep -n -F 'if (clonedRoot != nullptr) {' frameworks/native/services/surfaceflinger/Layer.cpp
+grep -n -F 'Rect rect(clonedRoot->mScreenBounds);' frameworks/native/services/surfaceflinger/Layer.cpp
+```
+
+假定原屏幕 Region 为 `[140,245,340,335]`，当前输入 Layer 的 self bounds 为 `[120,215,480,335]`，存活的 crop A/B bounds 分别为 `[160,230,320,320]` 与 `[180,240,360,330]`，clone root bounds 为 `[190,250,300,310]`。对五种历史分别写出 weak crop、replace 位和非 clone 的 SF 结果：①新 handle，从未调用任何 crop helper；②只调用 `setTouchableRegionCrop(A)`；③调用 `replaceTouchableRegionWithCrop(null)`；④先 replace(A)，再 set crop(null)；⑤先 replace(A)，再 set crop(B)。最后给每个结果加上 clone root 交集，保留中间值。
+
+## 13. Dispatcher 命中只消费最终屏幕事实
+
+`findTouchedWindowAtLocked()` 按 display 内 front-to-back 顺序遍历 handle。窗口必须属于当前 display 且 `visible`；带 `FLAG_NOT_TOUCHABLE` 的窗口不会成为前景命中窗口。随后才判断：
 
 ```text
-[ ] 能区分Rect、Region、frame与transform
-[ ] 能手算FRAME/CONTENT/VISIBLE/REGION
-[ ] 能解释App局部→WMS全局→Surface局部→SF屏幕全局
-[ ] 能区分Java Stack裁剪与SF Surface crop
-[ ] 能区分intersect crop和replace crop
-[ ] 能解释Layer放大时Region为何放大、windowScale为何取逆
-[ ] 能写出localX=(rawX-frameLeft)×windowXScale
-[ ] 能区分getRawX、getX与evdev ABS_X
-[ ] 能区分tap exclude与system gesture exclusion
-[ ] 能指出旋转与size-compat的版本边界
+native modal
+或 touchableRegionContainsPoint(int x, int y)
 ```
 
-## 102. 本章小结
+普通触摸从 `MotionEntry.pointerCoords` 取 X/Y 并转为 `int32_t`；mouse 使用 cursor position。到这里，point 与 Region 都是 Dispatcher 所理解的 Display 屏幕坐标，Dispatcher 不再知道它最初来自 CONTENT、REGION、Task dim bounds 还是 Layer crop。
 
-完整几何闭环是：
+普通 `WindowState` 原本的 modal 已在 WMS 改写为 `NOT_TOUCH_MODAL + 显式大 Region`，所以仍依靠 contains。手工 handle 若保持 native modal，则可绕过 Region contains；这就是“空 Region 一定不可触摸”不是跨所有构造路径定理的原因。
+
+`NOT_TOUCHABLE` 也不等于“绝不会收到本次手势的任何事件”。初始 DOWN 查找前景窗口时会开启 outside-target 收集；遍历到一个可见且带 `WATCH_OUTSIDE_TOUCH` 的窗口，即使它不可触摸或点不在 Region 内，仍可能先以 `DISPATCH_AS_OUTSIDE` 加入 `TouchState`。若它与最终前景窗口的 owner UID 不同，Dispatcher 才再给它加 `FLAG_ZERO_COORDS`，避免泄露坐标。
+
+Region 的命中也不是每个 MotionEvent 都重算。DOWN、SCROLL、hover，以及手势已 split 时的新 `POINTER_DOWN` 走 Case 1 查找；普通 MOVE/UP/CANCEL 和 non-split `POINTER_DOWN` 走 Case 2，复用已有 `TouchState`。Case 2 里只有单指 slippery MOVE 会再次调用窗口查找。因此，单凭 Region 在手势中途改变通常不会把当前流改投另一窗口；窗口生命周期与取消等其他状态变化仍需另查。
+
+命中只决定“选谁”。窗口上方的遮挡、outside observer、portal 递归、split 所有权和注入权限还会影响最终 targets，但它们不会重新解释 App 的四种 touchable-insets 模式。选中后，坐标回程才从最终 frame 与 window scale 开始。
+
+## 14. InputTarget 保存逆变换，多指还会改写保存的 raw
+
+`addWindowTargetLocked()` 先按 token 找 input channel；没有已注册 channel 就不产生该 target。正常窗口把这些值写进 `InputTarget`：
 
 ```text
-App用窗口局部InternalInsetsInfo声明可触摸形状
-→ WMS围绕WindowState frame转成全局Region
-→ 应用Task/Stack与tap-exclude策略
-→ 转回Surface局部并进入Layer事务
-→ SF按最终Layer scale/frame/crop生成屏幕Region
-→ Dispatcher用屏幕raw点命中
-→ 以frame负偏移和逆scale让MotionEvent.getX/Y回到App局部坐标
+xOffset = -final frameLeft
+yOffset = -final frameTop
+windowXScale / windowYScale = SF 已累计的逆 Layer 轴向 scale
+globalScaleFactor = InputMonitor 写入的 scaleFactor；mGlobalScale != 1 时为 1/mGlobalScale，否则为 1
 ```
 
-输入区域和事件坐标走的是同一套几何的正变换与逆变换。只要两边使用同一份最终Layer状态，视觉按钮、命中区域与App局部坐标就能闭合。
+offset 在 target 中先以未缩放的负 frame 保存。发布时 Dispatcher 才计算：
 
-## 103. 下一章预告
+```text
+publishedXOffset = xOffset × windowXScale
+publishedYOffset = yOffset × windowYScale
+```
 
-下一章深入Android 11的系统手势排除区域：从View设置exclusion rect、ViewRoot收集与坐标转换，到WMS长度限制、DisplayPolicy更新和边缘返回手势仲裁，并与本章的tap exclude彻底分开。
+`InputTarget` 不是只能存一组几何，但这不表示不同 connection 的窗口会挤进同一个 target。`addWindowTargetLocked()` 以相同 connection token 找到并复用一项，随后还断言 `targetFlags` 与 `globalScaleFactor` 相同；`addPointers()` 又断言新旧非空 pointerIds 不重叠。只有这些条件同时成立，才是合法合并。不同 token 各自形成 target；相应 target 带 `FLAG_SPLIT` 且只含 pointer 子集时，才会各自拆出事件。
+
+创建这类 `DispatchEntry` 时，规范基准是 `pointerIds.firstMarkedBit()`，即集合中最小的 pointer id，不是 MotionEvent 数组里口语所说的“第一根手指”。源码把其他 pointer 的 `PointerCoords` 先移到各自窗口原点、按 `currentScale/firstScale` 归一化，再移回基准 frame。这样一枚事件只需携带一组最终 scale/offset，却仍能让各 pointer 的局部值闭合。
+
+代价是：非基准 pointer 传到客户端的保存坐标可能已不是原 Display 点，因此它的 `getRawX(pointerIndex)` 也可能改变。`raw` 在 MotionEvent 中的严格含义是“不应用该事件保存的 mXScale/mXOffset”，不是“永远未经 Dispatcher 改写”。
+
+`globalScaleFactor != 1` 时，发布循环复制 PointerCoords 并调用 `scale(globalScaleFactor, 1, 1)`。由于 X/Y 的 window scale 参数明确传 1，这一步不改变 X/Y；它缩放的是 `TOUCH_MAJOR/MINOR` 与 `TOOL_MAJOR/MINOR`。注释说明 global scale 已包含在 windowX/YScale 的几何回程中，不能再乘到 X/Y 一次。pressure、size 与 orientation 也不会在这里缩放。
+
+退化 scale 不能硬套逆变换。SF 遇到某轴 scale 为 0 会把对应 window scale 设为 0；同 target 的多指规范化却直接用 `currentScale/firstScale`，没有为基准 scale 为 0 建立可逆坐标。本文所有数值闭环都明确排除这类场景。
+
+若 target 带 `FLAG_ZERO_COORDS`，Dispatcher 会清空坐标以避免向 outside 接收者泄露位置。此时任何普通 raw/local 等式都不适用。
+
+### 练习 8：先算单指逆变换，再证明多指归一化
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'it->addPointers(pointerIds, -windowInfo->frameLeft, -windowInfo->frameTop,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'inputWindowHandle.scaleFactor = 1.0f/child.mGlobalScale;' frameworks/base/services/core/java/com/android/server/wm/InputMonitor.java
+grep -n -F 'inputTarget.inputChannel->getConnectionToken() ==' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'inputTarget.globalScaleFactor = windowInfo->globalScaleFactor;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (inputTarget.flags & InputTarget::FLAG_SPLIT) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'splitMotionEvent(originalMotionEntry, inputTarget.pointerIds);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'pointerInfos[pointerId].xOffset = xOffset;' frameworks/native/services/inputflinger/dispatcher/InputTarget.cpp
+grep -n -F 'inputTarget.pointerInfos[inputTarget.pointerIds.firstMarkedBit()];' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'const PointerInfo& firstPointerInfo =' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'float scaleXDiff = currPointerInfo.windowXScale / firstPointerInfo.windowXScale;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'pointerCoords[pointerIndex].applyOffset(currPointerInfo.xOffset, currPointerInfo.yOffset);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'pointerCoords[pointerIndex].scale(1, scaleXDiff, scaleYDiff);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'pointerCoords[pointerIndex].applyOffset(-firstPointerInfo.xOffset,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'xOffset = dispatchEntry->xOffset * xScale;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'scaledCoords[i].scale(globalScaleFactor, 1' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'scaleAxisValue(*this, AMOTION_EVENT_AXIS_TOUCH_MAJOR, globalScaleFactor);' frameworks/native/libs/input/Input.cpp
+grep -n -F 'scaledCoords[i].clear();' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (!(flags & InputWindowInfo::FLAG_NOT_TOUCHABLE)) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (addOutsideTargets && (flags & InputWindowInfo::FLAG_WATCH_OUTSIDE_TOUCH)) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (touchedWindow.targetFlags & InputTarget::FLAG_DISPATCH_AS_OUTSIDE) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (inputWindowHandle->getInfo()->ownerUid != foregroundWindowUid) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'bool newGesture = (maskedAction == AMOTION_EVENT_ACTION_DOWN ||' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (newGesture || (isSplit && maskedAction == AMOTION_EVENT_ACTION_POINTER_DOWN)) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F '/* Case 2: Pointer move, up, cancel or non-splittable pointer down. */' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'tempTouchState.isSlippery()) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
+
+先用 `frameLeft=120`、`windowXScale=0.5`、屏幕点 `x=300` 算发布的 xOffset 与客户端局部 X。再假定相同 connection token、相同 target flags 与相同 `globalScaleFactor=1` 使两组几何合法合入一个 target：新加入的 pointerIds 分别为互不重叠的 `{0}`、`{1}`，pointer 0 的 `(offset,scale)=(-100,1)`，pointer 1 的 `(-300,0.5)`，两者原保存 X 分别为 160 与 500。以最小 pointer id 0 为基准逐行执行归一化，验证最终统一参数仍让两根手指各自回到原窗口局部值，并指出哪一根的客户端 raw 已不再等于输入的 Display X。最后说明 token 不同时先形成两个 target；只有相应 target 带 `FLAG_SPLIT` 且只拥有 pointer 子集时，`prepareDispatchCycleLocked()` 才把原 MotionEntry 拆成各自事件。
+
+## 15. InputTransport 与 MotionEvent 同时保留保存坐标和局部读数
+
+`InputPublisher::publishMotionEvent()` 把 PointerCoords、x/y scale、x/y offset 一并写入 `InputMessage`。App 端 `InputConsumer::initializeMotionEvent()` 原样取出，再交给 native `MotionEvent::initialize()` 保存为：
+
+```text
+mSamplePointerCoords
+mXScale / mYScale
+mXOffset / mYOffset
+```
+
+读取 API 才产生两种口径：
+
+```text
+getRawX(i) = savedPointerCoords[i].X
+getX(i)    = savedPointerCoords[i].X × mXScale + mXOffset
+```
+
+对普通单窗口、单几何、非 zero-coords、未再变换的 pointer，saved X 仍是 Display 点，而 `mXOffset=(-frameLeft)×windowXScale`，所以：
+
+```text
+getX = (displayX - finalFrameLeft) × windowXScale
+```
+
+这也是幸存触点在纯正轴向 scale 下的坐标闭环。沿用第 11 节的 `finalFrame=[120,215,480,335]`、`windowScale=(0.5,2/3)`，取屏幕点 `(300,300)`：
+
+```text
+published offset = (-60, -143.333...)
+getX = 300×0.5 - 60 = 90
+getY = 300×(2/3) - 215×(2/3) = 56.666...
+```
+
+局部点落在最初 `[10,20,110,80]` 内，和正向 Region 命中一致。整数 Region 的命中与浮点 MotionEvent 坐标在边缘可能受取整影响，所以不要用一个恰落边界的样本验证。
+
+事件从 `InputConsumer` 进入 View hierarchy 前还可能再变换。`ViewRootImpl.processPointerEvent()` 在存在 compatibility translator 时调用 `translateEventInScreenToAppWindow()`，后者执行 `event.scale(applicationInvertedScale)`；native `MotionEvent::scale()` 会缩放保存的 PointerCoords、offset 与 precision，因此 App 回调看到的 raw X/Y 也会随之缩放。`mCurScrollY` 路径随后调用 `offsetLocation()`，它只累加事件的 local offset，不改保存的 raw PointerCoords。
+
+进入 View hierarchy 也不是终点。常规非 CANCEL 分发中，`ViewGroup` 向一个 identity-matrix child 分发时，用 `offsetX=mScrollX-child.mLeft`、`offsetY=mScrollY-child.mTop` 调用 `offsetLocation()`；child 的 `getX()/getY()` 因而是 child-local，raw 保持不变。child 若有非 identity matrix，框架会复制或拆分事件，在 offset 后再调用 `transform(child.getInverseMatrix())`。native `MotionEvent::transform()` 通过重算 offset 只刻意保持 pointer index 0 的 raw X/Y；其余 pointer 的保存坐标会按新 offset 回写，raw 可能变化。若调用参数 `cancel` 为真或原 action 已是 CANCEL，`ViewGroup` 直接改写/转发 CANCEL，不做上述 child 坐标变换。
+
+所以 `getRawX()` 也不是触摸芯片的 evdev `ABS_X`。它之前已经经过 InputReader 校准、方向与 Display viewport 映射；同 target 的多指归一化、zero-coords、注入、ViewRoot compatibility scale 和非首 pointer 的 child matrix transform 还可能改变保存值。准确表述应是：raw API 跳过当前 MotionEvent 保存的 `mXScale/mXOffset`；Y 轴同理跳过 `mYScale/mYOffset`。
+
+调试错位时按同一时间窗口记录：
+
+1. listener 输出的模式与局部 `InternalInsetsInfo`；
+2. `WindowState.mGiven*`、`mFrame`、Task 与 tap-exclude；
+3. SurfaceFlinger 最终 frame、Region、window scale 与 crop；
+4. `dumpsys input` 中 Dispatcher 当前窗口表；
+5. App 同一 pointer 的 `rawX/rawY` 与 `x/y`。
+
+单独一份 dump 只是采样，不足以证明它和另一进程日志属于同一 Surface transaction；第 240 章的 sync 边界仍然适用。
+
+### 练习 9：用源码和数值闭合一次命中
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'msg.body.motion.xScale = xScale;' frameworks/native/libs/input/InputTransport.cpp
+grep -n -F 'msg.body.motion.xOffset = xOffset;' frameworks/native/libs/input/InputTransport.cpp
+grep -n -F 'void InputConsumer::initializeMotionEvent(MotionEvent* event, const InputMessage* msg) {' frameworks/native/libs/input/InputTransport.cpp
+grep -n -F 'msg->body.motion.xScale, msg->body.motion.yScale, msg->body.motion.xOffset,' frameworks/native/libs/input/InputTransport.cpp
+grep -n -F 'mXScale = xScale;' frameworks/native/libs/input/Input.cpp
+grep -n -F 'mXOffset = xOffset;' frameworks/native/libs/input/Input.cpp
+grep -n -F 'return getRawPointerCoords(pointerIndex)->getAxisValue(axis);' frameworks/native/libs/input/Input.cpp
+grep -n -F 'return value * mXScale + mXOffset;' frameworks/native/libs/input/Input.cpp
+grep -n -F 'public final float getX() {' frameworks/base/core/java/android/view/MotionEvent.java
+grep -n -F 'return nativeGetAxisValue(mNativePtr, AXIS_X, 0, HISTORY_CURRENT);' frameworks/base/core/java/android/view/MotionEvent.java
+grep -n -F 'public final float getRawX() {' frameworks/base/core/java/android/view/MotionEvent.java
+grep -n -F 'return nativeGetRawAxisValue(mNativePtr, AXIS_X, 0, HISTORY_CURRENT);' frameworks/base/core/java/android/view/MotionEvent.java
+grep -n -F 'mTranslator.translateEventInScreenToAppWindow(event);' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'event.scale(applicationInvertedScale);' frameworks/base/core/java/android/content/res/CompatibilityInfo.java
+grep -n -F 'event.offsetLocation(0, mCurScrollY);' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'mSamplePointerCoords.editItemAt(i).scale(globalScaleFactor);' frameworks/native/libs/input/Input.cpp
+grep -n -F 'final float offsetX = mScrollX - child.mLeft;' frameworks/base/core/java/android/view/ViewGroup.java
+grep -n -F 'event.offsetLocation(offsetX, offsetY);' frameworks/base/core/java/android/view/ViewGroup.java
+grep -n -F 'transformedEvent.offsetLocation(offsetX, offsetY);' frameworks/base/core/java/android/view/ViewGroup.java
+grep -n -F 'transformedEvent.transform(child.getInverseMatrix());' frameworks/base/core/java/android/view/ViewGroup.java
+grep -n -F 'if (cancel || oldAction == MotionEvent.ACTION_CANCEL) {' frameworks/base/core/java/android/view/ViewGroup.java
+grep -n -F 'void MotionEvent::transform(const float matrix[9]) {' frameworks/native/libs/input/Input.cpp
+grep -n -F 'float scaledRawX = getRawX(0) * mXScale;' frameworks/native/libs/input/Input.cpp
+grep -n -F 'c.setAxisValue(AMOTION_EVENT_AXIS_X, (x - mXOffset) / mXScale);' frameworks/native/libs/input/Input.cpp
+```
+
+使用这组固定输入：无 compatibility translator，`mGlobalScale=1`，`mCurScrollY=0`，窗口 nonmodal 并选择 REGION；WMS frame `[100,200,340,360]`，App 局部 Region `[10,20,110,120] ∪ [150,30,210,90]`，无 Java policy crop/exclude；非 portal、非 clone、初始 window scale 为 1，buffer `[0,0,240,160]`，Layer 映射 `(x,y)→(2x+100,1.5y+200)`，`surfaceInset=10`，replace=false 且 SF crop `[160,250,500,380]`，屏幕点 `(300,350)`。依次写出 WMS 全局 Region、Surface 局部 Region、SF frame/屏幕 Region、Dispatcher contains 结果、发布参数，以及 InputConsumer 初始化后、ViewRoot/child 再变换前的 raw/local。再令这是单指 ACTION_DOWN，ViewGroup 的 `cancel=false`、desired pointer 集不删 pointer 0，父 ViewGroup scroll 为 `(5,10)`、identity child 的 left/top 为 `(30,40)`；算 child 回调的 local，并说明 raw 是否改变。
+
+再独立推演三个固定变体：①改为 `replaceTouchableRegionWithCrop(null)`，并给当前输入 Layer 的 self bounds `[100,200,580,440]`；②保持相同 connection token、flags 与 `globalScaleFactor=1`，令互不重叠的 pointerIds `{0}`、`{1}` 合入同一 target，最小 id pointer 0 使用主场景的 `(offset,scale)=((-120,-215),(.5,2/3))` 和 raw `(300,350)`，非基准 pointer 1 使用 `((-300,-100),(.25,.5))` 和原 Display 点 `(700,300)`；③给 target 加 `FLAG_ZERO_COORDS`。逐一指出 Region、saved raw 与 local 公式中哪一项先发生变化。
+
+## 16. r48 结论、适用边界与下一章
+
+这条几何链可以压缩为九个判断：
+
+1. `InternalInsetsInfo` 是 App 每轮完整重写的窗口局部声明；CONTENT/VISIBLE 不是透明像素扫描。
+2. ViewRoot 先比较未转换声明，再按需做 compatibility 尺度转换；`setInsets()` 同步返回不等于 Dispatcher 已换表。
+3. WMS 保存 `mGiven*` 后，四种模式才围绕 `mFrame` 产生 Display 全局 Region。
+4. nonmodal 会继续改写 App 声明；modal 则直接换成 letterbox/Task/root-task/Display 系统范围，之后才做相关裁剪与 tap-exclude；`getTouchableRegion`、effective 与 surface 三种口径不能互换。
+5. Java dim-bounds intersect、Surface crop 与 organized-task replace 有不同门；freeform、HOME/RECENTS、`mCreatedByOrganizer`、`isOrganized()` 会组成不同结果。
+6. WMS 完成全局运算后把 Region 变回 Surface 局部；size-compat 逆缩放只修 r48 指定的重复缩放条件。
+7. SF 用完整 transform 定 frame，却只用对角 scale 加平移处理 Region；crop/replace 与有效 clone-root 交集再决定最终屏幕形状，replace 不保证只收窄。
+8. Dispatcher 在新命中时用最终屏幕 Region 选目标，再用最终 frame 负偏移和逆轴向 scale 建立事件回程；现有流通常复用 TouchState，同一 target 内的多指归一化还可能改写非基准 pointer 的保存坐标。
+9. child 分发会继续产生 child-local 坐标；`getRawX()` 只跳过当前 MotionEvent 保存的 scale/offset，不承诺等于原 Display 点，更不等于硬件未经校准的值。
+
+可严格闭合的只是幸存触点相对最终 frame 的平移与正、非零轴向 scale；Region 的交、差、替换和 clone 裁剪本身不可逆。发生负/零 scale、旋转、same-target 多指归一化或额外事件改写时，应逐层读取最终 Region、frame、PointerCoords 与参数，而不是把示例公式外推。
+
+下一章进入 `View.setSystemGestureExclusionRects()`、ViewRoot 坐标收集、WMS touchable/遮挡交集、左右边缘长度限制与导航手势仲裁，彻底把公开的 system gesture exclusion 与本章 tap-exclude 分开。

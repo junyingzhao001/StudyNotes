@@ -1,996 +1,700 @@
 # 224 Android RecentsAnimationController手势控制、输入消费者与结束提交
 
-> 源码版本：Android 11 / `android-11.0.0_r48`  
-> 学习方式：macOS只读核源，不编译、不运行AOSP  
-> 本章主线：Quickstep发起Recents Animation，WMS交出Task leash，Launcher本地跟手，最后由system_server提交Task层级
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`。
+>
+> 本章只讨论旧版 Quickstep Recents Animation：Launcher 怎样请求一段可持续操控的 Task 场景，system_server 怎样交付初始与动态 target，输入怎样从 App 窗口切到预注册 consumer，以及 finish、cancel、截图保活各自在哪一层结束。第 225 章再展开 Launcher 逐帧矩阵、圆角、裁剪与位移映射。
 
-## 1. 本章要解决什么问题
+第 223 章的普通 Remote Animation 是 start/cancel/finished 三段协议；Recents Animation 则把一次动画扩成一段可交互会话。它既要让 Launcher 长时间持有多个 Task leash，又要容纳手势中启动的新 Task、输入路由切换和三种最终层级选择。理解这条链的关键不是背接口，而是始终分开：控制消息已返回、WMS 状态已改、Surface transaction 已提交、SurfaceFlinger 已 latch，以及像素已 present。
 
-上一章讲普通Remote Animation：转场已确定，远端播放一段Animator，然后调用finished。
+## 1. 固定一次上滑场景，先给十八个观察点命名
 
-本章进入交互式Recents Animation：用户手指可能上滑、停住、反向、进入Overview、回Home或返回原App。系统怎样在整个手势期间保持真实Task可控，同时确保最后的Activity/Task层级与画面一致？
+先固定场景 `G_app_to_overview`：设备使用手势导航；当前前台是普通 App；Quickstep 与 Home/Recents 同进程；目标 Activity 已预加载但当前不可见；启动时没有旧 Recents controller；默认 Display、默认 TaskDisplayArea；wallpaper 已 ready；初始 Task 都有 main window 和 Surface；runner 存活；用户上滑进入非 live-tile Overview，最终显式结束到 Recents。
 
-## 2. 最重要的一句话
-
-手势进度不需要每帧跨Binder传给WMS。
-
-Quickstep收到输入后在自己的进程中计算矩阵，并直接用`SurfaceControl.Transaction`修改Task leash；Binder Controller主要处理控制面的离散命令，例如启用输入接管、截图、改变系统栏归属、完成到Home或App。
-
-## 3. 三层职责先分清
-
-```text
-Quickstep / Launcher进程
-  读取手势、算progress、逐帧改leash、决定最终方向
-
-RecentsAnimationController（WMS）
-  创建Task leash、发targets、输入路由协作、截图、取消、释放动画控制
-
-RecentsAnimation（ATMS/WM桥）
-  准备Home/Recents Activity、临时调整Task栈位置、完成时提交最终栈顺序
-```
-
-同名“Controller”在Launcher和system_server各有包装类，阅读时必须看包名。
-
-## 4. 总体流程图
-
-```mermaid
-flowchart TD
-    G["手势开始 / TaskAnimationManager"] --> B["IActivityTaskManager.startRecentsActivity"]
-    B --> RA["RecentsAnimation准备Home/Recents目标Activity"]
-    RA --> WMS["WMS.initializeRecentsAnimation"]
-    WMS --> RC["RecentsAnimationController"]
-    RC --> T["可见Task → TaskAnimationAdapter → leash"]
-    RC --> Q{"壁纸/目标是否ready"}
-    Q -->|"否"| Q
-    Q -->|"是"| RUN["IRecentsAnimationRunner.onAnimationStart"]
-    RUN --> L["Launcher持有targets与controller"]
-    L --> F["本地输入 + 本地Transaction逐帧跟手"]
-    F --> D{"手势最终选择"}
-    D -->|"到Home/Recents"| TOP["finish(true) → MOVE_TO_TOP"]
-    D -->|"回App"| ORI["finish(false) → MOVE_TO_ORIGINAL_POSITION"]
-    TOP --> C["释放leash并提交栈顺序"]
-    ORI --> C
-```
-
-## 5. 客户端第一站：TaskAnimationManager
-
-Launcher3的`TaskAnimationManager.startRecentsAnimation()`在UI线程建立`RecentsAnimationCallbacks`，注册手势状态与业务监听器，然后把真正Binder调用提交给`UI_HELPER_EXECUTOR`。
-
-这样ActivityTaskManager调用不会阻塞Launcher主线程的触摸与绘制。
-
-## 6. 为什么先结束旧动画
-
-开始新Recents Animation前，如果`mController`仍非null，源码记录错误并强制`finishRunningRecentsAnimation(false)`。
-
-一套手势状态只能对应一组当前Task leash；两场动画同时控制同一Task会造成矩阵、输入和最终栈顺序冲突。
-
-## 7. initialized不等于started
-
-Launcher先设置`STATE_RECENTS_ANIMATION_INITIALIZED`，但此时system_server可能仍在准备Home/Recents Activity、壁纸和Task leash。
-
-只有收到`onAnimationStart()`并分发给监听器后，才真正拥有可用targets。
-
-## 8. ActivityManagerWrapper做什么
-
-SystemUI shared里的`ActivityManagerWrapper.startRecentsActivity()`把Launcher监听器包装成`IRecentsAnimationRunner.Stub`。
-
-它负责平台`RemoteAnimationTarget[]`与兼容对象之间的转换，不负责每帧手势动画。
-
-## 9. IRecentsAnimationRunner有三个回调
-
-```text
-onAnimationStart(controller, apps, wallpapers, homeInsets, minimizedHomeBounds)
-onAnimationCanceled(nullable TaskSnapshot)
-onTaskAppeared(RemoteAnimationTarget)
-```
-
-相比普通Remote Animation，多了双向Controller、取消截图和运行期新增Task目标。
-
-## 10. Runner为什么是oneway
-
-`IRecentsAnimationRunner.aidl`声明`oneway interface`，WMS发送start/cancel/taskAppeared时不等待Launcher Binder线程做完UI工作。
-
-Launcher收到后再post到主线程，降低锁与Binder线程相互等待风险。
-
-## 11. 谁可以调用startRecentsActivity
-
-ATMS执行：
-
-```java
-enforceCallerIsRecentsOrHasPermission(
-    MANAGE_ACTIVITY_STACKS,
-    "startRecentsActivity()");
-```
-
-合法的Recents组件可调用，其他进程需要系统级栈管理权限；普通应用不能借此控制任意Task Surface。
-
-## 12. 原始调用身份怎样保存
-
-ATMS先记录Binder calling PID/UID，再清除calling identity。
-
-它用这两个值查`WindowProcessController caller`，稍后通过`setRunningRecentsAnimation(true/false)`标记真正发起动画的进程。
-
-## 13. runner为null代表预加载
-
-同一个API允许`recentsAnimationRunner=null`。
-
-此时只执行`preloadRecentsActivity()`，提前创建/附加Recents Activity并完成部分measure准备，不会创建RecentsAnimationController或交出Task leash。
-
-## 14. 预加载为何不把Activity真正显示出来
-
-后台启动使用`ActivityOptions.setAvoidMoveToFront()`以及`FLAG_ACTIVITY_NO_ANIMATION`。
-
-目标是让进程、Activity对象和View准备更早，而不是在用户尚未手势时突然把Overview放到前台。
-
-## 15. 预加载后的停止策略
-
-目标Activity若尚未STOPPING/STOPPED，源码把它加入stopping列表，并选择延迟到idle再真正stop。
-
-这样它还有机会在非stopped的ViewRoot状态下完成一次traversal，提前初始化measure等内容。
-
-## 16. targetActivityType怎样决定
-
-若目标Intent component等于系统配置的Recents component，类型为`ACTIVITY_TYPE_RECENTS`；否则为`ACTIVITY_TYPE_HOME`。
-
-所以“完成到Home”在源码中更准确的说法是“把目标Home/Recents栈移到顶部”。
-
-## 17. 先找现有目标栈和Activity
-
-`RecentsAnimation.startRecentsActivity()`先按target activity type找栈，再按当前user和Intent base component找目标Task顶部Activity。
-
-存在就复用，不存在才在后台创建。
-
-## 18. 为什么要记mRestoreTargetBehindStack
-
-已有Home/Recents栈时，源码记录当前位于它上方的栈。
-
-如果手势最后返回App，目标栈必须恢复到动画前的位置；这个引用就是`REORDER_MOVE_TO_ORIGINAL_POSITION`的锚点。
-
-## 19. 找不到上方栈为何启动前取消
-
-若目标栈已经没有任何栈在它上方，说明它本来就在最前或场景不符合“从App进入Recents”。
-
-源码调用`onAnimationCanceled(null)`并返回，不制造没有有效前景App可缩小的动画。
-
-## 20. 启动功耗提示与指标
-
-目标Activity不存在或尚不可见时，RootWindowContainer发送launch power hint；ActivityMetricsLogger也登记LaunchingState。
-
-Recents手势既是Surface动画，也是一次可能需要启动/唤醒Launcher Activity的系统启动事件。
-
-## 21. 为什么deferWindowLayout
-
-准备期间要移动栈、创建Activity、设置launch-behind、初始化多组动画Surface。
-
-`deferWindowLayout()`把中间状态的重复layout推迟，到finally中的`continueWindowLayout()`统一收敛，减少半完成层级被观察到的机会。
-
-## 22. 已有目标栈怎样临时摆放
-
-源码调用`moveStackBehindBottomMostVisibleStack(targetStack)`，把Home/Recents栈放到最底部可见App栈后方。
-
-这样前景App仍覆盖在上面，手势缩小时后面的目标Activity可以逐渐露出。
-
-## 23. 同一Home栈可能有多个Task
-
-例如默认Launcher与第三方Launcher可以共存于Home类型栈。
-
-若目标Activity所在Task不是该栈顶部Task，源码先`positionChildAtTop(task)`，确保这次目标Launcher位于正确位置。
-
-## 24. 新建目标Activity的特殊处理
-
-后台启动后同样把目标栈移动到可见App之后，并准备/执行`TRANSIT_NONE`。
-
-这里不播放普通AppTransition动画；真正视觉过渡即将由RecentsAnimation的Task leash接管。
-
-## 25. mLaunchTaskBehind的意义
-
-目标Activity被设置：
-
-```java
-targetActivity.mLaunchTaskBehind = true;
-```
-
-这让Home/Recents Activity在手势期间保持可见/可绘制，却仍位于前景App后面，不立即夺走最终前台栈语义。
-
-## 26. 为什么先捕获Task再更新可见性
-
-源码先初始化Recents Animation、获取当前可见Task控制权，然后才`ensureActivitiesVisible(..., PRESERVE_WINDOWS)`。
-
-如果先改变可见性，某些前景Task可能先被隐藏或重建，来不及成为远程动画目标。
-
-## 27. 开新动画前先取消旧Controller
-
-WMS先以`REORDER_MOVE_TO_ORIGINAL_POSITION`同步取消旧Recents Animation，再创建新Controller。
-
-旧动画必须先把Home/Recents栈恢复并释放leash，不能只覆盖一个成员变量引用。
-
-## 28. WMS初始化入口
-
-```java
-mWindowManager.initializeRecentsAnimation(
-    targetActivityType,
-    runner,
-    callbacks,
-    displayId,
-    recentTaskIds,
-    targetActivity);
-```
-
-WMS保存唯一`mRecentsAnimationController`，调用initialize，并更新AppTransition booster。
-
-## 29. RecentsAnimation与Controller的回调关系
-
-`RecentsAnimation`实现`RecentsAnimationCallbacks`。
-
-Controller只决定“动画结束，应该用哪个reorderMode”；真正移动Home/Recents栈、恢复launch-behind和重新resume Activity由RecentsAnimation执行。
-
-## 30. Controller初始化先注册AppTransition监听
-
-这个监听器用于“延迟取消到下一场AppTransition开始或取消”的功能。
-
-它不是监听本次手势每一帧，而是为手势期间又启动其他Task时平滑交接。
-
-## 31. 初始目标从哪些Task来
-
-Controller取得默认TaskDisplayArea的`getVisibleTasks()`，并把目标Home/Recents栈的所有leaf Task补入集合且去重。
-
-所以targets既包括屏幕上可见App，也包括位于后方、即将被露出的目标栈Task。
-
-## 32. 为什么补入目标栈Task
-
-Home/Recents当前可能被前景App完全遮住，不一定出现在普通可见Task结果中。
-
-但手势需要控制或至少正确分层显示它，因此必须显式纳入动画集合。
-
-## 33. 哪些Task被跳过
-
-源码跳过：
-
-```text
-config.tasksAreFloating()
-WINDOWING_MODE_SPLIT_SCREEN_PRIMARY
-```
-
-浮动Task与分屏主侧有独立窗口管理语义，不按普通全屏Recents target处理。
-
-## 34. recentTaskIds参与什么
-
-每个Task创建Adapter时传入：
-
-```java
-isRecentTaskInvisible = !recentTaskIds.get(taskId)
-```
-
-最终写入`RemoteAnimationTarget.isNotInRecents`，告诉Launcher该Task不在最近任务列表中。
-
-## 35. isNotInRecents不等于Surface不可见
-
-一个Task可以当前在屏幕上、需要动画，却因为排除策略不显示在Recents列表。
-
-该字段描述任务模型归属，不决定是否创建leash。
-
-## 36. TaskAnimationAdapter复用SurfaceAnimator
-
-`addAnimation()`调用：
-
-```java
-task.startAnimation(
-    task.getPendingTransaction(),
-    taskAdapter,
-    hidden,
-    ANIMATION_TYPE_RECENTS,
-    finishedCallback);
-```
-
-因此Task真实Surface仍被放入临时leash，最终由SurfaceAnimator callback恢复。
-
-## 37. Recents以Task为粒度
-
-普通Remote Animation的opening/closing常以Activity为目标；Recents Controller为每个Task创建`TaskAnimationAdapter`。
-
-最近任务卡片和手势返回对象本来就是Task，Task内多个Activity应作为整体移动。
-
-## 38. Adapter.startAnimation仍然只截获
-
-它设置初始position/crop，并保存：
-
-```text
-mCapturedLeash
-mCapturedFinishCallback
-mLastAnimationType
-```
-
-与上一章一样，system_server不在这里运行逐帧Animator。
-
-## 39. Recents初始crop怎样算
-
-Adapter把leash放到Task相对parent的`mLocalBounds.left/top`，再将local bounds offset到`(0,0)`作为window crop。
-
-位置属于父坐标系，crop属于leash局部尺寸，不能把屏幕left/top重复放进crop。
-
-## 40. 没有任何动画Task怎么办
-
-`mPendingAnimations.isEmpty()`时，以`REORDER_MOVE_TO_ORIGINAL_POSITION`取消。
-
-没有Task leash就无法进行Recents手势，目标栈临时位置必须恢复。
-
-## 41. 初始化时建立runner死亡监听
-
-有目标后立即`linkToDeathOfRunner()`。
-
-失败则取消并恢复原位置；运行中runner死亡也走同一方向，避免Launcher进程消失后Home栈卡在临时位置。
-
-## 42. 壁纸为何影响启动
-
-若目标Activity可作为wallpaper target，Controller请求重做壁纸布局。
-
-上滑时Home壁纸通常需要随目标一起正确显现，过早交出Task leash可能先出现黑底或旧壁纸状态。
-
-## 43. minimizedHomeBounds是什么
-
-Controller保存root Home Task的bounds；真正start时只有目标Activity处于split-screen secondary才把它传给Launcher，否则传null。
-
-它帮助Launcher理解分屏下Home被最小化后的目标几何，不是所有设备恒有的屏幕矩形。
-
-## 44. initialize为何主动performSurfacePlacement
-
-Task animation adapter已安装，壁纸和目标可见性也已变化，需要一次SurfacePlacement创建leash、应用层级与更新窗口状态。
-
-之后Controller才有可能从Adapter拿到有效captured leash。
-
-## 45. FixedRotation与StatusBar也要知道
-
-初始化通知FixedRotationTransitionListener开始Recents动画，并调用`StatusBarManagerInternal.onRecentsAnimationStateChanged(true)`。
-
-手势窗口动画不是孤立效果；旋转变换与系统栏状态必须在同一生命周期内协调。
-
-## 46. pending start为什么存在
-
-Controller构造时`mPendingStart=true`。
-
-即使Task leash已经创建，也可能等待目标壁纸可用；只有ready后才调用runner的`onAnimationStart()`。
-
-## 47. wallpaper ready门
-
-`checkAnimationReady()`计算：
-
-```java
-!isTargetOverWallpaper()
-    || (wallpaperTarget != null
-        && wallpaperTransitionReady())
-```
-
-不需要壁纸则立即允许；需要壁纸时必须已有wallpaper target且其转场ready。
-
-## 48. pendingStart防什么竞态
-
-Wallpaper/layout检查可能多次触发。
-
-`startAnimation()`先检查`!mPendingStart || mCanceled`，并在成功构造目标后设false，防止重复发送一组leash给runner。
-
-## 49. startAnimation构造App targets
-
-Controller倒序遍历TaskAnimationAdapter，调用`createRemoteAnimationTarget()`。
-
-若某Task已找不到top visible Activity或主窗口，就回放其finish callback并从pending集合移除。
-
-## 50. target的mode怎样决定
-
-Task顶部可见Activity的activity type等于目标Home/Recents类型时为`MODE_OPENING`，其他Task为`MODE_CLOSING`。
-
-这里没有普通Remote Animation的`MODE_CHANGING`分支。
-
-## 51. Recents target的几何
-
-Target包含Task屏幕bounds、相对父节点localBounds、prefix order、主窗口clip/contentInsets、windowConfiguration和Task leash。
-
-position使用Task bounds左上角；Launcher仍应优先区分屏幕与父坐标系。
-
-## 52. contentInsets也叠加letterbox
-
-Controller先读主窗口contentInsets，再加主窗口ActivityRecord的letterbox insets。
-
-手势卡片裁剪若忽略信箱区域，会在宽高比不匹配应用上出现内容错位。
-
-## 53. wallpaper targets何时创建
-
-App targets非空后，Controller为当前可见wallpaper windows启动WallpaperAnimationAdapter。
-
-Recents传入duration和statusBar delay均为0，因为手势持续时间由用户决定，不是固定时长动画。
-
-## 54. Recents Adapter duration为何为0
-
-`TaskAnimationAdapter.getDurationHint()`返回0，status bar start time返回当前uptime。
-
-这不表示动画瞬间结束；它表示本地AppTransition时长模型不适用于开放式手势。
-
-## 55. start前再performLayout的原因
-
-Controller在回调runner前执行一次`performLayout(false, false)`，注释说明旋转后要取得正确content insets。
-
-目标数组中的几何是一个准备时快照，必须尽量与当前Display配置一致。
-
-## 56. Home contentInsets的回退
-
-若目标Activity主窗口已存在，使用其contentInsets；否则调用WMS取得Display stable insets。
-
-预加载也不能保证窗口必然已创建，所以协议必须有无主窗口的回退数据。
-
-## 57. onAnimationStart传了什么
-
-```java
-mRunner.onAnimationStart(
-    mController,
-    appTargets,
-    wallpaperTargets,
-    contentInsets,
-    minimizedHomeBounds);
-```
-
-与普通Remote Animation不同，finished callback没有单独参数；Launcher通过传入的`IRecentsAnimationController.finish()`结束。
-
-## 58. start RemoteException的r48边界
-
-当前源码catch `RemoteException`后只记录错误，未在这个catch块中立即调用cancel。
-
-runner已在initialize阶段linkToDeath，进程死亡通常由DeathRecipient收口；但阅读时应如实保留“start发送失败不直接cancel”的实现差异，不能套用上一章行为。
-
-## 59. 收到start后如何切线程
-
-`ActivityManagerWrapper`先把平台target包装为Compat；`RecentsAnimationCallbacks`再把创建Controller与监听器通知post到Launcher主线程。
-
-Binder线程不直接访问RecentsView、GestureState或动画View对象。
-
-## 60. start与cancel可能乱序吗
-
-客户端显式维护`mCancelled`。
-
-若cancel先被处理、start后到，`onAnimationStart()`不会再通知正常监听器，而是异步调用`finishAnimationToApp()`，把服务端控制尽快归还。
-
-## 61. Launcher本地Controller是什么
-
-`com.android.quickstep.RecentsAnimationController`包装SystemUI shared的`RecentsAnimationControllerCompat`。
-
-它增加线程切换、结束监听、系统栏标志、分屏最小化和截图清理协作，不是WMS创建leash的那个Controller。
-
-## 62. 每帧progress在哪里
-
-Launcher的Swipe Handler根据MotionEvent计算位移和动画进度，再通过持有的target leash更新矩阵、crop、alpha、corner radius等。
-
-`IRecentsAnimationController.aidl`没有`setProgress(float)`，这正是“数据面本地、控制面Binder”的直接证据。
-
-## 63. 为什么本地逐帧更跟手
-
-若每个MOVE都要Launcher→system_server→SurfaceFlinger往返，会增加Binder调度与锁竞争。
-
-直接对SurfaceControl提交Transaction缩短输入到合成属性更新路径，也允许与Launcher自身View动画在同一帧策略内协调。
-
-## 64. 输入消费者为何预先注册
-
-TouchInteractionService在用户解锁后创建`InputConsumerController.getRecentsAnimationInputConsumer()`并注册。
-
-源码注释说明：动画中途才注册InputConsumer会cancel当前MotionEvent链，所以先建InputChannel，真正需要时只切换enabled和可见路由。
-
-## 65. 注册InputConsumer做了什么
-
-客户端调用WMS `createInputConsumer()`取得一端InputChannel，并创建`BatchedInputEventReceiver`。
-
-WMS侧保存名为`recents_animation_input_consumer`的InputConsumerImpl及另一端channel。
-
-## 66. 注册不等于立即抢输入
-
-InputMonitor每次更新先hide所有InputConsumer。
-
-只有Recents Controller存在、`mInputConsumerEnabled=true`、窗口属于正在动画的非目标App时，才把Recents consumer显示到对应窗口之上。
-
-## 67. enableInputConsumer的客户端顺序
-
-Launcher包装执行：
-
-```java
-mController.hideCurrentInputMethod();
-mController.setInputConsumerEnabled(true);
-```
-
-先隐藏IME可减少键盘窗口与手势区域、Insets动画之间的冲突，再启用App区域输入接管。
-
-## 68. setInputConsumerEnabled服务端做什么
-
-在WMS锁内更新布尔值，强制`updateInputWindowsLw(true)`并schedule animation。
-
-它不是直接读取触摸事件，而是让下一次InputWindow快照把预注册consumer放到正确位置。
-
-## 69. 哪些Activity会被覆盖输入
-
-`shouldApplyInputConsumer(activity)`要求：
-
-```text
-consumer已enabled
-activity非null
-不是目标Home/Recents Activity
-activity属于某个正在动画Task
-```
-
-因此Launcher自己的目标窗口不会被自己的Recents consumer再次覆盖。
-
-## 70. consumer的触摸区域怎样设置
-
-Controller取目标Home/Recents Activity主窗口bounds，写入consumer的`touchableRegion`，并按当前被遍历App窗口焦点设置hasFocus。
-
-随后InputMonitor把consumer Surface reparent/show在命中的动画App窗口附近。
-
-## 71. 为什么遍历到第一个命中后停止添加
-
-`mAddRecentsAnimationInputConsumerHandle`成功show后设false。
-
-一条Recents consumer channel代表本次手势输入接收端，不为每个动画窗口创建独立channel。
-
-## 72. BatchedInputEventReceiver怎样消费
-
-SystemUI shared的InputConsumerController使用`BatchedInputEventReceiver`，把事件交给注册的InputListener，finally中调用`finishInputEvent(event, handled)`。
-
-输入仍要完成回执，否则InputDispatcher会保留未完成事件并可能造成超时问题。
-
-## 73. 注册时可选哪个VSync
-
-`registerInputConsumer(boolean withSfVsync)`可选择普通App Choreographer或SF Choreographer实例。
-
-Recents当前TouchInteractionService调用无参版本；PIP等路径可显式选择SF VSync，不能把所有InputConsumer都写成SF VSync批处理。
-
-## 74. runner死亡为何还销毁consumer
-
-`binderDied()`先取消动画恢复原位置，再显式`destroyInputConsumer(INPUT_CONSUMER_RECENTS_ANIMATION)`。
-
-控制进程死亡后，即使系统侧enabled状态来不及复位，也不能留下吞掉应用触摸的孤儿输入窗口。
-
-## 75. IRecentsAnimationController的控制面能力
-
-主要方法包括：
-
-```text
-screenshotTask
-finish
-setInputConsumerEnabled
-setAnimationTargetsBehindSystemBars
-hideCurrentInputMethod
-setDeferCancelUntilNextTransition
-cleanupScreenshot
-setWillFinishToHome
-removeTask
-```
-
-没有逐帧矩阵API。
-
-## 76. screenshotTask怎样限制目标
-
-服务端只遍历`mPendingAnimations`，taskId匹配才调用TaskSnapshotController同步截图。
-
-Launcher不能通过这个Controller随意截取不属于当前Recents动画的其他Task。
-
-## 77. 截图从哪里取
-
-Controller让TaskSnapshotController对目标Task执行snapshot、加入skip closing snapshot集合，再以内存路径、全分辨率获取TaskSnapshot。
-
-这是Task快照，不是对最终面板输出做全屏截屏。
-
-## 78. screenshotTask里的userId边界
-
-r48这段`getSnapshot(taskId, 0 /* userId */, ...)`写死0，而延迟取消的`screenshotRecentTask()`使用`task.mUserId`。
-
-这是源码真实差异，分析多用户截图问题时不能假设两条路径参数完全相同。
-
-## 79. 系统栏标志归谁控制
-
-Launcher跨过手势阈值后可调用`setAnimationTargetsBehindSystemBars()`。
-
-服务端对非目标Task设置`setCanAffectSystemUiFlags(behindSystemBars)`，决定系统栏外观继续取动画App还是改由Home/Launcher状态主导。
-
-## 80. 参数命名容易反读
-
-Launcher的`setUseLauncherSystemBarFlags(true)`实际调用服务端：
-
-```java
-setAnimationTargetsBehindSystemBars(false)
-```
-
-意思是旧App targets不再位于/控制系统栏背后，于是使用Launcher的系统栏flags。
-
-## 81. setWillFinishToHome只影响failsafe
-
-该方法更新`mWillFinishToHome`。
-
-它不会立刻移动Home栈；当外部触发1秒failsafe时，Runnable才据此选择`MOVE_TO_TOP`还是`MOVE_TO_ORIGINAL_POSITION`。
-
-## 82. 1秒failsafe不是启动总超时
-
-Controller常量`FAILSAFE_DELAY=1000`，但initialize/startAnimation没有自动post它。
-
-WMS收到`triggerAnimationFailsafe()`消息后才调用`scheduleFailsafe()`。因此不能把它写成“每场Recents动画启动后固定1秒必须结束”。
-
-## 83. 正常finish的两个方向
-
-Launcher调用：
-
-```text
-finish(true, sendUserLeaveHint)  → REORDER_MOVE_TO_TOP
-finish(false, sendUserLeaveHint) → REORDER_MOVE_TO_ORIGINAL_POSITION
-```
-
-UI包装名`finishAnimationToHome/ToApp`是更直观的语义。
-
-## 84. finish为什么先移除新增Task目标
-
-运行期间通过`onTaskAppeared()`加入的目标记录在`mPendingNewTaskTargets`。
-
-最终finish前先尝试`removeTaskInternal()`，避免临时进入动画集合的新Task影响原始Home/App提交关系。
-
-## 85. finish回调为何必须在WMS锁外调用
-
-源码明确先退出`synchronized(mService.getWindowManagerLock())`，再调用`mCallbacks.onAnimationFinished()`。
-
-回调进入RecentsAnimation后会取得ATMS全局锁、执行WMS清理和栈移动；持有旧锁调用会放大锁顺序死锁风险。
-
-## 86. sendUserLeaveHint有什么用
-
-MOVE_TO_TOP且该值为true时，RecentsAnimation设置`mUserLeaving=true`并用`moveTaskToFront()`。
-
-这允许前一个Activity收到用户离开语义，并可能按其PiP配置进入画中画；false则只把目标栈moveToFront。
-
-## 87. 三种ReorderMode总表
-
-| 模式 | 含义 | 常见来源 |
+| 点 | 源码侧含义 | 仍不能推出 |
 |---|---|---|
-| `REORDER_MOVE_TO_TOP` | 目标Home/Recents栈成为前台 | 正常完成到Home/Overview、failsafe判定toHome |
-| `REORDER_MOVE_TO_ORIGINAL_POSITION` | 恢复目标栈到原来后方位置 | 正常返回App、runner死亡、无目标失败 |
-| `REORDER_KEEP_IN_PLACE` | 保持当前栈位置，不做普通重排转场 | 延迟取消交接、显式取消不恢复位置 |
+| `C_down` | `TouchInteractionService` 的 gesture monitor 收到本次手势 | Recents input consumer 已可见 |
+| `C_queue` | `TaskAnimationManager` 把 `startRecentsActivity()` 排到 `UI_HELPER_EXECUTOR` | system_server 已收到请求 |
+| `C_init` | `GestureState` 写入 `STATE_RECENTS_ANIMATION_INITIALIZED` | runner 已收到 target |
+| `A_enter` | ATMS 完成入口验权并保存请求 caller pid/uid | runner Binder 宿主已认证 |
+| `A_stage` | `RecentsAnimation` 临时移动目标 stack、置 `mLaunchTaskBehind` | 最终层级已决定 |
+| `W_oldCheck` | WMS 执行同步旧 controller 取消检查；固定场景为空操作 | 有旧会话时替换一定隔离 |
+| `W_collect` | 新 controller 收集初始 Task 并启动 `SurfaceAnimator` | 每个 target 都能构造成功 |
+| `L_taskCapture` | 初始 App Task adapter 截获 leash、finish callback、animation type 和几何 | Task setup transaction 已提交 |
+| `S_taskSetup` | 后续 surface placement merge/close 初始 App Task setup | SurfaceFlinger 已 latch |
+| `B_start` | 建 wallpaper targets 后发出 oneway `onAnimationStart()` | wallpaper setup 已提交，或 Launcher Binder Stub 已执行 |
+| `C_wrap` | Launcher Binder 线程包装 targets 并构造客户端 controller | UI listener 已回调 |
+| `C_started` | 主线程 listener 收到 `onRecentsAnimationStart()` | input consumer 已接管 |
+| `I_enable` | 同步 controller 调用把服务端 boolean 置 true，并请求更新 input windows | consumer Surface 已提交或可命中 |
+| `I_proxy` | Launcher 为目标终态安装 `InputConsumerProxy` listener | 旧触摸链一定迁移到 consumer |
+| `F_localPost` | Launcher wrapper 已把 finished listeners 投到 MAIN | listener 已执行，或服务端 finish 请求已发出 |
+| `F_server` | 同步 `IRecentsAnimationController.finish()` 在 system_server 返回 | WMS 层级恢复 transaction 已提交 |
+| `S_finish` | Display pending transaction 被 merge 并提交给 SurfaceFlinger | 对应帧已 present |
+| `P_present` | HWC present fence 对应的画面真正显示 | 可由前面的 Java callback 替代证明 |
 
-## 88. MOVE_TO_TOP怎样提交
-
-RecentsAnimation先把目标Activity加入`mNoAnimActivities`，再把其Task或整个targetStack移到前台。
-
-视觉已经由手势完成，不应在提交真实栈顺序时再叠一段普通窗口动画。
-
-## 89. MOVE_TO_ORIGINAL_POSITION怎样提交
-
-使用启动前保存的`mRestoreTargetBehindStack`，调用`moveStackBehindStack(targetStack, restoreStack)`。
-
-这把临时放到可见App后方的Home/Recents栈恢复到原有相对位置，用户继续看到原App。
-
-## 90. KEEP_IN_PLACE为何提前return
-
-它只按条件更新目标栈可见性，不执行后续prepare/execute AppTransition和resume逻辑。
-
-该模式用于已有下一场转场接手的交接场景，强行再排一次栈会打乱新的启动。
-
-## 91. 结束提交的时序图
-
-```mermaid
-sequenceDiagram
-    participant L as "Launcher"
-    participant C as "IRecentsAnimationController"
-    participant RC as "WMS RecentsAnimationController"
-    participant RA as "ATMS RecentsAnimation"
-    participant SA as "SurfaceAnimator"
-    participant TDA as "TaskDisplayArea"
-    L->>C: "finish(toHome, userLeaveHint)"
-    C->>RC: "移除运行期新增Task目标"
-    RC-->>RA: "onAnimationFinished(reorderMode)（WMS锁外）"
-    RA->>RA: "取消栈顺序监听、清running标志"
-    RA->>RC: "cleanupRecentsAnimation"
-    RC->>SA: "回放各Task/壁纸finish callback"
-    SA->>SA: "reparent真实Surface、remove leash"
-    alt "MOVE_TO_TOP"
-        RA->>TDA: "目标Home/Recents栈移到前台"
-    else "MOVE_TO_ORIGINAL_POSITION"
-        RA->>TDA: "恢复到mRestoreTargetBehindStack之后"
-    else "KEEP_IN_PLACE"
-        RA->>TDA: "保持位置"
-    end
-```
-
-## 92. 清理为何放在Surface transaction中
-
-RecentsAnimation调用`mWindowManager.inSurfaceTransaction()`，内部先`cleanupRecentsAnimation()`再移动栈。
-
-释放多条Task leash、恢复Surface父节点与最终窗口层级尽量在同一合成事务边界收敛，减少中间闪烁。
-
-## 93. WMS何时清空唯一Controller
-
-`cleanupRecentsAnimation()`先把`mRecentsAnimationController=null`，再调用旧Controller的`cleanupAnimation()`。
-
-这样后续窗口/输入查询不会继续把正在清理的对象当成活跃Recents控制者。
-
-## 94. cleanupAnimation如何释放Task
-
-倒序遍历pending TaskAnimationAdapter，恢复Task可影响SystemUI flags，回放captured finish callback并移出列表。
-
-SurfaceAnimator收到回调后拆leash，真实Task Surface回到普通层级。
-
-## 95. KEEP/TOP为何dontAnimateDimExit
-
-对`MOVE_TO_TOP`或`KEEP_IN_PLACE`，清理前调用`task.dontAnimateDimExit()`。
-
-这避免Task离开Recents控制时又补一段dim layer退出动画，造成已完成手势后的亮度闪动。
-
-## 96. 还要清哪些状态
-
-Controller还会：
+固定成功路径的核心偏序是：
 
 ```text
-释放wallpaper animation
-移除failsafe Runnable
-注销AppTransition listener
-unlink runner death并清runner引用
-取消残留截图Animator
-强制更新InputWindows
-结束fixed rotation协作
-通知StatusBar recents running=false
+C_down < C_queue < A_enter < A_stage < W_oldCheck < W_collect < L_taskCapture
+C_queue < C_init                         （C_init 与 A_enter 无固定先后）
+L_taskCapture < S_taskSetup < B_start < C_wrap < C_started
+wallpaper setup pending-write < B_start；wallpaper setup submit 与 B_start 无固定偏序
+C_started < I_enable；I_proxy 取决于 Launcher 选择的终态
+F_localPost < enqueue helper finish
+MAIN finished listener执行 与 helper同步finish调用/返回 无固定偏序
+服务端reset写pending < S_finish < P_present
 ```
 
-## 97. target Activity的launch-behind何时恢复
+这不是全序。尤其 `C_init` 是客户端立即写的状态，可能早于 system_server 收到请求；`F_localPost` 只固定在 helper finish 入队之前，MAIN listener 真正执行会与 helper 竞跑。日志里看到 initialized 或 finished listener，都不能直接跨越到服务端或显示层完成点。
 
-WMS Controller释放leash后，RecentsAnimation把`targetActivity.mLaunchTaskBehind=false`。
+## 2. 三个控制面、两条 AIDL 与一枚可转交能力
 
-launch-behind只是手势期间的临时可见性工具，最终Activity可见性应重新由真实栈顺序决定。
+Recents 会话至少跨三层对象：
 
-## 98. 清理后为何还prepare TRANSIT_NONE
+| 层 | 关键对象 | 保存的事实 |
+|---|---|---|
+| ATMS 编排层 | `RecentsAnimation` | 目标 Activity type、临时 stack 位置、launch-behind Activity、恢复锚点、最终 reorder callback |
+| WMS 控制层 | 服务端 `RecentsAnimationController` | runner、初始/动态 Task adapters、wallpaper adapters、输入开关、取消/截图/failsafe 状态 |
+| Launcher 控制层 | `TaskAnimationManager`、`RecentsAnimationCallbacks`、客户端 `RecentsAnimationController` | 当前 listeners、targets、last appeared target、控制 Binder 包装与本地 Surface 引用 |
 
-TOP或ORIGINAL_POSITION分支改变了栈顺序与Activity可见性。
-
-源码准备`TRANSIT_NONE`、ensure visible、resume focused stacks，再execute transition，让生命周期和窗口可见状态收敛，但不叠加普通视觉动画。
-
-## 99. organized root Task的额外同步
-
-若rootTask被TaskOrganizer组织，完成后强制`dispatchTaskInfoChanged()`。
-
-手势期间客户端状态可能变化，Organizer需要一份最新TaskInfo与system_server最终状态重新对齐。
-
-## 100. onTaskAppeared为何存在
-
-Recents动画运行中，用户可能从Overview启动新Task，或系统出现新的enter Task。
-
-`Task.applyAnimationUnchecked()`检测活跃Recents Controller后，不走普通动画，而调用`addTaskToTargets()`把它动态纳入控制。
-
-## 101. 新Task target为何hidden启动
-
-`createTaskRemoteAnimation()`调用`addAnimation(..., hidden=true, finishedCallback)`。
-
-在Launcher收到target并设置正确初始变换前先隐藏，可避免新Task以最终全屏状态闪现一帧。
-
-## 102. onTaskAppeared是单个target增量
-
-若Task已在pending动画集合就不重复发送；否则创建leash/target并通过oneway runner回调。
-
-Launcher无需重新接收整组数组，可以增量接管新Task。
-
-## 103. Launcher怎样替换旧appeared target
-
-TaskAnimationManager保存`mLastAppearedTaskTarget`。
-
-新taskId不同且Controller仍活跃时，先调用`removeTaskTarget(old)`，再把新target写入GestureState。
-
-## 104. removeTask为何要求Task isOnTop
-
-服务端只在taskId匹配且`target.mTask.isOnTop()`时移除。
-
-注释说明要等Task已经对用户可见，避免在remove动画与Task真正可见之间形成闪烁窗口。
-
-## 105. 单个Task Adapter取消与普通Remote不同
-
-Recents的`TaskAnimationAdapter.onAnimationCancelled()`只要任意一个Task animator被取消，就取消整场并恢复原位置。
-
-上一章普通Remote Controller允许局部Record收缩；Recents手势依赖整组Task一致性，策略更严格。
-
-## 106. 栈顺序变化为什么会触发延迟取消
-
-RecentsAnimation注册`OnStackOrderChangedListener`。
-
-当新的可见栈不是当前动画Task，或它正是目标Home Activity，且Launcher请求defer时，系统准备`TRANSIT_NONE`并标记“下一场transition开始时取消”。
-
-## 107. 为什么不能立刻拆leash
-
-另一Task启动瞬间若直接移除当前Task leash，Launcher画面可能从live tile突然跳回真实全屏窗口，产生闪烁。
-
-延迟到下一场AppTransition开始，使旧手势画面和新启动动画有明确交接点。
-
-## 108. deferred cancel的两个开关
+两条 AIDL 的方向和同步性相反：
 
 ```text
-mRequestDeferCancelUntilNextTransition：是否请求延迟
-mCancelDeferredWithScreenshot：延迟时是否用截图替换leash内容
+system_server -- oneway onAnimationStart(controller, targets...) --> Launcher
+system_server -- oneway onAnimationCanceled(snapshot) -----------> Launcher
+system_server -- oneway onTaskAppeared(target) -------------------> Launcher
+
+Launcher -- 同步 screenshotTask / finish / input / bars / defer / cleanup / remove --> system_server
 ```
 
-只有前者为true时，栈顺序变化才设置`mCancelOnNextTransitionStart`。
+`IRecentsAnimationRunner` 整个接口声明为 `oneway`；`IRecentsAnimationController` 没有 `oneway`。因此 runner 通知的代理返回只说明 oneway 事务已交给 Binder 驱动，不说明远端 Stub 或主线程 listener 已执行。反向 controller 方法会等 Stub 返回，但“同步”只约束 Binder 方法本身，不自动等待 input transaction、Display pending transaction、SF latch 或 present。
 
-## 109. AppTransition listener何时继续取消
+controller Stub 没有逐方法重复 `MANAGE_ACTIVITY_STACKS` 验权。screenshot、finish、system bars、input 和 remove 等路径会清除调用身份；defer、cleanup screenshot 与 will-finish boolean 则直接在 global lock 下改 controller 状态。安全边界是：ATMS 接受获准 caller 提供的 runner Binder，再把这枚 controller 句柄回调给它。该句柄是一枚可转交能力；若持有者主动交给别的进程，Stub 不会重新证明对方就是最初 caller。
 
-下一场AppTransition开始或被取消，listener都调用`continueDeferredCancel()`。
+还要分开三种身份：
 
-它先注销自身，确认Controller未cancel，再按标志调用`cancelAnimationWithScreenshot()`。
+- `startRecentsActivity()` 的 Binder caller pid/uid：入口验权与 `WindowProcessController` 查找使用它；
+- `IRecentsAnimationRunner` Binder 的真实宿主：这条路径没有用 caller pid/uid 反查它；
+- Launcher 收到的 controller capability：后续控制调用凭持有 Binder 句柄进入，而不是凭每次调用者再次过入口权限。
 
-## 110. 截图取消怎样避免闪烁
+所以“caller 进程正在跑 Recents animation”只描述请求 caller 的进程标志，不是 runner 所有权证明。
 
-Controller对旧Task生成TaskSnapshot，创建`TaskScreenshotAnimatable`，然后让新的SurfaceAnimator从Task SurfaceAnimator转移动画。
+## 3. Launcher 发起请求：initialized、started 与代际空洞
 
-真实Task可脱离原leash去参与下一转场，而Launcher暂时看到相同内容的截图并继续控制视觉外壳。
+`OtherActivityInputConsumer` 在手势开始阶段构造 handler。若 `TaskAnimationManager.isRecentsAnimationRunning()` 为 false，它走 `startRecentsAnimation()`；若已有 controller，则用 `continueRecentsAnimation()` 把新 `GestureState` 接到原会话。
 
-## 111. cancel回调中的null含义
+新请求的顺序很容易被方法名误导：
 
-`onAnimationCanceled(null)`表示leash立即失效，Launcher应直接清理。
+1. 主线程建立新的 `RecentsAnimationCallbacks`，依次加入管理器 listener、`GestureState` 和交互 handler；
+2. 把同步 `ActivityManagerWrapper.startRecentsActivity()` 排进 `UI_HELPER_EXECUTOR`；
+3. 不等 helper，更不等 Binder start callback，立即写 `STATE_RECENTS_ANIMATION_INITIALIZED`；
+4. system_server 之后 oneway 回调，Launcher Binder 线程先包装 targets、构造客户端 controller；
+5. 只有 listeners 的分发被投回主线程；此时 `GestureState` 才能进入 started 语义。
 
-非null TaskSnapshot表示画面已被截图替代，Launcher必须先把live tile切到截图，等不再需要后调用`cleanupScreenshot()`。
+`ActivityManagerWrapper` 会捕获任意 `Exception`。它仅在调用方传入非空 `resultCallback` 时报告 true/false；`TaskAnimationManager` 在 r48 传的是 null。因此权限错误、服务异常或参数异常可以被包装层吞掉，而 initialized 状态仍保留。诊断不能把 initialized 当作“请求已接受”，应继续寻找 ATMS 入口、server start、Launcher callback 三侧证据。
 
-## 112. cleanupScreenshot完成什么
+更棘手的是这份管理器没有 request generation：
 
-服务端取消`mRecentScreenshotAnimator`并清引用。
+- 旧请求还在路上、`mController == null` 时，新请求不会取消旧请求，却会覆盖 `mCallbacks`、`mLastGestureState` 等共享字段；迟到的旧 callback 可能撞进新一代状态；
+- 旧 controller 已存在时，Studio build 直接抛 `IllegalArgumentException`，不会继续 force-finish；
+- 非 Studio build 只记录错误，再调用 `finishRunningRecentsAnimation(false)`。该方法把旧 controller finish 投到 MAIN，立即做客户端清理；随后新 start 已可排入 UI helper。旧 finish 不是新 start 的屏障。
 
-截图Animator的finish callback再通知RecentsAnimation完成对应reorderMode，最终释放延迟取消所保留的控制。
-
-## 113. 截图失败怎么办
-
-若`screenshotRecentTask()`返回null，Controller立即调用`onAnimationFinished()`，不能等待一个永远不存在的`cleanupScreenshot()`。
-
-客户端仍会收到cancel null，按立即失效路径清理。
-
-## 114. cancel的其他入口
-
-常见包括：
+典型队列可写成：
 
 ```text
-新Recents动画开始前取消旧动画
-无可见Task/无App窗口
-runner linkToDeath失败或binderDied
-任意Task AnimationAdapter被取消
-调用cancelRecentsAnimation
-外部触发failsafe
-栈顺序变化后的延迟取消
+UI线程：post oldFinishToMain → localCleanupOld → enqueue newStartToHelper
+MAIN稍后：old finish wrapper → enqueue oldBinderFinishToHelper
+UI_HELPER：newStart 可能先于 oldBinderFinish
 ```
 
-不同入口选择TOP、ORIGINAL或KEEP，不能统一写成“取消就回App”。
+新 start 到达 system_server 时会同步取消 WMS 里的旧 controller，这能收敛多数交叠，却不能补出客户端缺失的代际检查。读竞态日志时要按 callback 所属 Binder 句柄和 targets，而不是只看 `TaskAnimationManager` 当前字段。
 
-## 115. cancelRecentsAnimation布尔参数
+## 4. ATMS 入口、预加载与 caller 运行标志
 
-ATMS API的`restoreHomeStackPosition=true`映射`MOVE_TO_ORIGINAL_POSITION`；false映射`KEEP_IN_PLACE`。
+`ActivityTaskManagerService.startRecentsActivity()` 先执行 `enforceCallerIsRecentsOrHasPermission(MANAGE_ACTIVITY_STACKS)`。与配置 Recents UID 具有相同 appId 的 caller 可进入；其他 caller 需要 signature 级栈管理权限。它在清身份前保存 pid/uid，随后在 global lock 内查 `WindowProcessController`，再创建 `RecentsAnimation`。
 
-它不是正常`finish(toHome)`的同一个布尔含义，两个API不要靠参数位置类比。
+runner 为 null 时只走预加载：
 
-## 116. runner死亡的完整后果
+- 已有目标且已 visible requested 或是 top running Activity，直接返回；
+- 已有进程则刷新配置；没有 ActivityRecord 就用 background launch 创建；
+- 目标未 attach 时可显式启动进程/Activity，但 `andResume=false`；
+- 不处于 STOPPING/STOPPED 的目标被加入 stopping，让客户端仍有机会 traversal，而不是成为前台 resumed Activity。
 
-DeathRecipient选择`MOVE_TO_ORIGINAL_POSITION`取消，通知/清理动画，并销毁Recents InputConsumer。
+background launch 并不沿用 Binder caller 身份。`ActivityStarter` 被显式写入配置的 `mRecentsUid`、Recents package/feature 与当前 userId；`execute()` 的结果没有被检查。若启动失败，后续重新查得的 target stack/Activity 可能为空，并在摆位或 launch-behind 写入处抛异常。外层只 log、rethrow、恢复 layout/trace，不会向 runner 补 cancel，也不对 running flag、已移动 stack 或 launch-behind 做统一回滚。
 
-调用者进程的`runningRecentsAnimation`标志则在RecentsAnimation.finishAnimation中清除。
+runner 非 null 才进入真实会话。`RecentsAnimation` 根据 intent component 决定目标 type：只有 component 等于配置的 Recents component 才是 `ACTIVITY_TYPE_RECENTS`，否则是 `ACTIVITY_TYPE_HOME`。类名叫 Recents 并不意味着目标永远是 Recents Activity。
 
-## 117. 状态图
+入口找到 caller WPC 后，启动会在建 controller 前调用 `setRunningRecentsAnimation(true)`；finish 再写 false。该布尔与 remote-animation 布尔做 OR 后异步推动 AM 的进程状态更新。它既不是 runner callback 完成点，也不保证 OOM 调整已经执行。
 
-```mermaid
-stateDiagram-v2
-    [*] --> Preparing: "准备目标Activity、临时栈位置、Task leash"
-    Preparing --> PendingStart: "initialize完成，等待壁纸ready"
-    PendingStart --> Running: "onAnimationStart已发送"
-    PendingStart --> Restoring: "无Task/runner死亡/Adapter取消"
-    Running --> FinishingTop: "finish(true)"
-    Running --> Restoring: "finish(false)或失败恢复"
-    Running --> DeferredCancel: "栈顺序变化 + defer"
-    DeferredCancel --> ScreenshotHold: "下一transition + screenshot成功"
-    ScreenshotHold --> Keep: "Launcher cleanupScreenshot"
-    DeferredCancel --> Keep: "无需截图或截图失败"
-    FinishingTop --> Cleaned: "释放leash + target栈置顶"
-    Restoring --> Cleaned: "释放leash + 恢复原位置"
-    Keep --> Cleaned: "释放leash + 保持栈位置"
-    Cleaned --> [*]
-```
+这里存在一个同 caller 替换边界：新请求先写 true，但旧值本来已经为 true，于是什么也不发；随后同步取消旧 controller，旧 finish 写 false。新会话不会再次把它写回 true，于是 WMS 仍可继续控制新会话，而 caller 的 running-recents 标志已经为 false。反过来，若 `getProcessController()` 找不到 caller，整场动画仍可启动，只是没有这份进程标志。
 
-## 118. 四个“完成”点不要混淆
+异常路径同样需要单独看：running 标志在 stack staging 前写入，通用 `catch/finally` 只恢复 window layout 与 trace；后续异常没有统一回滚这枚布尔。不能把它当作服务端 controller 是否存在的权威状态。
+
+## 5. 目标 Activity 先被临时摆位，ORIGINAL 也不是完整撤销
+
+若目标 Activity 已存在，启动先保存“目标 stack 当时正上方的 stack”为 `mRestoreTargetBehindStack`。找不到上方 stack 时，服务端 oneway 通知 cancel(null) 并直接 return。这条早退位于 `Trace.traceBegin()` 之后、通用 `try/finally` 之前，所以本次 trace 没有配对的 `traceEnd()`；它是诊断瑕疵，不应被理解为 controller 已建立。
+
+真实 staging 在 `deferWindowLayout()` 中完成：
+
+1. 既有目标 stack 被移动到最底部可见 stack 后面；
+2. 如果目标 Activity 所属 Task 不是该 stack 最上层 Task，再把该 Task 提到 stack 顶部；
+3. 没有目标 Activity 时，以 `avoidMoveToFront`、`NEW_TASK | NO_ANIMATION` 等约束做 background launch，再把新 stack 放到底部；
+4. 给精确的目标 Activity 置 `mLaunchTaskBehind=true`，替换 intent extras；
+5. 同步取消旧 WMS controller，再初始化新 controller；
+6. 捕获完可见 Task 后才 `ensureActivitiesVisible(..., PRESERVE_WINDOWS)`。
+
+保存的恢复信息只有一枚 stack 锚点，没有保存目标 Task 在 stack 内的旧 index。因此开始阶段若执行了 `positionChildAtTop(task)`，`REORDER_MOVE_TO_ORIGINAL_POSITION` 也不会把 Task 恢复到原来的兄弟位置。新增目标 Activity 的路径根本没有旧锚点；`moveStackBehindStack()` 遇到 null、同一 stack 或不同 parent 会直接返回。
+
+有旧 controller 时还会跨会话串写：新 `RecentsAnimation` 已把同一目标 Activity 置为 launch-behind，才调用 `cancelRecentsAnimation()`。旧 `RecentsAnimation.finishAnimation()` 随后可能用旧的 launched Activity 与 restore anchor 清 `mLaunchTaskBehind`、重排 stack；新会话不会在 cancel 返回后重新断言 launch-behind。WMS controller 虽被替换，Activity/stack 却是共享状态，不能把 `W_oldCheck` 当成代际隔离屏障。
+
+还要注意 launch-behind 的清理条件：finish 先做 controller cleanup，再从当前目标 stack 查 `mLaunchedTargetActivity`。若该 Activity 已不在 stack，代码直接 return，来不及把 `mLaunchTaskBehind` 清成 false。名称里的 ORIGINAL 是“尝试恢复 stack 相对位置”，不是事务式回滚所有启动副作用。
+
+`mDefaultTaskDisplayArea` 在 `RecentsAnimation` 构造时就固定为 Root 的默认 TDA。这一限制贯穿目标 stack 查找、listener 注册和重排；不能因为 controller 带着 `displayId` 就推断 r48 已支持任意 display/TDA。
+
+## 6. 初始 Task、leash 与 readiness：先提交 setup，不等于已显示
+
+controller 初始化从指定 Display 的默认 TDA 取两组 Task：当前 visible tasks，以及目标 Home/Recents stack 下的全部 leaf Tasks；合并时去重。它跳过 floating tasks 和 split-screen primary，给其余 Task 建 `TaskAnimationAdapter`。`isNotInRecents` 来自 recent-task id 集合，与 Task 当前是否可见不是同一概念。
+
+若筛选后没有 Task，或 runner 的 death link 建立失败，`initialize()` 会同步 cancel、回调 ATMS、令 WMS controller cleanup/null 后再 return。但外层 `RecentsAnimation.startRecentsActivity()` 不检查初始化是否仍成功，仍继续 ensure visible、记录 metrics，并在末尾注册 TaskDisplayArea stack-order listener。cleanup 的 unregister 发生在这次注册之前，因而删不到它；留下的 listener 以后虽会因 WMS controller 为 null 而快速返回，却仍是迟到注册的生命周期残留。
+
+每个 adapter 在构造时快照 Task bounds、相对 parent 的 local bounds；`Task.startAnimation()` 随后借 `SurfaceAnimator` 建 leash，并把这些信息写入初始 transaction：
 
 ```text
-Launcher手势动画到达终点
-  只是客户端视觉决策完成
-
-IRecentsAnimationController.finish返回
-  Binder请求已处理，不保证屏幕已显示
-
-SurfaceAnimator finish callback执行
-  leash层级已在Transaction中恢复/删除
-
-SurfaceFlinger/HWC present fence signal
-  才接近实际显示时间证据
+setPosition(leash, localBounds.left, localBounds.top)
+setWindowCrop(leash, localBounds translated to 0,0)
+capture leash + finishCallback + ANIMATION_TYPE_RECENTS
 ```
 
-本章前三者源码没有自动等价于第四个。
+Remote target 的创建门只检查 top visible Activity 的 main window。mode 也只有两种：top visible Activity type 等于目标 Home/Recents type 时为 OPENING，否则为 CLOSING；这条 Recents 路径不生成 CHANGING target。position、localBounds、screenSpaceBounds 是 adapter 构造阶段的值，不是 Launcher 每次读取时的实时查询。
 
-## 119. 常见误解纠正
+一个隐含不变量是 adapter 必须先收到 `startAnimation()`：`createRemoteAnimationTarget()` 没检查 captured leash，`removeAnimation()` 又直接解引用 captured finish callback。Task Surface 不存在或 wrapper 未捕获时，坏 target 清理可能以空指针结束，而不是稳定地降级为 cancel。任一 Task adapter 后续被 `SurfaceAnimator` 取消，也会取消整场 Recents 会话并选择 ORIGINAL。
 
-| 误解 | 正确理解 |
-|---|---|
-| 手势progress每帧传给WMS | Launcher本地直接改Task leash |
-| 注册InputConsumer后立即吞输入 | 还需Controller enable并由InputMonitor show |
-| 1秒failsafe是所有动画固定时长 | 只有外部trigger后才post的兜底 |
-| finish(false)只是停止Animator | 还会恢复目标栈原始位置并收敛生命周期 |
-| cancel一定返回原App | 可能TOP、ORIGINAL或KEEP |
-| 普通Remote与Recents只差一个接口名 | Recents还管理输入、动态Task、截图交接与栈提交 |
+`task.commitPendingTransaction()` 这个名字比实际保证更强：`WindowContainer.commitPendingTransaction()` 在 r48 只调用 `scheduleAnimation()`。不过固定初始 App Task 路径外层仍处于 `RecentsAnimation.startRecentsActivity()` 的 window-layout defer 中；`continueWindowLayout()` 后的 surface placement 会 merge/close Task setup transaction，Root 再执行 `checkAnimationReady()`。在本章固定成功路径里，可以建立：
 
-## 120. macOS只读练习一：追启动主链
+```text
+initial App Task leash captured < Task setup submit < oneway onAnimationStart enqueue
+```
+
+这只保证初始 App Task 的提交次序，不证明 SF 已 apply、latch 或 present。wallpaper adapters 是 `startAnimation()` 内、ready check 之后才创建的；其 leash 操作写入 wallpaper pending transaction 后就紧接 oneway start，没有第二个 merge/close 屏障。因此 wallpaper setup submit 与 runner 收到 start 之间没有同样的偏序保证。
+
+若目标可能成为 wallpaper target，ready 还要求 wallpaper target 非 null 且 `wallpaperTransitionReady()`。未绘制 wallpaper 会启动独立的 500ms draw timeout；超时把状态改成 TIMEOUT，直接调用 pending Recents controller 的 `startAnimation()`，随后强制 surface placement。它只防 wallpaper 阻塞，不是整场 controller 的通用超时。第 13 节的 1 秒 failsafe 还要由外部事件显式触发，也不能与这 500ms 混为一谈。start 时先构造 app targets、再建 wallpaper targets，把 `mPendingStart=false`，更新 layout/insets，最后 oneway 回调 runner。回调抛 `RemoteException` 只记录日志，不重试，也不自动取消；metrics 通知仍会继续。
+
+传给 runner 的 content insets 优先取目标 Activity main window；窗口尚未建立时才退到指定 Display 的 stable insets。minimized-home bounds 也不是永远存在，只有目标 Activity 位于 split-screen secondary 时才传出。wallpaper targets 则通过 Root 全局遍历建立，没有在这条调用中按 controller display 过滤。
+
+多显示边界因此更窄：初始 tasks 固定默认 TDA，Root readiness 读取默认 Display wallpaper，cleanup booster 也固定默认 Display。`displayId` plumbing 只覆盖部分数据，不等价于完整多 Display、多 TDA 支持。
+
+## 7. Target 到达 Launcher 后，每帧主数据面不再走 controller Binder
+
+`onAnimationStart()` 到达 Launcher 时，`ActivityManagerWrapper` 的 Binder Stub 先把 framework targets 包成 compat 对象；`RecentsAnimationCallbacks` 仍在 Binder 线程上创建 `RecentsAnimationTargets` 和客户端 `RecentsAnimationController`。只有遍历 listeners 的动作被 post 到 MAIN。因而以下顺序才准确：
+
+```text
+Binder Stub wrap targets
+  → Binder线程构造 Targets/Controller
+  → post MAIN
+  → TaskAnimationManager保存mController/mTargets
+  → GestureState与手势handler收到start
+```
+
+`RemoteAnimationTarget` 同时装着两类东西：跨 Parcel 复制的 taskId、bounds、insets、mode、windowConfiguration，以及 Launcher 可操作的 SurfaceControl 句柄。拿到句柄不意味着接管 Activity 生命周期；Launcher 只能在 leash 所界定的层级中写变换。
+
+真正高频的数据面没有 `setProgress()` AIDL。Quickstep 在本地按手势进度计算 `SurfaceParams`；存在 `mSyncTransactionApplier` 时，`SurfaceTransactionApplier.scheduleApply()` 对齐 Launcher RenderThread frame，写 matrix、crop、alpha、corner radius 等属性并 `apply()`；applier 为 null 时，`TransformParams.applySurfaceParams()` 会在当前 caller 线程直接 apply transaction。所以 controller Binder 是低频控制面；逐帧性能问题应查 Launcher caller/UI、RT 与 Surface transaction，而不是查 system_server 每帧 Binder。
+
+客户端 `RemoteAnimationTargets.release()` 释放的是 Launcher 这一侧的 SurfaceControl Java/native 引用。服务端 `SurfaceAnimator` reset/remove leash 是另一条生命周期，物理显示又是第三条。客户端 release 不能代替服务端 cleanup，服务端 cleanup 也不能证明某帧已 present。
+
+终态还存在 live-tile 分支。普通 Home 或非 live-tile Overview 会最终调用 controller finish；启用 live tile 时，Overview 分支可只写 `STATE_CURRENT_TASK_FINISHED`，随后配置“下一次 transition 发生时 deferred cancel-with-screenshot”并保留 Recents controller；这次配置本身并不立即截图。下一次 `OtherActivityInputConsumer` 会 `continueRecentsAnimation()` 接回同一会话。日志里的“当前 Task 已完成”因此不能一概解释为服务端 Recents animation 已 finish。
+
+## 8. 两条输入路径与四道接管门必须分开
+
+Quickstep 同时使用两种不同输入设施：
+
+| 设施 | 建立时机 | 作用 |
+|---|---|---|
+| `monitorGestureInput("swipe-up", displayId)` | 手势导航初始化 | 让 `TouchInteractionService` 观察导航手势并可 pilfer 当前 pointer stream |
+| `recents_animation_input_consumer` | 用户解锁后预注册 | 手势进入动画后，在被控制 App 窗口附近建立一个可由 Launcher 接收的代理通道 |
+
+预注册是为避免动画中途新建 consumer 导致既有 MotionEvent 链被取消。成功路径会让 WMS 创建 server/client `InputChannel`、向 InputManager 注册 server 端、建立 Input Consumer Surface，并把 client channel 传回 Launcher。默认 `registerInputConsumer()` 使用普通 `Choreographer.getInstance()`；只有显式传 true 才选择 SF Choreographer。r48 还把 create/destroy 硬编码到 `DEFAULT_DISPLAY`。
+
+注册失败路径也不完整：`createInputConsumer()` 抛 `RemoteException` 后，wrapper 只记日志，不 return，仍尝试用未初始化的 `InputChannel` 构造 receiver。JNI `nativeInit()` 会再抛未被这里捕获的 `RuntimeException`，所以字段不会赋值，也不会通知 `registered=true`。客户端 registered 不是假阳性，但原始远端失败会升级成本地注册调用异常。
+
+“已注册”距离“事件到达具体手势处理器”至少还有四道门：
+
+1. **Channel 门**：Launcher 的 `InputEventReceiver` 与 WMS server channel 已存在；
+2. **Controller 门**：`mInputConsumerEnabled=true`，且当前 Activity 不是 Home/Recents target、却属于被动画控制的 Task；
+3. **InputWindow 门**：InputMonitor 的异步遍历找到首个匹配 App window，把 consumer show 在它上方一层并提交 InputWindow 信息；
+4. **Listener 门**：`InputConsumerProxy.enable()` 已把本次终态对应的 listener 装到客户端 controller。
+
+`BaseSwipeUpHandlerV2` 只有同时达到 APP_CONTROLLER_RECEIVED 与 GESTURE_STARTED 才调用 `enableInputConsumer()`。客户端先在 UI helper 隐藏 IME，再同步设置服务端开关。服务端 `updateInputWindowsLw(true)` 只是向 AnimationHandler post 更新；遍历产生的 input transaction 还要 merge 到 Display pending transaction并 schedule animation。同步 Binder 返回不保证 consumer Surface 已 show、InputDispatcher 已安装快照或新事件已经路由过来。
+
+InputMonitor 每轮先 hide/reset 全部 consumers，再按窗口从顶到底遍历。对第一个满足条件的 App window，它复制该窗口的 focus 状态，却把 consumer touchable region 设为目标 Home/Recents main window bounds，而不是当前 App bounds；Surface relative layer 是匹配 App window 的 `+1`。没有目标 main window就不会 show。
+
+Listener 门也不能省略。预注册 receiver 即便 listener 为 null，`InputConsumerController` 仍会结束输入事件；`InputConsumerProxy.enable()` 通常要等手势选择 Launcher 终态才安装真正代理。runner death 会额外销毁 WMS 侧 consumer，而普通动画 cleanup 只令当前 WMS引用失效并通过 input update 隐藏；客户端 receiver 的本地 registered 状态可能与服务端对象错开，后续需要重新注册才能恢复一致。
+
+## 9. Controller 方法都是同步 Binder，调用线程与完成含义却各不相同
+
+`IRecentsAnimationController` 没有 oneway 方法，但 Launcher wrapper 并未把所有调用统一搬到后台：
+
+| 操作 | r48 Launcher 常见调用线 | Stub 返回最多证明什么 |
+|---|---|---|
+| `screenshotTask(taskId)` | MAIN 直接同步 Binder | 服务端已尝试为受控 Task 取 snapshot，并返回对象或 null |
+| `setDeferCancelUntilNextTransition()` | MAIN 直接同步 Binder | 两个 defer boolean 已写入 controller |
+| `removeTask(taskId)` | `onTaskAppeared` 的 MAIN listener 直接同步 Binder | 已返回本次 `isOnTop` 检查与移除结果 |
+| `setAnimationTargetsBehindSystemBars()` | `UI_HELPER_EXECUTOR` | Task 标志已改并 request traversal |
+| `hideCurrentInputMethod()`、`setInputConsumerEnabled()` | 同一个 helper task 依次同步调用 | hide 请求已交给本地 IME 服务；输入开关已写并排了窗口更新 |
+| `cleanupScreenshot()` | `UI_HELPER_EXECUTOR` | screenshot animator 已被请求 cancel；后续 finish callback 可能已重入 |
+| `finish()` | `UI_HELPER_EXECUTOR` | 服务端重排方法已返回，或 compat 已吞下 RemoteException |
+| `setWillFinishToHome()` | 手势 MAIN 经 compat 直接同步调用 | failsafe 的目标 boolean 已写入 |
+
+因此 screenshot、defer 和动态 target 移除都可能阻塞 Launcher 主线程。看到“controller 是同步接口”也不能反推所有动作都在 MAIN；必须读具体 wrapper。
+
+截图接口只遍历 `mPendingAnimations`，不接受任意 taskId。匹配后先 `snapshotTasks()`，把 Task 加入 skip-closing 集合，再调用 `getSnapshot(taskId, 0, ...)`；这里 userId 硬编码为 0。服务端的 null 可以表示 canceled、task 不受控或 snapshot 不存在；compat 又把 null 与 `RemoteException` 都折叠成空 `ThumbnailData`。上层若只检查非 null，就无法区分这些失败来源。
+
+系统栏方法也有一个命名反向：Launcher 的 `setUseLauncherSystemBarFlags(true)` 会向服务端传 `behindSystemBars=false`。服务端遍历非目标类型 Task，设置 `setCanAffectSystemUiFlags(behindSystemBars)` 并请求 traversal；cleanup 对每个 adapter 无条件恢复 true，而不是恢复进入会话前逐 Task 的旧值。
+
+`setWillFinishToHome()` 只影响 failsafe 触发时选择 TOP 还是 ORIGINAL，不会直接 finish，也不会改变正常手势的终态。控制方法名只表示请求意图；想证明视觉结果，仍要继续追 traversal、pending merge、SF commit 和 present fence。
+
+## 10. 动态 Task 走 onTaskAppeared，但建立顺序弱于初始 App Task
+
+Recents controller 存在时，`Task.applyAnimationUnchecked()` 截获传统 AppTransition 动画。只有 `enter=true` 才调用 `addTaskToTargets()`；`enter=false` 也不会回落到 superclass。这意味着会话中 opening Task 可变成动态 remote target，而 closing Task 的普通动画也可能被抑制。
+
+动态 opening 的服务端链是：
+
+```text
+Task.applyAnimationUnchecked(enter=true)
+  → addTaskToTargets(task, transitionFinishedCallback)
+  → addAnimation(hidden=true)
+  → mPendingNewTaskTargets.add(taskId)
+  → createRemoteAnimationTarget()
+  → oneway runner.onTaskAppeared(target)
+```
+
+`hidden=true` 让新 target 在 Launcher 决定如何呈现前保持隐藏。问题是 `commitPendingTransaction()` 仍只 schedule animation；与初始 App Task 批次不同，这里没有固定的 after-placement 边界把“setup 已提交”放到 `onTaskAppeared` 之前。runner 可能先拿到 leash 句柄，相关 show/reparent/crop 还留在 Display pending transaction。能操作句柄不等于输入画面已经形成。
+
+另一个不对称是 `mPendingNewTaskTargets.add(taskId)` 发生在 target null 检查之前。若 Task 没有 top visible main window，`createRemoteAnimationTarget()` 返回 null，runner 收不到 appeared，但 id 已进入“新 target”集合；没有就地 remove。若 oneway appeared 因 `RemoteException` 失败，adapter 也继续由 server 控制，直到全局收尾。
+
+`removeTask()` 只在目标 Task 当前 `isOnTop()` 时成功。Launcher 的 `TaskAnimationManager` 只保留最后一个 appeared target；新 appeared 到来时，它尝试移除前一个，却忽略 boolean 返回值。失败 target 仍在 server pending 列表里，正常 finish 会再遍历新 id 尝试移除；仍不满足 isOnTop 的项最后依赖全局 cleanup。
+
+这条动态链需要同时观察四本账：runner 已收到哪些 target、server pending adapters、pending-new ids、Launcher last-appeared 引用。任意一本都不能单独代表完整集合。客户端 `RemoteAnimationTargets.release()` 只显式 release 初始 `unfilteredApps` 与 wallpapers；替换旧 appeared 时只请求 server remove 后覆盖引用，管理器 cleanup 也只 release `mTargets`，再把 `mLastAppearedTaskTarget` 清 null。动态 compat target 没有显式 `release()`，其本地 SurfaceControl 句柄依赖引用消失后的 finalization；`GestureState` 还可能延长引用寿命。server remove/cleanup 不能替代这侧 release。
+
+## 11. 正常 finish 先通知本地，再向服务端提交三种选择
+
+客户端 `finishController(toRecents, callback, sendUserLeaveHint)` 的顺序是：
+
+```text
+mOnFinishedListener.accept(this)
+  → RecentsAnimationCallbacks 把 finished listeners 投到 MAIN
+UI_HELPER_EXECUTOR.execute(
+  同步 compat.finish(toRecents, sendUserLeaveHint)
+  → 若有callback，再投回MAIN)
+```
+
+也就是说，“客户端 finished 通知已发起”先于 Binder finish 排队。MAIN 上的 listener 与 helper 上的 Binder 请求随后并发推进，本地 `TaskAnimationManager.cleanUpRecentsAnimation()` 可以先释放 targets、移除 listeners、清当前字段。它不是服务端 cleanup 的确认。
+
+可选 `onFinishComplete` 只在 compat `finish()` 返回后投 MAIN；但 compat 捕获 `RemoteException` 后也正常返回。因此它最多说明“客户端调用尝试已经返回”，不是 server callback、Surface cleanup 或 present 的不可失败确认。
+
+server Stub 先在 WMS lock 下检查 `mCanceled` 并尝试移除所有 dynamic-new targets，然后释放该锁，才调用 `RecentsAnimation.onAnimationFinished()`。这段检查没有设置 one-shot finishing 标志：两个并发 finish 都可能先通过门，finish 与 cancel 也可能在门外竞跑。最终由先进入 `RecentsAnimation.finishAnimation()`、且仍看到 WMS controller 非 null 的调用完成 cleanup 与 reorder；后到者可能只看到 controller 已清而返回。Binder 入口先到不等于其 reorder mode 必胜。
+
+获胜且无异常的 callback 会在 ATMS/WMS global lock 下注销 stack-order listener、清 caller running flag，并在 `inSurfaceTransaction()` 块中执行 controller cleanup 与 Task 重排。对这一固定成功调用，同步 Binder 保证这些 Java 路径在返回前已走到结尾；它仍没有把所有 Display pending transaction 自动变成已显示画面，失败或竞争败者的返回也不提供同样含义。
+
+`toRecents` 只被映射成两个模式：true 为 TOP，false 为 ORIGINAL。KEEP 不是普通 Launcher finish 的第三个布尔值，而是 server cancel 路径使用的独立 reorder mode。
+
+前一节提到的 live-tile Overview 是例外：它可以不调用 finish，只把当前 Task 的 UI 状态收束，再保留 controller 供下一次手势继续。必须结合 feature flag、end target 和 server controller 是否仍存在，才能解释一次手势结束后的会话寿命。
+
+## 12. TOP、ORIGINAL、KEEP 改的是层级意图，不是物理呈现完成
+
+三种模式的服务端结果并不对称：
+
+| 模式 | hierarchy 动作 | visibility/transition 动作 | 特殊边界 |
+|---|---|---|---|
+| `REORDER_MOVE_TO_TOP` | 将目标 Task 或目标 stack 移到前台 | `TRANSIT_NONE`、ensure visible、resume、execute transition | `sendUserLeaveHint=true` 时设置 user-leaving，并走 `moveTaskToFront()` 以允许前 App 进入 PiP |
+| `REORDER_MOVE_TO_ORIGINAL_POSITION` | 尝试把目标 stack 放回保存锚点之后 | 同样执行无动画 transition、可见性与 resume | 不恢复目标 Task 的旧 index；锚点无效时可 no-op |
+| `REORDER_KEEP_IN_PLACE` | 不再移动 stack | 必要时只刷新 target 可见性，随后提前 return | 不执行后面的 transition/resume；常用于 stack-order cancel |
+
+所有模式先调用 `WMS.cleanupRecentsAnimation()`：WMS 把全局 controller 字段置 null，controller 遍历 Task/wallpaper adapters，调用 captured SurfaceAnimator finish callback，并清 death link、failsafe、runner、输入窗口与状态栏通知。之后才查当前 target stack 和精确 Activity，再清 `mLaunchTaskBehind` 并执行模式分支。
+
+顺序上的细节很重要：若 target Activity 已不在目标 stack，cleanup 已发生，但方法会在清 launch-behind 前 return。KEEP 若目标有效，则会清 launch-behind；当没有 deferred screenshot 且目标 stack 不是 focused stack 时，它可局部 ensure visible，然后直接结束，不进入公共 transition 逻辑。
+
+Surface 侧至少要保留这条层级：
+
+```text
+captured finish callback
+  → SurfaceAnimator reset/reparent/remove 写入 WindowContainer pending transaction
+  → DisplayContent.prepareSurfaces merge pending
+  → WMS关闭/应用本轮 global transaction，提交给SurfaceFlinger
+  → SF apply/commit layer hierarchy
+  → composition与HWC present fence
+```
+
+`inSurfaceTransaction()` 的词义不能吞掉中间层。adapter 回调拿到的仍可能是 Task/Display pending transaction。finally 先调用 `continueWindowLayout()`：`continueLayout()` 在有 layout changes 或 deferred requests 时会同步 `performSurfacePlacement()`；随后若 Root 仍 `isLayoutNeeded()`，代码还会再显式 placement。若两处都没有执行 placement，pending 只依赖已 schedule 的 animation traversal。因此同步 finish 返回可以证明获胜 callback 与 Java 层重排已走过，却不能普遍证明 pending 已 merge。
+
+本章的 Recents Task/Wallpaper adapter 不请求 animation-finish defer，所以固定 cleanup 中 reset 写 pending 发生在 Binder 返回前；pending submit 与 Binder reply 谁先被外部观察到则没有通用保证，present 更晚。`SurfaceAnimator` 的通用机制允许 Animatable/AnimationAdapter 请求 defer，但那不是此处用来削弱偏序的默认条件。诊断画面残留时，要找 `prepareSurfaces`、transaction id 或 layer trace，而不是只找 finish log。
+
+## 13. cancel、defer 与 1 秒 failsafe 是三套机制
+
+非截图 cancel 的固定服务端顺序是：拿 WMS lock，若已 canceled 则 return；移除 failsafe；置 `mCanceled=true`；oneway 通知 runner `onAnimationCanceled(null)`；仍在锁内调用 ATMS finish callback，完成 controller cleanup 与指定 reorder。由于 runner 回调是 oneway，Launcher 实际处理 cancel 可以早于或晚于 server cleanup；跨进程没有“先看完 cancel UI，再拆 leash”的等待关系。
+
+触发源则很多：初始化无 target、runner death-link 失败、Task adapter 被取消、新 start 替换旧 controller、runner death、显式 WMS cancel、stack order 变化和 failsafe。它们选择的 reorder mode 不完全相同，排障时不能只按 callback 名称归类。
+
+stack-order 路径可由 Launcher 请求 defer：服务端先标记“下次 transition start/cancel 时继续”，仍处于注册状态的 AppTransition listener 命中后再调用普通 cancel 或截图 cancel。该 listener 在任意一次 transition starting/cancelled 回调开头都会先 unregister，然后才检查 `mCancelOnNextTransitionStart`；如果更早的无关 transition 已把它一次性消费，之后 stack-order change 只设 boolean、不会重新注册 listener，deferred cancel 可能再也等不到回调。defer boolean 只是推迟触发点，不会建立无限期自动恢复，也不等同于动画 timeout。
+
+r48 的 1 秒 failsafe 也不是每场 Recents 初始化时自动启动的 watchdog。真实入口是 PhoneWindowManager 处理未被消费、非长按的 power-key up，向 WMS 发 `ANIMATION_FAILSAFE` 消息；WMS 发现当前 controller 后才调用 `scheduleFailsafe()`。一秒后根据 `mWillFinishToHome` 选择 TOP 或 ORIGINAL。若从未触发这条外部消息，就没有这只定时器。
+
+Launcher 里的 `RecentsAnimationCallbacks.mCancelled` 还要与 server `mCanceled` 分开。前者只由本地 `notifyAnimationCanceled()` 设置；真正收到 server `onAnimationCanceled()` 时不会写它。它只用于“本地主动取消发生后，迟到 start callback 应立即 finish-to-app”的客户端门，不能泛化成所有 server cancel-before-start 的代际保护。
+
+runner death 通常走 ORIGINAL cancel，随后销毁关联 input consumer。但第 14 节的成功截图 hold 已提前把 `mCanceled` 置 true；此时 death 回调里的 cancel 会直接 return，只剩 input consumer 销毁，不能完成 hold。
+
+## 14. deferred screenshot 是一份必须显式归还的保活协议
+
+截图取消不是“发回一张图然后照常 finish”，而是把 finish 拆成两阶段。AppTransition listener 到点后，服务端先从 `mPendingAnimations.get(0)` 取 Task；这里没有 empty guard，也没有证明它就是产品语义里的“当前卡片”。随后同步抓 snapshot，并建立 `TaskScreenshotAnimatable`：创建 screenshot Surface、挂入 buffer；旧式 `SurfaceControl.setMatrix()` 写 legacy global transaction，`show()` 写 Task pending transaction；独立 `SurfaceAnimator.transferAnimation()` 再接管原 Task animation。
+
+这些 Surface 操作仍可能只在 pending transaction 中。服务端随后就 oneway 回调 `onAnimationCanceled(snapshot)`，所以 runner 收图不证明 screenshot Surface 已提交、latch 或替换了真实 Task 像素。AIDL 注释中的“已替换”应按协议目标理解，不能当成物理时间戳。
+
+两条结果完全不同：
+
+```text
+snapshot == null
+  → oneway cancel(null)
+  → 同步 server finish(KEEP)
+
+snapshot != null
+  → oneway cancel(snapshot)
+  → server保持controller与screenshot animator
+  → runner调用cleanupScreenshot()
+  → cancel screenshot animator
+  → animator finish callback触发server finish(KEEP)
+```
+
+进入第二条路径前，server 已置 `mCanceled=true` 并移除 failsafe。此后普通 controller `finish()` 会因 canceled 而 no-op；runner 必须调用 `cleanupScreenshot()` 才能推进。若发送 snapshot 时发生 `RemoteException`、runner 随后死亡，或 runner 永远不 cleanup，本地没有新的 timeout 自动解套：death cancel 与再次 failsafe 都会被 canceled gate 吞掉。
+
+非空 snapshot 也不证明 animation transfer 成功。source animator 没有 leash 时，`transferAnimation()` 直接 return；destination screenshot Surface 或 parent 为空时，它 cancel 尚未装入 animation 的 destination 后 return。`screenshotRecentTask()` 对这两种结果都不检查，仍把 snapshot 回给 runner。之后即使 runner 调 `cleanupScreenshot()`，空 animator 的 cancel 也不会触发 static finish callback，server 仍可能停在 hold。
+
+客户端收到非空 snapshot 后，`TaskAnimationManager` 让 `BaseActivityInterface.switchRunningTaskViewToScreenshot()` 在 UI 真正切图完成后运行 cleanup runnable；该 runnable 才会做客户端清理并把 `cleanupScreenshot()` 排到 helper。若此时 `getCreatedActivity()==null`，r48 的实现直接 return，连传入 runnable 都不执行，于是客户端与 server 都可能停在 screenshot hold。
+
+`cleanupScreenshot()` 内部的 `SurfaceAnimator.cancelAnimation()` 还有一处重入顺序：cancel 先 reset，再调用 animation finish callbacks，之后才把 leash remove 写入传入 transaction。screenshot animator 的 finish callback 会在这个中间点触发 Recents finish，所以“controller 已清理”甚至可能早于外层 cancel 记录 leash remove。
+
+成功 cleanup 的服务端顺序应写成：client screenshot View 已切换；cleanup Binder 进入；reset 先记录 screenshot Surface 清理；animator finish callback 重入 Recents controller cleanup；外层 cancel 再记录 screenshot leash remove并 schedule pending transaction；最后 Stub 才能退出。释放 global lock 后，Binder reply 与 AnimationThread 的 merge/submit 没有固定的外部观察顺序；present 更晚。任何一个早期 callback 都不能独自证明最后一层。
+
+## 15. 九组只读练习把会话完成点钉回 r48
+
+以下命令只读源码，均可在 macOS Bash 3.2 或 Zsh 5.9 执行。每个 `rg -e` 都是独立证据点；命中后还要阅读相邻锁、线程切换与失败分支，不能只凭方法名下结论。
+
+### 练习 1：核对两条 AIDL、入口权限与 capability 边界
 
 ```bash
+set -eu
 cd /Users/ninebot/androidSource
-rg -n "startRecentsActivity|initializeRecentsAnimation|mLaunchTaskBehind|moveStackBehindBottomMostVisibleStack" \
-  packages/apps/Launcher3/quickstep \
-  frameworks/base/packages/SystemUI/shared/src \
-  frameworks/base/services/core/java/com/android/server/wm
+rg -n -F \
+  -e 'oneway interface IRecentsAnimationRunner {' \
+  -e 'void onAnimationStart(in IRecentsAnimationController controller,' \
+  frameworks/base/core/java/android/view/IRecentsAnimationRunner.aidl
+rg -n -F \
+  -e 'interface IRecentsAnimationController {' \
+  -e 'ActivityManager.TaskSnapshot screenshotTask(int taskId);' \
+  -e 'boolean removeTask(int taskId);' \
+  frameworks/base/core/java/android/view/IRecentsAnimationController.aidl
+rg -n -F \
+  -e 'enforceCallerIsRecentsOrHasPermission(MANAGE_ACTIVITY_STACKS, "startRecentsActivity()");' \
+  -e 'final int callingPid = Binder.getCallingPid();' \
+  -e 'final WindowProcessController caller = getProcessController(callingPid, callingUid);' \
+  frameworks/base/services/core/java/com/android/server/wm/ActivityTaskManagerService.java
+rg -n -F \
+  -e 'return UserHandle.isSameApp(callingUid, mRecentsUid);' \
+  frameworks/base/services/core/java/com/android/server/wm/RecentTasks.java
 ```
 
-目标：用自己的话解释为什么Home/Recents Activity先放到可见App后方，却要设置launch-behind保持可绘制。
+解释 runner 三个回调为什么不等远端执行、controller 调用为何会等待 Stub；再说明后续 Stub 没有逐方法权限检查，为什么仍不能把最初 caller pid 当成 runner Binder 宿主证明。
 
-## 121. macOS只读练习二：验证“没有setProgress”
+### 练习 2：重建 Launcher start 队列与无代际窗口
 
 ```bash
+set -eu
 cd /Users/ninebot/androidSource
-sed -n '1,180p' frameworks/base/core/java/android/view/IRecentsAnimationController.aidl
-sed -n '1,120p' frameworks/base/core/java/android/view/IRecentsAnimationRunner.aidl
+rg -n -F \
+  -e 'if (FeatureFlags.IS_STUDIO_BUILD) {' \
+  -e 'finishRunningRecentsAnimation(false /* toHome */);' \
+  -e '.startRecentsActivity(intent, null, mCallbacks, null, null));' \
+  -e 'gestureState.setState(STATE_RECENTS_ANIMATION_INITIALIZED);' \
+  packages/apps/Launcher3/quickstep/src/com/android/quickstep/TaskAnimationManager.java
+rg -n -F \
+  -e 'mController = new RecentsAnimationController(animationController,' \
+  -e 'Utilities.postAsyncCallback(MAIN_EXECUTOR.getHandler(), () -> {' \
+  -e 'public void notifyAnimationCanceled() {' \
+  packages/apps/Launcher3/quickstep/src/com/android/quickstep/RecentsAnimationCallbacks.java
+rg -n -F \
+  -e 'ActivityTaskManager.getService().startRecentsActivity(intent, receiver, runner);' \
+  -e 'if (resultCallback != null) {' \
+  frameworks/base/packages/SystemUI/shared/src/com/android/systemui/shared/system/ActivityManagerWrapper.java
 ```
 
-目标：列出所有离散控制方法，并说明每帧矩阵为什么由Launcher直接写leash。
+画出 old controller 已存在时 MAIN 与 UI helper 的入队次序；再推演旧请求尚未回调、`mController==null` 时连续发两个 start，指出 initialized 为什么不能排除静默失败。
 
-## 122. macOS只读练习三：追输入接管
+### 练习 3：验证目标 type、临时摆位与不完整恢复
 
 ```bash
+set -eu
 cd /Users/ninebot/androidSource
-rg -n "registerInputConsumer|setInputConsumerEnabled|shouldApplyInputConsumer|updateInputConsumerForApp" \
-  packages/apps/Launcher3/quickstep/recents_ui_overrides \
-  frameworks/base/packages/SystemUI/shared/src \
-  frameworks/base/services/core/java/com/android/server/wm
+rg -n -F \
+  -e 'mTargetActivityType = targetIntent.getComponent() != null' \
+  -e 'mRestoreTargetBehindStack = getStackAbove(targetStack);' \
+  -e 'mDefaultTaskDisplayArea.moveStackBehindBottomMostVisibleStack(targetStack);' \
+  -e 'targetStack.positionChildAtTop(task);' \
+  -e 'targetActivity.mLaunchTaskBehind = true;' \
+  -e 'mService.mRootWindowContainer.ensureActivitiesVisible(null, 0, PRESERVE_WINDOWS);' \
+  frameworks/base/services/core/java/com/android/server/wm/RecentsAnimation.java
+rg -n -F \
+  -e 'taskDisplayArea.moveStackBehindStack(targetStack,' \
+  -e 'targetActivity.mLaunchTaskBehind = false;' \
+  -e 'if (targetActivity == null) {' \
+  frameworks/base/services/core/java/com/android/server/wm/RecentsAnimation.java
+rg -n -F \
+  -e '.setCallingUid(mRecentsUid)' \
+  -e '.setCallingPackage(mRecentsComponent.getPackageName())' \
+  -e '.setUserId(mUserId)' \
+  -e '.execute();' \
+  frameworks/base/services/core/java/com/android/server/wm/RecentsAnimation.java
 ```
 
-目标：画出“预注册InputChannel→手势中enable→InputMonitor把consumer放到动画App之上→Launcher receiver回执事件”的链路。
+分别推演既有目标 Task 被提到 stack 顶、新建目标没有 restore anchor、finish 时目标 Activity 已移走三种情况，列出 ORIGINAL 能恢复和不能恢复的状态。
 
-## 123. macOS只读练习四：手算结束模式
+### 练习 4：追初始 App Task setup 与 wallpaper readiness
 
-判断下列场景的reorderMode：
-
-```text
-A. 用户上滑到底回Home
-B. 用户反向滑动回原App
-C. Launcher进程死亡
-D. 栈顺序变化且请求截图延迟交接
-E. cancelRecentsAnimation(false)
+```bash
+set -eu
+cd /Users/ninebot/androidSource
+rg -n -F \
+  -e 'final ArrayList<Task> visibleTasks = mDisplayContent.getDefaultTaskDisplayArea()' \
+  -e 'targetStack.forAllLeafTasks(c, true /* traverseTopToBottom */);' \
+  -e 'if (config.tasksAreFloating()' \
+  -e 'task.startAnimation(task.getPendingTransaction(), taskAdapter, hidden,' \
+  -e 'task.commitPendingTransaction();' \
+  -e 'mService.mWindowPlacerLocked.performSurfacePlacement();' \
+  frameworks/base/services/core/java/com/android/server/wm/RecentsAnimationController.java
+rg -n -F \
+  -e 'mCapturedLeash = animationLeash;' \
+  -e 'mCapturedFinishCallback = finishCallback;' \
+  -e 'final int mode = topApp.getActivityType() == mTargetActivityType' \
+  frameworks/base/services/core/java/com/android/server/wm/RecentsAnimationController.java
+rg -n -F \
+  -e 'wallpaperController.getWallpaperTarget() != null' \
+  -e 'mPendingStart = false;' \
+  -e 'mRunner.onAnimationStart(mController, appTargets, wallpaperTargets, contentInsets,' \
+  frameworks/base/services/core/java/com/android/server/wm/RecentsAnimationController.java
+rg -n -F \
+  -e 'WALLPAPER_DRAW_PENDING_TIMEOUT_DURATION = 500;' \
+  -e 'mService.getRecentsAnimationController().startAnimation();' \
+  frameworks/base/services/core/java/com/android/server/wm/WallpaperController.java
+rg -n -F \
+  -e 'cancelAnimation(REORDER_MOVE_TO_ORIGINAL_POSITION, "initialize-noVisibleTasks");' \
+  -e 'cancelAnimation(REORDER_MOVE_TO_ORIGINAL_POSITION, "initialize-failedToLinkToDeath");' \
+  frameworks/base/services/core/java/com/android/server/wm/RecentsAnimationController.java
+rg -n -F \
+  -e 'mDefaultTaskDisplayArea.registerStackOrderChangedListener(this);' \
+  frameworks/base/services/core/java/com/android/server/wm/RecentsAnimation.java
 ```
 
-参考：A TOP；B ORIGINAL；C ORIGINAL；D KEEP并等待下一transition/截图清理；E KEEP。
+把 App Task adapter 捕获、schedule、surface placement submit、ready check、500ms wallpaper timeout、wallpaper adapter 创建、oneway start 七点排序；再说明 wallpaper setup 为何没有同样的 submit-before-callback 屏障，以及 initialize 内同步 cancel 为什么仍会留下迟到注册的 stack listener。
 
-## 124. 源码阅读导航
+### 练习 5：逐道打开输入 consumer 的四扇门
 
-```text
-packages/apps/Launcher3/quickstep/src/com/android/quickstep/TaskAnimationManager.java
-packages/apps/Launcher3/quickstep/src/com/android/quickstep/RecentsAnimationCallbacks.java
-packages/apps/Launcher3/quickstep/src/com/android/quickstep/RecentsAnimationController.java
-packages/apps/Launcher3/quickstep/recents_ui_overrides/src/com/android/quickstep/TouchInteractionService.java
-frameworks/base/packages/SystemUI/shared/src/com/android/systemui/shared/system/ActivityManagerWrapper.java
-frameworks/base/packages/SystemUI/shared/src/com/android/systemui/shared/system/InputConsumerController.java
-frameworks/base/core/java/android/view/IRecentsAnimationRunner.aidl
-frameworks/base/core/java/android/view/IRecentsAnimationController.aidl
-frameworks/base/services/core/java/com/android/server/wm/RecentsAnimation.java
-frameworks/base/services/core/java/com/android/server/wm/RecentsAnimationController.java
-frameworks/base/services/core/java/com/android/server/wm/InputMonitor.java
-frameworks/base/services/core/java/com/android/server/wm/Task.java
+```bash
+set -eu
+cd /Users/ninebot/androidSource
+rg -n -F \
+  -e 'monitorGestureInput("swipe-up",' \
+  -e 'mInputConsumer.registerInputConsumer();' \
+  packages/apps/Launcher3/quickstep/recents_ui_overrides/src/com/android/quickstep/TouchInteractionService.java
+rg -n -F \
+  -e 'registerInputConsumer(false);' \
+  -e 'mWindowManager.createInputConsumer(mToken, mName, DEFAULT_DISPLAY, inputChannel);' \
+  -e 'mInputEventReceiver = new InputEventReceiver(inputChannel, Looper.myLooper(),' \
+  -e 'mWindowManager.destroyInputConsumer(mName, DEFAULT_DISPLAY);' \
+  -e 'withSfVsync ? Choreographer.getSfInstance() : Choreographer.getInstance());' \
+  frameworks/base/packages/SystemUI/shared/src/com/android/systemui/shared/system/InputConsumerController.java
+rg -n -F \
+  -e 'jniThrowRuntimeException(env, "InputChannel is not initialized.");' \
+  frameworks/base/core/jni/android_view_InputEventReceiver.cpp
+rg -n -F \
+  -e 'mController.hideCurrentInputMethod();' \
+  -e 'mController.setInputConsumerEnabled(true);' \
+  packages/apps/Launcher3/quickstep/src/com/android/quickstep/RecentsAnimationController.java
+rg -n -F \
+  -e 'mHandler.post(mUpdateInputWindows);' \
+  -e 'mDisplayContent.getPendingTransaction().merge(mInputTransaction);' \
+  -e 'mRecentsAnimationInputConsumer.show(mInputTransaction, w);' \
+  frameworks/base/services/core/java/com/android/server/wm/InputMonitor.java
+rg -n -F \
+  -e 't.setRelativeLayer(mInputSurface, w.getSurfaceControl(), 1);' \
+  frameworks/base/services/core/java/com/android/server/wm/InputConsumerImpl.java
+rg -n -F \
+  -e 'mInputConsumerController.setInputListener(this::onInputConsumerEvent);' \
+  packages/apps/Launcher3/quickstep/recents_ui_overrides/src/com/android/quickstep/util/InputConsumerProxy.java
 ```
 
-## 125. 本章复读后的精确结论
+分别标记 gesture monitor、client registered、server channel、server enabled、InputWindow submitted、proxy listener installed；解释 create 抛 RemoteException 后为何会继续走到 JNI RuntimeException，以及同步 enable 返回时后面哪三层仍可能没完成。
 
-1. Recents Animation把可见Task和目标Home/Recents Task放入SurfaceAnimator leash，Launcher在本地按输入逐帧变换。  
-2. target Activity通过临时栈位置和launch-behind保持“在后方但可绘制”，直到finish才提交真实前台关系。  
-3. InputConsumer在服务启动后预注册，手势中只enable并更新InputWindow，避免中途创建channel打断Motion链。  
-4. 正常finish、即时cancel、延迟cancel和截图交接是不同协议，最终可能TOP、ORIGINAL或KEEP。  
-5. system_server始终保留Task层级、Activity生命周期、leash清理、runner死亡和failsafe的最终控制权。
+### 练习 6：建立 controller 调用线程与结果折叠矩阵
 
-## 126. 检查题
+```bash
+set -eu
+cd /Users/ninebot/androidSource
+rg -n -F \
+  -e 'return mController.screenshotTask(taskId);' \
+  -e 'mController.setDeferCancelUntilNextTransition(defer, screenshot);' \
+  -e 'return mController.removeTask(target.taskId);' \
+  -e 'mController.setAnimationTargetsBehindSystemBars(!useLauncherSysBarFlags);' \
+  -e 'UI_HELPER_EXECUTOR.execute(() -> mController.cleanupScreenshot());' \
+  packages/apps/Launcher3/quickstep/src/com/android/quickstep/RecentsAnimationController.java
+rg -n -F \
+  -e 'return snapshot != null ? new ThumbnailData(snapshot) : new ThumbnailData();' \
+  -e 'return new ThumbnailData();' \
+  -e 'return false;' \
+  frameworks/base/packages/SystemUI/shared/src/com/android/systemui/shared/system/RecentsAnimationControllerCompat.java
+rg -n -F \
+  -e 'return snapshotController.getSnapshot(taskId, 0 /* userId */,' \
+  -e 'task.setCanAffectSystemUiFlags(behindSystemBars);' \
+  -e 'taskAdapter.mTask.setCanAffectSystemUiFlags(true);' \
+  frameworks/base/services/core/java/com/android/server/wm/RecentsAnimationController.java
+```
 
-1. 为什么`IRecentsAnimationController`没有`setProgress()`？  
-2. `mLaunchTaskBehind`与把目标栈移到App后方分别解决什么问题？  
-3. InputConsumer的“registered”和“enabled/visible”有什么区别？  
-4. `finish(true)`为何不仅是结束Animator，还要移动目标栈？  
-5. 延迟取消为什么要等下一AppTransition，截图又解决什么闪烁？  
-6. `REORDER_KEEP_IN_PLACE`与`MOVE_TO_ORIGINAL_POSITION`在真实Task层级上有什么差异？
+给每个 wrapper 标出调用线程，再列出 screenshot 空结果、RemoteException 和 remove false 在 compat 层如何折叠；说明 system-bar cleanup 为什么不是逐 Task 旧值恢复。
 
-## 127. 下一章预告
+### 练习 7：推演 dynamic target 的添加、移除与客户端持有
 
-下一章继续深入Quickstep的数据面：`RemoteAnimationTargets`、TransformParams、TaskViewSimulator与SurfaceParams怎样把手势progress转换为Task leash的矩阵、裁剪、圆角和层级，并与Launcher自身View动画同帧提交。
+```bash
+set -eu
+cd /Users/ninebot/androidSource
+rg -n -F \
+  -e 'final RecentsAnimationController control = mWmService.getRecentsAnimationController();' \
+  -e 'if (control != null) {' \
+  -e 'if (enter) {' \
+  -e 'control.addTaskToTargets(this, (type, anim) -> {' \
+  frameworks/base/services/core/java/com/android/server/wm/Task.java
+rg -n -F \
+  -e 'true /* hidden */, finishedCallback);' \
+  -e 'mPendingNewTaskTargets.add(task.mTaskId);' \
+  -e 'mRunner.onTaskAppeared(target);' \
+  -e 'target.mTask.isOnTop()' \
+  frameworks/base/services/core/java/com/android/server/wm/RecentsAnimationController.java
+rg -n -F \
+  -e 'mController.removeTaskTarget(mLastAppearedTaskTarget);' \
+  -e 'mLastAppearedTaskTarget = appearedTaskTarget;' \
+  packages/apps/Launcher3/quickstep/src/com/android/quickstep/TaskAnimationManager.java
+rg -n -F \
+  -e 'for (RemoteAnimationTargetCompat target : unfilteredApps) {' \
+  -e 'for (RemoteAnimationTargetCompat target : wallpapers) {' \
+  packages/apps/Launcher3/quickstep/src/com/android/quickstep/RemoteAnimationTargets.java
+```
+
+构造 target 创建返回 null、appeared oneway 失败、旧 appeared Task 不在 top 三条路径，分别更新 server adapter、new-id、runner seen、client last-target 四本账；再检查动态 target 是否进入初始数组的 release 循环。
+
+### 练习 8：区分客户端 finish、三种重排与 Surface 提交
+
+```bash
+set -eu
+cd /Users/ninebot/androidSource
+rg -n -F \
+  -e 'mOnFinishedListener.accept(this);' \
+  -e 'mController.finish(toRecents, sendUserLeaveHint);' \
+  -e 'MAIN_EXECUTOR.execute(callback);' \
+  packages/apps/Launcher3/quickstep/src/com/android/quickstep/RecentsAnimationController.java
+rg -n -F \
+  -e 'mCallbacks.onAnimationFinished(moveHomeToTop' \
+  -e '? REORDER_MOVE_TO_TOP' \
+  -e ': REORDER_MOVE_TO_ORIGINAL_POSITION, sendUserLeaveHint);' \
+  frameworks/base/services/core/java/com/android/server/wm/RecentsAnimationController.java
+rg -n -F \
+  -e 'mWindowManager.inSurfaceTransaction(() -> {' \
+  -e 'mWindowManager.cleanupRecentsAnimation(reorderMode);' \
+  -e 'targetStack.moveTaskToFront(targetActivity.getTask(),' \
+  -e 'taskDisplayArea.moveStackBehindStack(targetStack,' \
+  -e 'if (mWindowManager.mRoot.isLayoutNeeded()) {' \
+  frameworks/base/services/core/java/com/android/server/wm/RecentsAnimation.java
+rg -n -F \
+  -e 'reset(mAnimatable.getPendingTransaction(), true /* destroyLeash */);' \
+  frameworks/base/services/core/java/com/android/server/wm/SurfaceAnimator.java
+rg -n -F \
+  -e 'SurfaceControl.mergeToGlobalTransaction(transaction);' \
+  frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+rg -n -F \
+  -e 'if (hasChanges || mDeferredRequests > 0) {' \
+  -e 'performSurfacePlacement();' \
+  frameworks/base/services/core/java/com/android/server/wm/WindowSurfacePlacer.java
+rg -n -F \
+  -e 'commitTransaction();' \
+  frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp
+rg -n -F \
+  -e 'result.presentFence = hwc.getPresentFence(*mId);' \
+  frameworks/native/services/surfaceflinger/CompositionEngine/src/Display.cpp
+```
+
+为“本地 finished 已投递”“同步 Binder 已返回”“reset 已写 pending”“pending 已 merge”“SF 已 commit”“HWC 已 present”各写一个独立观察条件，并解释为何前三者不能替代后三者。
+
+### 练习 9：闭合 cancel、power failsafe 与 screenshot hold
+
+```bash
+set -eu
+cd /Users/ninebot/androidSource
+rg -n -F \
+  -e 'final Task task = mPendingAnimations.get(0).mTask;' \
+  -e 'mRunner.onAnimationCanceled(taskSnapshot);' \
+  -e 'mRecentScreenshotAnimator.transferAnimation(task.mSurfaceAnimator);' \
+  -e 'mRecentScreenshotAnimator.cancelAnimation();' \
+  -e 'cancelAnimation(REORDER_MOVE_TO_ORIGINAL_POSITION, "binderDied");' \
+  -e 'mService.mH.removeCallbacks(mFailsafeRunnable);' \
+  -e 'mDisplayContent.mAppTransition.unregisterListener(this);' \
+  -e 'if (mCancelOnNextTransitionStart) {' \
+  -e 'mCancelOnNextTransitionStart = true;' \
+  frameworks/base/services/core/java/com/android/server/wm/RecentsAnimationController.java
+rg -n -F \
+  -e 'mHandler.post(mWindowManagerFuncs::triggerAnimationFailsafe);' \
+  frameworks/base/services/core/java/com/android/server/policy/PhoneWindowManager.java
+rg -n -F \
+  -e 'mRecentsAnimationController.scheduleFailsafe();' \
+  frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+rg -n -F \
+  -e 'activityInterface.switchRunningTaskViewToScreenshot(thumbnailData,' \
+  -e 'mController.cleanupScreenshot();' \
+  packages/apps/Launcher3/quickstep/src/com/android/quickstep/TaskAnimationManager.java
+rg -n -F \
+  -e 'ACTIVITY_TYPE activity = getCreatedActivity();' \
+  -e 'if (activity == null) {' \
+  -e 'recentsView.switchToScreenshot(thumbnailData, runnable);' \
+  packages/apps/Launcher3/quickstep/src/com/android/quickstep/BaseActivityInterface.java
+rg -n -F \
+  -e 'if (from.mLeash == null) {' \
+  -e 'if (surface == null || parent == null) {' \
+  -e 'if (animation != null) {' \
+  frameworks/base/services/core/java/com/android/server/wm/SurfaceAnimator.java
+```
+
+先说明无关 transition 如何提前消费一次性 listener；再推演 snapshot null、snapshot non-null 后正常 cleanup、transfer 早退、回调发送失败、runner 随后死亡、Launcher Activity 为 null 六条路径，对每条标明谁还能触发最终 server finish，以及哪条没有本地 timeout。
+
+## 16. 用会话矩阵收口，并把逐帧几何留给第 225 章
+
+| 现象 | 第一证据点 | 常见误判 | 下一步 |
+|---|---|---|---|
+| 手势状态长期只有 initialized | ATMS 是否收到 start、runner 是否有 callback | initialized 等于 server 已接受 | 查 UI helper 异常与 null result callback |
+| 新手势拿到旧 targets | 两次 start 的 Binder 句柄与 callback 时刻 | manager 字段天然有 generation | 按请求代际重建 MAIN/helper 队列 |
+| 新会话运行但 caller 没有 Recents 标志 | WPC boolean 的 true/false 更新 | 每个 controller 都独立引用计数 | 查同 caller 替换时旧 cleanup 写 false |
+| ORIGINAL 后 Task 顺序变化 | stack restore anchor 与 Task index | ORIGINAL 是完整回滚 | 查启动阶段 `positionChildAtTop()` |
+| runner 收到 start，首帧却仍不对 | target 类型、setup submit 与 SF latch | 所有初始 target 都有 callback 前提交屏障 | 分开查 App Task 与 wallpaper transaction |
+| 输入 consumer 显示 registered 却无事件 | 四道门、目标 main window、listener | 注册就等于接管 | 分别查 server enabled、InputWindow 与 proxy |
+| enable 返回后首个事件仍给 App | InputMonitor Handler 与 transaction submit | 同步 Binder 会同步刷新 InputDispatcher | 对齐 input-window 更新帧和既有 touch focus |
+| 动态 Task callback 后黑一下 | hidden leash setup 是否 merge | appeared 保证 Surface 已 show | 查 dynamic add 的 pending transaction |
+| 旧动态 target 未移除 | `isOnTop()` 返回值与 server pending list | client 调 remove 就一定成功 | 记录 boolean，并等全局 cleanup |
+| 客户端 finished 后 server 仍 active | local listener 与 helper Binder 队列 | 本地 cleanup 是远端确认 | 查 compat RemoteException 与 ATMS finish |
+| finish 返回但 leash 仍在 trace 中 | SurfaceAnimator pending 与下一次 placement | 同步返回等于 remove 已提交 | 查 pending merge 和 SF hierarchy commit |
+| power key 后才出现 1 秒 cancel | `ANIMATION_FAILSAFE` 消息 | controller 初始化自带 timeout | 还原 power-key up 触发条件 |
+| cancel(null) UI 与 server cleanup 顺序漂移 | runner oneway 与 cancel 锁内 callback | runner 一定先收尾 UI | 分别采 Launcher Binder 与 WMS trace |
+| 非空 snapshot 后永久卡住 | canceled、screenshot animator、cleanup call | runner death 会自动 finish | 查 Activity-null runnable、Binder death 和 failsafe gate |
+| client Surface 引用数量增长 | 初始数组 release 与 appeared target 引用 | server remove 会释放 client handle | 单独审计动态 target 的 release 所有权 |
+
+推荐按六条执行线读 trace：Launcher MAIN 负责 listener、手势状态、本地清理与部分直接 apply；UI helper 负责 start、finish 与部分控制调用；Launcher Binder 线程负责 target 包装；有 applier 时 Launcher RT 负责对齐帧的 transaction apply；system_server Binder/global-lock 路径负责 controller 与 Task 层级；WMS AnimationThread、SurfaceFlinger 和 HWC 负责 pending merge 到 present。把这些线折成一条“动画线程”，几乎一定会把因果关系写反。
+
+本章最终可保留五条不变量：
+
+1. initialized、started、controller finished、server cleaned、frame presented 是五个不同事实；
+2. runner 通知是 oneway，controller 控制是同步 Binder，但同步返回不越过异步 transaction；
+3. 初始 App Task 有固定成功路径的 setup-before-callback；wallpaper 与 dynamic target 都没有同样强的提交边界；
+4. TOP、ORIGINAL、KEEP 选择 Task/stack 收口策略，ORIGINAL 不承诺还原所有临时改动；
+5. 非空 screenshot cancel 把 liveness 责任交给 runner，`cleanupScreenshot()` 是协议必需项，不是可选释放优化。
+
+第 225 章将在这套控制边界之上继续追 `TransformParams`、`TaskViewSimulator`、matrix/crop/corner-radius、orientation 与 `SurfaceTransactionApplier`：那里回答的是“Launcher 怎样计算并提交每一帧”，而本章回答的是“哪些 Surface 可控、输入何时改道、会话怎样真正结束”。

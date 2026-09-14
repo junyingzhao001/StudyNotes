@@ -1,863 +1,423 @@
 # 258 Android PackageInstaller用户确认、InstallStart、未知来源授权与安装UI回传链
 
-## 1. 本章目标
+本章源码基线是 Android 11 / API 30 / `android-11.0.0_r48`。最容易误判的现场不是“安装按钮在哪”，而是安装器已经收到 `STATUS_PENDING_USER_ACTION`，用户又在 Settings 打开“允许来自此来源”，界面随后消失，却迟迟没有安装成功。这里至少有三本互不替代的账：来源应用有没有资格请求安装、用户是否同意当前 APK、PMS 是否最终提交包事实。
 
-本章回答一个看似简单、实际有三层状态的问题：应用提交APK后，为什么有时立刻安装，有时先收到`STATUS_PENDING_USER_ACTION`，又有时先跳到“允许来自此来源的应用”设置页？
+本章沿一次真实请求回答：已有 `PackageInstaller.Session`与直接打开 APK URI 为什么走不同入口；system_server为什么把确认 Intent装进状态回调而不直接弹窗；`InstallStart`怎样重建来源身份；用户限制、AppOp和 Settings开关怎样串联；点击同意后又由谁接住最终结果。读完应能只凭 sessionId、installId、public status、legacy status和 Activity result，判断请求停在哪一层。
 
-读完后，你应该能从`PackageInstaller.Session.commit()`一路追到系统安装确认界面，再把用户同意、拒绝和最终安装成功/失败三个回程分开。
+除专门讨论的分支外，Session主线限定为 single-package、non-staged、非 APEX、文件已完整落入 stage的普通 APK。multi、staged与重启边界放在第15节；DataLoader的 `STATUS_PENDING_STREAMING`已在第257章完成，不把它硬塞进本章确认状态机。
 
-## 2. 先记住最终结论
+## 1. 两个“允许”和一个“成功”为什么不能合并
 
-Android 11中至少要区分三件事：
+先把三个问题分开：
 
-1. “该来源能否请求安装”由`REQUEST_INSTALL_PACKAGES`声明、AppOp和用户限制共同控制。
-2. “用户是否同意安装这一个APK”由PackageInstaller确认界面控制。
-3. “APK最终是否安装成功”由Session重新推进后PMS的验证与提交结果决定。
+1. 来源允许：对普通具名未知来源，发起者是否声明了 `REQUEST_INSTALL_PACKAGES`，用户限制是否放行，它的 `OP_REQUEST_INSTALL_PACKAGES`是否为 ALLOWED；trusted旁路与 anonymous兼容分支另算。
+2. 本次确认：用户是否接受这一份已能解析身份的 APK；已有 Session用 `mPermissionsManuallyAccepted`记住本次回答。
+3. 安装终局：PMS后续的 verifier、prepare、scan、reconcile和 commit是否成功。
 
-前两项通过，也不代表第三项必然成功。
+`REQUEST_INSTALL_PACKAGES`不是 `INSTALL_PACKAGES`。前者是 app-op permission的请求资格，InstallStart读取的是声明关系，Settings开关改的是 AppOp；后者是 signature/privileged级系统安装能力，也是 r48 服务端 `setPermissionsResult()`的调用能力。来源 AppOp变成 ALLOWED不会让第三方安装器获得静默安装权，用户点击“安装”也不会一次性批准目标 APK声明的危险权限。
 
-## 3. 两条入口不能混为一谈
+同样，`STATUS_PENDING_USER_ACTION=-1`不是负数意义上的失败，而是非终态：“调用方现在应在合适的前台时机启动 `Intent.EXTRA_INTENT`。”只有 `STATUS_SUCCESS`或某个 `STATUS_FAILURE_*`才是本次 PackageInstaller操作的公开终局。
 
-第一条是Session入口：应用商店创建并写好Session，`commit()`后framework发现需要人工确认，于是把一个确认Intent放进状态回调。
+## 2. 两条入口先分叉，身份、数据与结果也随之分叉
 
-第二条是APK URI入口：文件管理器用`ACTION_VIEW`或`ACTION_INSTALL_PACKAGE`打开APK，系统PackageInstaller先做来源与确认UI，再由`InstallInstalling`新建自己的Session并提交。
+系统 PackageInstaller应用同时承接两类请求：
 
-## 4. 本章源码地图
+| 维度 | 已有 Session确认 | APK URI入口 |
+|---|---|---|
+| 到达 `InstallStart`前 | installer已创建、写入、seal并本地验证 Session | 调用方只有 `content:`或 `package:` URI |
+| 外部动作 | framework经 status receiver交出 `ACTION_CONFIRM_INSTALL` | `ACTION_VIEW`或 `ACTION_INSTALL_PACKAGE` |
+| 用户点同意 | `setPermissionsResult(sessionId, true)`，原 Session继续 | `file:`快照进入 `InstallInstalling`新建特权 Session；`package:`走已有包安装 |
+| 字节所有权 | 原 Session stage | `content:`先复制到安装器私有临时文件，再复制进新 Session |
+| 结果通道与可信度 | 派发时快照的 `mRemoteStatusReceiver`是 Session结果通道；满足前置条件且在快照前再次 `commit()`才可换 receiver | `content:`/内部 `file:`用 installId匹配的包限定广播；`package:`的权威 int被 r48 UI丢弃，随后 UI结果不可信 |
 
-```text
-frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
-frameworks/base/services/core/java/com/android/server/pm/PackageInstallerService.java
-frameworks/base/core/java/android/content/pm/PackageInstaller.java
-frameworks/base/packages/PackageInstaller/AndroidManifest.xml
-frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
-frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStaging.java
-frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
-frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallInstalling.java
-frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/EventResultPersister.java
-packages/apps/Settings/src/com/android/settings/applications/appinfo/ExternalSourcesDetails.java
-```
+共有路线可以压缩为：来源身份整理 → 来源限制/AppOp → 当前 APK确认 →〔原 Session继续｜创建系统安装器 Session｜调用已有包恢复 API〕→ PMS结果。两类外部入口会经过同一个确认 Activity，但后半程实际有三支，不能因此把它们画成同一个 Session。
 
-## 5. 进程与线程地图
-
-```text
-第三方安装器进程：创建/写入/提交Session，接收IntentSender状态
-system_server PackageInstaller线程：验证Session、判断是否需确认、继续安装
-com.android.packageinstaller主线程：InstallStart与确认/进度/结果Activity
-com.android.packageinstaller AsyncTask线程：复制content URI或APK到Session
-com.android.settings主线程：修改来源包的REQUEST_INSTALL_PACKAGES AppOp
-```
-
-## 6. 总体架构图
-
-```mermaid
-flowchart TD
-    A["第三方安装器<br/>Session.commit"] --> B["system_server<br/>PackageInstallerSession"]
-    B --> C{"需要用户确认?"}
-    C -- "否" --> PMS["PMS installStage"]
-    C -- "是" --> CB["STATUS_PENDING_USER_ACTION<br/>EXTRA_INTENT"]
-    CB --> IS["PackageInstaller InstallStart"]
-    IS --> SRC{"来源允许?"}
-    SRC -- "否" --> SET["Settings<br/>每来源AppOp"]
-    SET --> UI["PackageInstallerActivity<br/>本次APK确认"]
-    SRC -- "是" --> UI
-    UI -- "同意" --> SPR["setPermissionsResult(true)"]
-    SPR --> B
-    UI -- "拒绝" --> ABORT["Session失败<br/>INSTALL_FAILED_ABORTED"]
-    PMS --> RESULT["最终status回原IntentSender"]
-```
-
-## 7. 三道门的直观比喻
-
-可以把它想成进入机房：
-
-- 来源授权是“这个快递员是否有资格送件”。
-- 安装确认是“这一次送来的箱子你是否接收”。
-- PMS最终安装是“安检、称重、登记后能否真正入库”。
-
-只拿到快递员通行证，不能替代对具体箱子的确认和安检。
-
-## 8. framework在哪里决定需要确认
-
-入口是`PackageInstallerSession.makeSessionActiveLocked()`。非APEX、非multi-package父Session在进入`installStage`前，会调用`needToAskForPermissionsLocked()`。
-
-它判断的是安装器身份是否具备静默安装资格，不是在此处重新计算APK请求的运行时权限。
-
-## 9. 静默安装权限矩阵
-
-`needToAskForPermissionsLocked()`检查：
-
-- `INSTALL_PACKAGES`；
-- 更新现有包时的`INSTALL_PACKAGE_UPDATES`；
-- 安装器更新自身时的`INSTALL_SELF_UPDATES`；
-- root或system UID；
-- Device Owner或affiliated Profile Owner；
-- `INSTALL_FORCE_PERMISSION_PROMPT`强制提示位。
-
-普通第三方安装器即使能创建Session，通常仍要用户确认。
-
-## 10. `INSTALL_PACKAGES`与`REQUEST_INSTALL_PACKAGES`不是同一权限
-
-`INSTALL_PACKAGES`是`signature|privileged`的真正静默安装能力，普通第三方App拿不到。
-
-`REQUEST_INSTALL_PACKAGES`表示“可以请求用户安装”，还要结合AppOp和UI；它不是把第三方App升级成静默安装器。
-
-## 11. 更新权限只覆盖特定目标
-
-`INSTALL_PACKAGE_UPDATES`只有在目标包已经存在时才算满足；`INSTALL_SELF_UPDATES`只有目标包UID等于安装器UID时才满足。
-
-所以“具备有限更新权限”不能被理解为可静默安装任意新包。
-
-## 12. targetPackageUid何时参与
-
-Session此前已经解析出`mPackageName`，这里用目标user查询现有包UID。返回-1意味着是新安装，不满足“更新现有包”的条件。
-
-这一步发生在Session内容验证之后，而不是createSession刚创建空目录时。
-
-## 13. Device Owner例外还有用户约束
-
-`isInstallerDeviceOwnerOrAffiliatedProfileOwnerLocked()`先要求Session user与安装器UID所属user相同，再让`DevicePolicyManagerInternal`判断能否静默安装。
-
-跨用户安装不能仅凭另一个用户里的Device Owner身份绕过确认。
-
-## 14. 强制提示优先级最高
-
-即使安装器持有静默权限，只要`INSTALL_FORCE_PERMISSION_PROMPT`被保留，返回值仍是“需要询问”。
-
-因此“有`INSTALL_PACKAGES`就永远不显示UI”并不准确。
-
-## 15. 人工接受位防止重复询问
-
-Session字段`mPermissionsManuallyAccepted`初始为false。用户同意后置true，再次执行`needToAskForPermissionsLocked()`便立即返回false。
-
-它只记录本Session当前system_server进程中的确认结果，不会授予安装器永久静默安装权限。r48没有把这个字段写进`install_sessions.xml`；若尚未终结的Session跨system_server/设备重启恢复，不能假设这次内存确认仍被保留。
-
-## 16. 提示发生前APK已经过初步验证
-
-`makeSessionActiveLocked()`要求Session sealed，并检查`mPackageName`、`mSigningDetails`和`mResolvedBaseFile`非空。
-
-因此确认页面对的是已能解析出身份的Session，不是任意未封口字节流。
-
-## 17. framework构造的确认Intent
-
-核心代码可以压缩为：
-
-```java
-Intent intent = new Intent(PackageInstaller.ACTION_CONFIRM_INSTALL);
-intent.setPackage(mPm.getPackageInstallerPackageName());
-intent.putExtra(PackageInstaller.EXTRA_SESSION_ID, sessionId);
-sendOnUserActionRequired(context, statusReceiver, sessionId, intent);
-```
-
-`setPackage`把处理范围限制到系统配置的PackageInstaller包，但最终由其中的Intent Filter解析到`InstallStart`。
-
-## 18. 状态回调是一个“信封”
-
-framework不会直接从system_server启动UI，而是向安装器提供的`IntentSender`发送：
-
-```text
-EXTRA_SESSION_ID = 当前Session
-EXTRA_STATUS = STATUS_PENDING_USER_ACTION
-Intent.EXTRA_INTENT = 真正的ACTION_CONFIRM_INSTALL Intent
-```
-
-外层Intent是状态；内层Intent才是安装器应在合适时机展示的用户操作。
-
-## 19. 为什么不由system_server强行弹界面
-
-API文档允许安装器根据前台状态决定立即启动，或先发通知引导用户回来。
-
-这样避免后台安装请求突然抢占用户界面，也让应用商店能管理自己的交互节奏。
-
-## 20. `STATUS_PENDING_USER_ACTION`不是失败
-
-值虽然是-1，但它是“暂停等待用户操作”的公开状态，不是`STATUS_FAILURE`。
-
-Session已经sealed，仍可在用户同意后继续；调用方不能把所有非零status都当作终态。
-
-## 21. 等待确认时为何关闭一次active引用
-
-发送用户操作后，Session调用`closeInternal(false)`，释放commit保持的额外active引用，使Session对观察者表现为空闲。
-
-它没有销毁stage，也没有撤销sealed状态。
-
-## 22. 接受确认的Binder入口
-
-确认UI调用`PackageInstaller.setPermissionsResult(sessionId, true)`，再跨`IPackageInstaller`到`PackageInstallerService.setPermissionsResult()`。
-
-服务端要求调用者具有`INSTALL_PACKAGES`，所以第三方安装器不能自行伪造“用户已点同意”。
-
-## 23. 为什么系统确认UI能回传
-
-`com.android.packageinstaller`的Manifest声明`INSTALL_PACKAGES`，它是平台系统组件，能通过服务端权限检查。
-
-安全模型不是“知道sessionId即可批准”，而是“受信任系统UI持权限并代用户回传”。
-
-## 24. 用户同意后的第二轮安装
-
-`setPermissionsResult(true)`在锁内将`mPermissionsManuallyAccepted=true`，向Session Handler发送`MSG_INSTALL`。
-
-第二轮再次走`makeSessionActiveLocked()`，确认门这次放行，然后才继承文件、提取native库并进入PMS。
-
-## 25. 用户拒绝的终态
-
-`setPermissionsResult(false)`会`destroyInternal()`，再以`INSTALL_FAILED_ABORTED`和“User rejected permissions”结束Session。
-
-安装器的原始`IntentSender`随后收到公开的失败状态，而不是只依赖Activity的`RESULT_CANCELED`。
-
-## 26. “返回键”也是明确拒绝
-
-当`PackageInstallerActivity`处理Session确认时，`onBackPressed()`会先调用`setPermissionsResult(false)`。
-
-确认页上的取消按钮也走false，因此这两条路径会真正终结Session。
-
-## 27. 并非所有关闭UI都等于拒绝Session
-
-未知来源限制、Settings返回非OK或某些错误Dialog只是`finish()`，未必调用`setPermissionsResult(false)`。
-
-r48中这种情况下Session可能仍保持sealed并等待后续处理；安装器应观察状态并提供重试或放弃入口，不能只看确认Activity是否消失。
-
-## 28. 最终回调仍使用原IntentSender
-
-用户同意不会更换`mRemoteStatusReceiver`。PMS完成后，Session仍把`EXTRA_STATUS`、`EXTRA_LEGACY_STATUS`、包名和消息送回commit时的接收器。
-
-所以确认UI只是中途控制点，不是最终结果拥有者。
-
-## 29. Session确认时序图
-
-```mermaid
-sequenceDiagram
-    participant Store as 第三方安装器
-    participant S as PackageInstallerSession
-    participant PI as 系统PackageInstaller UI
-    participant PMS as PackageManagerService
-    Store->>S: commit(statusReceiver)
-    S->>S: seal + validate
-    S-->>Store: STATUS_PENDING_USER_ACTION + EXTRA_INTENT
-    Store->>PI: startActivity(EXTRA_INTENT)
-    PI->>PI: 来源限制/AppOp/本次APK确认
-    alt 用户同意
-        PI->>S: setPermissionsResult(true)
-        S->>S: MSG_INSTALL再次推进
-        S->>PMS: installStage
-        PMS-->>S: legacy install result
-        S-->>Store: 最终公开status
-    else 用户拒绝本次安装
-        PI->>S: setPermissionsResult(false)
-        S-->>Store: STATUS_FAILURE_ABORTED
-    end
-```
-
-## 30. `InstallStart`是导流Activity
-
-Manifest把它导出，并注册三组入口：
-
-- APK content URI的`ACTION_VIEW`；
-- `ACTION_INSTALL_PACKAGE`；
-- framework内部`ACTION_CONFIRM_INSTALL`。
-
-它使用透明主题，主要负责身份核验和选择下一个非导出Activity。
-
-## 31. 真正确认页为何不导出
-
-`PackageInstallerActivity`、`InstallStaging`和`InstallInstalling`均`exported=false`。
-
-外部调用统一经过`InstallStart`，避免攻击者跳过来源身份整理，直接构造内部字段进入确认或安装阶段。
-
-## 32. 如何识别Session入口
-
-`InstallStart`只用action是否为`ACTION_CONFIRM_INSTALL`判断：
-
-```java
-boolean isSessionInstall =
-        PackageInstaller.ACTION_CONFIRM_INSTALL.equals(intent.getAction());
-int sessionId = isSessionInstall
-        ? intent.getIntExtra(PackageInstaller.EXTRA_SESSION_ID, -1) : -1;
-```
-
-不要用URI是否为空来判断Session路径。
-
-## 33. Session入口如何找安装器包名
-
-从状态回调启动UI时，`getCallingPackage()`可能为空。`InstallStart`会读取`SessionInfo.getInstallerPackageName()`补回callingPackage。
-
-来源判断因此绑定到Session记录的installer身份，而不是随便相信Intent中的字符串。
-
-## 34. 普通APK Intent的callingPackage
-
-如果Activity以可追踪方式启动，`getCallingPackage()`可提供调用包；否则代码会进一步向ActivityManager查询`getLaunchedFromUid(activityToken)`。
-
-包名和UID是两类信息：包名用于展示/挑选shared UID包，UID用于权限与AppOp。
-
-## 35. originating UID为什么敏感
-
-Intent可携带`EXTRA_ORIGINATING_UID`，但普通调用者能伪造extra。
-
-因此`InstallStart.getOriginatingUid()`默认不用它，而使用真实launching UID。
-
-## 36. 只有两类中转者可转交原UID
-
-持有`MANAGE_DOCUMENTS`的文档管理器，或系统Downloads Provider，可以把Intent里的originating UID传递下去。
-
-这是因为它们本来就是代表其他App选择/下载文件的可信中转者。
-
-## 37. Downloads Provider还要核对系统身份
-
-代码解析authority为`downloads`的Provider，要求其ApplicationInfo是system app且UID匹配。
-
-同名普通Provider不能仅靠占用authority获得信任。
-
-## 38. shared UID下targetSdk取最大值
-
-`getMaxTargetSdkVersionForUid()`遍历该UID的全部包并取最大targetSdk。
-
-只要共享UID里有面向O及以上的包，就进入新来源声明规则；这比只看任意一个包更保守。
-
-## 39. Android O起必须声明请求安装权限
-
-当originating UID可确定且最大targetSdk至少26时，`InstallStart`要求该UID对应的某个包声明`REQUEST_INSTALL_PACKAGES`。
-
-没有声明就直接取消导流，不进入未知来源设置或安装确认。
-
-## 40. 这里检查的是“声明”而非AppOp已允许
-
-`declaresAppOpPermission()`查询PermissionManager的app-op permission packages，再和各用户中的package UID比较。
-
-永久允许状态稍后由`OP_REQUEST_INSTALL_PACKAGES`判断；声明与用户开关是两道不同条件。
-
-## 41. `canRequestPackageInstalls()`的对应关系
-
-公开API会检查调用包归属、targetSdk至少O、非instant app、声明`REQUEST_INSTALL_PACKAGES`、用户限制以及ExternalSourcesPolicy。
-
-ExternalSourcesPolicy在r48由AppOpsService提供，只有AppOp为`MODE_ALLOWED`才返回true。
-
-## 42. 默认AppOp为何不是“默认允许”
-
-`OP_REQUEST_INSTALL_PACKAGES`的系统默认模式是`MODE_DEFAULT`。确认Activity首次遇到它时，会主动改为`MODE_ERRORED`并显示阻止Dialog。
-
-所以“Manifest写了权限，首次就能直接安装”是错误理解。
-
-## 43. trusted source旁路很窄
-
-只有sourceInfo是privileged app，并且Intent显式带`EXTRA_NOT_UNKNOWN_SOURCE=true`，`InstallStart`才跳过O以后来源包的`REQUEST_INSTALL_PACKAGES`声明门，后续确认Activity也才跳过未知来源AppOp门。
-
-普通App即使伪造同名extra，也会因缺少`PRIVATE_FLAG_PRIVILEGED`而失败。
-
-## 44. trusted只旁路“来源门”
-
-它不会自动替用户点击本次APK的“安装”按钮。直接APK入口仍会显示新装/更新确认；Session是否无需确认则由framework的静默权限矩阵决定。
-
-不要把`EXTRA_NOT_UNKNOWN_SOURCE`解释成全链路静默安装开关。
-
-## 45. `FLAG_ACTIVITY_FORWARD_RESULT`的作用
-
-`InstallStart`把结果转交给下一个Activity，并保留read URI grant。
-
-这样多层导流结束后，最初用`startActivityForResult`的调用者仍可收到结果，而透明trampoline自己立即finish。
-
-## 46. content URI为什么先进入`InstallStaging`
-
-源码明确把这条路径标为deprecated兼容路径，但仍会把内容复制到PackageInstaller自己的临时文件。
-
-原因是外部ContentProvider中的字节可能在解析与安装间被修改，内部副本提供稳定快照。
-
-## 47. 临时文件放在哪里
-
-`TemporaryFileManager.getStagedFile()`在PackageInstaller的device-protected no-backup目录创建`package*.apk`。
-
-它不是PMS最终`/data/app` code path，只是UI流程的可信输入副本。
-
-## 48. 复制发生在后台线程
-
-`InstallStaging.StagingAsyncTask`用ContentResolver打开输入流，以1 MiB缓冲写临时文件，并在取消时尽快停止。
-
-主线程只展示staging进度视图，避免直接阻塞Activity。
-
-## 49. staged副本怎样清理
-
-复制成功后进入`DeleteStagedFileOnResult`，它以`startActivityForResult`打开确认页，回程时删除临时APK。
-
-此外BOOT_COMPLETED会清理本次启动之前遗留在no-backup目录中的旧文件。
-
-## 50. `package:` URI不是APK字节
-
-如果scheme是`package`，`PackageInstallerActivity`通过包名查询已存在但可能未对当前用户安装的包；后续`InstallInstalling`调用`installExistingPackage()`。
-
-它与从content/file读取新APK是两套数据来源。
-
-## 51. 不支持的URI怎样结束
-
-`InstallStart`只接受预期的content或package分支；其他情况返回`INSTALL_FAILED_INVALID_URI`。
-
-内部确认页只处理经过导流后生成的file或package URI，不是一个通用URI解析器。
-
-## 52. Session确认页从哪里取得APK
-
-`PackageInstallerActivity`读取SessionInfo，要求Session存在、sealed且`resolvedBaseCodePath`非空，再把该路径包装成内部file URI解析图标与包信息。
-
-它不是重新从第三方安装器取得原始content URI。
-
-## 53. SessionInfo校验不是最终安全验证
-
-UI只确认状态足以展示；真正签名、版本、split与安装冲突裁决仍在Session/PMS链路。
-
-图标或label能显示，不代表APK已满足所有安装规则。
-
-## 54. Wear设备的r48限制
-
-手持式PackageInstallerActivity检测`DeviceUtils.isWear()`后显示不支持Dialog。
-
-Wear有独立安装服务路径，本章的手持确认UI不能直接套到手表流程。
-
-## 55. UI先解析PackageInfo
-
-file URI调用`PackageUtil.getPackageInfo()`读取Manifest与权限元数据；解析失败显示Parse error并设置legacy invalid APK结果。
-
-`package:`则查询现有PackageInfo与图标。
-
-## 56. 来源包名与目标包名绝不能混
-
-`mOriginatingPackage`表示“谁发起安装”；`mPkgInfo.packageName`表示“正在安装谁”。
-
-未知来源AppOp记在前者，更新/新装确认展示的是后者。
-
-## 57. shared UID来源包怎样选
-
-`getPackagesForUid()`若返回多个包，代码优先选择等于`mCallingPackage`的那一个；找不到时记录日志并取数组第一项。
-
-因此UID是安全主体，但AppOp仍按uid+packageName键记录，包名选择会影响设置页展示。
-
-## 58. 第一层用户限制：禁止安装任何App
-
-`checkIfAllowedAndInitiateInstall()`先检查`DISALLOW_INSTALL_APPS`。
-
-系统基础限制显示错误；设备管理员限制跳转Admin Support详情。它比未知来源AppOp更早执行。
-
-## 59. 第二层限制：禁止未知来源
-
-随后分别检查`DISALLOW_INSTALL_UNKNOWN_SOURCES`和`DISALLOW_INSTALL_UNKNOWN_SOURCES_GLOBALLY`。
-
-局部与全局限制的管理员来源分开处理，系统基础限制则直接显示不可用。
-
-## 60. 用户限制与AppOp不是同一本账
-
-AppOp允许某来源，不会覆盖DevicePolicy/UserManager限制；反过来，未设置用户限制也不等于AppOp已经允许。
-
-`canRequestPackageInstalls()`与确认Activity都会组合这些条件。
-
-## 61. 来源未知时的r48兼容处理
-
-若无法得到`mOriginatingPackage`，r48显示Anonymous Source警告，并允许用户选择继续。
-
-这不是永久授予某个包AppOp，因为系统连来源包名都没有；它只给当前Activity设置`mAllowUnknownSources`。
-
-## 62. 已知来源进入AppOp判断
-
-核心分支是：
-
-```java
-int mode = appOps.noteOpNoThrow(OP_REQUEST_INSTALL_PACKAGES,
-        mOriginatingUid, mOriginatingPackage);
-switch (mode) {
-    case MODE_DEFAULT: setMode(..., MODE_ERRORED); // fall through
-    case MODE_ERRORED: show blocked dialog; break;
-    case MODE_ALLOWED: initiateInstall(); break;
-}
-```
-
-它既记录一次请求，也取得当前用户选择。
-
-## 63. 为什么把DEFAULT写成ERRORED
-
-未选择与明确禁止最终都不能放行。写成ERRORED让后续Settings列表能把它识别为潜在来源，并明确显示“不允许”。
-
-这也是`AppStateInstallAppsBridge.isPotentialAppSource()`会接受非DEFAULT项的原因。
-
-## 64. 其他AppOp mode怎样处理
-
-r48这里只接受DEFAULT、ERRORED和ALLOWED。若出现IGNORED等其他模式，代码记error并finish。
-
-所以不能按通用AppOps经验假设“任何非errored都等于允许”。
-
-## 65. 被阻止时打开哪个Settings页
-
-Dialog构造`Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES`，data为`package:<originatingPackage>`，通过`startActivityForResult`启动。
-
-带package scheme时，Settings解析到单个应用的`ExternalSourcesDetails`，不是所有来源App列表。
-
-## 66. Settings页展示资格
-
-`AppStateInstallAppsBridge`同时记录该包是否声明`REQUEST_INSTALL_PACKAGES`以及当前AppOp mode。
-
-没有声明且仍是DEFAULT的普通App不是有效潜在来源，开关会被禁用。
-
-## 67. 开关真正修改什么
-
-`ExternalSourcesDetails.setCanInstallApps()`写：
-
-```java
-appOps.setMode(OP_REQUEST_INSTALL_PACKAGES, uid, packageName,
-        allowed ? MODE_ALLOWED : MODE_ERRORED);
-```
-
-它没有调用`grantRuntimePermission`，也没有授予`INSTALL_PACKAGES`。
-
-## 68. 关闭来源权限为何kill UID
-
-用户把开关关掉时，Settings对非core UID调用`ActivityManager.killUid()`。
-
-这样来源App正在运行的安装流程不能继续沿用旧状态；core UID则被保护，不执行kill。
-
-## 69. Settings如何把“刚允许”返回确认页
-
-当单包Settings Activity中的开关发生实际变化，代码设置`RESULT_OK`或`RESULT_CANCELED`。
-
-确认页只在request code匹配且结果为OK时设置`mAllowUnknownSources=true`并继续。
-
-## 70. 只是按返回键不会被当作允许
-
-`onActivityResult()`对非OK分支直接finish。
-
-因此打开Settings却不打开开关，不能靠返回确认页继续安装。
-
-## 71. 返回后为什么还note一次AppOp
-
-成功允许后，确认页再次`noteOpNoThrow`，记录“来源已被允许并继续请求安装”的使用事件。
-
-这是审计/统计动作，不是第二次授权。
-
-## 72. `mAllowUnknownSources`只属于当前Activity
-
-它会写入savedInstanceState以跨配置重建保存，但不替代AppOps的持久状态。
-
-真正供以后`canRequestPackageInstalls()`查询的是MODE_ALLOWED。
-
-## 73. 来源授权决策图
-
-```mermaid
-flowchart TD
-    S["进入PackageInstallerActivity"] --> R{"DISALLOW_INSTALL_APPS?"}
-    R -- "是" --> RD["错误或管理员详情"]
-    R -- "否" --> T{"privileged + NOT_UNKNOWN<br/>或本次已允许?"}
-    T -- "是" --> C["进入本次APK确认"]
-    T -- "否" --> U{"未知来源限制?"}
-    U -- "是" --> UD["错误或管理员详情"]
-    U -- "否" --> P{"能识别来源包?"}
-    P -- "否" --> AN["匿名来源警告<br/>仅本次继续"]
-    P -- "是" --> O{"AppOp mode"}
-    O -- "ALLOWED" --> C
-    O -- "DEFAULT" --> E["改ERRORED并显示阻止"]
-    O -- "ERRORED" --> E
-    E --> SET["单包Settings开关"]
-    SET -- "RESULT_OK" --> C
-```
-
-## 74. 通过来源门后还要识别新装或更新
-
-`initiateInstall()`先处理canonical旧包名，再用`MATCH_UNINSTALLED_PACKAGES`查询现有ApplicationInfo。
-
-只有`FLAG_INSTALLED`为真才当作更新，否则仍按新安装展示。
-
-## 75. 系统App更新提示不同
-
-已有目标包若带`FLAG_SYSTEM`，显示“更新系统应用”文案；普通已安装包显示更新文案；不存在则显示安装文案。
-
-这只是UI警示差异，系统包能否被更新仍由PMS规则决定。
-
-## 76. Android 11确认页不再展示权限清单
-
-r48的`install_content_view.xml`只有新装、更新、更新系统App三类简短问题，没有逐项权限列表。
-
-源码里“new application with no permissions”这句注释不能当成目标APK没有声明权限的事实：`startInstallConfirm()`没有根据`requestedPermissions`选择这段文案，真实布局也没有权限列表。
-
-## 77. 防覆盖点击第一层：隐藏非系统Overlay
-
-Activity给Window添加`SYSTEM_FLAG_HIDE_NON_SYSTEM_OVERLAY_WINDOWS`。
-
-系统在该窗口显示期间隐藏非系统悬浮层，降低恶意App覆盖“安装”按钮诱导点击的风险。
-
-## 78. 防覆盖点击第二层：过滤obscured触摸
-
-安装按钮调用`setFilterTouchesWhenObscured(true)`。即使触摸被标记为被遮挡，也不会触发确认。
-
-它与第243章的InputDispatcher obscured flag链直接对应。
-
-## 79. onPause时主动禁用安装按钮
-
-Activity暂停时把OK设为disabled，resume后再依据`mEnableOk`恢复。
-
-这减少Settings切换、窗口覆盖或生命周期交接期间按钮仍可点击的时间窗。
-
-## 80. 默认焦点放在取消按钮
-
-非触摸模式下，代码让negative button先获得焦点。
-
-电视、键盘或无障碍导航场景中，不会因回车默认落在“安装”而意外批准。
-
-## 81. Session入口点击安装做什么
-
-若`mSessionId != -1`，positive button只调用`setPermissionsResult(true)`并finish。
-
-它不会把resolvedBaseCodePath再复制进一个新Session，也不会直接调用`installExistingPackage()`。
-
-## 82. 直接APK入口点击安装做什么
-
-若`mSessionId == -1`，positive button调用`startInstall()`，启动`InstallInstalling`。
-
-这时此前只有UI临时文件，还没有真正提交给PMS的安装Session。
-
-## 83. 这就是两条入口最关键的分叉
-
-```text
-已有Session：确认 -> setPermissionsResult -> 原Session继续
-APK URI：确认 -> InstallInstalling -> 新建系统安装器Session -> 写入并commit
-```
-
-把APK URI路径画成“第三方Session继续”会多出一个不存在的Session。
-
-## 84. `InstallInstalling`为何能静默提交自己的Session
-
-这个Session的installer UID是系统`com.android.packageinstaller`，它持有`INSTALL_PACKAGES`。
-
-用户确认已在创建Session之前完成，所以commit阶段`needToAskForPermissionsLocked()`通常无需再弹一次相同UI。
-
-## 85. 直接路径创建哪些Session参数
-
-它创建FULL_INSTALL，设置非instant、originating/referrer URI、originating UID、installerPackageName和`INSTALL_REASON_USER`。
-
-随后用`parsePackageLite`尽量填packageName、installLocation和预计安装大小。
-
-## 86. 解析失败为何仍尝试创建Session
-
-Lite解析或大小计算失败时，代码记录日志并退化为文件长度。
-
-真正写入与framework校验仍可能给出更准确失败；UI不会仅因预计size计算失败立即中止。
-
-## 87. APK复制到Session发生在AsyncTask
-
-后台打开临时file，调用`session.openWrite("PackageInstaller", 0, size)`，以1 MiB缓冲写入，并累加staging progress。
-
-结束前显式`session.fsync(out)`，再把Session对象返回主线程。
-
-## 88. 复制阶段可以取消
-
-用户点击取消会cancel AsyncTask；若Session已创建，则`abandonSession()`。
-
-这发生在commit前，尚可安全放弃stage。
-
-## 89. commit后为何禁用取消
-
-`onPostExecute()`调用commit后禁用取消按钮并禁止点击窗口外结束。
-
-Session已经sealed并进入系统安装流程，简单关闭Activity不能被当作可靠撤销协议。
-
-## 90. 结果接收器为什么用显式广播
-
-`InstallInstalling`创建只发给自身包的PendingIntent广播，action为`ACTION_INSTALL_COMMIT`，并携带独立`installId`。
-
-Manifest中的`InstallEventReceiver`还要求发送方有`INSTALL_PACKAGES`，减少伪造结果广播。
-
-## 91. sessionId与installId不是同一个ID
-
-sessionId由PackageInstallerService分配，标识stage和安装事务；installId由`EventResultPersister`分配，只用于把广播结果匹配到当前UI观察者。
-
-二者生命周期与命名空间不同。
-
-## 92. 为什么需要`EventResultPersister`
-
-安装可能在Activity配置变化或进程重建期间完成。接收器若没有在线observer，就把status、legacyStatus和message写入AtomicFile。
-
-新Activity重新注册同一installId时，可立即拿到已保存结果。
-
-## 93. pending user action在结果持久器里是特殊项
-
-`EventResultPersister.onEventReceived()`遇到`STATUS_PENDING_USER_ACTION`时直接启动`Intent.EXTRA_INTENT`，不把它存为最终EventResult。
-
-因为它不是终态；只有成功/失败才应唤醒结果观察者。
-
-## 94. 这条自动启动路径的适用边界
-
-AOSP系统安装器自己的Session通常已具`INSTALL_PACKAGES`，所以一般不会再pending；强制提示等特殊情形才可能触发。
-
-第三方安装器应按公开API自行处理内层Intent，不能假设系统替所有应用自动启动。
-
-## 95. SessionCallback只负责进度显示
-
-`InstallSessionCallback.onProgressChanged()`把0到1的float映射到ProgressBar。
-
-`onFinished()`为空，最终成功/失败由带详细status的IntentSender广播处理；两种回调不能混为一个。
-
-## 96. 最终状态有公开码与legacy码
-
-Session把内部`INSTALL_*`结果转换成`PackageInstaller.STATUS_*`，同时附带`EXTRA_LEGACY_STATUS`和message。
-
-UI用公开码选择成功/失败类别，用legacy码在`EXTRA_RETURN_RESULT`路径回给旧Intent API调用者。
-
-## 97. 成功UI的两种模式
-
-若调用方要求`EXTRA_RETURN_RESULT`，`InstallSuccess`立即设置`RESULT_OK`和`INSTALL_SUCCEEDED`后finish。
-
-否则显示“完成/打开”，并只在目标包存在可启动Activity时启用“打开”。
-
-## 98. 失败UI的两种模式
-
-要求返回结果时，`InstallFailed`返回`RESULT_FIRST_USER`和legacy失败码；否则按blocked、conflict、incompatible、invalid或通用失败显示解释。
-
-存储不足还会提供进入应用管理的入口。
-
-## 99. Activity result不是Session status的替代品
-
-Session API的权威结果送到commit的`IntentSender`；APK Intent兼容API才主要通过Activity result回调用者。
-
-调试时先确认自己走哪条入口，再决定监听广播/PendingIntent还是`onActivityResult`。
-
-## 100. “允许此来源”不是对APK签名的信任
-
-AppOp键是originating uid+packageName，表达用户允许这个来源App发起安装。
-
-它不记录某个下载网址、某张证书或某个目标APK的白名单。
-
-## 101. 来源授权也不是永久不可撤销
-
-用户可在Settings“安装未知应用”里把来源改回MODE_ERRORED；Settings还会kill非core来源UID。
-
-之后`canRequestPackageInstalls()`返回false，新请求重新被阻止。
-
-## 102. 安装确认不授予运行时权限
-
-用户点“安装”只是允许PackageInstaller继续包安装事务。
-
-APK声明的dangerous权限仍遵循运行时授权、默认权限授予或角色策略；不能把安装按钮理解成一次性批准Manifest全部权限。
-
-## 103. 来源允许不等于静默安装
-
-第三方来源即使`canRequestPackageInstalls()==true`，它仍通常缺少`INSTALL_PACKAGES`。
-
-因此Session commit仍会返回`STATUS_PENDING_USER_ACTION`，或直接APK路径仍显示具体APK确认页。
-
-## 104. 确认成功不等于安装成功
-
-确认之后还可能因签名冲突、版本降级、split不一致、空间不足、verifier阻止或PMS策略失败。
-
-应用商店必须继续等待最终status，而不能在UI消失时显示“安装完成”。
-
-## 105. 用户拒绝与策略阻止不同
-
-明确点击取消对应`INSTALL_FAILED_ABORTED`；设备策略限制通常显示管理员详情或blocked语义；未知来源未授权则可能只关闭UI、让Session继续等待。
-
-这三者的恢复方式分别是重新创建/提交、联系管理员、去Settings授权或放弃Session。
-
-## 106. 直接APK路径的数据不可变策略
-
-content URI先复制到PackageInstaller私有临时文件，确认后又写入PackageInstallerSession stage。
-
-这是两次不同目的的复制：前者防外部Provider换内容，后者进入PMS受控安装事务。
-
-## 107. 安全边界汇总
-
-本链同时依赖：
-
-- system_server不直接相信安装器回传“已同意”；
-- InstallStart不相信任意originating UID extra；
-- 内部Activity不导出；
-- 来源AppOp按uid+package保存；
-- 用户限制优先；
-- Overlay隐藏和obscured触摸过滤；
-- 最终PMS仍验证包身份。
-
-任何一层都不能单独替代其余层。
-
-## 108. 第一次复读：两个“允许”已拆开
-
-“允许来自此来源”写的是来源App的AppOp；“安装”按钮写的是当前Session的`mPermissionsManuallyAccepted`。前者可跨请求保留，后者只属于一个Session。
-
-## 109. 第二次复读：两个Session路径已拆开
-
-第三方Session确认后继续原Session；content/file APK确认后由系统PackageInstaller新建Session。正文中凡出现`InstallInstalling`，都只属于后一条直接APK路径。
-
-## 110. 第三次复读：三个回传渠道已拆开
-
-`SessionCallback`用于生命周期/进度，commit的`IntentSender`用于Session权威status，Activity result用于老式APK Intent UI回程。它们可能同时出现，但语义不相同。
-
-## 111. 版本边界
-
-本章严格对应Android 11 `android-11.0.0_r48`中framework内置`frameworks/base/packages/PackageInstaller`。后续Android把安装器模块、Session约束、PendingIntent可变性、未知来源UI和后台启动限制继续调整；厂商也可能替换PackageInstaller包。分析设备时必须核对真实package、Manifest与tag。
-
-## 112. macOS只读练习1：手算是否需要确认
+### 练习 1：先画出三条互不混淆的路线
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '500,550p' +  frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
-sed -n '1785,1830p' +  frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'public void commit(@NonNull IntentSender statusReceiver, boolean forTransfer)' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'if (hasParentSessionId()) {' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'assertCallerIsOwnerOrRootLocked();' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'assertNoWriteFileTransfersOpenLocked();' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F "Can't install packages while in secure FRP" frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'final Intent intent = new Intent(PackageInstaller.ACTION_CONFIRM_INSTALL);' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F '<activity android:name=".InstallStart"' frameworks/base/packages/PackageInstaller/AndroidManifest.xml
+grep -n -F 'PackageInstaller.ACTION_CONFIRM_INSTALL.equals(intent.getAction());' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
+grep -n -F 'nextActivity.setClass(this, InstallStaging.class);' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
+grep -n -F 'nextActivity.setClass(this, PackageInstallerActivity.class);' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
+grep -n -F 'mInstaller.setPermissionsResult(mSessionId, true);' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
+grep -n -F 'new PackageInstaller.SessionParams(' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallInstalling.java
+grep -n -F 'getPackageManager().installExistingPackage(appInfo.packageName);' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallInstalling.java
 ```
 
-分别为普通商店、新装；持`INSTALL_PACKAGE_UPDATES`的新装；持该权限的更新；Device Owner同用户；带FORCE_PROMPT的system UID手算返回值。每例写出哪个布尔项生效。
+沿命中行前后阅读，分别画“已有 Session等待确认”“content URI”“package URI”三条线。每条都写明 Session owner、APK字节迁移和权威结果是否存在；`package:`没有新 Session或 APK复制，就明确写“无”。若画出 `InstallInstalling`继续原 Session，就说明入口已经串错。再把 status链启动前的同步异常画在 commit左侧，避免把“没有 callback”一律诊断成 pending丢失。
 
-## 113. macOS只读练习2：追外层status与内层Intent
+## 3. Session确认门位于本地验证之后、PMS交接之前
+
+普通非 staged Session在 `streamValidateAndCommit()`返回 true后已有 `mPackageName`、`mSigningDetails`和 resolved base，随后 `handleInstall()`进入 `makeSessionActiveLocked()`。所以确认 UI面对的是已能解析出包身份的输入，不是任意未封口字节；但它仍早于 PMS的后半程，并不证明签名升级关系、空间、verifier和最终事务都会通过。
+
+`needToAskForPermissionsLocked()`以当前 `mInstallerUid`计算静默资格：
+
+- 有通用 `INSTALL_PACKAGES`即可；
+- 有 `INSTALL_PACKAGE_UPDATES`且目标包 UID不是 -1，只覆盖更新；
+- 有 `INSTALL_SELF_UPDATES`且目标包 UID等于 installer UID，只覆盖自更新；
+- root、system或同用户 Device Owner/affiliated Profile Owner可以旁路；
+- `INSTALL_FORCE_PERMISSION_PROMPT`无论上述资格如何都强制询问。
+
+目标 UID按 Session的 target user查询。Device Owner分支还先要求 Session user等于 installer UID所属 user，因此另一个用户里的管理身份不能直接跨用户静默批准。判断不能缓存：Session transfer会改变 installer身份。
+
+这道门并不覆盖所有 Session。`handleInstall()`先处理 staged Session并交给 `StagingManager`，APEX又只能走 staged；multi-package parent自身没有目标包，真正调用确认判断的是 child。r48的 multi细节还会制造部分提交边界，第15节再收口。
+
+### 练习 2：手算静默资格矩阵
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '3235,3270p' +  frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
-sed -n '145,275p' +  frameworks/base/core/java/android/content/pm/PackageInstaller.java
-sed -n '40,145p' +  frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private boolean needToAskForPermissionsLocked()' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'mPm.checkUidPermission(android.Manifest.permission.INSTALL_PACKAGES,' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'mPm.checkUidPermission(android.Manifest.permission.INSTALL_SELF_UPDATES,' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'mPm.checkUidPermission(android.Manifest.permission.INSTALL_PACKAGE_UPDATES,' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'final int targetPackageUid = mPm.getPackageUid(mPackageName, 0, userId);' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'final boolean isInstallerRoot = (mInstallerUid == Process.ROOT_UID);' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F '(params.installFlags & PackageManager.INSTALL_FORCE_PERMISSION_PROMPT) != 0;' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'if (userId != UserHandle.getUserId(mInstallerUid)) {' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'dpmi.canSilentlyInstallPackage(' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'mStagingManager.commitSession(this);' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
 ```
 
-画出`IntentSender -> EXTRA_STATUS -> Intent.EXTRA_INTENT -> ACTION_CONFIRM_INSTALL -> EXTRA_SESSION_ID`，解释为什么收到pending后不能立刻当作失败。
+手算六例：普通新装、仅有 update权限的新装、该权限下的更新、同 UID自更新、同用户 Device Owner、带 FORCE_PROMPT的 system UID。每例写“需不需要问”及决定性布尔项，再解释 staged为何不进入同一判断位置。
 
-## 114. macOS只读练习3：核对未知来源授权
+## 4. pending回调是一只信封，不是 system_server直接弹窗
+
+需要询问时，Session构造显式指向系统 package installer包的 `ACTION_CONFIRM_INSTALL`，只放入 sessionId。随后 `sendOnUserActionRequired()`再创建外层 fill-in Intent：
+
+| 层 | 关键内容 | 谁消费 |
+|---|---|---|
+| 外层状态 | sessionId、`STATUS_PENDING_USER_ACTION` | 安装器提交时提供的 `IntentSender` |
+| 内层动作 | `Intent.EXTRA_INTENT`中的显式包确认 Intent | 安装器选择合适时机启动 |
+
+这样设计把“安装事务需要交互”与“何时抢占屏幕”分开。公开 API明确建议：用户正在使用安装器时可立即启动，否则先发通知把用户带回前台。system_server只送状态，不替应用决定后台拉起 UI。
+
+发出 pending后，Session调用 `closeInternal(false)`释放 commit额外增加的 active引用，因此观察者可能看到它变 idle；stage仍 sealed，写入口不会重开。更窄的失败边界是 `IntentSender.SendIntentException`被吞掉：若 receiver已经失效，framework不会自动弹窗或生成终态，Session可能只剩一份等待外部处置的 sealed状态。
+
+status receiver也不是第一次 `commit()`后冻结的字段。`markAsSealed()`先把参数写进 `mRemoteStatusReceiver`，再对已经 sealed的 Session快速返回；因此在 prepared、未 destroyed、无 open writer、FRP与 transfer检查均通过时，owner/root再次 `commit()`可替换尚未派发的 pending或终态去向，并重投异步消息。若 `mCommitted=true`，验证只会快速返回；若 Session已经 relinquished给 PMS，重投反而会在 `makeSessionActiveLocked()`失败。`dispatchSessionFinished()`又会先快照 receiver再排消息，所以快照后的 recommit改不了已派发结果。这是有阶段边界的恢复钩子，不是任意时刻安全换观察者。
+
+### 练习 3：拆开外层状态与内层动作
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '420,510p' +  frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
-sed -n '60,145p' +  packages/apps/Settings/src/com/android/settings/applications/appinfo/ExternalSourcesDetails.java
-sed -n '25410,25465p' +  frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'intent.setPackage(mPm.getPackageInstallerPackageName());' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'intent.putExtra(PackageInstaller.EXTRA_SESSION_ID, sessionId);' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'fillIn.putExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_PENDING_USER_ACTION);' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'fillIn.putExtra(Intent.EXTRA_INTENT, intent);' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'target.sendIntent(context, 0, fillIn, null, null);' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F '} catch (IntentSender.SendIntentException ignored) {' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'closeInternal(false);' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'mRemoteStatusReceiver = statusReceiver;' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F '// After updating the observer, we can skip re-sealing.' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'statusReceiver = mRemoteStatusReceiver;' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'if (mCommitted) {' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'public static final int STATUS_PENDING_USER_ACTION = -1;' frameworks/base/core/java/android/content/pm/PackageInstaller.java
 ```
 
-列出Manifest声明、targetSdk、instant-app、UserManager限制、AppOp五项条件，并说明Settings开关为什么不是运行时权限grant。
+写出 receiver存活与失效两种时序。前者标出谁真正调用 `startActivity()`；后者回答为什么“commit已返回、Session不活跃、没有失败回调”仍不能判成成功或自动取消。再给同一 sealed Session依次传 receiver A、B，分别令 B发生在结果快照前、快照后和 relinquished后，判断通知与失败去向。
 
-## 115. macOS只读练习4：比较两条安装入口
+## 5. 同意与拒绝回到 framework，但这是一项窄系统能力
+
+确认 Activity调用 `PackageInstaller.setPermissionsResult(sessionId, accepted)`，经 `IPackageInstaller`进入 Service。Service只强制调用者拥有 `INSTALL_PACKAGES`，随后按 sessionId查表；它不再核对调用包就是确认 Intent显式指向的 package installer，也不检查 Session owner或 target user。AOSP PackageInstaller应用能调用，是因为它在 Manifest中持有这项平台权限。
+
+Session侧的门也很窄：只要求 `mSealed`。没有独立的 `AWAITING_USER_ACTION`状态，也没有一次性 nonce。于是这不是“知道 sessionId就能批准”，而是“任何持有该高权限的系统主体都被信任”；对厂商系统组件做安全审计时必须把这个能力面算进去。
+
+接受与拒绝完全不对称：
+
+- true：锁内置 `mPermissionsManuallyAccepted=true`，向 Session Handler投递 `MSG_INSTALL`；第二轮再次走 `makeSessionActiveLocked()`，不重新解析 APK，确认门因该位直接放行。
+- false：立即 `destroyInternal()`，以 `INSTALL_FAILED_ABORTED`和“User rejected permissions”派发终态。
+
+true只表示排入第二轮，不表示 PMS已经接管。`makeSessionActiveLocked()`还会检查 relinquished/destroyed，随后处理继承文件和 native库，构造 `ActiveInstallSession`；只有它真正传给 `mPm.installStage()`才进入 PMS后半程。`mPermissionsManuallyAccepted`没有写入 Session XML，status receiver也不持久化，所以重启不能恢复原确认握手。
+
+### 练习 4：核对批准能力与第二轮完成点
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '300,590p' +  frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
-sed -n '45,430p' +  frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallInstalling.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'void setPermissionsResult(int sessionId, boolean accepted);' frameworks/base/core/java/android/content/pm/IPackageInstaller.aidl
+grep -n -F 'mContext.enforceCallingOrSelfPermission(android.Manifest.permission.INSTALL_PACKAGES, TAG);' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerService.java
+grep -n -F 'session.setPermissionsResult(accepted);' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerService.java
+grep -n -F 'if (!mSealed) {' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'mPermissionsManuallyAccepted = true;' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'mHandler.obtainMessage(MSG_INSTALL).sendToTarget();' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'dispatchSessionFinished(INSTALL_FAILED_ABORTED, "User rejected permissions", null);' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'if (mRelinquished) {' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'mPm.installStage(installingSession);' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'android:name="android.permission.INSTALL_PACKAGES"' frameworks/base/packages/PackageInstaller/AndroidManifest.xml
+grep -n -F 'new ChildStatusIntentReceiver' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'if (installingChildSession != null) {' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'throw new PackageManagerException("No child sessions found!");' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'dispatchSessionFinished(PackageManager.INSTALL_SUCCEEDED, "Session staged", null);' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'you may commit the session again.' frameworks/base/core/java/android/content/pm/PackageInstaller.java
+grep -n -F 'writeBooleanAttribute(out, ATTR_COMMITTED, isCommitted());' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'mCommitted = true;' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
 ```
 
-分别从`mSessionId != -1`和`mSessionId == -1`开始画图，标出哪条调用`setPermissionsResult`、哪条创建Session、哪条复制APK，以及最终结果由谁接收。
+推演“未 sealed”“sealed但从未发 pending”“已 relinquished”“正常等待确认”四种 Session收到 true/false的结果。结论必须区分 Binder调用被接受、消息已排队、ActiveInstallSession已生成和 PMS已接手；再说明 multi全体等待与 staged success为何都不能套用普通单 Session终局。
 
-## 116. 第四次复读：r48关闭UI不总是终结Session
+## 6. InstallStart是唯一导出的安装导流边界
 
-确认页明确取消/返回会`setPermissionsResult(false)`；但来源设置取消、用户限制Dialog等多条路径只finish。阅读日志时应同时看Session是否destroyed及原status receiver是否收到终态，不能用“安装器界面消失”代替服务端状态。
+AOSP PackageInstaller Manifest把 `InstallStart`导出，注册 `ACTION_VIEW`、`ACTION_INSTALL_PACKAGE`和隐藏的 `ACTION_CONFIRM_INSTALL`；`InstallStaging`、`PackageInstallerActivity`、`InstallInstalling`及最终结果 Activity都不导出。外部输入先经过同一个 trampoline，内部页面才可以信任它整理出的 extras。
 
-## 117. 自测题
+`InstallStart`只以 action是否等于 `ACTION_CONFIRM_INSTALL`识别 Session入口，不以 URI是否为空猜测。若通过 Session到达且 `getCallingPackage()`为空，它从 `SessionInfo.getInstallerPackageName()`补来源包；随后把 calling package、source ApplicationInfo和 originating UID显式写给内部 Activity。
 
-1. `STATUS_PENDING_USER_ACTION`的外层和内层Intent分别装什么？
-2. `INSTALL_PACKAGES`与`REQUEST_INSTALL_PACKAGES`有什么区别？
-3. 用户允许某来源后，为什么仍可能看到安装确认？
-4. InstallStart怎样防止伪造originating UID？
-5. MODE_DEFAULT为什么会被改成MODE_ERRORED？
-6. Session入口点“安装”后会不会创建新Session？
-7. content URI为何先复制临时文件？
-8. installId与sessionId各自做什么？
-9. 用户点安装后为何仍要等待最终status？
-10. r48中哪些关闭UI路径可能不等于拒绝Session？
+它复制原 Intent并覆盖 flags为 `FLAG_ACTIVITY_FORWARD_RESULT | FLAG_GRANT_READ_URI_PERMISSION`。FORWARD_RESULT让下游最终 Activity result直接交还最初调用者；它不是 PackageInstaller Session的 status receiver，也不把 pending状态转成终态。导流 Activity启动下一个页面后立即 finish。
 
-## 118. 自测题参考答案
+### 练习 5：验证导出面与路由规则
 
-1. 外层是pending状态和sessionId，内层是可启动的ACTION_CONFIRM_INSTALL。
-2. 前者是系统静默安装能力；后者只是声明可请求，并受AppOp、限制和UI控制。
-3. 来源授权针对发起者，安装确认针对当前APK/Session。
-4. 默认使用真实launching UID，只信任文档管理器或系统Downloads转交的extra。
-5. 默认也不能放行，写ERRORED让拒绝状态明确且能进入潜在来源列表。
-6. 不会；它给原Session调用setPermissionsResult(true)。
-7. 防止外部Provider在解析与安装之间替换字节。
-8. sessionId标识PMS安装事务，installId匹配PackageInstaller UI的持久化广播结果。
-9. PMS后续仍可能在签名、版本、split、存储或策略处失败。
-10. Settings非OK返回、来源/用户限制和部分错误Dialog只finish；要看Session服务端终态。
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F '<activity android:name=".InstallStart"' frameworks/base/packages/PackageInstaller/AndroidManifest.xml
+grep -n -F '<activity android:name=".InstallStaging"' frameworks/base/packages/PackageInstaller/AndroidManifest.xml
+grep -n -F '<activity android:name=".PackageInstallerActivity"' frameworks/base/packages/PackageInstaller/AndroidManifest.xml
+grep -n -F '<activity android:name=".InstallInstalling"' frameworks/base/packages/PackageInstaller/AndroidManifest.xml
+grep -n -F 'final int sessionId = (isSessionInstall' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
+grep -n -F 'sessionInfo.getInstallerPackageName()' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
+grep -n -F 'nextActivity.setFlags(Intent.FLAG_ACTIVITY_FORWARD_RESULT' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
+grep -n -F 'nextActivity.putExtra(PackageInstallerActivity.EXTRA_CALLING_PACKAGE, callingPackage);' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
+grep -n -F 'startActivity(nextActivity);' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
+```
 
-## 119. 本章总结
+按 Manifest命中行确认哪个组件可被外部显式触达；再为 ACTION_CONFIRM_INSTALL、content、package和其他 scheme写路由表。说明为何 FORWARD_RESULT不能替代 commit `IntentSender`。
 
-Android 11安装确认链不是一个Dialog，而是framework与两个系统应用协作的状态机。PackageInstallerSession先根据安装器权限、目标是否已安装、root/system/Device Owner和FORCE_PROMPT决定能否静默；需要用户时，经commit的IntentSender发送`STATUS_PENDING_USER_ACTION`与内层`ACTION_CONFIRM_INSTALL`。InstallStart核准真实来源UID、O及以上的`REQUEST_INSTALL_PACKAGES`声明并导流；PackageInstallerActivity再组合用户限制、每来源AppOp、Settings单包开关与当前APK确认。已有Session同意后回传`setPermissionsResult(true)`继续原事务，直接APK URI则由InstallInstalling创建特权Session、复制、commit并以持久化广播接收结果。来源允许、Session确认和最终安装成功始终是三本账。
+## 7. 来源身份不是一个可随便相信的 Intent字符串
 
-## 120. 下一章预告
+InstallStart先得到 calling package的 `ApplicationInfo`。能识别包时 originating UID取 `sourceInfo.uid`；否则向 ActivityManager查询该 Activity的 launched-from UID。调用者自己塞入的 `EXTRA_ORIGINATING_UID`默认不可信，只有两类中转者可以代传：持有 `MANAGE_DOCUMENTS`的文档管理器，或 authority为 `downloads`、ApplicationInfo确为 system app且 UID吻合的 Downloads Provider。
 
-第259章进入“Android APK安装Verifier、PACKAGE_NEEDS_VERIFICATION广播、超时与最终放行链”，继续沿用户确认后的验证阶段，区分required verifier、sufficient verifier、integrity verification、timeout和最终放行。
+`EXTRA_NOT_UNKNOWN_SOURCE=true`也不是普通调用者的旁路。只有 sourceInfo带 `PRIVATE_FLAG_PRIVILEGED`时，InstallStart才把它解释成 trusted source；PackageInstallerActivity稍后还会用 calling package、sourceInfo和同一 extra再判一次。这个旁路只跳过“未知来源”声明、限制与 AppOp，不跳过最前面的 `DISALLOW_INSTALL_APPS`，也不会替用户点击当前 APK的确认按钮。
+
+来源 UID可对应多个包。O及以上声明门先取该 UID所有包的最大 targetSdk；只要最大值至少26，就要求该 UID关联的某个包出现在 `REQUEST_INSTALL_PACKAGES`的 app-op permission package集合里。确认 Activity随后又从 `getPackagesForUid()`选择 AppOp包名：优先 mCallingPackage，否则取数组第一项。于是安全主体主要是 UID，展示与 AppOp键却仍含 packageName；shared UID现场要同时记录两者。
+
+### 练习 6：对抗伪造来源与 shared UID
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'ActivityManager.getService()' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
+grep -n -F '.getLaunchedFromUid(getActivityToken());' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
+grep -n -F 'Manifest.permission.MANAGE_DOCUMENTS' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
+grep -n -F 'if (isSystemDownloadsProvider(callingUid)) {' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
+grep -n -F 'ApplicationInfo.PRIVATE_FLAG_PRIVILEGED' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
+grep -n -F 'Intent.EXTRA_NOT_UNKNOWN_SOURCE' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
+grep -n -F 'getMaxTargetSdkVersionForUid(this, originatingUid);' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
+grep -n -F 'declaresAppOpPermission(' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
+grep -n -F 'String[] packagesForUid = mPm.getPackagesForUid(sourceUid);' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
+grep -n -F 'if (packageName.equals(mCallingPackage)) {' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
+```
+
+推演普通 App伪造 originating UID、普通 App伪造 trusted extra、Documents中转、假 downloads Provider和两个包共享 UID五例。每例写出最终 UID来自哪里、哪个包名成为 AppOp键、声明门是否可过。
+
+## 8. 未知来源门是用户限制、可信旁路和 AppOp的有序矩阵
+
+PackageInstallerActivity先查 `DISALLOW_INSTALL_APPS`。system基础限制显示不可用，管理员限制打开 Admin Support并结束；这道总门连 trusted source也不能绕过。
+
+通过总门后，只有 `mAllowUnknownSources=true`或 privileged+NOT_UNKNOWN_SOURCE才直接进入当前 APK确认。其余请求依次检查 `DISALLOW_INSTALL_UNKNOWN_SOURCES`与 GLOBAL版本：system基础限制显示错误，管理员来源打开对应支持页。用户限制和 AppOp是两本账，ALLOWED不能压过限制。
+
+没有来源包名时，r48显示 anonymous source警告；用户可以只对当前 Activity继续，系统没有 packageName可写 AppOp。能识别来源时才执行 `noteOpNoThrow(OP_REQUEST_INSTALL_PACKAGES, uid, package)`：
+
+| mode | r48动作 | 能否进入当前 APK确认 |
+|---|---|---|
+| DEFAULT | 先写成 ERRORED，再落入 blocked Dialog | 否 |
+| ERRORED | blocked Dialog，可去单包 Settings | 否 |
+| ALLOWED | `initiateInstall()` | 是 |
+| 其他值 | 记错误并 finish | 否 |
+
+`PackageManager.canRequestPackageInstalls()`与 UI方向一致却不完全等价。它还要求调用 UID拥有所问 package、targetSdk至少26、非 instant、该 package自身声明权限；公开调用在未声明时抛 `SecurityException`，不是简单返回 false。PMS随后检查两项未知来源限制与 ExternalSourcesPolicy，但没有检查 UI最先处理的 `DISALLOW_INSTALL_APPS`，也无法表达没有可归因 package的 anonymous兼容分支。一个具名来源 App得到的 boolean，不能替代另一条实际 Activity状态机。
+
+### 练习 7：手推来源门而不是只看一个 boolean
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'UserManager.DISALLOW_INSTALL_APPS, Process.myUserHandle());' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
+grep -n -F 'if (mAllowUnknownSources || !isInstallRequestFromUnknownSource(getIntent())) {' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
+grep -n -F 'UserManager.DISALLOW_INSTALL_UNKNOWN_SOURCES_GLOBALLY' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
+grep -n -F 'if (mOriginatingPackage == null) {' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
+grep -n -F 'mAppOpsManager.noteOpNoThrow(appOpCode,' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
+grep -n -F 'case AppOpsManager.MODE_DEFAULT:' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
+grep -n -F 'mOriginatingPackage, AppOpsManager.MODE_ERRORED);' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
+grep -n -F 'case AppOpsManager.MODE_ALLOWED:' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
+grep -n -F 'mAllowUnknownSources = true;' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
+grep -n -F 'mAppOpsManager.noteOpNoThrow(appOpCode, mOriginatingUid, mOriginatingPackage);' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
+grep -n -F 'if (info.targetSdkVersion < Build.VERSION_CODES.O) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (isInstantApp(packageName, userId)) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'throw new SecurityException("Need to declare " + appOpPermission' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mExternalSourcesPolicy.getPackageTrustedToInstallApps(packageName, uid);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+```
+
+建立“总安装限制 × unknown限制 × trusted/anonymous/known × AppOp mode”矩阵。分别说明 anonymous请求为何没有同一 package可供 `canRequestPackageInstalls()`比较，以及具名来源的 API结果为何仍不能覆盖 UI的总安装限制。
+
+## 9. Settings开关只改每来源 AppOp，RESULT_OK也有前提
+
+blocked Dialog构造 `ACTION_MANAGE_UNKNOWN_APP_SOURCES`并附 `package:<originatingPackage>`，AOSP Settings因此路由到单包 `ManageAppExternalSourcesActivity`和 `ExternalSourcesDetails`。列表/详情先用 `AppStateInstallAppsBridge`计算两项：包是否声明 app-op permission、当前 mode是什么。`isPotentialAppSource()`要求“mode非 DEFAULT或声明过”之一，否则开关禁用。
+
+开关最终只执行：
+
+`setMode(OP_REQUEST_INSTALL_PACKAGES, uid, packageName, ALLOWED或ERRORED)`。
+
+它不 grant runtime permission，也不授予 `INSTALL_PACKAGES`。从允许切回拒绝时，Settings还会 kill非 core来源 UID，避免仍运行的来源进程沿用旧流程；core UID不杀。
+
+Settings只有在开关实际变化、且承载组件正是单包 ManageAppExternalSourcesActivity时才调用 `setResult(ALLOWED ? RESULT_OK : RESULT_CANCELED)`。结果要等该 Activity结束才回到确认页。PackageInstallerActivity只在 request code匹配且 result为 OK时把内存位 `mAllowUnknownSources=true`、再 note一次 AppOp并进入确认；其他结果直接 finish。第二次 note是使用记录，不是第二次授权。`mAllowUnknownSources`只随 Activity saved state保存，跨请求资格仍以 AppOp为准。
+
+因此“限制 → AppOp → 当前确认”只是首次检查顺序，不是持续不变量。Settings回传 OK后，`onActivityResult()`直接 `initiateInstall()`，既不重跑两类用户限制，也不检查第二次 note返回的 mode；管理员限制或 AppOp若在往返窗口内变化，本次 UI仍可能继续。开关实际从允许改成拒绝时的 `killUid()`也只结束来源进程，不会替它 abandon已存在的 Session，更不会主动关闭正在运行的系统确认页；单纯 Back或 RESULT_CANCELED不触发这项清理。
+
+## 10. content与package输入先解决“字节在哪里”，再谈确认
+
+APK URI入口不是一种数据模型：
+
+- `content:`：InstallStart送往 `InstallStaging`。后台从 ContentResolver读取，复制到 PackageInstaller的 device-protected no-backup目录 `package*.apk`，再以内部 `file:` URI经过 `DeleteStagedFileOnResult`进入确认页。
+- `package:`：表示设备上已有、可能只是在当前用户未安装的包；确认后 `InstallInstalling`调用 `installExistingPackage()`，没有 APK字节复制，也不创建普通安装 Session。r48这里还藏着一个假成功边界：API以 int返回多数失败码，`ApplicationPackageManager`只把 `INSTALL_FAILED_INVALID_URI`转换成 `NameNotFoundException`，而 Activity忽略返回值、未抛异常便直接 `launchSuccess()`。例如确认后策略发生竞态变化，PMS因新出现的 `DISALLOW_INSTALL_APPS`返回 `INSTALL_FAILED_USER_RESTRICTED`时，页面仍可能误报成功。
+- 其他 scheme：InstallStart返回 `INSTALL_FAILED_INVALID_URI`，不会把内部确认页当通用 URI解析器。
+
+content快照防止外部 Provider在 UI解析与真正写 Session之间换字节。确认流程回程后，`DeleteStagedFileOnResult`删除临时 APK；设备启动时 TemporaryFileManager还会删除本次 boot之前遗留的 no-backup文件。它不是 `/data/app`最终 code path，也不是 Session stage。
+
+已有 Session确认不重新取第三方 URI。PackageInstallerActivity要求 `SessionInfo`存在、sealed且 `resolvedBaseCodePath`非空，再将内部路径包装成 file URI用于解析图标和包信息。UI可展示只说明输入足够解析，不等于 PMS最终验证成功。
+
+### 练习 8：核对快照、内部文件与显示输入
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'ContentResolver.SCHEME_CONTENT' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStart.java
+grep -n -F 'File.createTempFile("package", ".apk", context.getNoBackupFilesDir())' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/TemporaryFileManager.java
+grep -n -F 'getContentResolver().openInputStream(packageUri)' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStaging.java
+grep -n -F 'installIntent.setClass(InstallStaging.this, DeleteStagedFileOnResult.class);' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallStaging.java
+grep -n -F 'sourceFile.delete();' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/DeleteStagedFileOnResult.java
+grep -n -F 'if (info == null || !info.sealed || info.resolvedBaseCodePath == null) {' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
+grep -n -F 'packageUri = Uri.fromFile(new File(info.resolvedBaseCodePath));' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
+grep -n -F 'mPkgInfo = PackageUtil.getPackageInfo(this, sourceFile,' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/PackageInstallerActivity.java
+grep -n -F 'getPackageManager().installExistingPackage(appInfo.packageName);' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallInstalling.java
+grep -n -F 'if (res == INSTALL_FAILED_INVALID_URI) {' frameworks/base/core/java/android/app/ApplicationPackageManager.java
+grep -n -F 'return PackageManager.INSTALL_FAILED_USER_RESTRICTED;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+```
+
+画出 content字节的 Provider → private snapshot → Session stage → final code path四个位置，给每条迁移标出所有者与清理者；再解释 package scheme为何不能画进这条复制链。最后设定“确认页初检后才新增 `DISALLOW_INSTALL_APPS`”的竞态，对照 int返回、异常捕获和 `launchSuccess()`说明假成功如何出现。
+
+## 11. 确认页展示目标包，但来源包才是 AppOp主体
+
+PackageInstallerActivity同时持有两组身份：`mOriginatingPackage/mOriginatingUid`表示谁发起安装，`mPkgInfo.packageName`表示正在安装谁。来源身份用于限制和 AppOp；目标身份用于新装/更新文案、图标和最终包规则。把两者混成“安装包名”会把授权记到错误对象。
+
+file URI由 `PackageUtil.getPackageInfo()`解析；package URI查询现有 `PackageInfo`。`initiateInstall()`处理 canonical旧名，再以 `MATCH_UNINSTALLED_PACKAGES`查询目标：只有 ApplicationInfo带 `FLAG_INSTALLED`才按更新显示，system App又用单独警示文案。r48布局不列目标 APK的权限清单；注释里的“no permissions”不能当成 Manifest事实。
+
+确认点击还有两层界面防护。Window添加 `SYSTEM_FLAG_HIDE_NON_SYSTEM_OVERLAY_WINDOWS`，positive button启用 `setFilterTouchesWhenObscured(true)`；Activity进入 pause会禁用按钮，resume后按 `mEnableOk`恢复，非触摸模式默认焦点落在取消。它们减少覆盖点击风险，却不替代来源身份和 PMS验证。
+
+## 12. 同一个界面关闭，服务端后果可能完全不同
+
+通过来源门后，按钮才有明确的当前 APK语义：
+
+| 动作 | 已有 Session | 直接 APK URI |
+|---|---|---|
+| positive | `setPermissionsResult(true)`并 finish | 启动 `InstallInstalling` |
+| negative | `setPermissionsResult(false)`，Session ABORTED | Activity result取消，尚未创建/提交安装 Session |
+| back | `setPermissionsResult(false)` | 只结束当前 UI链 |
+
+但在进入这个确认面板之前，许多关闭只调用 `finish()`：InstallStart声明门失败、SessionInfo状态异常、用户限制 Dialog、Admin Support跳转、anonymous取消、blocked Dialog取消、Settings非 OK回程、解析错误和 Wear分支。它们未必替已有 Session调用 false。于是“PackageInstaller界面消失”既不能证明用户拒绝，也不能证明 stage已销毁；安装器必须继续看原 status receiver或显式 abandon。
+
+直接 URI路径的 Activity result又不是 Session API status。只有请求携带 `EXTRA_RETURN_RESULT`时，最终成功/失败 Activity才明确返回 RESULT_OK/RESULT_FIRST_USER与 `EXTRA_INSTALL_RESULT`。已有 Session点击 positive只调用 `setPermissionsResult(true)`并 finish，没有设置 RESULT_OK，Activity默认结果仍是 RESULT_CANCELED；因此不能用启动内层确认页的 Activity result判断是否接受。它的权威终局送往 `dispatchSessionFinished()`快照的 `mRemoteStatusReceiver`；只有在该快照前成功 recommit才会替换首次 IntentSender。调试时先问入口，再选观察通道。
+
+## 13. 直接 APK同意后，系统安装器才创建并写一个新 Session
+
+`InstallInstalling`对 file URI创建 `MODE_FULL_INSTALL` Session，明确设非 instant、referrer/originating URI、originating UID、可选 installer package和 `INSTALL_REASON_USER`。Lite解析尽量提供目标包名、installLocation和预计安装大小；解析或大小计算失败只退回 file length，真正 framework验证仍可给出终局错误。
+
+后台 `InstallingAsyncTask`打开该 Session，以固定 entry名 `PackageInstaller`调用 `openWrite()`，循环复制 private snapshot，更新 staging progress并 `fsync()`。复制阶段的 Cancel按钮会取消 task并 abandon Session；Back却只在取消按钮仍启用时执行普通 `onBackPressed()`，随后 `onDestroy()`虽取消并等待 task，却没有 abandon，可能留下未提交 Session等待系统过期清理。成功返回主线程才创建只限定到自身包的 foreground广播 PendingIntent，调用 `session.commit()`，禁用取消并禁止点窗口外结束。
+
+此时新 Session的实际 installer UID是 AOSP PackageInstaller应用自身的 Binder UID，它持有 `INSTALL_PACKAGES`；用户已经在创建它之前完成确认，所以 framework静默资格通常放行，不再弹相同页面。传入的 installerPackageName用于归因，不会把 Session owner UID变回原来源应用，也不意味着这个应用 UID等于 `Process.SYSTEM_UID`。
+
+commit仍不是成功。PMS结果通过 PendingIntent广播回来；这个 Activity注册的 `InstallSessionCallback.onProgressChanged()`只更新进度，`onFinished()`特意留空。公共 SessionCallback本身仍有“事务已成功或失败完成”的语义，只是此 UI选择从 IntentSender取得更详细的 public/legacy status与错误消息。
+
+## 14. sessionId、installId、status与Activity result是四种账
+
+`sessionId`由 PackageInstallerService分配，标识 stage与安装事务；`installId`由 PackageInstaller应用自己的 `EventResultPersister`递增生成，只把结果广播匹配到某个 UI observer。两者命名空间、owner和生命周期都不同。
+
+public status是 SDK面向调用者的稳定、粗粒度类别，legacy status是 PMS内部 `INSTALL_*`细因及旧接口兼容码；Activity result则是旧 URI UI链在明确请求时的回程契约。三者可以描述同一次安装，却不能互相冒充，更不能用 UI result反推某个 Session的最终回调。
+
+`InstallEventReceiver`在 Manifest中导出，但要求发送方有 `INSTALL_PACKAGES`。收到普通终态时，persister按 installId找在线 observer；没有 observer就把 public status、legacy status和 message写入 `AtomicFile`，Activity重建后重新注册可立即取走。写盘由 AsyncTask延后，返回调用栈不等于已经落盘。
+
+pending user action是特例：它在读取 installId之前试图直接启动 `Intent.EXTRA_INTENT`，不进入最终结果表。AOSP InstallInstalling创建的 Session因 PackageInstaller应用自身 UID持有 `INSTALL_PACKAGES`且未设 FORCE_PROMPT，正常链不会走到这里；更不能把这段兜底当可靠代启动器。r48内层 Intent没有 `FLAG_ACTIVITY_NEW_TASK`，调用处又是 BroadcastReceiver的非 Activity Context，而 targetSdk≥P的 `ContextImpl.startActivity()`会拒绝这种调用。这是一条潜在异常路径，不是 system_server pending模型的保证。
+
+这份持久账主要覆盖 Activity配置变化和短暂进程重建，不是跨 boot完成协议。`install_results.xml`与临时 APK同在 no-backup目录；BOOT_COMPLETED时 TemporaryFileManager遍历并删除 boot之前的文件。构造器遇到损坏 XML也会清空结果再异步写新状态。
+
+最终 UI再做一层适配：请求 `EXTRA_RETURN_RESULT`时，InstallSuccess返回 RESULT_OK+`INSTALL_SUCCEEDED`，InstallFailed返回 RESULT_FIRST_USER+legacy code；否则显示“完成/打开”或失败页。但 r48正常广播链有一个丢参缺口：`launchFinishBasedOnResult()`失败时把 public status用于选择失败分支，却调用只接收 legacy status/message的 `launchFailure()`；后者启动 InstallFailed时没有放回 `EXTRA_STATUS`。所以 InstallFailed会读到默认通用失败，源码中 blocked/conflict/incompatible/invalid/storage的分类视图及 storage管理入口，不能由这条正常链的 public status触发。Activity result只是旧 Intent入口的回程包装，不改变 PMS已经产生、却在 UI跳转处丢失的 PackageInstaller status。
+
+### 练习 9：从广播倒推四种 ID与完成点
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'PackageInstaller.SessionParams.MODE_FULL_INSTALL' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallInstalling.java
+grep -n -F 'params.setInstallerPackageName(getIntent().getStringExtra(' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallInstalling.java
+grep -n -F 'mSessionId = getPackageManager().getPackageInstaller().createSession(params);' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallInstalling.java
+grep -n -F '.openWrite("PackageInstaller", 0, sizeBytes)' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallInstalling.java
+grep -n -F 'session.fsync(out);' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallInstalling.java
+grep -n -F 'broadcastIntent.setPackage(getPackageName());' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallInstalling.java
+grep -n -F 'session.commit(pendingIntent.getIntentSender());' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallInstalling.java
+grep -n -F 'mInstallId = InstallEventReceiver' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallInstalling.java
+grep -n -F 'if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/EventResultPersister.java
+grep -n -F 'context.startActivity(intent.getParcelableExtra(Intent.EXTRA_INTENT));' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/EventResultPersister.java
+grep -n -F 'Calling startActivity() from outside of an Activity ' frameworks/base/core/java/android/app/ContextImpl.java
+grep -n -F 'mResults.put(id, new EventResult(status, legacyStatus, statusMessage));' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/EventResultPersister.java
+grep -n -F 'mResultsFile = new AtomicFile(resultFile);' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/EventResultPersister.java
+grep -n -F 'if (systemBootTime > fileOnBoot.lastModified()) {' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/TemporaryFileManager.java
+grep -n -F 'public void onFinished(int sessionId, boolean success) {' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallInstalling.java
+grep -n -F 'getPackageManager().getPackageInstaller().abandonSession(mSessionId);' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallInstalling.java
+grep -n -F 'int mResultCode = RESULT_CANCELED;' frameworks/base/core/java/android/app/Activity.java
+grep -n -F 'getBooleanExtra(Intent.EXTRA_RETURN_RESULT, false)' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallSuccess.java
+grep -n -F 'launchFailure(legacyStatus, statusMessage);' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallInstalling.java
+grep -n -F 'failureIntent.putExtra(PackageInstaller.EXTRA_LEGACY_STATUS, legacyStatus);' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallInstalling.java
+grep -n -F 'getIntExtra(PackageInstaller.EXTRA_STATUS,' frameworks/base/packages/PackageInstaller/src/com/android/packageinstaller/InstallFailed.java
+```
+
+给定“Activity旋转时终态到达”“进程在异步写盘前退出”“终态已落盘后进程重建”“设备重启”“收到 pending”五个现场，写出 observer、AtomicFile和 UI各自会做什么；再说明 sessionId、installId、public status、legacy code和 Activity result分别回答哪一问。解释 pending直接启动为何可能违反 NEW_TASK规则、Cancel与 Back为何留下不同 Session状态；最后沿三个 launch-failure命中点说明 receiver明明拿到精确 public status，普通失败页为何仍只能落到默认分类。
+
+## 15. multi、staged与重启边界决定了如何诊断卡住
+
+已有 Session确认链还有四个 r48边界不能用正常 happy path覆盖。
+
+第一，staged Session在 `handleInstall()`开头直接交给 StagingManager并向当前 receiver回报 `INSTALL_SUCCEEDED / "Session staged"`，不走普通 `makeSessionActiveLocked()`确认门。这个 success只表示已提交 staged流程，不表示包已安装；pre-reboot验证以 ready或 failed表达，重启恢复与激活后再以 applied或 failed收口，这些状态不会向原 commit receiver补发一次最终安装结果。看到 staged参数时，不应期待本章这只 confirmation Intent。
+
+第二，multi child不能直接 commit；parent commit为每个 child安装 `ChildStatusIntentReceiver`，pending仍携带 child sessionId，全部成功或任一失败才改回 parent sessionId聚合给外部 receiver。parent自身跳过目标包判断，逐个 child调用 `makeSessionActiveLocked()`。若某 child需要确认，它返回 null并发 pending，但循环会把其他非 null child继续放进 `installingChildSessions`并调用 list版 `installStage()`；若所有 child都等待，空列表还会在 PMS触发“`No child sessions found!`”。用户后来对某 child点 true，又直接给该 child投 `MSG_INSTALL`。所以 r48不能假设“一个 child等待用户，整组必然原地不动”，排障必须按 child sessionId核对实际 PMS交接集合。
+
+第三，确认位和回调都不是重启协议。XML schema含 committed/sealed和静态 SessionParams，却不保存 `mPermissionsManuallyAccepted`、`mRemoteStatusReceiver`以及本地验证派生出的 package/signing/resolved-file字段；第一次 commit会先同步落盘 sealed，随后异步才置 `mCommitted=true`，而这一步本身不保证再次写 Session XML，所以磁盘可能是 sealed=true、committed=false。重启读到 false后，recommit可重新验证并派生字段；若碰巧读到 true，`streamValidateAndCommit()`会快速返回，派生字段却仍为空，r48普通 APK后续不能可靠恢复。只有 APEX在 `onAfterSessionRead()`额外重建所需字段。公开 API虽允许 owner再次 commit并给新 receiver，这也只是恢复尝试，不等于旧回调或派生状态已经回来。
+
+第四，UI关闭不等于服务端终态。最可靠的诊断顺序是：先辨入口；再记 Session owner/installer UID与 originating UID/package；检查 Session sealed/committed/relinquished/destroyed和是否 staged/multi child；确认最后 public status是否 pending；查看 AppOp与两类用户限制；最后分别等 PMS status与 Activity result。界面截图只能说明当前交互页，不足以代替这几本账。
+
+## 16. 九类完成证据与第259章接口
+
+下面是九类完成证据，不是一条让所有入口依次走完的统一时间线：
+
+这份清单从“commit正常返回”才开始。child直接提交、非 owner调用、仍有 writer、Secure FRP或 transfer模式不匹配都可能在任何 status callback之前同步抛出；它们不是第1类证据之后的异步失败。
+
+1. `[commit边界]` `Session.commit()`正常返回首先只证明没有同步抛异常；普通 single Session在 `markAsSealed()`成功后才完成 seal并投递异步验证。multi child sealing失败时该 void方法也可直接返回而不调用 `dispatchStreamValidateAndCommit()`，所以调用方不能仅凭返回值证明已调度，更不能证明本地验证完成。
+2. `[任一普通 Session]` `streamValidateAndCommit()`返回 true：内容验证完成、`mCommitted=true`，不代表 PMS已接管；内部 file链是在第7类证据之后才到这里。
+3. `[需要确认的已有 Session]` 收到 `STATUS_PENDING_USER_ACTION`：需要交互且外层 receiver存活，不是失败或 UI已启动。
+4. `[确认 UI]` InstallStart通过来源声明与身份整理：能进入内部页面，不代表 AppOp或用户限制放行。
+5. `[可选 Settings往返]` 来源 AppOp写成 ALLOWED：该 uid+package可请求，不代表当前 APK已获同意，而且回程存在不重查窗口。
+6. `[确认 UI]` positive：已有 Session只是投递第二轮；内部 `file:`开始创建/写系统 Session；`package:`准备同步调用已有包恢复 API。
+7. `[再入边界]` 已有 Session收到第二轮消息，或内部 `file:`路径执行新 Session的 `commit()`：都不代表 PMS已接手；`package:`跳过此类证据。
+8. `[Session两支]` `ActiveInstallSession`真正传给 `mPm.installStage()`：PMS后半程已交接，不代表 verifier与事务成功；`package:`与 staged跳过这一形态。
+9. `[non-staged Session终局]` 当前 commit receiver收到 `STATUS_SUCCESS`才是 PackageInstaller操作终局。只有内部 file链再把它翻译成 InstallSuccess或按请求返回 Activity result；已有 Session由自己的 receiver消费者处置。`package:`因忽略 int失败码甚至可能只有 UI假成功；staged的同名 success只表示“Session staged”，仍要另看 ready/applied/failed。
+
+因此，已有 Session主线大致是 1→2→3→4→〔5〕→6→7→8→9；content转内部 file的路线是 4→〔5〕→6→7→2→8→9；`package:`只走 4→〔5〕→6后进入同步 API与可能失真的 UI结果。方括号中的第5类本来就是条件分支。
+
+最简心智模型是：InstallStart守住外部入口和来源身份，PackageInstallerActivity组合用户限制、来源 AppOp与本次点击；在已有 Session路线，PackageInstallerSession保存本次确认并把工作交给 PMS，在内部 file路线则由系统安装器另建特权 Session。结果 receiver只负责把异步终局带回消费者。任何一层的“允许”都不能替后续层签字。
+
+第259章从第8类证据继续：PMS接手后，required verifier、sufficient verifier、integrity verification、timeout与最终放行怎样共同决定安装能否进入真正的 prepare/scan/reconcile/commit。

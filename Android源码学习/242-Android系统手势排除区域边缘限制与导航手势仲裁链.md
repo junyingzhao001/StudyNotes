@@ -1,939 +1,455 @@
-# 242 Android系统手势排除区域、边缘限制与导航手势仲裁链
+# 242 Android 系统手势排除区域、边缘限制与导航手势仲裁链
 
 > 源码版本：Android 11 / `android-11.0.0_r48`  
-> 学习方式：macOS只读核源，不编译、不运行AOSP
+> 学习方式：macOS 只读核源，不编译、不运行 AOSP
 
-## 1. 本章要解决什么
+## 1. 主问题：一次 exclusion 请求最终能阻止哪次返回手势
 
-第241章把WMS的`mTapExcludeRegion`与公开的system gesture exclusion明确分开。
+一个贴着屏幕左边缘的抽屉和系统“侧滑返回”会争用同一串 pointer。`View.setSystemGestureExclusionRects()` 提供的不是“这块区域归 App 所有”，而是一份有条件的优先级请求：只有 Rect 经客户端可见性映射、WMS 触摸能力与 Z 序裁剪、每侧边缘预算筛选后，才会成为 SystemUI 在下一次 `ACTION_DOWN` 读取的 actual exclusion Region。
 
-本章沿后一条链完整追踪：
+本章追问一件事：App 提交的一组 View 局部 Rect，究竟在哪些条件下能阻止某次边缘返回候选；若没有阻止，SystemUI 又到哪个 MOVE 才请求接管原窗口的触摸流？
 
-```text
-View.setSystemGestureExclusionRects传入的Rect相对谁？
-View移动、被父View裁剪或隐藏后，排除区怎样更新？
-Window级Rect和View级Rect怎样合并？
-WMS为什么还要与窗口touchable region、上层窗口遮挡求交？
-“最多200dp”究竟限制宽度、面积还是高度？
-左右边缘共用还是分别计数？
-IME、Home和沉浸式为什么例外？
-SystemUI怎样根据最终Region决定返回手势，又在何时抢走App触摸流？
-```
-
-## 2. 一句总纲
-
-系统手势排除区不是让App获得一块新触摸区域，而是让系统在App本来就能触摸的位置降低普通系统手势的优先级：
+读完应能分开回答五个完成点：
 
 ```text
-View声明局部精细手势Rect
-→ ViewRoot把可见部分映射到窗口坐标并合并
-→ WMS按窗口Z序、真实touchable region和遮挡关系生成Display请求Region
-→ 对左右系统手势边缘分别施加纵向高度预算
-→ SystemUI接收最终Region
-→ 边缘DOWN在Region内则不启动返回手势
-→ Region外达到横向阈值后pilfer原触摸流并触发Back
+View 已保存请求
+ViewRoot 已把窗口坐标 List 放入 oneway Binder
+WMS 已更新该 Display 的 actual/unrestricted Region
+SystemUI 主线程已换成本地 Region
+本次手势已越阈值；若 native pilfer 返回 OK，当前 windows/portal 路由已清、monitor 保留，只有满足合成条件的旧连接才排入 CANCEL
 ```
 
-## 3. 总体链路
+任意前一项都不自动证明后一项。第 241 章已经解释 `getEffectiveTouchableRegion()` 的四种 touchable-insets、modal、Task 与 tap-exclude 几何；本章只把它当作 WMS 聚合的输入，不重走那条链。第 243 章才讨论遮挡安全与 tapjacking。
 
-```mermaid
-flowchart LR
-    VIEW["View局部 exclusion rects"] --> TRACKER["GestureExclusionTracker"]
-    WINDOW["Window根级 rects"] --> TRACKER
-    TRACKER --> VR["ViewRootImpl窗口坐标List"]
-    VR --> SESSION["IWindowSession oneway上报"]
-    SESSION --> WS["WindowState mExclusionRects"]
-    WS --> DC["DisplayContent Z序聚合/裁剪/限额"]
-    DC --> LISTENER["ISystemGestureExclusionListener"]
-    LISTENER --> SYSUI["EdgeBackGestureHandler"]
-    SYSUI -->|"排除区外且越过阈值"| PILFER["pilferPointers并执行Back"]
-```
+## 2. 两条时间线：Region 发布链与单次触摸仲裁链
 
-## 4. 源码地图
+排除区发布和某一次触摸是两条并行时间线：
 
 ```text
-frameworks/base/core/java/android/view/View.java
-frameworks/base/core/java/android/view/Window.java
-frameworks/base/core/java/com/android/internal/policy/PhoneWindow.java
-frameworks/base/core/java/android/view/GestureExclusionTracker.java
-frameworks/base/core/java/android/view/ViewRootImpl.java
-frameworks/base/core/java/android/view/IWindowSession.aidl
-frameworks/base/services/core/java/com/android/server/wm/Session.java
-frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
-frameworks/base/services/core/java/com/android/server/wm/WindowState.java
-frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
-frameworks/base/services/core/java/com/android/server/wm/WindowManagerConstants.java
-frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
-frameworks/base/core/java/android/view/WindowInsets.java
+发布链
+View/Window 局部 Rect
+→ GestureExclusionTracker 映射成窗口 List
+→ IWindowSession oneway
+→ WindowState 请求缓存
+→ DisplayContent actual/unrestricted
+→ ISystemGestureExclusionListener oneway
+→ SystemUI main executor 更新本地 Region
+
+触摸链
+InputDispatcher 同时送给正常窗口目标与 gesture monitor
+→ SystemUI 只在 ACTION_DOWN 读取当时的本地 Region
+→ 阈值前继续旁观
+→ 横向意图成立后请求 pilfer
+→ native 返回 OK 时清窗口路由、保留 monitor，并只对可合成的旧连接排 CANCEL
+→ 插件稍后决定 triggerBack 或 cancelBack
 ```
 
-## 5. API解决的是手势冲突
+所以“刚调用 API，紧接着从边缘按下”天然存在代际问题。该 DOWN 读到旧 Region 还是新 Region，取决于客户端 Handler、两次 Binder、WMS 全局锁、SystemUI main executor 与输入消息的实际排队顺序。r48 没有把一次 App 请求与某个未来 pointer id 绑定成事务。
 
-典型冲突：
+几何口径也有四层：View post-layout 局部、窗口局部 List、Display 全局 Region、SystemUI 当前缓存。调试时必须同时记录坐标系与时间，不能只比较两个形似的矩形数值。
 
-```text
-App左边缘抽屉：从左向右拖
-系统返回手势：从左向右拖
-```
+## 3. API 契约：只放松冲突手势，不创造触摸权
 
-如果没有协议，系统和App会争夺同一个起始动作。
+`setSystemGestureExclusionRects()` 的文档说系统“可以选择”放松自身手势识别。它不是以下任何承诺：
 
-## 6. exclusion不是“禁止所有系统输入”
+- 不给窗口增加 InputDispatcher 命中范围；
+- 不保证每种系统级手势都服从请求；
+- 不保证整个请求都会通过边缘预算；
+- 不保证 API 返回后的当前手势立刻采用新结果。
 
-API文档使用的是“系统可选择放松自己的手势识别”。
+三个 Insets 口径要分开：
 
-它不保证屏蔽每一种系统级动作，更不允许覆盖mandatory system gestures。
+| 口径 | 回答的问题 | exclusion 能否覆盖 |
+|---|---|---|
+| `systemGestures()` | 哪些边缘连续手势可能由系统优先处理 | 普通部分可请求让出优先级 |
+| `mandatorySystemGestures()` | 哪些系统手势必须保持优先 | 不能由该 API 覆盖 |
+| `tappableElement()` | 简单点击应避开哪些持久系统元素 | 与连续边缘手势不是同一问题 |
 
-## 7. exclusion也不创造触摸权
+WMS 的 `calculateSystemGestureExclusion()` 并没有一行通用的“actual 减 mandatory Region”。mandatory 是 API 与具体系统手势消费者必须遵守的策略边界；在本章的 Edge Back 消费者里，底部手势区检查先于 exclusion。不能把它误写成客户端 Rect 在 WMS 中固定经过的第四次求交。
 
-某Rect即使被App请求排除，如果那里不属于该窗口真实touchable region，WMS也不会采纳。
+同理，actual Region 命中只让 SystemUI 放弃这次 Back 候选。App 仍须本来就是正常窗口目标，窗口内部也仍由 ViewGroup 决定哪个 child 接收事件。
 
-排除区只能在“App本来能接收触摸”的范围内改变手势优先级。
+## 4. View 声明生命周期：引用、清空与位置监听
 
-## 8. View API的坐标系
+View API 的 Rect 是 post-layout 局部坐标。需要精细拖动的 thumb 可以声明自己的局部小范围，不应先加窗口位置。文档建议在 `onLayout()` 或 `onDraw()` 更新，因为尺寸、父层裁剪和位置通常到那时才稳定。
 
-`View.setSystemGestureExclusionRects()`接收的是View的post-layout局部坐标。
+r48 直接把调用者的 `List<Rect>` 引用保存进 `ListenerInfo`，getter 也返回同一引用；它没有逐个深拷贝。调用后原地修改 List 或其中 Rect 会绕过正常的更新消息，所以文档明确要求不要再改。
 
-例如一个宽300高100的SeekBar，其thumb附近Rect可写在`[0,0,300,100]`内部，而不是加上窗口位置。
+非空声明会给 RenderNode 注册 `PositionUpdateListener`。position changed/lost 回调可能来自 HWUI worker，它只向 View Handler 队首 post，再由 View 调用 ViewRoot。Handler 为 null 时这次 post 不发生。
 
-## 9. 为什么强调post-layout
+清空有一个只属于 r48 实现的尖角：代码移除了 RenderNode listener，却没有把 `mPositionUpdateListener` 字段置 null。随后同一 View 再设非空 List，setter 会主动 post 一次当前结果，但因为字段仍非空，不会重新 add listener；再往后的纯 RenderNode 位置变化可能失去这条通知来源。
 
-View尺寸和位置通常要到layout后才确定。
-
-文档建议在`onLayout()`或`onDraw()`调用，保证Rect与最终内容几何一致。
-
-## 10. List的所有权约定
-
-文档要求调用后不要继续修改传入List。
-
-r48的View实现直接保存该List引用，没有深拷贝每个Rect；调用者原地修改会绕过正常更新通知。
-
-## 11. 传空List
-
-空List会清掉View的排除声明，并移除RenderNode position listener。
-
-若从未创建ListenerInfo且本来就是空，源码直接返回，避免无意义对象分配。
-
-## 12. 为什么监听RenderNode位置
-
-排除Rect是View局部的，但View可以因动画、translation或渲染节点位置更新而移动。
-
-实现注册`RenderNode.PositionUpdateListener`，在`positionChanged`和`positionLost`时要求重新计算。
-
-## 13. 回调线程不一定是UI线程
-
-源码警告position callback可能由HWUI worker thread调用。
-
-所以它不直接操作ViewRoot，而是向View Handler队首post `updateSystemGestureExclusionRects()`。
-
-## 14. ViewRoot只记录“这个View脏了”
-
-`updateSystemGestureExclusionRectsForView(view)`交给`GestureExclusionTracker`，再发送：
-
-```text
-MSG_SYSTEM_GESTURE_EXCLUSION_CHANGED
-```
-
-实际合并集中在ViewRoot消息处理线程。
-
-## 15. Tracker为何使用WeakReference
-
-它不应因为排除声明永久持有已脱离层级的View。
-
-扫描时遇到View被回收、未attach或不可聚合显示，就移除对应info。
-
-## 16. aggregated visibility
-
-只有`isAggregatedVisible()`为true的View继续提供Rect。
-
-父层隐藏导致子View虽自身visibility未改，排除区也应消失。
-
-## 17. 局部Rect怎样映射到窗口
-
-每个Rect复制后调用：
-
-```java
-p.getChildVisibleRect(excludedView, mappedRect, null)
-```
-
-该调用沿父层级映射坐标，并裁掉被祖先可见边界截掉的部分。
-
-## 18. 完全不可见Rect会被丢弃
-
-若`getChildVisibleRect()`返回false，不把该Rect加入新列表。
-
-所以App声明一个超出View的Rect，并不意味着越界部分必然上报给WMS。
-
-## 19. 部分可见Rect会被裁小
-
-例如子View局部Rect为`[0,0,100,100]`，父容器只显示其右半边，映射后的窗口Rect只保留可见右半。
-
-这与WMS之后按窗口touchable region求交是两层不同裁剪。
-
-## 20. Window根级声明
-
-`Window.setSystemGestureExclusionRects()`面向没有View层级、例如`takeSurface()`的场景。
-
-PhoneWindow实现把根级List交给ViewRoot；它与各View提供的Rect相加，而不是替换View列表。
-
-## 21. Window级坐标
-
-Window API的Rect相对窗口坐标，已经不需要通过某个具体View父链映射。
-
-Tracker创建结果列表时先放root rects，再追加各View映射后的rects。
-
-## 22. 变化合并
-
-`computeChangedRects()`只有检测到根列表、View列表或可见性变化，且最终List与旧结果不同，才返回新List。
-
-返回null表示无需再次跨Binder上报。
-
-## 23. r48 Tracker的可疑比较
-
-`GestureExclusionViewInfo.update()`计算了`newRects`，但源码比较的是：
-
-```java
-if (mExclusionRects.equals(localRects)) return UNCHANGED;
-mExclusionRects = newRects;
-```
-
-旧字段保存的是映射后Rect，右边却是View局部Rect。
-
-## 24. 为什么要标成版本实现细节
-
-当View不在窗口原点或被裁剪时，mapped rect与local rect不同，这个比较可能造成额外changed判断；反过来，某些位置/裁剪变化的识别也不能只靠这个等式直觉推导。
-
-本章只记录r48源码事实，不把它推广成API保证。
-
-## 25. ViewRoot上报内容
-
-ViewRoot拿到变化List后调用：
-
-```text
-IWindowSession.reportSystemGestureExclusionChanged(mWindow, rects)
-```
-
-并把同一窗口坐标List通知`OnSystemGestureExclusionRectsChangedListener`。
-
-## 26. AIDL是oneway
-
-`reportSystemGestureExclusionChanged`在IWindowSession.aidl中声明为`oneway`。
-
-App线程只把请求异步发送到system_server，不等待WMS完成聚合或SystemUI收到结果。
-
-## 27. Session与WMS入口
-
-Session先检查该Session持有的窗口，再转到WMS。
-
-WMS通过`windowForClientLocked(session, window, true)`定位WindowState，避免客户端替别的窗口上报。
-
-## 28. WindowState保存的是请求值
-
-`mExclusionRects`保存客户端窗口坐标List。
-
-相等时不触发重新计算；变化时清旧List、加入新项，再让DisplayContent更新。
-
-## 29. 请求值不等于最终值
-
-后续还有：
-
-```text
-窗口可见/可触摸资格
-窗口局部到Display坐标变换
-与effective touchable region求交
-上层窗口遮挡
-左右边缘高度预算
-特殊窗口/沉浸模式豁免
-```
-
-因此App无法仅凭自己传入的List知道最终系统采纳Region。
-
-## 30. 为什么聚合发生在DisplayContent
-
-系统返回手势属于Display边缘，多个Window可以重叠。
-
-只有DisplayContent拥有同一显示上的完整Z序、系统手势InsetsSource和可见窗口集合。
-
-## 31. 没有listener时的优化
-
-`updateSystemGestureExclusion()`发现没有注册的系统监听者，会直接返回false。
-
-WindowState仍保存请求；当首个listener注册时，DisplayContent再计算整份Region。
-
-## 32. SystemUI是主要消费者
-
-手势导航启用时，`EdgeBackGestureHandler`向WMS注册`ISystemGestureExclusionListener`。
-
-WMS把Display坐标的最终Region异步回调给SystemUI主执行器。
-
-## 33. 两份Region
-
-listener可能收到：
-
-```text
-systemGestureExclusion：应用限制后的实际Region
-systemGestureExclusionUnrestricted：未施加边缘预算的请求Region
-```
-
-第二份主要用于调试、统计哪些请求被拒绝。
-
-## 34. 计算从整屏unhandled开始
-
-`unhandled`初始为整个Display。
-
-DisplayContent按窗口从上到下遍历；每处理一个可触摸窗口，就从unhandled减去它的effective touchable region。
-
-## 35. 上层窗口为什么先占地
-
-若上层窗口覆盖某点，后层App即使在该点声明排除，也无法接收那里的初始触摸。
-
-所以它也不应借排除声明影响系统手势。
-
-## 36. 窗口资格过滤
-
-以下窗口跳过：
-
-```text
-cantReceiveTouchInput()
-不可见
-FLAG_NOT_TOUCHABLE
-或整个Display已没有unhandled区域
-```
-
-排除API不是给无输入窗口恢复触摸能力的后门。
-
-## 37. effective touchable region
-
-WMS使用`getEffectiveTouchableRegion()`，它包含touch modality、Stack crop和tap-exclude等结果。
-
-这正是第241章两条机制的交点：system gesture exclusion会被tap-exclude之后的真实触摸范围限制，但两者仍不是同一个API。
-
-## 38. 与unhandled求交
-
-```text
-touchableRegion = window effective touchable region ∩ unhandled
-```
-
-这样只保留当前窗口在Z序上实际暴露、能收到初始触摸的部分。
-
-## 39. 普通窗口Rect转Display坐标
-
-WMS先把List转为Region，然后：
-
-```text
-按WindowState mGlobalScale缩放
-加Window frame.left/top
-与当前touchableRegion求交
-```
-
-这条坐标链与第241章的窗口局部→Display全局模型一致。
-
-## 40. 隐式全排除的旧应用
-
-Android Q以前的目标SDK应用，在sticky immersive隐藏导航栏时，可由DeviceConfig兼容开关让整个touchable region隐式排除系统手势。
-
-此时不读取其显式Rect列表。
-
-## 41. 这不是所有沉浸应用的永久特权
-
-需要同时满足：
-
-```text
-HIDE_NAVIGATION + IMMERSIVE_STICKY
-兼容DeviceConfig开关为true
-属于Activity窗口
-targetSdk < Q
-```
-
-新应用不能依赖这条旧兼容路径。
-
-## 42. system gesture edge来自InsetsSource
-
-左右边缘不是硬编码固定像素宽度。
-
-DisplayContent读取`ITYPE_LEFT_GESTURES`和`ITYPE_RIGHT_GESTURES` InsetsSource的frame，得到本Display当前手势边缘带。
-
-## 43. 边缘限制到底限制什么
-
-限制的是请求Region落入左/右edge frame部分的“纵向矩形高度总和”。
-
-不是：
-
-```text
-不是每个Rect最多200dp
-不是Rect宽度最多200dp
-不是总面积最多200dp²
-不是左右两边合计200dp
-```
-
-## 44. 左右分别拥有预算
-
-源码初始化：
-
-```java
-int[] remainingLeftRight = {limit, limit};
-```
-
-左边缘和右边缘各自拥有完整纵向高度预算。
-
-## 45. 默认最小200dp
-
-`WindowManagerConstants`从DeviceConfig读取dp值，但用：
-
-```java
-Math.max(200, configuredValue)
-```
-
-所以r48至少200dp；设备配置可以把预算调得更大。
-
-## 46. dp怎样转px
-
-每个Display按：
-
-```text
-limitPx = limitDp × densityDpi / 160
-```
-
-计算实际预算。不同密度Display的像素数不同，但物理dp目标相近。
-
-## 47. 预算是Display共享的
-
-所有需要受限的可见窗口按Z序共同消费该Display左右两份预算。
-
-不是每个Window各有200dp，也不是每个App进程各有200dp。
-
-## 48. 为什么按Z序共享
-
-上层窗口的可触摸区域先决定真实交互面。
-
-如果每个窗口独立拿满额度，重叠窗口叠加后可以让整条边缘都失去系统返回能力。
-
-## 49. 限额函数的输入
-
-对左边缘：
-
-```text
-requested local Region ∩ leftEdge
-```
-
-对右边缘同理。Region中完全不碰边缘带的部分不消费边缘预算。
-
-## 50. 中间区域不受这项限制
-
-WMS用请求Region减去leftEdge和rightEdge，把剩下middle直接并入最终Region。
-
-因为这项200dp规则专门保护边缘系统手势，不是限制App在屏幕中央的普通手势声明。
-
-## 51. 为什么仍返回中间Region
-
-system gesture类型不只“返回”，其他系统手势区域可能随设备策略变化。
-
-聚合函数保留完整请求语义，具体SystemUI消费者再结合自己的触摸带判断。
-
-## 52. Rect消费顺序
-
-`forEachRectReverse()`的注释说明顺序是：
-
-```text
-bottom → top
-同一纵向顺序下 right → left
-```
-
-所以在一个边缘上，靠下的Rect优先获得预算。
-
-## 53. 部分Rect怎样截断
-
-若当前Rect高度100px，但剩余预算只有30px：
-
-```java
-rect.top = rect.bottom - 30;
-```
-
-最终保留该Rect底部30px，顶部70px被拒绝。
-
-## 54. 为什么保留底部
-
-这是r48具体实现的优先顺序，不是由API文字承诺给App的排序契约。
-
-App应提交真正必要的小范围，而不是依赖“我靠下所以一定获批”的实现细节。
-
-## 55. 一组限额算例
-
-假设左边缘预算200px，从下到上有三个互不重叠Rect：
-
-```text
-C高度80
-B高度90
-A高度100
-```
-
-消费结果：
-
-```text
-C获80，剩120
-B获90，剩30
-A只获底部30
-最终获批总高度200
-```
-
-## 56. Region矩形高度求和的边界
-
-Region会把重叠Rect规范化成不重叠矩形集合，再迭代高度。
-
-不能简单把调用者List每个Rect.height相加推断消耗，重叠、合并和裁剪都会改变Region分解。
-
-## 57. 限制适用于哪些窗口
-
-一般App窗口在手势导航边缘需要限制，以保证用户总能找到可用返回区域。
-
-源码通过`needsGestureExclusionRestrictions()`决定豁免。
-
-## 58. sticky隐藏导航的豁免
-
-当客户端请求导航栏不可见，且Insets behavior为`BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE`，限制可被取消。
-
-这样沉浸内容可优先处理边缘；系统仍可用专门的transient bar手势策略介入。
-
-## 59. IME豁免
-
-`TYPE_INPUT_METHOD`不受边缘高度预算限制。
-
-输入法会根据`systemGestures()` Insets，在键盘左右边缘上报从visibleTop到根底部的排除Rect，避免返回手势干扰键盘边缘操作。
-
-## 60. Notification Shade豁免
-
-`TYPE_NOTIFICATION_SHADE`也跳过限制。
-
-它属于系统UI受信窗口，不是普通第三方App可创建的类型。
-
-## 61. Home豁免
-
-Activity type为HOME的窗口跳过限制。
-
-Launcher的系统导航交互是整体系统体验的一部分，源码给予特殊策略。
-
-## 62. mandatory gesture不能排除
-
-`WindowInsets.getMandatorySystemGestureInsets()`文档明确：mandatory system gestures不能被`setSystemGestureExclusionRects()`覆盖。
-
-所以“IME/Home不受200dp限制”也不等于能夺走mandatory区域的系统优先权。
-
-## 63. actual与unrestricted聚合
-
-每个Window的local请求都并入`outExclusionUnrestricted`。
-
-actual则依据是否受限，分别经过边缘预算或直接union。
-
-## 64. r48 restricted标志的细节
-
-函数最后用“左右剩余预算是否小于初始值”返回boolean。
-
-这表示只要受限路径在某边消费过预算，就可能标记restricted，即使请求没有真正被截断、actual与unrestricted相同。
-
-## 65. 与AIDL注释的张力
-
-AIDL说unrestricted参数在“没有应用限制”时应为null。
-
-r48实现的boolean更接近“受限规则路径是否使用过边缘预算”，不严格等同于两个Region是否真的不同；调试时应直接比较两份Region，不只看null。
-
-## 66. 更新何时通知listener
-
-若新的actual Region与缓存相同，`updateSystemGestureExclusion()`直接返回，不再广播。
-
-这意味着仅unrestricted请求变化、但actual恰好不变时，r48这段早退可能不发送新调试差异。
-
-## 67. 首个listener注册
-
-首个监听者触发立即重算；若重算没有导致广播，注册函数会单独把当前缓存回调给它。
-
-因此SystemUI启用手势导航后能立刻拿到当前Region，不必等待下一次App上报。
-
-## 68. WMS聚合图
-
-```mermaid
-flowchart TD
-    FULL["unhandled=整屏"] --> Z["窗口按Z序从上到下"]
-    Z --> ELIGIBLE{"可见且可触摸?"}
-    ELIGIBLE -->|"否"| NEXT["下一窗口"]
-    ELIGIBLE -->|"是"| TOUCH["effectiveTouchable ∩ unhandled"]
-    TOUCH --> MAP["窗口局部请求缩放/平移到Display"]
-    MAP --> CLIP["请求 ∩ 当前touchable"]
-    CLIP --> EDGE["左/右边缘分别消费高度预算"]
-    CLIP --> MID["中间区域直接加入"]
-    EDGE --> ACTUAL["actual Region"]
-    MID --> ACTUAL
-    CLIP --> UNLIMITED["unrestricted Region"]
-    TOUCH --> SUB["unhandled -= touchable"]
-    SUB --> NEXT
-```
-
-## 69. SystemUI保存两份Region
-
-EdgeBackGestureHandler回调在主执行器中更新：
-
-```text
-mExcludeRegion = actual
-mUnrestrictedExcludeRegion = unrestricted非null ? unrestricted : actual
-```
-
-第二份用于标记“用户从被预算拒绝的App请求区域完成了返回”。
-
-## 70. 只有手势导航启用才工作
-
-Handler要求导航栏已attach且当前模式是gestural。
-
-启用时注册WMS listener、创建gesture InputMonitor/InputEventReceiver和边缘动画panel；禁用时逐项释放。
-
-## 71. InputMonitor为何能同时看到事件
-
-`monitorGestureInput("edge-swipe", displayId)`建立手势监视通道。
-
-DOWN初期事件仍可发给正常App窗口，同时SystemUI监视并判断是否形成返回手势。
-
-## 72. ACTION_DOWN决定候选资格
-
-SystemUI在DOWN时检查：
-
-```text
-quickstep/系统flag是否禁用返回
-是否有gesture-blocking Activity
-是否位于底部手势区
-是否足够靠左/右边缘
-是否落在actual exclusion Region
-```
-
-不满足就不启动本次返回候选。
-
-## 73. 底部手势区优先
-
-若`y >= displayHeight - bottomGestureHeight`，边缘返回直接拒绝。
-
-这是为了避免与底部Home/Overview手势区域冲突。
-
-## 74. 边缘宽度不是exclusion limit
-
-```text
-edgeWidthLeft/right：SystemUI认为DOWN可启动返回的横向宽度
-exclusion limit：WMS允许App在边缘排除的纵向高度预算
-```
-
-一个控制X方向候选带，一个控制Y方向可让出的总长度。
-
-## 75. ML模型是额外候选判断
-
-在最内侧必定候选宽度之外、但仍位于较宽边缘范围时，r48可用App/位置特征模型决定是否接受。
-
-exclusion Region检查发生在候选范围判断之后，二者不是替代关系。
-
-## 76. transient navbar状态
-
-当导航栏以transient sticky方式显示时，SystemUI忽略mExcludeRegion的阻止效果，直接按withinRange决定。
-
-这与WMS对sticky hide nav的限制豁免相互配合，但分别发生在聚合端和消费端。
-
-## 77. actual排除命中的结果
-
-若DOWN在`mExcludeRegion`内：
-
-```text
-SystemUI记录excluded统计
-返回false
-不把本次流交给边缘返回panel
-不pilfer App触摸
-```
-
-App继续按正常View分发处理该流。
-
-## 78. 被拒绝请求区域
-
-若DOWN不在actual，却在unrestricted里，`mInRejectedExclusion=true`。
-
-这说明App请求过，但因预算/策略未获实际保护；系统仍允许返回，并用不同统计类型记录。
-
-## 79. DOWN通过还不立即抢流
-
-SystemUI先把事件同时观察并交给边缘动画插件。
-
-只有手势横向移动超过touch slop且横向量大于纵向量，才认定达到返回阈值。
-
-## 80. pilfer发生的时刻
-
-达到阈值后：
-
-```java
-mThresholdCrossed = true;
-mInputMonitor.pilferPointers();
-```
-
-InputDispatcher向原App目标合成CANCEL，后续pointer流留给手势monitor集合。
-
-## 81. 为什么不是DOWN就pilfer
-
-边缘处仍可能只是点击或纵向滚动。
-
-延迟到方向与距离明确后再抢占，可减少系统对App正常触摸的误伤。
-
-## 82. 多指会取消返回
-
-阈值前出现`ACTION_POINTER_DOWN`，SystemUI记录multi-touch未完成并cancel边缘插件。
-
-r48的边缘返回状态机不把多指当作有效Back手势。
-
-## 83. 长按会取消
-
-MOVE到来时若距downTime超过long-press timeout，候选取消。
-
-默认属性上限来自`gestures.back_timeout`，源码常量默认250ms。
-
-## 84. 纵向优先也取消
-
-若`dy > dx && dy > touchSlop`，判为垂直移动，不再抢流。
-
-这保护靠边的垂直列表滚动。
-
-## 85. Back最终怎样触发
-
-边缘插件确认完成后回调`triggerBack()`。
-
-SystemUI注入一对`KEYCODE_BACK` DOWN/UP，并通知OverviewProxy与统计链。
-
-## 86. exclusion不是直接把事件送给某个View
-
-它只让SystemUI不启动冲突的系统返回候选。
-
-真正的App目标仍由InputDispatcher基于InputWindowInfo命中，窗口内部仍按ViewGroup规则选择子View。
-
-## 87. 仲裁时序图
-
-```mermaid
-sequenceDiagram
-    participant ID as InputDispatcher
-    participant APP as App窗口
-    participant SYS as SystemUI手势Monitor
-    participant WMS as WMS排除Region
-    WMS-->>SYS: actual / unrestricted
-    ID->>APP: ACTION_DOWN
-    ID->>SYS: 同流ACTION_DOWN
-    alt DOWN位于actual exclusion
-        SYS-->>SYS: 不启动Back
-        ID->>APP: MOVE/UP继续
-    else DOWN允许候选
-        ID->>APP: MOVE
-        ID->>SYS: MOVE
-        alt 横向越过阈值
-            SYS->>ID: pilferPointers
-            ID->>APP: ACTION_CANCEL
-            ID->>SYS: 后续MOVE/UP
-            SYS-->>SYS: trigger KEYCODE_BACK
-        else 垂直/多指/长按
-            SYS-->>SYS: 取消候选
-            ID->>APP: 原流继续
-        end
-    end
-```
-
-## 88. SeekBar为何自动声明
-
-`AbsSeekBar`会把thumb bounds扩大到最小尺寸，放入排除Rect，再追加用户自定义Rect。
-
-拖动边缘thumb属于需要精细水平手势的典型场景。
-
-## 89. Text Editor也可能声明
-
-Editor为某些可拖动文本选择/插入控件设置排除Rect。
-
-框架控件自己使用该API，说明它不是只为导航抽屉设计。
-
-## 90. 不应排除整个ScrollView
-
-API文档明确不建议为宽泛区域或普通Button声明排除。
-
-简单点击在system gesture insets内通常仍保证到达窗口；冲突主要发生在从边缘开始的连续方向手势。
-
-## 91. system gesture Insets是什么
-
-`WindowInsets.Type.systemGestures()`告诉App哪些边缘可能被系统手势优先处理。
-
-App可据此只在真正相交的精细控件处声明排除，而不是猜固定边缘宽度。
-
-## 92. mandatory Insets是什么
-
-`Type.mandatorySystemGestures()`是不可通过exclusion覆盖的系统手势区域。
-
-设计交互时应把关键控件避开，而不是试图声明更大的Rect。
-
-## 93. tappable element Insets
-
-文档还区分`tappableElement`：简单tap是否可交给窗口，与连续系统手势优先权不是同一概念。
-
-三类Insets应分别理解，不能把“在系统手势边缘”误写成“所有触摸都被系统吃掉”。
-
-## 94. 诊断actual和unrestricted
-
-Pointer Location调试视图可注册同一listener，把actual与被拒绝差异画成不同颜色。
-
-源码属性为：
-
-```text
-debug.pointerlocation.showexclusion
-```
-
-本课程在macOS不实际运行，只通过源码理解该诊断入口。
-
-## 95. 常见错误一：200dp限制每个Rect
-
-错误。
-
-它是每个Display、每个左右边缘分别共享的总纵向预算；多个Window与多个Rect共同消费。
-
-## 96. 常见错误二：Rect越宽越费额度
-
-错误。
-
-一旦与edge frame相交，预算计算看Region分解矩形的height；宽度影响是否落入边缘，但不作为额度单位。
-
-## 97. 常见错误三：请求排除后App一定收到手势
-
-错误。
-
-请求还会被View可见裁剪、Window touchable Region、上层窗口遮挡、边缘预算和mandatory gesture策略限制。
-
-## 98. 常见错误四：排除区在MOVE中动态切换所有权
-
-EdgeBackGestureHandler主要在本次流的ACTION_DOWN用当前Region决定候选资格。
-
-DOWN后Region变化不应被理解为能把已经开始的手势任意倒带重选。
-
-## 99. 常见错误五：pilfer等于普通View拦截
-
-pilfer是InputDispatcher层把触摸焦点从原窗口目标取消给手势monitor，原App收到CANCEL。
-
-ViewGroup intercept只在同一窗口View树内部重新分配，层级完全不同。
-
-## 100. 常见错误六：沉浸式永远无限制
-
-源码区分新Insets行为豁免与pre-Q sticky immersive兼容全排除，两者条件不同。
-
-是否显示transient navbar还会影响SystemUI消费端是否尊重exclusion。
-
-## 101. macOS只读练习一：追View映射
+### 练习 1：推演一次清空再启用的 listener 状态
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '11420,11485p' frameworks/base/core/java/android/view/View.java
-sed -n '25,155p' frameworks/base/core/java/android/view/GestureExclusionTracker.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'public void setSystemGestureExclusionRects(@NonNull List<Rect> rects) {' frameworks/base/core/java/android/view/View.java
+grep -n -F 'if (rects.isEmpty() && mListenerInfo == null) return;' frameworks/base/core/java/android/view/View.java
+grep -n -F 'info.mSystemGestureExclusionRects = rects;' frameworks/base/core/java/android/view/View.java
+grep -n -F 'mRenderNode.removePositionUpdateListener(info.mPositionUpdateListener);' frameworks/base/core/java/android/view/View.java
+grep -n -F 'if (info.mPositionUpdateListener == null) {' frameworks/base/core/java/android/view/View.java
+grep -n -F 'mRenderNode.addPositionUpdateListener(info.mPositionUpdateListener);' frameworks/base/core/java/android/view/View.java
+grep -n -F 'h.postAtFrontOfQueue(this::updateSystemGestureExclusionRects);' frameworks/base/core/java/android/view/View.java
+grep -n -F 'ai.mViewRootImpl.updateSystemGestureExclusionRectsForView(this);' frameworks/base/core/java/android/view/View.java
+grep -n -F 'return list;' frameworks/base/core/java/android/view/View.java
 ```
 
-画出View局部Rect经父可见裁剪成为窗口Rect的步骤，并找出r48 mapped/local比较的可疑点。
+从一个已 attach 到 ViewRoot、`getHandler()!=null`、但尚未创建 ListenerInfo 的 View 开始，依次执行：①传非空 List `L1`；②不再调用 setter，只把 `L1[0]` 原地改掉；③传空 List；④传新的非空 `L2`；⑤只改变 RenderNode 位置。逐步写出保存的 List、setter 是否向 Handler 成功入队、position listener 是否实际注册，并说明第④步为什么只能触发一次显式更新、第⑤步为何可能没有位置回调。不得假定 setter 会复制 List。
 
-## 102. macOS只读练习二：手算Z序与预算
+## 5. GestureExclusionTracker：可见映射与 r48 比较缺口
 
-假设左边缘预算200px：顶部窗口暴露Rect高度60；下层窗口暴露Rect从下到上分别为90、100。
+Tracker 用 `WeakReference<View>` 保存来源，不应仅因 exclusion 声明延长 View 生命周期。扫描时，View 已回收、未 attach 或 `isAggregatedVisible()==false` 都返回 GONE；父 View 隐藏因此能让子声明退出最终 List。
 
-按WMS窗口Z序和Region底到顶顺序，算每段实际获批高度；再说明若顶部窗口覆盖下层50px，为什么要先改`unhandled`。
+对每个局部 Rect，Tracker 先复制，再调用父节点的 `getChildVisibleRect(excludedView, mappedRect, null)`。父链会处理位置、scroll、矩阵与可见裁剪；返回 false 的 Rect 被丢弃，部分可见的 Rect 只保留映射后的窗口部分。这是客户端裁剪，后面的 WMS touchable/unhandled 交集是另一层。
 
-## 103. macOS只读练习三：核对豁免
+r48 的变化比较存在明确缺口：函数已经算出窗口坐标 `newRects`，却用旧的映射结果 `mExclusionRects` 去比较新的 View 局部 `localRects`。若上轮映射值刚好等于局部值，例如 View 原先位于窗口原点，本轮只移动位置，比较会提前返回 UNCHANGED，刚算出的新映射不会写回。反过来，只要旧映射长期不等于 local，它又会反复走 CHANGED，最后仍可能被总 List 相等检查挡住上报。
+
+字段 `mDirty` 在此版本只被初始化和赋 true，没有被 `update()` 读取；不能把它讲成一次可靠的增量重算门。位置监听发消息，不等于 Tracker 必然接纳本轮 `newRects`。
+
+### 练习 2：算可见映射并复现一次漏更新
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '4990,5150p' \
-  frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
-sed -n '790,825p' \
-  frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'private final WeakReference<View> mView;' frameworks/base/core/java/android/view/GestureExclusionTracker.java
+grep -n -F 'if (v == null || !v.isAttachedToWindow() || !v.isAggregatedVisible()) {' frameworks/base/core/java/android/view/GestureExclusionTracker.java
+grep -n -F 'final List<Rect> localRects = excludedView.getSystemGestureExclusionRects();' frameworks/base/core/java/android/view/GestureExclusionTracker.java
+grep -n -F 'final List<Rect> newRects = new ArrayList<>(localRects.size());' frameworks/base/core/java/android/view/GestureExclusionTracker.java
+grep -n -F 'Rect mappedRect = new Rect(src);' frameworks/base/core/java/android/view/GestureExclusionTracker.java
+grep -n -F 'if (p != null && p.getChildVisibleRect(excludedView, mappedRect, null)) {' frameworks/base/core/java/android/view/GestureExclusionTracker.java
+grep -n -F 'newRects.add(mappedRect);' frameworks/base/core/java/android/view/GestureExclusionTracker.java
+grep -n -F 'if (mExclusionRects.equals(localRects)) return UNCHANGED;' frameworks/base/core/java/android/view/GestureExclusionTracker.java
+grep -n -F 'mExclusionRects = newRects;' frameworks/base/core/java/android/view/GestureExclusionTracker.java
+grep -n -F 'mDirty' frameworks/base/core/java/android/view/GestureExclusionTracker.java
 ```
 
-列出普通App、sticky hide nav、IME、notification shade、Home与pre-Q immersive各自是否受限及条件。
+Round 1 中，identity View 位于窗口 `(0,0)`、无裁剪，局部 Rect 为 `[0,0,100,80]`，先完成一次 compute。Round 2 的父链几何改为 View 净平移到 `(30,25)`，并给出祖先窗口坐标 clip `[50,40,110,90]`，局部 List 不变。先算 Round 2 的 `newRects=[50,40,110,90]`，再按源码比较左右两边，说明为何返回 UNCHANGED 并继续保留旧 `[0,0,100,80]`。最后令 aggregated visibility=false，说明下一次全扫描为何会移除此 View。
 
-## 104. macOS只读练习四：追SystemUI接管
+## 6. Window 根 Rect 与 View Rect 汇成窗口 List
+
+`Window.setSystemGestureExclusionRects()` 面向 `takeSurface()` 等没有普通 View 层级的场景。PhoneWindow 把它交给 ViewRoot 的 root List；这个 List 也是按引用保存，不替换各 View 的声明。
+
+`computeChangedRects()` 的结果顺序是 root Rect 先进入新 ArrayList，再按 Tracker 中 ViewInfo 顺序追加各 View 的映射 Rect。这里仍是 List，不会先合并重叠项为 Region。根列表变化或某 View 被判 CHANGED/GONE 会进入结果比较；只有最终 List 与上次不同，函数才返回非 null。
+
+ViewRoot 随后做两件并列的事：把同一个窗口坐标 List 交给 `IWindowSession`，并调用 App 内 `OnSystemGestureExclusionRectsChangedListener`。这个本地回调看到的是“已变换、准备上报的窗口 List”，不是 WMS 的 actual，也看不到 Z 序、边缘预算或 mandatory 消费策略。
+
+### 练习 3：区分窗口 List 与服务端 actual
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '545,615p' \
-  frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
-sed -n '647,710p' \
-  frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'getViewRootImpl().setRootSystemGestureExclusionRects(rects);' frameworks/base/core/java/com/android/internal/policy/PhoneWindow.java
+grep -n -F 'mGestureExclusionTracker.setRootSystemGestureExclusionRects(rects);' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'mRootGestureExclusionRects = rects;' frameworks/base/core/java/android/view/GestureExclusionTracker.java
+grep -n -F 'final List<Rect> rects = new ArrayList<>(mRootGestureExclusionRects);' frameworks/base/core/java/android/view/GestureExclusionTracker.java
+grep -n -F 'rects.addAll(info.mExclusionRects);' frameworks/base/core/java/android/view/GestureExclusionTracker.java
+grep -n -F 'if (!mGestureExclusionRects.equals(rects)) {' frameworks/base/core/java/android/view/GestureExclusionTracker.java
+grep -n -F 'mWindowSession.reportSystemGestureExclusionChanged(mWindow, rectsForWindowManager);' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F '.dispatchOnSystemGestureExclusionRectsChanged(rectsForWindowManager);' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'listener to add' frameworks/base/core/java/android/view/ViewTreeObserver.java
 ```
 
-标出DOWN排除、bottom area、edge width、横纵方向、long press、多指、pilfer和Back触发各自的时机。
+上次总缓存依次为 root R=`[0,0,20,50]`、已稳定映射的 View A=`[0,100,10,130]`、View B=`[100,100,120,140]`。本轮 R 与 A 不变，B 在 Tracker entry 尚未移除时刚 detach，且其余来源为空。写出 compute 返回 List 的顺序、本地 listener 所见内容及 B 的去向；再列出仅凭这次本地 callback 仍无法判断的三项服务端事实。若调用者随后原地修改 root List 却不再次调用 Window setter，说明为什么不能保证产生新消息。
 
-## 105. 复读后最容易不理解的地方
+## 7. oneway 上报：客户端返回究竟证明到哪里
+
+`IWindowSession.reportSystemGestureExclusionChanged()` 是 oneway。Session 只清理 calling identity 后转发；真正用 `windowForClientLocked(session, window, true)` 校验窗口属于该 Session 的是 WMS。找到 WindowState 后，相同 List 不触发聚合；变化时服务端清旧项、保存新项，再调用 DisplayContent。
+
+DisplayContent 若没有任何系统 listener，会直接返回而不计算 actual；请求仍已保存在 WindowState。首个 listener 注册时再计算整份 Display。若有 listener，WMS 在全局锁内算出缓存 Region，并通过另一个 oneway 接口通知；SystemUI 的 Binder stub 又 post 到 main executor 后才 `set()` 本地两份 Region。
+
+WindowState List 相等只抑制这次 App RPC 直接触发的重算，不把 actual 冻结。surface placement、Insets 状态变化、导航手势设置变化、Display metrics/density 更新，以及 DeviceConfig 的 limit 或 pre-Q 开关变化，都有独立入口再次调用 `updateSystemGestureExclusion()`；所以 App List 不变时，窗口几何、Z 序、edge frame 或预算变化仍可改写结果。
+
+因此客户端 API/oneway proxy 返回最多说明调用或 Binder 提交没有同步抛错，不证明 WMS 已存值；WMS 发出 callback 不证明 SystemUI main 已落表；SystemUI 落表也只影响之后处理的 DOWN。App 内 ViewTreeObserver 回调与服务端确认没有因果回执关系。
+
+### 练习 4：给五个时刻标完成含义
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'oneway void reportSystemGestureExclusionChanged(IWindow window, in List<Rect> exclusionRects);' frameworks/base/core/java/android/view/IWindowSession.aidl
+grep -n -F 'mService.reportSystemGestureExclusionChanged(this, window, exclusionRects);' frameworks/base/services/core/java/com/android/server/wm/Session.java
+grep -n -F 'final WindowState win = windowForClientLocked(session, window, true);' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+grep -n -F 'if (win.setSystemGestureExclusion(exclusionRects)) {' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+grep -n -F 'if (mExclusionRects.equals(exclusionRects)) {' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'mExclusionRects.addAll(exclusionRects);' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'if (mSystemGestureExclusionListeners.getRegisteredCallbackCount() == 0) {' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'mSystemGestureExclusion.set(systemGestureExclusion);' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'dc.updateSystemGestureExclusion();' frameworks/base/services/core/java/com/android/server/wm/RootWindowContainer.java
+grep -n -F 'mDisplayContent.updateSystemGestureExclusion();' frameworks/base/services/core/java/com/android/server/wm/InsetsStateController.java
+grep -n -F 'mDisplayContent.updateSystemGestureExclusion();' frameworks/base/services/core/java/com/android/server/wm/DisplayPolicy.java
+grep -n -F 'updateSystemGestureExclusionLimit();' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'mUpdateSystemGestureExclusionCallback.run();' frameworks/base/services/core/java/com/android/server/wm/WindowManagerConstants.java
+grep -n -F 'oneway interface ISystemGestureExclusionListener {' frameworks/base/core/java/android/view/ISystemGestureExclusionListener.aidl
+grep -n -F 'mMainExecutor.execute(() -> {' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+grep -n -F 'mExcludeRegion.set(systemGestureExclusion);' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+```
+
+固定时刻：t1=View setter 返回，t2=ViewRoot 的 oneway proxy 返回，t3=WMS 已保存 WindowState List，t4=WMS 已更新 actual 并调用 listener，t5=SystemUI main executor 已执行 Region `set()`。逐项写出能证明与不能证明的下一层。再分别推演“t3 时无 listener”和“新 List 与 WindowState 旧 List 相等”：哪些缓存会更新，哪些不会由这次 RPC 重算？最后列出上述五类非 App-report 重算入口，说明它们各自能改变哪种聚合输入。
+
+## 8. DisplayContent 的 Z 序账本：effective 与 unhandled
+
+System gesture 是 Display 级竞争：多个窗口会重叠，只有 DisplayContent 拥有完整 Z 序。聚合从 `unhandled=整屏` 开始，窗口按 top-to-bottom 遍历。`cantReceiveTouchInput()`、不可见、`FLAG_NOT_TOUCHABLE` 窗口被跳过；可处理窗口先取得第 241 章定义的 effective touchable Region，再与当前 unhandled 求交。这里的 effective 是本聚合算法采用的候选 touchable 口径，不能跳过 SurfaceFlinger/InputDispatcher 链，直接把它叫作最终生产命中 Region。
+
+这里的 unhandled 不是“还未处理 exclusion 的区域”，而是“在本算法里还未被更上层候选 touchable Region 占用的 Display 区域”。当前窗口有没有声明 exclusion 都不影响它随后从 unhandled 中减去已经与 unhandled 求交的本窗口 touchable Region。因此一个不声明排除区的顶层窗口，也能阻止更低窗口借被覆盖位置影响系统手势。
+
+modal effective Region 可以大到 Display/Task 策略范围。顶层 modal 即使 List 为空，也可能让后层请求全部失去暴露部分。相反，不可触摸 overlay 被资格门跳过，不从 unhandled 扣除；这与初始触摸穿过它的行为一致。安全遮挡标志是下一章的另一条账。
+
+## 9. 窗口 List 变成 Display Region：scale、translate、intersect
+
+普通显式请求先用 `rectListToRegion()` 合并；重叠 Rect 到此才成为规范化 Region。随后按 `mGlobalScale` 缩放、加 `mFrame.left/top`，最后与“effective touchable ∩ unhandled”求交：
 
 ```text
-排除区只是放松普通系统手势优先级，不创造App触摸范围
-View Rect先变窗口坐标，WMS再变Display坐标
-WMS先按Z序算真实暴露touchable区域，再做排除聚合
-200dp是左右各自的纵向共享预算
-actual决定是否阻止Back，unrestricted主要记录被拒请求
-DOWN只是候选；达到横向阈值才pilfer原App触摸流
+local = Region(window-coordinate List)
+displayRequest = translate(scale(local, mGlobalScale), frameOrigin)
+exposedRequest = displayRequest ∩ effectiveTouchable ∩ unhandled
 ```
 
-## 106. 复读修订一：API中的200dp不是固定唯一值
+所以 unrestricted 也不是 App 原始 List。它已经丢掉 View 不可见部分、窗口触摸范围外部分和被高层窗口占住的部分；“unrestricted”只表示后续没有施加每侧边缘高度预算。
 
-View文档写200dp是平台基线；r48服务端从DeviceConfig读取并保证最小200dp，设备可配置更高值。
+pre-Q sticky immersive 是另一种 local 来源。需同时满足 HIDE_NAVIGATION+IMMERSIVE_STICKY、DeviceConfig 兼容开关开启、存在 ActivityRecord 且 targetSdk<Q，WMS 才用当前暴露 touchable Region 替代显式 List。它仍要经过后面的 restriction 判定与 Display 聚合，不能从兼容条件直接推出任意设备上最终 actual 必为整窗。
 
-所以准确表述是“默认/最小基线200dp的可配置每边缘预算”，不能写死所有设备永远等于200dp。
+### 练习 5：手算 Z 序遮挡与坐标变换
 
-## 107. 复读修订二：unrestricted非null不必然证明发生截断
-
-r48以“是否消费过受限边缘预算”设置restricted标志，而非最终比较actual与unrestricted是否不同。
-
-分析拒绝量应做Region差集，不能只用第二参数是否null判断。
-
-## 108. 复读修订三：限制高度不是List高度简单相加
-
-客户端List先合并成Region，再经历View裁剪、window缩放/平移、touchable相交和Z序unhandled裁剪。
-
-真正消费的是最终落入edge frame的Region矩形序列高度。
-
-## 109. 复读修订四：App与SystemUI不是DOWN时二选一投递
-
-手势InputMonitor可与正常App同时观察初期事件。
-
-Region外的候选也不会在DOWN立即取消App；只有横向阈值成立、SystemUI调用pilfer后，App才收到CANCEL并失去后续流。
-
-## 110. Android 11 r48版本边界
-
-```text
-View/Window exclusion API在客户端合并后以oneway上报
-GestureExclusionTracker存在mapped结果与local列表比较的实现细节
-WMS以有效touchable region和top-to-bottom unhandled聚合
-每Display左右边缘分别使用最小200dp可配置纵向预算
-IME、notification shade、Home和特定sticky隐藏导航路径豁免
-pre-Q sticky immersive全排除受DeviceConfig兼容开关控制
-SystemUI EdgeBack先监视，横向越阈值后才pilfer并最终发送KEYCODE_BACK
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'unhandled.set(0, 0, mDisplayFrames.mDisplayWidth, mDisplayFrames.mDisplayHeight);' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'forAllWindows(w -> {' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'if (w.cantReceiveTouchInput() || !w.isVisible()' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'w.getEffectiveTouchableRegion(touchableRegion);' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'touchableRegion.op(unhandled, Op.INTERSECT);' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'rectListToRegion(w.getSystemGestureExclusion(), local);' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'local.scale(w.mGlobalScale);' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'final Rect frame = w.getWindowFrames().mFrame;' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'local.translate(frame.left, frame.top);' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'local.op(touchableRegion, Op.INTERSECT);' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'unhandled.op(touchableRegion, Op.DIFFERENCE);' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'if (w.isImplicitlyExcludingAllSystemGestures()) {' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
 ```
 
-## 111. 本章检查清单
+Display 为 `[0,0,400,800]`。顶窗 W1 合格、scale=1、frame 原点 `(0,0)`、effective touchable=`[0,0,400,200]`、显式 List=`[0,50,20,180]`；下窗 W2 合格、scale=2、frame 原点 `(0,100)`、effective touchable=`[0,100,400,500]`、局部 List=`[0,10,10,100]`。忽略边缘额度，按 Z 序写出两窗 exposed request 与每步 unhandled；验证 W2 的 Display 请求先变为 `[0,120,20,300]`，再只剩 `[0,200,20,300]`。最后把 W1 改成 effective 覆盖整屏且 List 为空，说明 W2 为何仍无贡献。
 
-```text
-[ ] 能说出View exclusion Rect的坐标系
-[ ] 能解释父View可见裁剪与RenderNode位置更新
-[ ] 能区分View级与Window根级List
-[ ] 能说明oneway上报的完成边界
-[ ] 能推演窗口Z序、touchable Region和unhandled
-[ ] 能解释左右边缘各自共享的纵向预算
-[ ] 能手算bottom-to-top部分截断
-[ ] 能列出主要豁免条件
-[ ] 能区分systemGestures与mandatorySystemGestures
-[ ] 能解释SystemUI从DOWN候选到pilfer再到Back的时序
+## 10. 左右边缘预算：来源、单位与反向消费
+
+左右 edge 不是硬编码的固定宽度，WMS 从 `ITYPE_LEFT_GESTURES`、`ITYPE_RIGHT_GESTURES` InsetsSource frame 读取。高度预算则由 DeviceConfig 的 dp 整数决定，r48 用 `Math.max(200, configured)` 保证至少 200dp，再按每个 Display 的 `densityDpi/160` 做整数换算。
+
+`remainingLeftRight={limit,limit}` 说明左右各有一份完整预算；它们由同一 Display 上受限窗口按 Z 序共享，不是每个 Rect、Window 或进程各有一份。高 Z 窗口先消费，即使它的 Rect 靠上，也会先于低 Z 窗口的底部 Rect；bottom-to-top 只描述同一窗口、同一侧 Region 内部的迭代。请求 Region 完全处于两条 edge 之外的 middle 会直接 union，不消费这两份预算。
+
+每一侧先让源码变量 `local`（此时已经是 Display 坐标）与 edge 求交，再用 `forEachRectReverse()` 按 bottom-to-top、同层 right-to-left 消费规范化 Region 的 Rect。若一个 Rect 高于剩余额度，只保留它底部的剩余高度。这里收费单位是 Region 迭代所得每个 Rect 的 `height()`：不是面积，也不是调用者 List 的简单高度和；两个水平分离但 Y 投影相同的岛会各收一次高度，因此形状和 Region 分解可间接影响消耗。
+
+r48 还有一个必须与最终几何分账的记账尖角。部分截断时，代码虽然把 `rect.top` 改到正确位置，却仍执行 `remaining -= 原始 height`，所以 remaining 可以为负；`grantedExclusion=limit-remaining` 也可能大于真正 union 进 actual 的高度。最终 Region 裁剪仍正确，但 `remaining` 与 WindowState 的 requested/granted 日志字段不能代替 Region 实测长度。
+
+### 练习 6：重算截断、负 remaining 与水平双岛
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'private static final int MIN_GESTURE_EXCLUSION_LIMIT_DP = 200;' frameworks/base/services/core/java/com/android/server/wm/WindowManagerConstants.java
+grep -n -F 'mSystemGestureExclusionLimitDp = Math.max(MIN_GESTURE_EXCLUSION_LIMIT_DP,' frameworks/base/services/core/java/com/android/server/wm/WindowManagerConstants.java
+grep -n -F '* mDisplayMetrics.densityDpi / DENSITY_DEFAULT;' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'getSourceProvider(ITYPE_LEFT_GESTURES)' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'getSourceProvider(ITYPE_RIGHT_GESTURES)' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F '{mSystemGestureExclusionLimit, mSystemGestureExclusionLimit};' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'Order is bottom to top, then right to left.' frameworks/base/services/core/java/com/android/server/wm/utils/RegionUtils.java
+grep -n -F 'Collections.reverse(rects);' frameworks/base/services/core/java/com/android/server/wm/utils/RegionUtils.java
+grep -n -F 'forEachRectReverse(r, rect -> {' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'if (remaining[0] <= 0) {' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'final int height = rect.height();' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'rect.top = rect.bottom - remaining[0];' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'remaining[0] -= height;' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'final int grantedExclusion = limit - remaining[0];' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'win.setLastExclusionHeights(side, requestedExclusion[0], grantedExclusion);' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
 ```
 
-## 112. 本章小结
+先固定 densityDpi=320、configured limit=120dp，算出实际 limit=400px；再把 configured 改为300dp重算。随后另取 fresh 左预算200px、edge=`[0,0,40,1000]`，规范化 Rect 从上到下为 A=`[0,0,40,100]`、B=`[0,150,40,240]`、C=`[0,300,40,380]`。按反向顺序写出 actual 片段、每步 remaining、`requestedExclusion` 与源码计算的 `grantedExclusion`；区分 actual 总高度200与最终 remaining=-70、granted=270。
 
-Android 11系统手势排除链可以概括为：
+再用 fresh 预算100px和两个水平分离 Rect `[0,400,10,450]`、`[20,400,30,450]`，说明 Y 投影虽只有50px，源码为何消费100px。最后指出右侧预算为何不受这些左侧运算影响。
 
-```text
-App只声明真正需要精细边缘手势的View局部Rect
-→ ViewRoot把可见部分汇总为窗口坐标List并异步上报
-→ WMS按窗口真实触摸能力、Z序遮挡和Display手势边缘聚合
-→ 左右各自用纵向预算保留一部分App优先区
-→ SystemUI用actual Region在DOWN阶段排除返回候选
-→ Region外先与App共同观察，横向意图明确后pilfer
-→ App收到CANCEL，SystemUI完成动画并发送Back键
+## 11. 限额与豁免：跳过预算不等于获得触摸
+
+`needsGestureExclusionRestrictions()` 的输出由窗口身份和当前导航栏请求共同决定：
+
+| 情况 | 边缘高度预算 | 仍受哪些上游/下游边界 |
+|---|---|---|
+| 普通 App | 应用 | View 可见、effective touchable、Z 序、mandatory/消费者 |
+| nav 请求不可见且 behavior 为 transient-by-swipe | 跳过 | 仍须 touchable 且未被高层占住 |
+| `TYPE_INPUT_METHOD` | 跳过 | 仍须 touchable；Edge Back 底部门仍先执行 |
+| `TYPE_NOTIFICATION_SHADE` | 跳过 | 系统窗口身份，不是普通 App 能伪造的类型 |
+| HOME Activity | 跳过 | 仍在 Display 聚合与具体消费者策略内 |
+
+IME 的实现会按 `systemGestures()` 左右 inset，从 `visibleTopInsets` 到 root 底部声明两条 Rect；这解释了它为什么需要边缘操作空间，但不把 mandatory 区变成可排除。
+
+pre-Q implicit exclusion 与“跳过预算”也是两个谓词。前者决定 local 取显式 List 还是整个暴露 touchable；后者由 requested Insets visibility/behavior、IME/shade/Home 决定。常见 sticky immersive 路径会同时满足，但推理时仍要分别列条件。
+
+### 练习 7：完成六类窗口的条件矩阵
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'final boolean stickyHideNav =' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F '&& win.mAttrs.insetsFlags.behavior == BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE;' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'return (!stickyHideNav || ignoreRequest) && type != TYPE_INPUT_METHOD' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F '&& type != TYPE_NOTIFICATION_SHADE && win.getActivityType() != ACTIVITY_TYPE_HOME;' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'final int immersiveStickyFlags =' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'return immersiveSticky && mWmService.mConstants.mSystemGestureExcludedByPreQStickyImmersive' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F '&& mActivityRecord != null && mActivityRecord.mTargetSdk < Build.VERSION_CODES.Q;' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'local.set(touchableRegion);' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'rootView.getRootWindowInsets().getInsetsIgnoringVisibility(Type.systemGestures());' frameworks/base/core/java/android/inputmethodservice/InputMethodService.java
+grep -n -F 'rootView.setSystemGestureExclusionRects(exclusionRects);' frameworks/base/core/java/android/inputmethodservice/InputMethodService.java
+grep -n -F 'system gestures cannot be overriden by' frameworks/base/core/java/android/view/WindowInsets.java
 ```
 
-这套设计的核心不是简单“系统让App”或“App让系统”，而是先用几何限制App的声明能力，再把最终决定放在系统手势状态机的DOWN与阈值阶段。
+固定其余资格门均通过，分别判断：A 普通 target R App、导航栏可见；B target R App、requested nav 不可见且 behavior=transient-by-swipe；C `TYPE_INPUT_METHOD`；D `TYPE_NOTIFICATION_SHADE`；E HOME Activity；F target P Activity，legacy HIDE_NAVIGATION+IMMERSIVE_STICKY、兼容开关=true，并固定 requested nav 不可见、behavior=transient-by-swipe。对每行写出 `needsRestrictions(false)`，再只对 F 判断是否 `isImplicitlyExcludingAllSystemGestures()` 以及是否读取显式 List。最后把 F 的兼容开关改 false，说明哪一个谓词变化。
 
-## 113. 下一章预告
+## 12. actual 与 unrestricted：名字不等于通知语义
 
-下一章深入触摸遮挡安全：InputDispatcher如何计算`WINDOW_IS_OBSCURED`与`WINDOW_IS_PARTIALLY_OBSCURED`，trusted overlay为何例外，View的`filterTouchesWhenObscured`怎样防御tapjacking，以及它与普通Z序命中、透明窗口和system gesture exclusion的边界。
+每个窗口的 exposedRequest（此时已在 Display 坐标）都 union 到 `outExclusionUnrestricted`；actual 则对受限窗口先消费左右预算，对豁免窗口直接 union。unrestricted 因此是“经过客户端可见映射、窗口触摸范围和 Z 序之后，但未施加边缘预算”的 Region，不足以证明某个原始 App Rect 的完整内容。
+
+`calculateSystemGestureExclusion()` 的注释把 boolean 描述成 actual 与 unrestricted 是否不同，但 r48 实现返回“左或右 remaining 是否小于初值”。只要普通受限窗口在 edge 消费过正高度，即使完全落在预算内、两份 Region 相等，boolean 也为 true；若该轮因 actual 改变而广播，或注册路径补发当前缓存，listener 收到的 unrestricted 仍是非 null。
+
+更新通知还有更窄的门：函数先重算 unrestricted 与 restricted flag，随后只比较新旧 actual；actual 相同便直接返回，不广播。因此只改变已被预算拒绝的请求，可以更新 WMS 的 unrestricted 缓存，却让已有 listener 保留旧副本。首个 listener 注册会触发计算；若计算没有自行广播，注册路径再单独回调当前缓存，避免新 listener 永远拿不到初值。
+
+SystemUI 收到 null unrestricted 时把它复制为 actual；非 null 也不自动代表两份不同。对同一次 callback 携带的两份 Region，可用 `unrestricted - actual` 判断该代际被预算拒绝的几何，不能拿参数是否为 null 当差集；但 actual-equality 早退可能使已有 listener 的 unrestricted 缓存落后于 WMS 当前值。
+
+### 练习 8：构造 actual 不变而 unrestricted 变化
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'mSystemGestureExclusionWasRestricted = calculateSystemGestureExclusion(' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'if (mSystemGestureExclusion.equals(systemGestureExclusion)) {' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'final Region unrestrictedOrNull = mSystemGestureExclusionWasRestricted' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F '.onSystemGestureExclusionChanged(mDisplayId, systemGestureExclusion,' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'outExclusionUnrestricted.op(local, Op.UNION);' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'return remainingLeftRight[0] < mSystemGestureExclusionLimit' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'mSystemGestureExclusionListeners.register(listener);' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'if (mSystemGestureExclusionListeners.getRegisteredCallbackCount() == 1) {' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'if (!changed) {' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'mUnrestrictedExcludeRegion.set(unrestrictedOrNull != null' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+```
+
+固定 Display=`[0,0,400,300]`、leftEdge=`[0,0,20,300]`、rightEdge=`[380,0,400,300]`，只有一个普通受限窗口，左预算100px且其余裁剪为空；首次前 actual 为空且已有 listener。第一次请求仅含底部 `[0,100,20,200]`，第二次在保持它不变的同时新增更靠上的 `[0,0,20,50]`。按 bottom-to-top 分别算两轮 actual、unrestricted、remaining 与 boolean；说明第二轮为何 actual 不变却 unrestricted 增大，以及已有 listener 是否收到第二次广播。再加入一个全新的第二 listener，推演注册路径为何会把当前缓存直接给它。最后另起 fresh 场景，旧 actual 为空，请求只有 middle Rect `[100,0,120,50]`；说明 boolean 为何是 false、两份内部 Region 为何相同，以及 actual 改变引发的 callback 为何把 unrestricted 参数置 null。
+
+## 13. SystemUI 收表并在 DOWN 依次过门
+
+`EdgeBackGestureHandler` 只有在导航栏已 attach 且当前为 gestural mode 时启用。启用会注册 WMS listener、建立 `monitorGestureInput("edge-swipe", displayId)`、创建主 Looper 的 InputEventReceiver 和边缘插件；禁用则释放这些对象。WMS callback 在 Binder 线程到达后再交给 main executor，输入事件也在主 Looper 消费，最终由两类消息的先后顺序决定某个 DOWN 读哪一版 Region。
+
+DOWN 的门序不能压成一次 contains：
+
+1. quickstep rotation、强制导航键、blocking Activity 与 SysUI flags 先做全局准入；
+2. `isWithinTouchRegion()` 先拒绝底部 gesture height；
+3. 离两侧超过两倍 margin 的点连统计候选都不是；
+4. X 落入 left/right edge width 才有 withinRange，ML 只可能收紧较外侧部分，不会把 range 外点扩进来；
+5. transient navbar 显示时在 actual 检查之前返回 withinRange；
+6. 非 transient 才用 actual 拒绝 Back，并用 unrestricted contains 记录 rejected-exclusion 统计分类。
+
+这解释了三个反直觉结果：actual 内的底部点先被 bottom 门拒绝，不记成 exclusion 命中；actual 内但本来不在 edge range 的点不能借 exclusion 获得 App 触摸权；`unrestricted contains && !actual contains` 只说明 SystemUI 当前缓存的未限额 Region 覆盖该点，可能来自显式或 pre-Q implicit 路径，也可能因 actual-equality 早退而落后于 WMS 当前缓存，不足以单独归因某个 View。
+
+## 14. 阈值前取消、阈值后 pilfer：触摸流何时换主
+
+DOWN 通过只让插件开始观察，SystemUI 不立刻抢流。正常窗口仍按 InputDispatcher 的 TouchState 收到初期事件，gesture monitor 同时收到副本。阈值前：
+
+- `ACTION_POINTER_DOWN` 取消当前 Back 候选；
+- 只有 MOVE 到来并发现 `eventTime-downTime > mLongPressTimeout` 才触发长按取消，没有独立定时器在 250ms 正点执行；
+- `dy>dx && dy>touchSlop` 取消纵向手势；
+- `dx>dy && dx>touchSlop` 才先置 `mThresholdCrossed=true`，再调用 `pilferPointers()`。
+
+这些分支只在 `!mThresholdCrossed` 时运行；多指若发生在越阈值之后，EdgeBackGestureHandler 不再执行本段的 pre-threshold 取消逻辑。该 POINTER_DOWN 能否再次到达 monitor 与插件，还取决于下述 Dispatcher 分支。
+
+`InputMonitor.pilferPointers()` 又不是同步成功凭证。它调用的 `IInputMonitorHost` 是 oneway；native 可能因 monitor token 未注册、Display 没有 TouchState、monitor 不在本流或流已不 down 返回 `BAD_VALUE`，Java 调用者拿不到这个结果。monitor 有效且正在观察同一 down stream 时，native 才返回 OK；它逐个尝试向旧窗口连接合成 pointer CANCEL，随后无条件用 `filterNonMonitors()` 清空当前 `state.windows` 与 portalWindows，gesture monitors 留下。
+
+“尝试”不能省略：旧 target 缺 InputChannel、Connection 已不存在或 BROKEN、或者 connection inputState 没有可合成的 pointer cancellation 时，都不会排入 CANCEL，但 windows/portal 仍被清掉。因此 native OK 证明路由账已切换，不证明每个旧 target 已排入或收到 CANCEL。
+
+这也只是 pilfer 完成瞬间的状态。`filterNonMonitors()` 保留 `down`、`split`、device/source/display 标识和 gesture monitors；若原 TouchState 已是 split，之后同 device/source/display 的非 mouse `ACTION_POINTER_DOWN` 仍会进入 Dispatcher 的 Case 1。若它命中支持 split、未 paused、Connection 存在且 responsive 的新窗口，且事件不是软件注入或注入权限已通过，新 pointer 才会加入该窗口 target；保留的 monitor 也收到事件，EdgeBackGestureHandler 因阈值已过而把它转给插件。若找不到合格窗口，本次 `isDown=false` 令 `newGestureMonitors` 为空，Case 1 的 no-target 门会丢弃整个 POINTER_DOWN，插件也收不到。两种分支都不会恢复旧 pointer 的原窗口 target。
+
+## 15. triggerBack 与完成点：接管不等于 Back 已消费
+
+pilfer 成功仍不等于系统已经执行返回。当前越阈值 MOVE 随后还会转给 edge plugin；插件根据后续运动/UP 决定调用 `triggerBack()` 或 `cancelBack()`。trigger 分支构造 `KEYCODE_BACK` DOWN/UP，两次都用 `INJECT_INPUT_EVENT_MODE_ASYNC`，且返回值被忽略。
+
+完整完成点应这样读：
+
+| 观察 | 最多证明 |
+|---|---|
+| App setter 返回 | View 已执行保存/post 逻辑 |
+| ViewRoot oneway 返回 | 请求已提交 Binder，不证明 WMS 已算 |
+| WMS callback 发出 | WMS actual 缓存已换，不证明 SystemUI main 已换 |
+| SystemUI `mExcludeRegion.set` | 未来 DOWN 可读新值，不倒改已判定流 |
+| `mThresholdCrossed=true` | 本地状态先翻转，pilfer 仍可能失败 |
+| native pilfer 返回 OK | 当前 windows/portal 已清且 monitors 保留；仅合格旧连接可能排入 CANCEL；后续 split POINTER_DOWN 可能加入新窗口，无合格窗口则会被丢弃 |
+| plugin `triggerBack()` | 已发起两次异步 Key 注入，不证明目标处理或 Activity 退出 |
+
+`cancelBack()` 只结束 SystemUI/plugin 候选与记录，不会把已经成功 pilfer 的旧窗口 TouchState 自动复原。相反，阈值前的多指、长按或纵向取消没有 pilfer，正常 App 流可继续。
+
+### 练习 9：从 DOWN 门推到 pilfer 与异步 Back
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'boolean isEnabled = mIsAttached && mIsGesturalModeEnabled;' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+grep -n -F '.registerSystemGestureExclusionListener(' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+grep -n -F 'mInputMonitor = InputManager.getInstance().monitorGestureInput(' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+grep -n -F 'if (y >= (mDisplaySize.y - mBottomGestureHeight)) {' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+grep -n -F 'if (x > 2 * (mEdgeWidthLeft + mLeftInset)' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+grep -n -F 'boolean withinRange = x < mEdgeWidthLeft + mLeftInset' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+grep -n -F 'if (mIsNavBarShownTransiently) {' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+grep -n -F 'if (mExcludeRegion.contains(x, y)) {' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+grep -n -F 'mInRejectedExclusion = mUnrestrictedExcludeRegion.contains(x, y);' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+grep -n -F 'mAllowGesture = !mDisabledForQuickstep && mIsBackGestureAllowed' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+grep -n -F 'if (action == MotionEvent.ACTION_POINTER_DOWN) {' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+grep -n -F '(ev.getEventTime() - ev.getDownTime()) > mLongPressTimeout' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+grep -n -F 'if (dy > dx && dy > mTouchSlop) {' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+grep -n -F '} else if (dx > dy && dx > mTouchSlop) {' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+grep -n -F 'mThresholdCrossed = true;' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+grep -n -F 'mInputMonitor.pilferPointers();' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+grep -n -F 'oneway interface IInputMonitorHost {' frameworks/base/core/java/android/view/IInputMonitorHost.aidl
+grep -n -F 'std::optional<int32_t> foundDisplayId = findGestureMonitorDisplayByTokenLocked(token);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (!foundDeviceId || !state.down) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'synthesizeCancelationEventsForInputChannelLocked(channel, options);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (channel != nullptr) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (connection == nullptr) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (connection->status == Connection::STATUS_BROKEN) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (cancelationEvents.empty()) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'state.filterNonMonitors();' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (newGesture || (isSplit && maskedAction == AMOTION_EVENT_ACTION_POINTER_DOWN)) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'std::vector<TouchedMonitor> newGestureMonitors = isDown' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (newTouchedWindowHandle != nullptr && newTouchedWindowHandle->getInfo()->paused) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (newTouchedWindowHandle == nullptr && newGestureMonitors.empty()) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (!checkInjectionPermission(touchedWindow.windowHandle, entry.injectionState)) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'void TouchState::filterNonMonitors() {' frameworks/native/services/inputflinger/dispatcher/TouchState.cpp
+grep -n -F 'sendEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_BACK);' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+grep -n -F 'InputManager.getInstance().injectInputEvent(ev, InputManager.INJECT_INPUT_EVENT_MODE_ASYNC);' frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/EdgeBackGestureHandler.java
+```
+
+固定 display=`1080×2400`、bottom height=200、左右 edge width=50、insets=0、ML=false、transient=false，其余全局门都放行；actual=`[0,200,50,400]`，unrestricted 还额外含 `[0,500,50,800]`。分别判断 P1=`(20,250)`、P2=`(20,600)`、P3=`(20,2250)`、P4=`(60,600)`、P5=`(1060,600)` 的 withinRange、actual 拒绝、rejected-exclusion 标记与 Back 候选结果。再令 transient=true，仅重算 P1，指出哪一步被绕过。
+
+从允许的 P2 开始，固定 touchSlop=12、longPressTimeout=250ms：100ms MOVE `(dx,dy)=(8,2)`，150ms MOVE `(20,5)`。说明哪一步调用 pilfer。再固定 monitor 有效、同一流仍 down、native 返回 OK，并给四个旧 target：W1 有 Channel、Connection 非 BROKEN 且 inputState 可合成 pointer cancellation；W2 缺 Channel；W3 的 Connection 为 BROKEN；W4 的 inputState 无可合成事件。分别写出谁会排入 CANCEL，以及 filter 后 windows/portal 与 monitors 的状态。
+
+另固定 pilfer 前 TouchState `split=true`，随后发生同 device/source/display 的非 mouse、新硬件 POINTER_DOWN（`entry.injectionState=null`）：先令触点命中支持 split、未 paused、已连接且 responsive 的 W5，再令其没有任何合格窗口，分别说明窗口 target、旧 monitor、插件和该事件的结果；两支都要解释为什么旧 pointer 的原 target 不会恢复。最后分别用阈值前 POINTER_DOWN、251ms 才到来的 MOVE、MOVE `(5,20)` 替换第二个 MOVE，说明为何三者都不 pilfer。即使插件随后调用 triggerBack，也要指出两次 ASYNC inject 尚不能证明什么。
+
+## 16. r48 结论、诊断顺序与下一章
+
+这条链可以压缩成九个判断：
+
+1. exclusion 只请求系统放松冲突手势，不创造窗口或 View 的触摸权。
+2. View Rect 是 post-layout 局部坐标；root Rect 是窗口坐标，两者由 Tracker 汇成窗口 List。
+3. View 可见映射与 r48 mapped/local 比较缺口，都发生在 Binder 之前。
+4. oneway 上报、本地 ViewTreeObserver callback、WMS 聚合和 SystemUI 落表是四个不同完成点。
+5. WMS 用本聚合口径的 effective touchable 与 top-to-bottom unhandled 先确定每个窗口在本算法中的暴露请求；这不替代 SF/Dispatcher 最终命中事实。
+6. 左右边缘各有一份按 Display 共享的纵向 Rect-height 预算；middle 与豁免窗口跳过该预算，但不跳过触摸/Z 序/mandatory 边界。
+7. unrestricted 已经过可见性、坐标、touchable 和 Z 序裁剪，只是未过边缘预算；非 null 不保证 actual 与它不同。
+8. SystemUI 只在 DOWN 用当时缓存判候选；bottom、edge range、transient 与 actual 的先后顺序会改变结果。
+9. 横向越阈值只发起 oneway pilfer；native OK 会清窗口路由，却只有可合成的旧连接才排入 CANCEL。pilfer 后的 split POINTER_DOWN 可能加入新合格窗口；没有合格窗口便在 Case 1 被丢弃，两支都不恢复旧 pointer target。插件发起 ASYNC Back 注入仍不是消费或界面退出确认。
+
+排查时依次取证：View/root 原始 List，Tracker 窗口 List，WindowState `mExclusionRects`，DisplayContent actual/unrestricted 与左右 edge/limit，SystemUI 本地两份 Region和 DOWN 点，最后才看 threshold、pilfer 的 native 条件、App CANCEL 与 Back 消费结果。只看 App setter 返回或一份 SystemUI dump，无法跨越整条异步链。
+
+下一章进入 `WINDOW_IS_OBSCURED`、`WINDOW_IS_PARTIALLY_OBSCURED`、trusted overlay 与 `filterTouchesWhenObscured`：解释某点即使通过普通 Z 序命中，为什么仍可能因上层不可信窗口而被标记或拒绝，以及它与本章“系统手势优先级请求”的边界。

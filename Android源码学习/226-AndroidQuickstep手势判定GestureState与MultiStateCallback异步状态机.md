@@ -1,749 +1,754 @@
 # 226 Android Quickstep手势判定、GestureState与MultiStateCallback异步状态机
 
 > 源码版本：Android 11 / `android-11.0.0_r48`  
-> 学习方式：macOS只读核源，不编译、不运行AOSP
+> 学习方式：macOS 只读核源，不编译、不运行 AOSP  
+> 核心路径：`TouchInteractionService → OtherActivityInputConsumer → BaseSwipeUpHandlerV2 → GestureState / MultiStateCallback`
 
-## 1. 本章要解决什么
+## 1. 固定场景：抬手不是结束，而是提交一个异步事务
 
-Task leash已经能跟手移动，但手指抬起时系统还要回答两个问题：最终去Home、停在Overview、打开另一Task，还是回原Task？Activity创建、Recents targets、截图、页面滚动和终点动画又以不同速度完成，谁来保证它们凑齐后才执行下一步？
+上一章已经看到 `TaskViewSimulator` 怎样把手指位移变成逐帧 `SurfaceControl.Transaction`。本章固定一个更长的场景：
 
-## 2. 两套状态账
+1. 前台是普通 App，用户从导航区域按下；
+2. 手势先越过“窗口可移动”门槛，再越过“Quickstep 接管输入”门槛；
+3. 抬手时，Launcher 选择 `HOME`、`RECENTS`、`NEW_TASK` 或 `LAST_TASK`；
+4. 终点动画、RecentsView 滚动、Launcher 首帧、截图替换和 Recents controller 回调各自在不同时间到达；
+5. 只有规定的状态组合齐备，才能执行对应的收尾动作。
 
-```text
-GestureState
-  跨TaskAnimationManager、Handler和新手势保存Recents生命周期与最终目标
+这里最容易产生的误解，是把 `ACTION_UP` 当作整个切换已经完成。源码中它只完成了“输入采样”这一段，并把 Handler 内部的 `STATE_GESTURE_COMPLETED` 置位。终点会在 UP 路径中同步算出；但发布 `END_TARGET_SET` 与真正启动终点动画可能要等 Recents targets 到达，后续还有两层状态机继续推进。
 
-BaseSwipeUpHandlerV2.mStateCallback
-  当前Handler内部保存Launcher Activity、Controller、截图、终点动画与清理屏障
-```
-
-二者都用MultiStateCallback，但flag集合和生命周期不同。
-
-## 3. 总体流程
-
-```mermaid
-flowchart TD
-    D["ACTION_DOWN"] --> M["MOVE超过slop"]
-    M --> P["pilferPointers + GESTURE_STARTED"]
-    P --> U["逐帧updateDisplacement"]
-    U --> E["ACTION_UP / CANCEL"]
-    E --> V["VelocityTracker + 当前shift + Recents页"]
-    V --> T{"calculateEndTarget"}
-    T --> H["HOME"]
-    T --> R["RECENTS"]
-    T --> N["NEW_TASK"]
-    T --> L["LAST_TASK"]
-    H --> A["终点动画"]
-    R --> A
-    N --> A
-    L --> A
-    A --> S["END_TARGET_ANIMATION_FINISHED"]
-    S --> Q["等待Recents滚动/截图/Controller等状态汇合"]
-    Q --> C["finish / launch / resume / cleanup"]
-```
-
-## 4. 输入第一站
-
-前景不是Launcher时，`OtherActivityInputConsumer`处理来自导航区域的MotionEvent，维护active pointer、down/last position、VelocityTracker、slop和MotionPauseDetector。
-
-它不直接决定Task层级，而把有效手势交给`BaseSwipeUpHandler`。
-
-## 5. 为何有两个slop
+可以把整个过程写成偏序，而不是一条固定时间线：
 
 ```text
-mPassedWindowMoveSlop：超过普通touch slop后可以开始移动窗口
-mPassedPilferInputSlop：超过更大方向判定slop后，正式抢走pointer stream
+输入事件 ──> 手势开始 ──> ACTION_UP
+                         │
+Recents controller ─────┼──> 终点动画
+Launcher create/start/draw ──> 截图替换
+RecentsView scroll ──────────> settled
+                         │
+                         └──> finish / launch / resume / invalidate
 ```
 
-前者让窗口更早跟手，后者避免轻微点击/返回手势被Quickstep误接管。
+本章的观察点有四个：
 
-## 6. 不同导航模式的slop倍率
+- `OtherActivityInputConsumer`：何时预热动画、移动窗口、pilfer 输入和结束采样；
+- `calculateEndTarget()`：四个终点怎样由位移、速度、页面和导航模式共同决定；
+- `GestureState`：跨对象保存的 Recents 生命周期与最终目标；
+- `BaseSwipeUpHandlerV2.mStateCallback`：当前 Handler 的 16 个软件门闩。
 
-全手势模式使用`2 * touchSlop²`阈值，双按钮模式使用`9 * touchSlop²`。
+这些状态位描述的是“客户端已经走到哪一步”，不自动等价于 Surface 已显示、system_server 已提交或 Binder 已成功。
 
-源码比较的是平方距离，所以倍率直接乘在`squaredTouchSlop`上，不等于距离分别是2倍和9倍。
+## 2. 输入入口：同一事件先经过坐标变换、消费者选择和缓存分发
 
-## 7. 为什么DOWN就可能启动Recents Animation
-
-非deferred目标在ACTION_DOWN调用`startTouchTrackingForWindowAnimation()`，给Launcher Activity和system_server更多准备时间。
-
-这时手势尚未正式开始，后续未过slop就UP还要取消已经预热的Recents动画。
-
-## 8. deferred down路径
-
-若起点可能属于其他手势区域，直到通过真正pilfer slop才创建Handler和启动Recents Animation。
-
-它减少误触时无意义的Home栈移动与Surface leash创建。
-
-## 9. 多指边界
-
-正式pilfer前若新增pointer不在允许的swipe-up区域，Consumer把事件临时改为ACTION_CANCEL并强制结束。
-
-正式接管后，活动pointer抬起会切换到另一个pointer，并重算downPos以保持累计位移连续。
-
-## 10. pointer切换为何调整downPos
-
-新手指坐标与旧手指不同，若只替换pointerId，下一帧displacement会跳变。
-
-源码用“旧累计位移”反推新downPos，让`lastPos-downPos`在切换前后保持一致。
-
-## 11. likelyToStartNewTask怎样粗判
-
-MOVE阶段比较水平距离与向上距离；水平更大时认为可能quick switch到另一Task。
-
-继续上一次手势但本次尚未重新过slop时，也先按可能新Task处理，避免Recents被错误纵向拉走。
-
-## 12. pilferPointers意味着什么
-
-通过正式slop后调用`InputMonitorCompat.pilferPointers()`，现有pointer stream转交Quickstep，其他窗口收到取消。
-
-随后关闭系统浮层/系统窗口，并通知Handler `onGestureStarted()`。
-
-## 13. MotionPauseDetector的作用
-
-全手势模式在上拉足够距离且不像水平quick switch时允许检测“停住”。
-
-这个停顿可形成shelf/Overview语义；太靠近App或明显横滑时禁止pause。
-
-## 14. ACTION_UP如何取速度
-
-VelocityTracker以每秒1000单位计算并限制最大fling速度，得到X/Y分量。
-
-沿导航栏到屏幕中心的主速度会根据底部、左边或右边导航栏转换符号，再传给Handler。
-
-## 15. fling判定
-
-Handler要求手势确实started，并且`abs(endVelocity)`超过资源`quickstep_fling_threshold_velocity`。
-
-只有速度大不够；尚未过slop的DOWN/UP不能变成fling。
-
-## 16. CANCEL固定回原Task
-
-`onGestureCancelled()`先把displacement归零，设置GESTURE_COMPLETED，再用`isCancel=true`进入普通结束函数。
-
-`calculateEndTarget()`在非fling cancel分支直接选择LAST_TASK。
-
-## 17. 四种终点
+输入链从 SystemUI 请求的 gesture monitor 开始：
 
 ```text
-HOME：回Launcher workspace
-RECENTS：停在Overview任务列表
-NEW_TASK：切换/启动另一Task
-LAST_TASK：回到手势开始或应恢复的App Task
+SystemUiProxy.monitorGestureInput("swipe-up", displayId)
+  → InputMonitorCompat.getInputReceiver(mainLooper, mainChoreographer, listener)
+  → InputChannelCompat.InputEventReceiver.onInputEvent()
+  → TouchInteractionService.onInputEvent()
+  → mUncheckedConsumer.onMotionEvent()
+  → OtherActivityInputConsumer.onMotionEvent()
 ```
 
-名字描述业务终点，不是Activity生命周期状态。
+`InputChannelCompat.InputEventReceiver` 先调用 listener，返回后才执行
+`finishInputEvent(event, true)`。这里没有 `try/finally`，所以“总会确认 handled”不是这段代码能保证的性质。
 
-## 18. GestureEndTarget的三个属性
-
-每个枚举保存：
-
-```text
-isLauncher
-日志containerType
-recentsAttachedToAppWindow
-```
-
-HOME/RECENTS的`isLauncher=true`；NEW_TASK/LAST_TASK为false。
-
-## 19. recentsAttachedToAppWindow并非等同isLauncher
-
-HOME的该值为false，RECENTS、NEW_TASK、LAST_TASK为true。
-
-它描述终点动画期间RecentsView是否视觉附着在App window，不是最终是否停留Launcher Activity。
-
-## 20. goingToNewTask怎样算
-
-有RecentsView和targets时，比较running task page与next page；不同则true。
-
-没有targets时假设是延续已结束的上一手势，设true；没有RecentsView则false。
-
-## 21. Overview阈值
-
-`mCurrentShift >= 0.7`认为到达Overview阈值。
-
-它影响非fling吸附方向，但快速fling会优先看速度和方向。
-
-## 22. 全手势非fling决策
-
-按源码顺序：
-
-```text
-Shelf正在peek → RECENTS
-否则已横向选另一页 → NEW_TASK
-否则未过0.7 → LAST_TASK
-否则 → HOME
-```
-
-因此慢慢上滑超过阈值在全手势模式常直接回Home，而停Overview依赖shelf pause状态。
-
-## 23. 双按钮非fling决策
-
-```text
-过0.7且手势已开始 → RECENTS
-否则若选择另一页 → NEW_TASK
-否则 → LAST_TASK
-```
-
-没有全手势模式的HOME分支。
-
-## 24. fling先看主方向
-
-`isSwipeUp = endVelocity < 0`。
-
-斜向fling还比较`abs(velocity.x)`与`abs(endVelocity)`，水平分量更快且已选择新页时允许NEW_TASK优先。
-
-## 25. 全手势向上fling
-
-向上且不是“水平更快的新Task”时直接HOME。
-
-若向上、水平新Task更强、且shelf未peek，则NEW_TASK。
-
-## 26. 其他向上fling
-
-非上述全手势Home分支时，若尚未过Overview阈值且水平更快的新Task成立，选择NEW_TASK；否则RECENTS。
-
-## 27. 向下fling
-
-若已选择另一Task则NEW_TASK，否则LAST_TASK。
-
-向下速度表达返回App意图，但横向quick switch仍可胜出。
-
-## 28. Overview禁用时的最终修正
-
-若策略禁止Overview且初步结果是RECENTS或LAST_TASK，源码返回LAST_TASK。
-
-这个条件对LAST_TASK是幂等，对RECENTS则强制回App。
-
-## 29. 决策树
-
-```mermaid
-flowchart TD
-    A{"isFling?"} -->|"否"| B{"isCancel?"}
-    B -->|"是"| LT["LAST_TASK"]
-    B -->|"否"| C{"全手势?"}
-    C -->|"是"| D{"shelf peek / 新页 / 0.7阈值"}
-    D --> R["RECENTS / NEW_TASK / LAST_TASK / HOME"]
-    C -->|"否"| E{"阈值与新页"}
-    E --> R2["RECENTS / NEW_TASK / LAST_TASK"]
-    A -->|"是"| F{"向上?"}
-    F -->|"否"| G{"新页?"}
-    G --> N1["NEW_TASK或LAST_TASK"]
-    F -->|"是"| H{"全手势且非水平更快新页?"}
-    H -->|"是"| HOME["HOME"]
-    H -->|"否"| N2["NEW_TASK或RECENTS"]
-```
-
-## 30. endShift为何只看isLauncher
-
-结束普通shift动画时：
-
-```text
-HOME/RECENTS → endShift=1
-NEW_TASK/LAST_TASK → endShift=0
-```
-
-NEW_TASK真正的横向页滚动由RecentsView处理，不靠纵向shift停在1。
-
-## 31. 非fling时长
-
-剩余shift距离乘`MAX_SWIPE_DURATION=350ms`和倍率，再上限350ms。
-
-离终点越近，吸附动画越短；RECENTS使用轻微overshoot，其余默认decelerate。
-
-## 32. fling起点前推一帧
-
-源码用当前Y速度乘单帧时长/dragLength，估算下一显示帧应到的shift，并限定到`0..dragLengthFactor`。
-
-这样手指抬起后动画不从上一采样位置重新起步，减少速度断裂。
-
-## 33. fling时长怎样估算
-
-剩余像素距离除以每毫秒速度得到基础时长，再约乘2匹配decelerate插值起点导数，最终不超过350ms。
-
-速度或dragLength异常时保留默认值。
-
-## 34. 双按钮RECENTS overshoot特例
-
-满足最小fling速度时构造`OvershootParams`，可能修改endShift、interpolator和duration，并把时长限制在120..350ms。
-
-这是视觉调参，不改变最终枚举终点。
-
-## 35. RECENTS还要等待页面settle
-
-Handler让RecentsView吸附到屏幕中心最近页，并把过长scroller时长压到350ms。
-
-最终动画duration取窗口shift与页面scroll二者较大值，避免窗口先完成而任务列表仍在滑。
-
-## 36. STATE_RECENTS_SCROLLING_FINISHED
-
-RecentsView页面转场结束回调设置该GestureState flag；没有RecentsView时立即设置。
-
-终点窗口动画完成与页面滚动完成是两条独立异步链。
-
-## 37. animateToProgress为何等Recents start
-
-它通过`runOnRecentsAnimationStart()`延后真正动画。
-
-用户可能很快抬手，但Task leash尚未从system_server返回；先保存终点意图，等targets可用后再执行。
-
-## 38. setEndTarget的atomic参数
-
-`setEndTarget(target,false)`只设置END_TARGET_SET，不自动设置END_TARGET_ANIMATION_FINISHED。
-
-Handler必须等ValueAnimator或Spring成功结束后显式置位，防止状态机提前launch/finish。
-
-## 39. atomic=true何时有用
-
-无需独立终点动画或需立即更正目标时，`setEndTarget(target)`会同时设置目标与动画完成flag。
-
-它表达“目标选择和到达是一个原子事件”。
-
-## 40. HOME用什么动画
-
-HOME走上一章的`RectFSpringAnim`，把当前Task leash弹簧收束到图标；成功后设置END_TARGET_ANIMATION_FINISHED。
-
-此时普通mCurrentShift ValueAnimator不再负责窗口终点。
-
-## 41. 其他目标用什么动画
-
-RECENTS/NEW_TASK/LAST_TASK用`mCurrentShift.animateToValue(start,end)`。
-
-每帧AnimatedFloat回调继续更新TaskViewSimulator和leash，同时必要时强制不可见RecentsView计算scroll。
-
-## 42. 动画结束前还会二次纠正目标
-
-如果原判NEW_TASK但最终页面又回running Task且没有真的启动新Task，改为LAST_TASK。
-
-若原判LAST_TASK但期间已经启动新Task，则改为NEW_TASK，确保最终把正确Task恢复到顶部。
-
-## 43. 为什么不能只相信UP瞬间
-
-终点吸附期间Recents页可能继续滚动，Task启动也可能异步发生。
-
-二次纠正使用动画结束时的最新page和lastStartedTask状态，避免旧决策提交错误Task。
-
-## 44. 中断时为何不置动画完成
-
-动画listener发现`mRecentsAnimationController==null`就返回。
-
-这说明Recents已被取消/清理，旧Handler不能继续推进终点状态机。
-
-## 45. GestureState的生命周期flags
-
-主要包括：
-
-```text
-END_TARGET_SET / END_TARGET_ANIMATION_FINISHED
-RECENTS_ANIMATION_INITIALIZED / STARTED
-RECENTS_ANIMATION_CANCELED / FINISHED / ENDED
-RECENTS_SCROLLING_FINISHED
-OVERSCROLL_WINDOW_CREATED
-```
-
-ENDED在cancel和finish两条路径都会设置。
-
-## 46. initialized与started再区分
-
-TaskAnimationManager发起Binder请求即INITIALIZED；收到Controller和targets并更新Manager后才STARTED。
-
-`isRecentsAnimationRunning()`以“initialized且未ended”为准，所以准备期也算运行中。
-
-## 47. canceled与finished为何分开
-
-二者都结束控制，但业务含义不同：cancel可能携带截图并走恢复/交接，finish表示正常提交方向。
-
-共同的ENDED方便只关心资源生命周期的监听器统一等待。
-
-## 48. GestureState复制构造的含义
-
-副本共享同一个MultiStateCallback和appeared Task集合引用，并复制当前字段。
-
-它不是独立快照；用于延续/交接同一手势上下文时继续观察同一状态推进。
-
-## 49. previouslyAppearedTaskIds
-
-每次更新last appeared target就把taskId加入集合。
-
-它帮助跨动态Task出现和连续手势记住哪些Task已被接管，避免只靠最后一个target丢失历史。
-
-## 50. MultiStateCallback的核心模型
-
-内部只有一个int bitmask：
+`TouchInteractionService` 在 `ACTION_DOWN` 上先按显示旋转修正事件，再判断是否位于 swipe-up 区域。命中后它做了一件看似重复、实则用途不同的事：
 
 ```java
-mState = mState | stateFlag;
+GestureState prevGestureState = new GestureState(mGestureState);
+GestureState newGestureState = createGestureState(mGestureState);
+mConsumer.onConsumerAboutToBeSwitched();
+mGestureState = newGestureState;
+mConsumer = newConsumer(prevGestureState, mGestureState, event);
 ```
 
-每个`runOnceAtState(mask, callback)`代表一个AND门；mask所有bit都出现后，callback执行一次并从队列移除。
+`prevGestureState` 是一个临时副本，供消费者切换期间查询；它与旧对象共享
+`MultiStateCallback` 和当时的 appeared-task 集合引用，其余字段只复制当下的值。
+真正承载新手势的是
+`createGestureState()` 创建的新对象，它拥有新的 callback。若
+`TaskAnimationManager` 仍有 controller，新对象只转移 running task、last-started task id
+和 appeared-task 集合，不继承旧手势的终点与整套生命周期状态。
 
-## 51. 它不是传统互斥状态机
+到达 `OtherActivityInputConsumer` 后，事件还会先尝试分发给 RecentsView：
 
-LAUNCHER_PRESENT、GESTURE_STARTED、APP_CONTROLLER_RECEIVED可以同时为true。
+- 首次取得 RecentsView consumer 时，会补发一个临时的
+  `ACTION_MOVE_ALLOW_EASY_FLING`；
+- 代理分发期间临时加上 `EDGE_NAV_BAR`，随后恢复原 flags；
+- 原事件恢复后才送进 `VelocityTracker`，因此 tracker 不会把临时 action/edge flag 当作输入事实。
 
-这些bit描述独立事实，不是只能处于其中一个的枚举state。
+这解释了为什么“Overview 横向翻页”和“Quickstep 自身的纵向位移判定”可以观察同一串触摸，却保留不同的解释层。
 
-## 52. runOnceAtState立即执行规则
+## 3. 两道 slop：一维窗口门槛与二维接管门槛
 
-注册时若mask已满足，callback同步立即运行；否则按相同mask放入LinkedList。
-
-因此调用者不能假设注册函数一定先返回、callback才发生。
-
-## 53. setState怎样触发回调
-
-OR入新bit后遍历所有mask；满足的LinkedList从头poll并执行直到为空。
-
-同mask可等待多个动作，按注册顺序执行。
-
-## 54. 回调可以在回调中继续置位
-
-执行Runnable期间可调用setState，产生嵌套状态推进。
-
-设计依赖主线程串行使用来保持可推理性；跨线程入口应使用`setStateOnUiThread()`。
-
-## 55. setStateOnUiThread
-
-当前就是main looper则直接set；否则向MAIN_EXECUTOR Handler post async callback。
-
-Binder回调和输入/辅助线程不会直接并发修改Handler状态表。
-
-## 56. clearState的边界
-
-clear只更新bit并通知持久change listeners，不会重新把已经执行的一次性callback放回队列。
-
-所以runOnceAtState适合单调里程碑；需要反复on/off用addChangeListener。
-
-## 57. change listener如何判边沿
-
-对每个mask比较oldState与newState是否都满足全部bit，只在false↔true变化时回调。
-
-它监听组合条件，不是每个单bit变化都无条件通知。
-
-## 58. Handler自己的16个flags
-
-可分为：
+源码维护三个布尔量：
 
 ```text
-Launcher：PRESENT / STARTED / DRAWN
-控制器：APP_CONTROLLER_RECEIVED
-手势：STARTED / CANCELLED / COMPLETED
-视觉：SCALED_HOME / SCALED_RECENTS
-截图：CAPTURE / CAPTURED / VIEW_SHOWN
-动作：RESUME_LAST_TASK / START_NEW_TASK / CURRENT_TASK_FINISHED
-终止：HANDLER_INVALIDATED
+mPassedWindowMoveSlop   窗口可以开始跟手
+mPassedPilferInputSlop  客户端已越过或视为越过 pilfer 门槛
+mPassedSlopOnThisGesture 本次触摸自身是否越过二维门槛
 ```
 
-## 59. 为什么不用一个巨大if
+第一道门槛只看从导航栏向屏幕中心的主轴位移：
 
-Launcher Activity可能先创建或后创建，Controller可能先到或后到，用户也可能在任何时刻抬手。
+```java
+if (Math.abs(displacement) > mTouchSlop) {
+    mPassedWindowMoveSlop = true;
+    mStartDisplacement = Math.min(displacement, -mTouchSlop);
+}
+```
 
-以组合flag注册动作，不必为所有事件排列写N套分支。
+它使用严格的 `>`。正常从底边向上时 `displacement` 为负；一旦越界，
+`Math.min(displacement, -mTouchSlop)` 通常保存的是这一帧的完整负位移。因此紧接着的
+`updateDisplacement(displacement - mStartDisplacement)` 往往从 0 开始，而不是简单地“扣掉一个 touch slop”。
 
-## 60. Controller与gesture started汇合
+第二道门槛看二维平方距离：
 
-只有`APP_CONTROLLER_RECEIVED | GESTURE_STARTED`都满足才enable Recents input consumer。
+```text
+dx² + dy² >= ratio × touchSlop²
+```
 
-先收到Controller不会提前抢输入；先过slop也不会在Controller为空时调用Binder。
+全手势模式的 `ratio` 是 2，其他非三键模式是 9；换算成欧氏距离分别是
+`√2 × touchSlop` 和 `3 × touchSlop`，不是 2 倍和 9 倍距离。它也不是“方向 slop”：
+是否禁用横滑是在二维门槛通过后，另用 `abs(dx) > abs(dy)` 检查。
 
-## 61. Launcher present与gesture started汇合
+两道门槛允许一种中间状态：窗口已经跟手，但 pilfer 请求还没有发出。即使
+`mPassedPilferInputSlop` 变成 `true`，它也只是客户端门闩：普通路径先置位再调用
+oneway `pilferPointers()`，续接路径更会在构造时直接预置，均不证明 InputDispatcher
+已经处理接管。此时
+`ACTION_UP` 仍会进入 Handler 的结束逻辑，只是 `mGestureStarted` 可能还是 `false`，所以不会被判成 fling。
 
-二者满足后执行`onLauncherPresentAndGestureStarted()`，准备与Launcher UI关联的手势工作。
+## 4. 正常启动、延迟启动与续接不是同一路径
 
-这允许冷启动Launcher和已在Home两种时序复用同一逻辑。
+普通目标在 `ACTION_DOWN` 就调用 `startTouchTrackingForWindowAnimation(eventTime)`。这不是宣布手势成立，而是尽早：
 
-## 62. Launcher drawn与gesture started汇合
+1. 创建 `BaseSwipeUpHandler`；
+2. 安装 gesture-end callback 与 motion-pause listener；
+3. 调用 `initWhenReady(intent)`；
+4. 向 `TaskAnimationManager` 请求 Recents animation。
 
-只有Launcher首帧已drawn且手势有效，才初始化Launcher animation controller。
+延迟目标来自两个条件之一：
 
-没有可绘制View树就提前seek Launcher属性会造成无锚点或状态丢失。
+```text
+Home 与 Overview 不是同一组件
+或 activityInterface.deferStartingActivity(deviceState, event) 返回 true
+```
 
-## 63. screenshot的四重门
+正在续接 Recents animation 时，构造器会强制取消 deferred；否则它要等二维 pilfer
+门槛通过的那一个 `ACTION_MOVE`，才用该 MOVE 的 `eventTime` 创建 Handler 并请求动画。
+同一帧还会补齐 window slop、记录 start displacement，然后 pilfer。
 
-`switchToScreenshot()`要求：
+续接路径更特殊。构造器一开始就把 window/pilfer 两个门闩置为 `true`，随后在
+`ACTION_DOWN` 创建 Handler 时：
+
+```text
+continueRecentsAnimation(new GestureState)
+  → addListener(handler)
+  → notifyRecentsAnimationState(handler)
+  → notifyGestureStarted(true)
+```
+
+所以它不等待新手势再次越过 slop。`mPassedSlopOnThisGesture` 仍从 `false` 开始，
+用于区分“续接门闩已预置”和“本次触摸自身确实越过了二维 slop”。
+
+`notifyGestureStarted()` 的顺序也值得保留：
+
+```text
+handler 非空
+  → inputMonitor.pilferPointers()
+  → closeOverlay()
+  → closeSystemWindows()
+  → handler.onGestureStarted(...)
+```
+
+`pilferPointers()` 返回只说明客户端调用已经发出，不能单凭这一行断言
+InputDispatcher 已完成接管或目标窗口已经处理 `CANCEL`。
+
+## 5. 多指、暂停与“可能切换任务”的三个边界
+
+每个 `ACTION_POINTER_UP` 在进入 switch 之前都会执行：
+
+```java
+mVelocityTracker.clear();
+mMotionPauseDetector.clear();
+```
+
+这与“抬起的是不是 active pointer”无关。若抬起 active pointer，源码再选 0/1 中的另一个
+pointer，并根据上一帧 `mLastPos - mDownPos` 反推新的 down position，保持累计位移连续。
+它保留的是“上一帧已记录位移”，不保证包含 pointer-up 事件中最新的坐标变化。
+
+还有一个隐蔽后果：`MotionPauseDetector.clear()` 会清空 listener。若 clear 时 Handler
+与 listener 已经创建，Consumer 不会在 pointer 切换后重新安装它，因此此后即使再次
+停住，也不会把 pause 变化回调给 Handler；如果之前 shelf 已处于 peek，Handler 自己的
+`mIsShelfPeeking` 还可能继续影响终点选择。反之，deferred 手势若在 Handler 创建前就发生
+POINTER_UP，后来首次越过二维门槛时，`startTouchTrackingForWindowAnimation()` 仍会首次
+安装 listener，不能把这一分支也算成永久丢失。
+
+在 pilfer 之前，第二根手指若落在 swipe-up 区域外，`forceCancelGesture()` 会把当前
+`MotionEvent` 临时改成 `ACTION_CANCEL`，调用本地结束逻辑，再恢复原 action。它不会凭这一动作自动 pilfer，也不能单独证明 App 已收到取消。
+
+MOVE 阶段还计算：
+
+```text
+horizontalDist = abs(dx)
+upDist = -displacement
+likelyNewTask =
+    （续接已成立但本次还没过二维 slop）
+    或 horizontalDist > upDist
+```
+
+注意第二项不是 `horizontalDist > abs(upDist)`。向 App 方向下拉时 `upDist` 为负，
+正的水平距离几乎必然大于它，因此也会暂时得到 `true`。全手势模式会先把这个结果用于
+`setDisallowPause()`，再向 pause detector 添加位置，最后调用 Handler 的
+`setIsLikelyToStartNewTask()`。前两步本身都可能同步改变 pause，并通过 listener 更早回调
+Handler，所以这里的“最后”只限定 likely-new-task setter 的调用顺序。
+
+## 6. ACTION_UP：速度坐标系、取消路径与延迟清理
+
+UP 事件先进入 RecentsView 代理和 `VelocityTracker.addMovement()`，随后
+`finishTouchTracking()` 才计算速度。符合 window slop 且 Handler 非空时：
+
+```text
+computeCurrentVelocity(1000, maxFlingVelocity)
+velocityX / velocityY = 当前 active pointer 的 X/Y 速度
+endVelocity =
+  右边导航栏： velocityX
+  左边导航栏：-velocityX
+  底部导航栏： velocityY
+最后一次 updateDisplacement()
+handler.onGestureEnded(endVelocity, PointF(velocityX, velocityY), downPos)
+```
+
+`endVelocity` 的符号统一为“从导航栏朝屏幕中心为负”。但 `PointF` 保留经过
+`TouchInteractionService` 旋转修正后的 X/Y 分量；后面的部分动画计算仍直接读
+`velocity.y`，这一点在侧边导航栏上尤其重要。
+
+`ACTION_CANCEL` 只在 window slop 已通过且 Handler 存在时调用
+`onGestureCancelled()`。它先把 displacement 归零，再置
+`STATE_GESTURE_COMPLETED`，最后以 `isCancel=true` 进入普通终点计算，因此落到
+`LAST_TASK`。
+
+若 window slop 未通过，则不会调用 Handler 的 ended/cancelled：
+
+```text
+onConsumerAboutToBeSwitched()
+  → onInteractionGestureFinished()
+  → 100 ms 后请求 cancelRecentsAnimation(restoreHomeStackPosition=true)
+```
+
+这个延迟任务没有 gesture generation 标识；它只是针对竞态的兜底。相反，window
+slop 已通过的 UP 不会立刻让 detached consumer 完成，Consumer 会等 Handler 的
+invalidation callback。
+
+## 7. 四个终点：先算 goingToNewTask，再按导航模式决策
+
+`GestureEndTarget` 不只是四个名字，还携带两个行为属性：
+
+| 终点 | `isLauncher` | `recentsAttachedToAppWindow` | 业务含义 |
+|---|---:|---:|---|
+| `HOME` | true | false | 回 Workspace |
+| `RECENTS` | true | true | 停在 Overview |
+| `NEW_TASK` | false | true | 启动或切到另一任务 |
+| `LAST_TASK` | false | true | 恢复应返回的任务 |
+
+`goingToNewTask` 的计算先于 fling/non-fling 分支：
+
+- `mRecentsView == null`：`false`；
+- 有 view 但 `hasTargets() == false`：直接 `true`；
+- 有 targets：`runningTaskIndex >= 0 && nextPage != runningTaskIndex`。
+
+“没有 targets 就是新任务”是客户端的路径假设，可能意味着续接，也可能是 start 尚未到达、空集合或引用已清理，不能把它写成已证明的历史事实。
+
+非 fling 决策可以压缩成：
+
+```text
+cancel                         → LAST_TASK
+全手势 + shelf peeking         → RECENTS
+全手势 + goingToNewTask        → NEW_TASK
+全手势 + shift < 0.7           → LAST_TASK
+全手势 + 其余                  → HOME
+非全手势 + shift >= 0.7
+          + gestureStarted     → RECENTS
+非全手势 + goingToNewTask      → NEW_TASK
+非全手势 + 其余                → LAST_TASK
+```
+
+fling 先用 `endVelocity < 0` 判断朝屏幕中心，再判断
+`goingToNewTask && abs(velocity.x) > abs(endVelocity)`：
+
+- 全手势、向上且 `willGoToNewTaskOnSwipeUp` 不成立：`HOME`；
+- 全手势、向上、`willGoToNewTaskOnSwipeUp` 成立且 shelf 未 peek：`NEW_TASK`；
+- 其他向上：未过 0.7 且 `willGoToNewTaskOnSwipeUp` 成立时为 `NEW_TASK`，否则 `RECENTS`；
+- 向下：`goingToNewTask` 为 `true` 时是 `NEW_TASK`，否则 `LAST_TASK`。
+
+最后，Overview 被策略禁用且候选是 `RECENTS` 或 `LAST_TASK` 时，结果统一为
+`LAST_TASK`。这一步不会把 `HOME` 或 `NEW_TASK` 改掉。
+
+## 8. 两个速度阈值与一个轴向缺口
+
+`onGestureEnded()` 用资源 `quickstep_fling_threshold_velocity` 判断“是不是 fling”：
+
+```java
+isFling = mGestureStarted && abs(endVelocity) > flingThreshold;
+```
+
+进入 `handleNormalGestureEnd()` 后，又读取
+`quickstep_fling_min_velocity`，决定是否启用基于速度的 duration/overshoot
+计算。这是两道用途不同的阈值。当前资源值分别为 500 dp/s 和 250 dp/s，所以一旦已被
+判成 fling，在长度大于 0 时也会通过第二道速度检查；不能把二者合并成一枚阈值，长度
+guard 仍是独立条件。
+
+非 fling 的普通进度动画根据剩余 shift 计算 duration，并限制在 350 ms 内。
+`RECENTS` 使用 `OVERSHOOT_1_2`。fling 则先预测下一帧起点：
+
+```java
+startShift = boundToRange(
+    currentShift - velocityPxPerMs.y * singleFrameMs / transitionDragLength,
+    0,
+    dragLengthFactor);
+```
+
+这里直接使用原始 `velocity.y`，且除法发生在 `transitionDragLength > 0` 检查之前。
+长度为 0 时 Java 浮点运算会产生无穷或 NaN；`boundToRange` 不能把 NaN 修成有效
+progress。普通 fling duration 同样用 `velocityPxPerMs.y` 作分母，而
+`calculateEndTarget()` 用的却是已按导航栏方向归一化的 `endVelocity`。因此侧边导航栏
+存在“终点按 X 决策、时长按 Y 计算”的轴向缺口。
+
+非全手势 `RECENTS` 的高速分支用 `OvershootParams`；其他高速分支按
+`2 × abs(distance / velocity.y)` 估时，`RECENTS` 仍可能选择
+`OVERSHOOT_1_2`。所以不能把 overshoot 简化为“只属于双按钮”。
+
+`HOME` 还要单独理解：公共代码虽算出 `endShift=1`，HOME 分支却不把 `endShift` 或
+interpolator 交给几何动画。它先把 nominal duration 钳制为至少 120 ms，再把 duration
+传给 `createHomeAnimationFactory(duration)`，而 `createWindowAnimationToHome()` 只接收
+`startShift` 与 factory；leash 的几何终点动画实际是 `RectFSpringAnim`，没有把该
+duration 直接设为 spring 时长。Launcher handler 在 Activity 已存在时返回按 accuracy
+创建的 workspace controller，并另启 staggered animation；Activity 尚不存在时的空
+controller 仍使用 duration。Fallback handler 也把 duration 用于 alpha/controller。
+因此不能从剩余 shift 直接推导 HOME spring 必然更短。
+
+## 9. 终点动画：目标先发布，完成位稍后发布
+
+`animateToProgressInternal()` 先调用：
+
+```java
+mGestureState.setEndTarget(target, false);
+```
+
+它立即写 `mEndTarget` 并置 `STATE_END_TARGET_SET`，但不置
+`STATE_END_TARGET_ANIMATION_FINISHED`。后者由 HOME spring 或普通
+`ValueAnimator` 的 success listener 发布。
+
+非 HOME 动画的 success listener 在 controller 仍非空且 `mRecentsView` 存在时，还会做一次目标纠正：
+
+```text
+原目标 NEW_TASK
+  且 nextPage == lastAppearedTaskIndex
+  且尚未调用过 startActivityFromRecents
+    → 改成 LAST_TASK
+
+原目标 LAST_TASK
+  且 lastStartedTaskId != -1
+    → 改成 NEW_TASK
+```
+
+`getLastAppearedTaskIndex()` 在 last-appeared id 为 `-1` 时才退回 running-task index；
+若 id 存在但 `getTaskIndexForId()` 查不到，它会直接返回 `-1`，不会再次 fallback。
+`hasStartedNewTask()` 只表示 last-started id 不是 `-1`，不证明启动成功或 task 已出现。
+纠正发生在 Animator 的结束回调内，而不是动画播放结束之前。更细看一步，纠正调用的是
+默认 `setEndTarget()`：它在改目标后会顺带置
+`STATE_END_TARGET_ANIMATION_FINISHED`；listener 末尾又显式置一次同一位。因此纠正与
+finished 发布嵌套在同一次结束回调中，后一次 set 只是幂等重复。
+
+`setEndTarget(target)` 的默认参数会连续置
+`END_TARGET_SET` 与 `END_TARGET_ANIMATION_FINISHED`。源码把这种用法称为 atomic，
+含义只是调用者无需稍后再发布 finished；机械执行仍是“赋值 → setState（可触发回调）
+→ 日志 → 再 setState”，不是不可插入观察的原子指令。若 `END_TARGET_SET` 的
+run-once callback 已经消费过，后续纠正目标不会让它再次运行。
+
+还有一个取消语义陷阱。普通 `Animator.cancel()` 会触发
+`AnimationSuccessListener.onAnimationCancel()`，因而屏蔽 success；但
+`RectFSpringAnim.cancel()` 只通知 update listener 的 `onCancel()`，然后调用
+`end()`，最终向 Animator listener 发送 `onAnimationEnd(null)`。因此 HOME spring
+的“cancel”仍可能走 success listener；回调内部还要用 controller 是否为空来挡住后续状态推进。
+
+## 10. GestureState：生命周期账本不等于 controller 是否存在
+
+`GestureState` 有九个状态位：
+
+```text
+END_TARGET_SET
+END_TARGET_ANIMATION_FINISHED
+RECENTS_ANIMATION_INITIALIZED
+RECENTS_ANIMATION_STARTED
+RECENTS_ANIMATION_CANCELED
+RECENTS_ANIMATION_FINISHED
+RECENTS_ANIMATION_ENDED
+OVERSCROLL_WINDOW_CREATED
+RECENTS_SCROLLING_FINISHED
+```
+
+`INITIALIZED` 表示客户端已经把“请求启动 Recents animation”的本地工作排入队列，
+不是 Binder 已发送，更不是 controller 已返回。启动异常若没有走到 end 回调，
+这个状态账本可能长期保留“running”的判断。
+
+两个同名问题有不同答案：
+
+```text
+GestureState.isRecentsAnimationRunning()
+  = INITIALIZED 已置 && ENDED 未置
+
+TaskAnimationManager.isRecentsAnimationRunning()
+  = 当前 controller != null
+```
+
+前者是历史状态位推导，后者是当前引用检查；在请求已排队但 controller 未到、取消处理中、
+或本地 finish 已先清理引用时，它们可以不一致。
+
+平台 cancel 的 Binder 回调先被调度到 main thread；进入
+`BaseSwipeUpHandlerV2.onRecentsAnimationCanceled()` 后，如果本来就在主线程，
+`setStateOnUiThread(CANCELLED | HANDLER_INVALIDATED)` 会同步执行相关 callbacks，
+然后 `super` 才清 controller 与 targets。这个顺序是刻意保留的局部时序，不应再把
+Handler 内的 set 描述成“一定异步”。
+
+GestureState 自己则在 cancel 时依次置 `CANCELED`、`ENDED`，正常 finish 时依次置
+`FINISHED`、`ENDED`。`ENDED` 是统一的终止门闩，前两个位记录原因。
+
+## 11. MultiStateCallback：位掩码、一次性队列与重入顺序
+
+`MultiStateCallback` 的核心判断只有一条：
+
+```text
+(currentState & stateMask) == stateMask
+```
+
+`runOnceAtState(mask, callback)` 若条件已满足就立刻运行；否则把 callback 放进该 mask
+对应的 `LinkedList`。同一 mask 按 FIFO 排空，不同 mask 由 `SparseArray` 的数值 key
+顺序扫描。一次性是“同一个 MultiStateCallback 实例中的这个 callback 只从队列取出一次”，
+并不意味着同名业务动作在对象重建后永不再发生。
+
+`setState(flag)` 的准确顺序是：
+
+1. 保存 `oldState`；
+2. `mState |= flag`；
+3. 扫描并排空所有已满足的一次性 callback；
+4. 最后才通知持久 change listeners。
+
+这个实现没有队列化重入。callback 内再次 `setState()` 会深度优先推进内层状态；
+外层随后仍用自己捕获的旧 `oldState` 对最终 `mState` 发通知，可能让 listener 观察到
+重复或不直观的 true。若 callback 在执行中 `clearState(mask)`，当前 while 循环也不会
+重新检查 mask，剩余同 mask callbacks 仍会继续运行。
+
+它也没有 `try/finally`：某个 callback 抛异常时，状态位已经写入，但后续 callbacks 与
+listener 通知会中断。这说明它是一个轻量协调器，不是带回滚、隔离与持久化的事务框架。
+
+`setStateOnUiThread()` 只在调用线程不是 main looper 时才 post；调用者要区分
+“跨线程入队”与“主线程同步重入”这两种执行形态。
+
+## 12. Handler 的 16 位门闩：用合取条件表达偏序
+
+`BaseSwipeUpHandlerV2` 的 callback 使用另一套 16 位状态：
+
+| 分组 | 状态 |
+|---|---|
+| Launcher UI | `LAUNCHER_PRESENT`、`LAUNCHER_STARTED`、`LAUNCHER_DRAWN` |
+| controller | `APP_CONTROLLER_RECEIVED` |
+| 终点缩放 | `SCALED_CONTROLLER_HOME`、`SCALED_CONTROLLER_RECENTS` |
+| 手势 | `HANDLER_INVALIDATED`、`GESTURE_STARTED`、`GESTURE_CANCELLED`、`GESTURE_COMPLETED` |
+| 截图 | `CAPTURE_SCREENSHOT`、`SCREENSHOT_CAPTURED`、`SCREENSHOT_VIEW_SHOWN` |
+| 收尾动作 | `RESUME_LAST_TASK`、`START_NEW_TASK`、`CURRENT_TASK_FINISHED` |
+
+关键 callback 可以画成合取门：
+
+```text
+PRESENT ∧ GESTURE_STARTED
+  → 配置 Recents UI 与终点监听
+
+DRAWN ∧ GESTURE_STARTED
+  → 创建 Launcher animation controller
+
+RESUME_LAST_TASK ∧ APP_CONTROLLER_RECEIVED
+  → resumeLastTask()
+
+START_NEW_TASK ∧ SCREENSHOT_CAPTURED
+  → startNewTask()
+
+PRESENT ∧ APP_CONTROLLER_RECEIVED ∧ DRAWN ∧ CAPTURE_SCREENSHOT
+  → switchToScreenshot()
+
+SCREENSHOT_CAPTURED ∧ GESTURE_COMPLETED ∧ SCALED_CONTROLLER_RECENTS
+  → finishCurrentTransitionToRecents()
+
+END_TARGET_ANIMATION_FINISHED ∧ RECENTS_SCROLLING_FINISHED
+  → onSettledOnEndTarget()
+```
+
+最大的 RECENTS 收尾门还要求七项同时成立：
 
 ```text
 LAUNCHER_PRESENT
-APP_CONTROLLER_RECEIVED
-LAUNCHER_DRAWN
-CAPTURE_SCREENSHOT
+∧ APP_CONTROLLER_RECEIVED
+∧ LAUNCHER_DRAWN
+∧ SCALED_CONTROLLER_RECENTS
+∧ CURRENT_TASK_FINISHED
+∧ GESTURE_COMPLETED
+∧ GESTURE_STARTED
+  → setupLauncherUiAfterSwipeUpToRecentsAnimation()
 ```
 
-缺任一项都继续等待，避免对不存在的Activity/View/Controller截图交接。
+这些都是只增不减的正向门闩。`HANDLER_INVALIDATED` 只会触发清理 callback，其他门没有
+自动附带“且未 invalidated”的负条件。因此取消后到达的晚事件仍可能补齐旧组合；源码主要靠
+controller/null 检查、对象引用与具体 callback 内的 guard 限制影响，并非状态机天然拒绝所有晚回调。
 
-## 64. RECENTS完成门
+## 13. SCREENSHOT_CAPTURED 和 APP_CONTROLLER_RECEIVED 都只是软件事实
 
-结束到RECENTS需要：
+`SCREENSHOT_CAPTURED` 的名字很强，但路径语义更接近“截图阶段可以放行”：
+
+- live tile：有 controller 才尝试 screenshot/update thumbnail，随后无条件置位；
+- 没有 targets：直接置位；
+- controller 为空：没有 post-draw，也会走立即置位；
+- HOME：可以调用 `screenshotTask()`，但不更新 TaskView，随后立即置位；
+- 普通 task：若拿到 TaskView 且未 cancel，`ViewUtils.postDraw()` 延后两个
+  `onPostDraw` 回调再置位；
+- `screenshotTask()` 失败时 wrapper 可返回空 `ThumbnailData`，位仍可继续推进。
+
+因此该位不证明像素有效，也不证明 SurfaceFlinger 已 present。两次 post-draw 只是 View
+绘制时序栅栏。
+
+`APP_CONTROLLER_RECEIVED` 同样是单调的“曾经收到过 controller”。cancel 后父类会清
+`mRecentsAnimationController`，但不会清这个位。截图四门虽包含它，函数内部仍检查
+controller 是否为空；反过来，`resumeLastTask()` 直接解引用 controller，依赖的是正常
+生命周期顺序，而不是该状态位能证明引用此刻有效。
+
+这给阅读状态名提供一条通用规则：
 
 ```text
-SCREENSHOT_CAPTURED
-GESTURE_COMPLETED
-SCALED_CONTROLLER_RECENTS
+状态名 = 某条客户端路径已经宣布可继续
+状态名 ≠ 其英文名所暗示的所有外部效果均已完成
 ```
 
-用户已抬手、窗口已到目标且截图已准备，才finish当前转场。
+## 14. settled 后的四条收尾路径与 Binder 边界
 
-## 65. HOME完成门
+终点动画 finished 与 RecentsView scrolling finished 同时成立后，
+`onSettledOnEndTarget()` 才把目标翻译成 Handler 状态：
 
-HOME使用相同前两项加`SCALED_CONTROLLER_HOME`。
+| 终点 | 新增 Handler 状态 | 后续动作 |
+|---|---|---|
+| `HOME` | `SCALED_CONTROLLER_HOME` + `CAPTURE_SCREENSHOT` | 截图放行后 finish-to-home |
+| `RECENTS` | `SCALED_CONTROLLER_RECENTS` + `CAPTURE_SCREENSHOT` + `SCREENSHOT_VIEW_SHOWN` | 截图与手势完成后 finish-to-recents |
+| `NEW_TASK` | `START_NEW_TASK` + `CAPTURE_SCREENSHOT` | 截图放行后启动所选 task |
+| `LAST_TASK` | `RESUME_LAST_TASK` | controller 到达后 finish(false) |
 
-之后还等待CURRENT_TASK_FINISHED才reset，保证服务端Recents Controller的真实Task提交已经请求完成。
+其中 HOME 分支还会在 `onSettledOnEndTarget()` 内立即调用
+`notifySwipeToHomeFinished()`；这个通知早于截图门和 controller finish。
 
-## 66. NEW_TASK完成门
+四条路径的 controller 语义并不统一：
 
-END_TARGET动画和scroll settled后设置START_NEW_TASK与CAPTURE_SCREENSHOT；真正`startNewTask()`要求START_NEW_TASK和SCREENSHOT_CAPTURED。
+- `LAST_TASK`：`finish(false, null)` 后立即日志并 `reset()`，不等待回调；
+- `RECENTS`：普通模式 `finish(true, callback)`；live tile 不 finish，只把
+  `CURRENT_TASK_FINISHED` 置位，并在完成后保留 controller、设置 defer-cancel；
+- `HOME`：Launcher handler 调 `finish(true, callback, sendUserLeaveHint=true)`；
+  Fallback handler 调 `finish(false, callback, sendUserLeaveHint=true)`；
+- `NEW_TASK`：live tile 先 `finish(true)` 再启动。普通模式若 task 是本次首次
+  appeared，匹配的 `onTaskAppeared` 先让 V2 handler `reset()`，父层随后
+  `finish(false)`；若该 task 已在本手势中 appeared，launch-success callback 会先走父层
+  `onRestartPreviouslyAppearedTask()` 的 `finish(false)`，V2 override 返回后再 `reset()`。
 
-先固定当前live tile画面，再启动目标Task，减少Surface交接闪烁。
+`RecentsAnimationController.finishController()` 先在调用线程执行本地
+on-finished listener，再把真正的 compat `finish()` 排到 UI helper executor。
+compat 层捕获并吞掉 `RemoteException`；其后的 callback 只表示这次 Binder 调用已经返回
+或失败被吞掉，不是 WindowManager 已完成提交、更不是新画面已经 present。
 
-## 67. LAST_TASK完成门
+于是 `CURRENT_TASK_FINISHED` 也只是本地门闩：没有 targets、controller 为空或 live tile
+分支都能立即置位；正常 callback 也至多说明 finish 尝试返回。GestureState 的
+`FINISHED/ENDED`、targets release 和 Handler 清理可以早于真正的远端可见结果。
 
-onSettled直接设置RESUME_LAST_TASK；真正resume要求再有APP_CONTROLLER_RECEIVED。
+`NEW_TASK` 还有失败边界：若待启动 TaskView 为空或 Handler 已 cancel，底层启动函数可能
+不调用结果 callback；这条路径不能靠“最终一定会 success=false”来保证复位。
 
-没有Controller就无法正确finish回App，状态机会等待而非空指针调用。
+## 15. 旋转重建、取消与失败注入：状态机会在哪些地方重新武装
 
-## 68. onSettledOnEndTarget是分流点
-
-它等待：
+Launcher Activity 因旋转而重建时，Handler 不复用原来的
+`mStateCallback`。`onActivityInit()` 会：
 
 ```text
-END_TARGET_ANIMATION_FINISHED
-RECENTS_SCROLLING_FINISHED
+oldState = 原状态去掉 PRESENT / STARTED / DRAWN
+initStateCallbacks() 创建新 MultiStateCallback 并重新注册所有 run-once
+newCallback.setState(oldState) 回放非 UI 位
+再绑定新 Activity，等待新的 present/start/draw
 ```
 
-然后按HOME/RECENTS/NEW_TASK/LAST_TASK设置Handler内部后续flags。
-
-## 69. 为什么动画完还持续computeScroll
-
-RecentsView不可见时View优化可能不主动计算scroll，但live window offset仍依赖scroll。
-
-Handler用postOnAnimation循环，直到SCROLLING_FINISHED、失效或取消，确保状态账不是“动画结束但几何未settle”。
-
-## 70. HOME分流动作
-
-设置SCALED_HOME与CAPTURE_SCREENSHOT，并通知SystemUI swipe-to-home finished。
-
-真正finish到Home仍由后续截图/Controller状态门完成。
-
-## 71. RECENTS分流动作
-
-同时设置SCALED_RECENTS、CAPTURE_SCREENSHOT和SCREENSHOT_VIEW_SHOWN。
-
-Overview终点要让任务卡片UI接管live window显示。
-
-## 72. NEW_TASK分流动作
-
-设置START_NEW_TASK与CAPTURE_SCREENSHOT。
-
-页面已经settle到目标Task后才启动，防止UP瞬间nextPage还在变化。
-
-## 73. LAST_TASK分流动作
-
-只设置RESUME_LAST_TASK，不要求截图。
-
-用户回原App时可让服务端恢复真实Task Surface，无需先把live tile换成卡片截图。
-
-## 74. Handler invalidated是什么
-
-它表示当前手势Handler不再有权推进UI/Controller。
-
-一旦置位执行invalidateHandler；若Launcher已present还做Launcher专属清理，若同时RESUME_LAST_TASK则通知转场取消。
-
-## 75. 取消回调顺序
-
-onRecentsAnimationCanceled先注销ActivityInitListener，异步置`GESTURE_CANCELLED | HANDLER_INVALIDATED`，然后才调用父类清Controller/targets。
-
-注释说明先更新状态再清引用，让已注册屏障有机会看到取消事实。
-
-## 76. 正常手势结束不等于交互完成
-
-OtherActivityInputConsumer注释明确：ACTION_UP只结束touch tracking，后续吸附动画、页面scroll、截图、Task启动或服务端finish仍可运行。
-
-因此不能在UP就回收Handler和targets。
-
-## 77. 没过slop就UP
-
-Consumer立即清理交互，并延迟100ms调用`cancelRecentsAnimation(restoreHomeStackPosition=true)`。
-
-延迟用于规避SystemUI处理UP与Launcher已在DOWN预启Recents之间的竞态。
-
-## 78. 继续上一手势
-
-若TaskAnimationManager已有活跃Recents动画，新Consumer复用callbacks/controller，`continueRecentsAnimation()`替换GestureState监听器并把INITIALIZED|STARTED一起置位。
-
-它不会重复向system_server创建第二套Task leash。
-
-## 79. isRunningAnimationToLauncher
-
-要求Recents仍运行、endTarget非null且`isLauncher=true`。
-
-目标刚设为HOME/RECENTS但Recents已ENDED时返回false，避免旧目标枚举误导新手势。
-
-## 80. 输入代理何时enable
-
-确定终点`isLauncher=true`时启用InputConsumerProxy，把后续触摸交给OverviewInputConsumer/Launcher UI。
-
-去NEW_TASK/LAST_TASK则不需要Launcher接管终点后的输入。
-
-## 81. RECENTS attach状态
-
-`recentsAttachedToAppWindow`结合shelf、新Task可能性和当前endTarget决定RecentsView是否视觉绑定App window。
-
-attach动画过程中每帧重新applyWindowTransform，因为它会改变窗口受overscroll约束的方式。
-
-## 82. 活动重启监听
-
-终点属于Launcher时注册TaskStackChangeListener；若过渡中原运行Activity尝试restart，则取消当前窗口动画并用默认options从Recents重启Task。
-
-这是少见竞态的安全回退。
-
-## 83. 日志终点与真实提交
-
-GestureEndTarget自带containerType用于统计；LAST_TASK日志pageIndex=-1，HOME/RECENTS/quick switch映射不同事件。
-
-日志记录不能作为WMS已完成Task reorder的证据。
-
-## 84. 状态时序示例：冷启动后快速回Home
-
-```mermaid
-sequenceDiagram
-    participant IN as "InputConsumer"
-    participant H as "Swipe Handler"
-    participant GS as "GestureState"
-    participant MS as "Handler MultiState"
-    participant RC as "Recents Controller callback"
-    IN->>H: "DOWN预启动"
-    IN->>H: "过slop → GESTURE_STARTED"
-    RC->>GS: "RECENTS_STARTED"
-    RC->>MS: "APP_CONTROLLER_RECEIVED"
-    MS->>RC: "两flag齐 → enableInputConsumer"
-    IN->>H: "UP，高速向上"
-    H->>GS: "END_TARGET_SET(HOME)"
-    H->>H: "RectFSpringAnim"
-    H->>GS: "END_TARGET_ANIMATION_FINISHED"
-    GS->>H: "等scroll finished后onSettled"
-    H->>MS: "SCALED_HOME + CAPTURE_SCREENSHOT"
-    MS->>H: "等Launcher/controller/drawn后截图"
-    MS->>H: "截图+gesture+scaled齐 → finish HOME"
-```
-
-## 85. MultiStateCallback的线程假设
-
-类内部没有锁；Quickstep通过UI线程入口序列化大多数状态修改。
-
-直接从Binder/后台线程调用`setState()`会破坏这一假设，跨线程应使用`setStateOnUiThread()`。
-
-## 86. bit数量边界
-
-GestureState用递增`1 << FLAG_COUNT`分配；Handler显式使用0..15位。
-
-int最多安全表达32个独立bit，扩展状态时必须留意移位溢出与名称数组长度。
-
-## 87. DEBUG_STATES=false的影响
-
-生产默认不保存state name数组，也不打印每次转换，降低热路径日志开销。
-
-行为仍由相同bitmask执行；调试名只是可观测性，不参与判断。
-
-## 88. runOnce队列不删除key
-
-回调执行后LinkedList变空，但SparseArray key仍可存在；之后同mask注册会复用空列表。
-
-这是小型结构复用，不表示旧callback会再次运行。
-
-## 89. 回调执行顺序边界
-
-setState按SparseArray的key顺序扫描mask，不是全局注册时间顺序；只有同一mask内LinkedList保持注册顺序。
-
-业务不应让不同mask回调依赖隐含遍历顺序，应通过额外flag建立显式因果。
-
-## 90. 状态只说明软件事实
-
-LAUNCHER_DRAWN、SCREENSHOT_CAPTURED、CURRENT_TASK_FINISHED等是Quickstep定义的里程碑。
-
-它们不自动等于SurfaceFlinger present fence或屏幕扫描完成，不能用于精确物理显示测量。
-
-## 91. 常见误解纠正
-
-| 误解 | 正确理解 |
-|---|---|
-| 一个enum控制全流程 | enum只表示终点，异步进度由两套bitmask维护 |
-| fling只看Y速度 | 斜滑还比较X与主速度并考虑是否选新页 |
-| UP就结束Recents | 后面还有吸附、scroll、截图、launch/finish和清理 |
-| setEndTarget就已到终点 | atomic=false时还要等动画完成flag |
-| MultiStateCallback是互斥状态机 | 它是独立事实bit的AND汇合器 |
-| clearState会重新武装runOnce | 一次性回调执行后不会自动恢复 |
-
-## 92. macOS只读练习一：手算终点
-
-分别判断：
+所以同一业务动作在新 callback 实例上可以重新武装。先前已经满足的非 UI 组合会在
+`setState(oldState)` 时再次触发相应动作，而且回放发生在 `mActivity`、`mRecentsView`
+换成新实例之前，callback 还可能读到旧引用；“run once”不能跨实例去重。另一个细节是
+`onRecentsAnimationStart()` 动态注册的 enable-input-consumer callback 不在
+`initStateCallbacks()` 的静态表中，重建不会自动重新注册它。
+
+取消路径也可能主动结束 window animation：
 
 ```text
-A. 全手势、非fling、shift=0.8、无shelf、没换页
-B. 全手势、向上fling、水平速度较小
-C. 双按钮、非fling、shift=0.8
-D. 向下fling、已横向选另一页
-E. ACTION_CANCEL
+onRecentsAnimationCanceled()
+  → 同步置 GESTURE_CANCELLED | HANDLER_INVALIDATED
+  → invalidateHandler()
+  → endRunningWindowAnim(false)
+  → 再由 super 清 controller / targets
 ```
 
-参考：A HOME，B HOME，C RECENTS，D NEW_TASK，E LAST_TASK。
+`endRunningWindowAnim(false)` 会走 animation end；success listener 会运行，但它看到
+controller 仍非空，可能继续置终点完成位。Activity restart 也可能 cancel HOME spring，
+而该 spring 的 cancel 如前所述仍以 end 结束。正确的测试不能只覆盖理想顺序，还应注入：
 
-## 93. macOS只读练习二：追输入门
+- controller 先到、Launcher 后 draw，反过来也测；
+- UP 先于 targets，targets 先于 UP；
+- animation end 与 cancel 交错；
+- 旋转重建发生在截图门之前或之后；
+- callback 重入、抛异常与 late task appeared。
+
+判断是否安全的重点不是“所有事件按预想顺序来”，而是每个合取门在任意合法顺序下是否只产生可接受的副作用。
+
+## 16. 九个源码练习与结论
+
+下面的命令都只读取 Android 11 源码。每个练习先把路径放进变量，便于从仓库根目录执行。
+
+### 练习 1：还原输入接收链
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '210,430p' \
-  packages/apps/Launcher3/quickstep/recents_ui_overrides/src/com/android/quickstep/inputconsumers/OtherActivityInputConsumer.java
+set -eu
+TIS=packages/apps/Launcher3/quickstep/recents_ui_overrides/src/com/android/quickstep/TouchInteractionService.java
+ICC=frameworks/base/packages/SystemUI/shared/src/com/android/systemui/shared/system/InputChannelCompat.java
+rg -n -F 'monitorGestureInput("swipe-up"' "$TIS"
+rg -n -F 'this::onInputEvent' "$TIS"
+rg -n -F 'mUncheckedConsumer.onMotionEvent(event)' "$TIS"
+rg -n -F 'listener.onInputEvent(event)' "$ICC"
+rg -n -F 'finishInputEvent(event, true' "$ICC"
 ```
 
-标出window-move slop、pilfer slop、pointer切换、velocity计算和未过slop延迟取消。
+检查 listener 与 `finishInputEvent` 的先后，并确认消费者分发发生在 service 内。
 
-## 94. macOS只读练习三：为回调写布尔式
+### 练习 2：比较两道 slop
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '205,275p' \
-  packages/apps/Launcher3/quickstep/recents_ui_overrides/src/com/android/quickstep/BaseSwipeUpHandlerV2.java
+set -eu
+F=packages/apps/Launcher3/quickstep/recents_ui_overrides/src/com/android/quickstep/inputconsumers/OtherActivityInputConsumer.java
+rg -n -F 'Math.abs(displacement) > mTouchSlop' "$F"
+rg -n -F 'mStartDisplacement = Math.min(displacement, -mTouchSlop)' "$F"
+rg -n -F 'squaredHypot(displacementX, displacementY)' "$F"
+rg -n -F 'QUICKSTEP_TOUCH_SLOP_RATIO_GESTURAL = 2' "$F"
+rg -n -F 'QUICKSTEP_TOUCH_SLOP_RATIO_TWO_BUTTON = 9' "$F"
 ```
 
-把每个`runOnceAtState(A|B|...)`改写成自然语言AND条件，确认事件先后交换不会改变最终是否执行。
+分别标注一维严格大于、二维大于等于，以及平方倍率对应的实际距离。
 
-## 95. macOS只读练习四：验证runOnce语义
+### 练习 3：对照 deferred 与 continuation
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '35,190p' \
-  packages/apps/Launcher3/quickstep/src/com/android/quickstep/MultiStateCallback.java
+set -eu
+F=packages/apps/Launcher3/quickstep/recents_ui_overrides/src/com/android/quickstep/inputconsumers/OtherActivityInputConsumer.java
+T=packages/apps/Launcher3/quickstep/recents_ui_overrides/src/com/android/quickstep/TouchInteractionService.java
+rg -n -F 'mIsDeferredDownTarget = !continuingPreviousGesture' "$F"
+rg -n -F 'startTouchTrackingForWindowAnimation(ev.getEventTime())' "$F"
+rg -n -F 'continueRecentsAnimation(mGestureState)' "$F"
+rg -n -F 'gestureState.getActivityInterface().deferStartingActivity' "$T"
 ```
 
-推演先set A、注册A|B、set B、clear B、再set B：原callback只执行一次；新注册A|B的callback会因条件已满足立即执行。
+注意 start 函数在 DOWN 与越过门槛的 MOVE 中都可能出现，必须结合分支上下文阅读。
 
-## 96. 源码阅读导航
+### 练习 4：验证多指清理顺序
 
-```text
-packages/apps/Launcher3/quickstep/src/com/android/quickstep/GestureState.java
-packages/apps/Launcher3/quickstep/src/com/android/quickstep/MultiStateCallback.java
-packages/apps/Launcher3/quickstep/recents_ui_overrides/src/com/android/quickstep/inputconsumers/OtherActivityInputConsumer.java
-packages/apps/Launcher3/quickstep/recents_ui_overrides/src/com/android/quickstep/SwipeUpAnimationLogic.java
-packages/apps/Launcher3/quickstep/recents_ui_overrides/src/com/android/quickstep/BaseSwipeUpHandlerV2.java
-packages/apps/Launcher3/quickstep/src/com/android/quickstep/TaskAnimationManager.java
+```bash
+set -eu
+F=packages/apps/Launcher3/quickstep/recents_ui_overrides/src/com/android/quickstep/inputconsumers/OtherActivityInputConsumer.java
+M=packages/apps/Launcher3/quickstep/src/com/android/quickstep/util/MotionPauseDetector.java
+rg -n -F 'ev.getActionMasked() == ACTION_POINTER_UP' "$F"
+rg -n -F 'mVelocityTracker.clear()' "$F"
+rg -n -F 'mMotionPauseDetector.clear()' "$F"
+rg -n -F 'setOnMotionPauseListener(null);' "$M"
+rg -n -F 'ptrId == mActivePointerId' "$F"
 ```
 
-## 97. 本章复读后的精确结论
+确认 tracker/pause 清理位于 active-pointer 判断之前，再查 listener 是否被清空。
 
-1. 输入Consumer先用两级slop区分“允许窗口跟手”和“正式pilfer整条pointer stream”，UP时再计算方向速度。  
-2. 终点同时取决于导航模式、fling、纵横速度、0.7阈值、shelf pause和Recents当前页。  
-3. GestureState保存跨组件生命周期，Handler MultiState保存当前Launcher UI/截图/动作屏障，不能合并为一个枚举。  
-4. MultiStateCallback以bit OR累积事实、以mask AND触发一次性动作，使Activity、Controller、手势和页面滚动任意顺序到达都能汇合。  
-5. ACTION_UP、终点动画完成、Recents finish和硬件present是四个不同完成点。
+### 练习 5：追踪 UP 的速度坐标
 
-## 98. 检查题
+```bash
+set -eu
+F=packages/apps/Launcher3/quickstep/recents_ui_overrides/src/com/android/quickstep/inputconsumers/OtherActivityInputConsumer.java
+rg -n -F 'computeCurrentVelocity(1000' "$F"
+rg -n -F 'mNavBarPosition.isRightEdge()' "$F"
+rg -n -F '? -velocityX' "$F"
+rg -n -F 'new PointF(velocityX, velocityY)' "$F"
+rg -n -F 'postDelayed(mCancelRecentsAnimationRunnable, 100)' "$F"
+```
 
-1. window move slop与pilfer slop分别保护什么？  
-2. 为什么全手势慢滑过0.7可能到HOME，而双按钮到RECENTS？  
-3. NEW_TASK为什么可能在终点动画结束时被纠正为LAST_TASK？  
-4. `setEndTarget(target,false)`后还缺哪个状态？  
-5. 为什么END_TARGET_ANIMATION_FINISHED还要与RECENTS_SCROLLING_FINISHED汇合？  
-6. runOnceAtState与addChangeListener分别适合什么场景？
+写出底、左、右三种导航栏下 `endVelocity` 的符号，并区分原始 `PointF`。
 
-## 99. 下一章预告
+### 练习 6：手算四终点决策
 
-下一章进入Launcher/Overview的Task数据模型：RecentTasks如何从system_server取得任务列表，Task/TaskKey/ThumbnailData怎样缓存与失效，TaskView又如何把静态快照与Recents Animation的live tile对应到同一个taskId。
+```bash
+set -eu
+F=packages/apps/Launcher3/quickstep/recents_ui_overrides/src/com/android/quickstep/BaseSwipeUpHandlerV2.java
+rg -n -F 'private GestureEndTarget calculateEndTarget' "$F"
+rg -n -F 'goingToNewTask = true' "$F"
+rg -n -F 'mIsShelfPeeking' "$F"
+rg -n -F 'willGoToNewTaskOnSwipeUp' "$F"
+rg -n -F 'isOverviewDisabled()' "$F"
+```
+
+至少手算：全手势慢上拉、全手势斜向快速滑、非全手势过 0.7、cancel 四组输入。
+
+### 练习 7：定位 duration 的轴向风险
+
+```bash
+set -eu
+F=packages/apps/Launcher3/quickstep/recents_ui_overrides/src/com/android/quickstep/BaseSwipeUpHandlerV2.java
+rg -n -F 'quickstep_fling_threshold_velocity' "$F"
+rg -n -F 'quickstep_fling_min_velocity' "$F"
+rg -n -F 'velocityPxPerMs.y' "$F"
+rg -n -F 'mTransitionDragLength > 0' "$F"
+rg -n -F 'createWindowAnimationToHome(start, homeAnimFactory)' "$F"
+```
+
+观察除法与长度 guard 的相对位置，并比较 target 决策和 duration 使用的速度轴。
+
+### 练习 8：审计 GestureState 与 MultiStateCallback
+
+```bash
+set -eu
+G=packages/apps/Launcher3/quickstep/src/com/android/quickstep/GestureState.java
+M=packages/apps/Launcher3/quickstep/src/com/android/quickstep/MultiStateCallback.java
+rg -n -F 'mStateCallback = other.mStateCallback' "$G"
+rg -n -F 'STATE_RECENTS_ANIMATION_INITIALIZED' "$G"
+rg -n -F '!mStateCallback.hasStates(STATE_RECENTS_ANIMATION_ENDED)' "$G"
+rg -n -F 'final int oldState = mState' "$M"
+rg -n -F 'callbacks.pollFirst().run()' "$M"
+rg -n -F 'notifyStateChangeListeners(oldState)' "$M"
+```
+
+用源码顺序说明 callback 重入时为什么会先推进内层，再返回外层 listener 通知。
+
+### 练习 9：核对截图与 finish 的含义
+
+```bash
+set -eu
+H=packages/apps/Launcher3/quickstep/recents_ui_overrides/src/com/android/quickstep/BaseSwipeUpHandlerV2.java
+C=packages/apps/Launcher3/quickstep/src/com/android/quickstep/RecentsAnimationController.java
+R=frameworks/base/packages/SystemUI/shared/src/com/android/systemui/shared/system/RecentsAnimationControllerCompat.java
+rg -n -F 'STATE_SCREENSHOT_CAPTURED' "$H"
+rg -n -F 'ViewUtils.postDraw(taskView' "$H"
+rg -n -F 'STATE_CURRENT_TASK_FINISHED' "$H"
+rg -n -F 'mOnFinishedListener.accept(this)' "$C"
+rg -n -F 'UI_HELPER_EXECUTOR.execute' "$C"
+rg -n -F 'catch (RemoteException e)' "$R"
+```
+
+把每个命中点分类为本地位、View draw 栅栏、本地 listener、executor 排队或 Binder 异常边界。
+
+本章最终可留下五条结论：
+
+1. Quickstep 有“一维窗口移动”和“二维输入接管”两道不同门槛；
+2. `ACTION_UP` 只结束采样，并不表示目标、远端 finish 或画面呈现已完成；
+3. 四终点由导航模式、位移、速度、页面与 shelf 状态共同决定，且存在原始 Y 速度参与时长计算的轴向缺口；
+4. `GestureState` 记录跨组件生命周期，Handler 的 16 位状态记录本地偏序，两者都不能替代当前引用与外部系统事实；
+5. `MultiStateCallback` 是可同步重入、无回滚的一次性位掩码协调器，必须连同 callback 副作用与重建路径一起审计。
+
+下一章转向 `RecentTasks`、`TaskKey` 与 `ThumbnailData`，继续追踪 Overview 中“任务元数据”和“任务像素”分别怎样加载、缓存与失效。

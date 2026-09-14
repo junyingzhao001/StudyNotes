@@ -1,1024 +1,573 @@
-# 232 Android IMMS、InputMethodService与软键盘显示输入隐藏完整链
+# 232 Android IMMS、InputMethodService 与软键盘显示输入隐藏完整链
 
-> 源码版本：Android 11 / `android-11.0.0_r48`  
-> 学习方式：macOS只读核源，不编译、不运行AOSP
+本文基于 `android-11.0.0_r48`。我们从用户点进一个 `EditText` 开始，依次追踪 App 侧焦点与 `InputConnection`、system_server 中的 `InputMethodManagerService`（IMMS）、输入法进程里的 `InputMethodService`（IMS）、IME 独立窗口，以及 Android 11 新 Insets 模式下的 show/hide 动画；最后再沿反方向看一个字符怎样写回 App。
 
-## 1. 本章要解决什么
+本章最重要的不变量是：**View 获得焦点、它成为 served View、App 创建编辑协议、IMMS 接纳 start、IME Service 已绑定、Session 已创建、IME 收到 start、IMMS 安排 show、IMS 接受 show、IME 窗口完成布局、Insets 动画结束、Surface 事务提交、像素物理呈现，是彼此不同的完成点。**
 
-用户点进一个`EditText`，软键盘出现；点击一个字母，文字进入编辑框；按返回键，键盘消失。表面只有三个动作，内部却横跨App、`system_server`和输入法三个进程。
+版本锚点：
 
-本章要回答：
+- `frameworks/base/core/java/android/view/ImeFocusController.java`
+- `frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java`
+- `frameworks/base/core/java/android/view/inputmethod/EditorInfo.java`
+- `frameworks/base/core/java/com/android/internal/view/InputBindResult.java`
+- `frameworks/base/core/java/com/android/internal/view/IInputConnectionWrapper.java`
+- `frameworks/base/core/java/com/android/internal/view/InputConnectionWrapper.java`
+- `frameworks/base/core/java/com/android/internal/view/IInputMethod.aidl`
+- `frameworks/base/core/java/com/android/internal/view/IInputContext.aidl`
+- `frameworks/base/core/java/android/inputmethodservice/IInputMethodWrapper.java`
+- `frameworks/base/core/java/android/inputmethodservice/InputMethodService.java`
+- `frameworks/base/core/java/android/inputmethodservice/SoftInputWindow.java`
+- `frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java`
+- `frameworks/base/services/core/java/com/android/server/wm/ImeInsetsSourceProvider.java`
+- `frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java`
+- `frameworks/base/core/java/android/view/ImeInsetsSourceConsumer.java`
 
-```text
-谁决定哪个View是当前编辑器？
-InputConnection为什么不是“输入法对象”？
-IMMS怎样防止后台App冒充前台输入目标？
-输入法服务、输入会话和IME窗口分别是什么？
-showSoftInput返回true时，键盘究竟走到了哪一步？
-输入法按键怎样反向写回App中的Editable？
-```
+## 1. 先把一次输入的完成点拆开
 
-## 2. 先记住一句总纲
-
-IME系统不是“App直接弹出一个键盘View”，而是：
-
-```text
-App把编辑器协议交给系统
-→ 系统选择并连接可信IME
-→ IME在自己的进程创建TYPE_INPUT_METHOD窗口
-→ Insets控制链显示这个窗口
-→ IME通过InputConnection协议把编辑命令写回App
-```
-
-## 3. 三个进程、两条主方向
-
-```mermaid
-flowchart LR
-    subgraph APP["目标App进程"]
-        V["EditText / View"]
-        IMM["InputMethodManager"]
-        IC["InputConnection"]
-        CTX["IInputContext Stub"]
-    end
-    subgraph SYS["system_server"]
-        IMMS["InputMethodManagerService"]
-        WMS["WindowManagerService / Insets"]
-    end
-    subgraph IME["输入法进程"]
-        IMS["InputMethodService"]
-        SESSION["IInputMethodSession"]
-        RIC["远端InputConnection包装"]
-        WIN["IME Window"]
-    end
-    V --> IMM
-    IMM -->|"焦点、EditorInfo、IInputContext"| IMMS
-    IMMS -->|"bind/start/show/hide"| IMS
-    IMMS --> WMS
-    IMS --> WIN
-    WMS -->|"WindowToken、Insets control"| WIN
-    RIC -->|"commitText等Binder调用"| CTX
-    CTX --> IC
-    IC --> V
-    IMS --- SESSION
-```
-
-方向一是“App → 系统 → IME”：建立输入、显示/隐藏键盘。
-
-方向二是“IME → App”：读取光标附近文本、设置组合文本、提交字符、执行编辑器动作。
-
-## 4. 五个对象不要混为一谈
-
-| 对象 | 所在进程 | 作用 |
-|---|---|---|
-| `InputMethodManager`（IMM） | App | 跟踪served View，发起start/show/hide，保存当前IME session |
-| `InputMethodManagerService`（IMMS） | system_server | 验证调用方，选择/绑定IME，管理客户端、会话与可见请求 |
-| `InputMethodService`（IMS） | IME | 输入法应用实现的Service基类，创建键盘UI并处理输入生命周期 |
-| `InputConnection` | App | 当前编辑器向IME暴露的“编辑协议” |
-| `IInputMethodSession` | IME，Binder句柄交给App | 每个IME客户端会话的事件/状态通道，尤其承接输入事件与编辑状态通知 |
-
-`InputConnection`不是网络连接，也不是IME窗口；它是“如何编辑当前文本”的接口。
-
-## 5. 本章源码地图
-
-客户端主线：
+“点输入框、键盘出现、输入一个字、再隐藏”不是一个调用栈，而是两条相反方向的数据链加一条窗口链：
 
 ```text
-frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
-frameworks/base/core/java/android/view/inputmethod/InputConnection.java
-frameworks/base/core/java/com/android/internal/view/IInputConnectionWrapper.java
-frameworks/base/core/java/com/android/internal/view/IInputContext.aidl
+建立与显示：
+View/Window 焦点
+  → IMM 在 View Looper 创建 EditorInfo 与 InputConnection
+  → 同步 Binder 进入 IMMS 做用户、客户端、display、WMS 焦点和包名校验
+  → 选择并异步绑定当前 IME，创建 WindowToken 与 Session
+  → oneway IInputMethod.bindInput / startInput / showSoftInput
+  → IMS 主线程准备输入 UI 和 TYPE_INPUT_METHOD 窗口
+  → IME 请求 WMS 在布局后 show Insets
+  → 控制目标执行 IME Insets 动画 → Surface 后续呈现
+
+编辑回写：
+IME 按键逻辑
+  → 远端 InputConnection.commitText
+  → oneway IInputContext
+  → App 指定 Looper 上的 IInputConnectionWrapper
+  → EditableInputConnection / BaseInputConnection
+  → Editable、TextWatcher、布局、绘制
+
+隐藏与回收：
+App/系统 hide 请求
+  → IMMS 策略记账并异步通知 IMS
+  → IMS 清本地 UI 意图并请求 WMS hide Insets
+  → 控制目标完成隐藏动画
+  → 通知 IME 已隐藏并在独立路径移除残留 Surface
 ```
 
-系统服务主线：
+诊断时先问“卡在哪个完成点”，不要只问“键盘为什么没弹”：
+
+| 观察 | 最多能证明 | 仍不能证明 |
+| --- | --- | --- |
+| `startInputInner()` 返回 `true` | 本轮没有在若干本地 abort/重投分支提前返回，且一次 IMMS 调用已返回或抛出的远端异常已被捕获 | IMMS 返回成功码、已拿到 Session、IME 已开始输入 |
+| `SUCCESS_WAITING_IME_BINDING` | IMMS 已发起 Service 连接 | 已取得 `IInputMethod` |
+| `SUCCESS_WITH_IME_SESSION` | 返回对象里的 Session、channel、sequence 可用 | IME 输入 View 或窗口可见 |
+| `showSoftInput()` 返回 `true` | r48 已走到“有当前 IME 接口并安排 show”的分支 | oneway 调用成功交付、IME 接受、窗口绘制 |
+| `ResultReceiver.RESULT_SHOWN` | IMS 的本地可见状态由 hidden 变为 shown | WMS post-layout、动画或物理 present 完成 |
+| Insets 动画 `finish()` | 控制器逻辑到达终帧 | SurfaceFlinger 已在屏幕显示该帧 |
+
+反向也要小心：r48 的 `showCurrentInputLocked()`先写 `mShowRequested`，再判断部分拒绝条件；Service 正在绑定时，本次调用可以返回 `false`，后来 `attachNewInputLocked()`仍可能重放保存的显示意图。`false` 并不总是“未来绝不会显示”。
+
+## 2. 三个进程、六组 Binder 接口和同名字段
+
+通常有三个安全域：目标 App、system_server、用户选中的 IME App。IME 窗口属于输入法进程，不是目标 Activity View 树的子 View。
+
+| 角色 | 关键对象 | 责任 |
+| --- | --- | --- |
+| 目标 App | `ImeFocusController`、`InputMethodManager`、真实 `InputConnection` | 选择 served View，导出编辑协议，保存当前 Session |
+| system_server | IMMS、WMS、`ImeInsetsSourceProvider` | 仲裁客户端和用户，绑定 IME，管理 token/Session，选择 Insets 控制目标 |
+| IME App | `IInputMethodWrapper`、IMS、`SoftInputWindow`、远端 `InputConnectionWrapper` | 处理输入生命周期，绘制键盘，通过协议读写编辑器 |
+
+接口方向与同步语义不能混在一起：
+
+| 接口 | 方向 | r48 AIDL 语义 |
+| --- | --- | --- |
+| `IInputMethodManager` | App → IMMS | start/show/hide 是同步 Binder 方法，返回的是 system_server 当下结果 |
+| `IInputMethod` | IMMS → IME | 整个接口是 `oneway`；跨进程调用返回不等于 IME 已处理 |
+| `IInputMethodClient` | IMMS → App | `oneway`；App Stub 再投递到 IMM 的 Handler |
+| `IInputContext` | IME → App | `oneway`；编辑命令不带执行结果，查询另带 callback |
+| `IInputMethodSession` | App/IMMS → IME Session | `oneway`；传递选择、光标、事件状态和收尾通知 |
+| `IInputMethodPrivilegedOperations` | IME → IMMS | 受当前 IME token 约束的同步接口 |
+
+同名字段尤其危险：
+
+- App IMM 的 `mCurMethod` 是 `IInputMethodSession`；IMMS 的 `mCurMethod` 是顶层 `IInputMethod`。
+- IMMS 的 `mShowRequested` 是服务端显示意图；IMS 的 `mShowInputRequested` 是输入法 UI 状态。
+- IMMS 的 `mInputShown` 表示 show 已被安排给当前 IME，不是屏幕事实；IMS 的 `mIsInputViewShown` 也是本地 View 状态，不是 present fence。
+- IMMS 的 `mImeWindowVis` 来自当前 IME 的状态上报，会与前述字段短暂分叉；WMS文档也明确它不保证与 WMS状态同步，r48 的 WMS实现只在该入口消费 back-key disposition，不靠这个布尔值驱动 Insets Source。
+
+IMMS 的 `executeOrSendMessage()`也有一个反直觉分支：目标若是本地 `Binder`，它投递 `mCaller`；目标若是普通跨进程 `BinderProxy`，它在当前 IMMS 调用线程直接执行 `handleMessage()`，而其中的 `IInputMethod` 调用本身是 oneway。真正把收到的命令切到 IME 主线程的是 `IInputMethodWrapper` 的 `HandlerCaller`。所以不能把所有 show/start 都画成“先切 system_server 主线程”。
+
+## 3. 焦点怎样把一个 View 变成 served editor
+
+起点不是 `showSoftInput()`，而是 ViewRoot 对窗口焦点与 View 焦点的协调。
+
+`ImeFocusController.onPreWindowFocus()`在窗口可接受 IME 且不是 local-focus 模式时，把当前 `ViewRootImpl` 交给 IMM。`onPostWindowFocus()`随后：
+
+1. 取真正 focused View；没有时用根 View 作为窗口焦点代表。
+2. `onViewFocusChanged(..., true)`只在 View 具有 IME focus 和 Window focus 时更新 `mNextServedView`。
+3. 检查当前连接是否仍属于同一个 View，必要时强制新一轮 focus。
+4. 调用 IMM delegate，把 WINDOW_GAINED_FOCUS 与可能的 start input 合并报告给 IMMS。
+
+`checkFocus()`才把 next 提升为 served：
 
 ```text
-frameworks/base/services/core/java/com/android/server/inputmethod/
-    InputMethodManagerService.java
-frameworks/base/core/java/com/android/internal/view/
-    IInputMethodManager.aidl
-    IInputMethodClient.aidl
-    IInputMethodSession.aidl
+mServedView == mNextServedView 且不强制 → 无变化
+mNextServedView == null               → finishInput + 请求关闭当前 IME
+存在新的 next                          → 更新 served，结束旧 composing，再 startInput
 ```
 
-IME与窗口主线：
+失焦事件不会一律把 next 立刻清空，因为触摸模式可能短暂清焦；detach 和 window dismissed 等明确边界另行收尾。这也是 `requestFocus()`之后立即 show 仍可能失败的原因：局部 View 焦点、Window 焦点、ViewRoot 当前身份和 served 状态尚未必收敛。
+
+`InputMethodManager.showSoftInput(view, ...)`会先 `checkFocus()`，然后要求传入 View 就是 served View，或由 served View 声明它是合法的 input-connection proxy。`hideSoftInputFromWindow()`则要求 served View 存在且其 WindowToken 与参数相同。旧 Activity 保存的 token 不能直接代表新窗口。
+
+`canStartInput()`通常要求 served View 有 Window focus，也给 Autofill UI 显示保留例外。它只回答是否适合启动输入，不等于 WMS 已把该窗口选成最终 IME target。
+
+## 4. `startInputInner()`怎样安全创建编辑协议
+
+IMM 先在 `mH` 锁内取得 served View，然后释放锁再调用 App 的 View 代码。原因不是形式上的“线程切换”，而是 `onCreateInputConnection()`可能复杂、重入并改变焦点；持锁调用会制造死锁和陈旧覆盖。
+
+随后有三道门：
+
+- View 没有 WindowToken：尚未 attach，终止本轮。
+- `view.getHandler()` 为 `null`：状态已从脚下改变，IMM 调用 `closeCurrentInput()`尝试收起旧键盘。这个名字容易误导：它只向 IMMS发送 `HIDE_NOT_ALWAYS`，不在此处 clear/deactivate连接；若此前是 forced show，服务端还可以拒绝该 hide。
+- 当前 Looper 不是 View Handler 的 Looper：把一个“重新读取届时 served View并重新 start”的 Runnable post 到 View 线程，然后本轮返回 `false`；源码不检查 `Handler.post()`的返回值。这里只说明这个分支已改道，其他多个 abort分支也会返回 `false`。
+
+窗口获焦入口还有一层交错：完整 start若返回 `false`，原调用栈会继续用空 EditorInfo/InputContext向 IMMS报告一次 window focus。若这个 `false`来自跨 Looper重投，已经 post 的完整 start与原线程的 focus-only Binder调用会竞争 `mH`，谁先到 IMMS并无保证。因此“同一次获焦一定把窗口报告和完整编辑器原子交付”也不成立。
+
+到达正确线程后，IMM 先填框架可确认的 `EditorInfo` 字段，再让 View 同时补齐描述并返回协议：
 
 ```text
-frameworks/base/core/java/android/inputmethodservice/InputMethodService.java
-frameworks/base/core/java/android/inputmethodservice/IInputMethodWrapper.java
-frameworks/base/services/core/java/com/android/server/wm/ImeInsetsSourceProvider.java
+EditorInfo：packageName、fieldId、inputType、imeOptions、初始选区、周围文本……
+InputConnection：读取光标附近文本、组合、提交、删除、选区、editor action……
 ```
 
-## 6. 第一个起点不是showSoftInput，而是焦点
+这里用 `getOpPackageName()`，因为 IMMS 后面要按 UID 核验包名，不只是给键盘显示标签。标准 `TextView` 仅在自己是启用的文本编辑器且文本可编辑时返回 `EditableInputConnection`；`onCreateInputConnection()`返回 `null` 时，窗口仍可报告焦点，IMMS 也可能收到非空 `EditorInfo`，但没有可供 IME 编辑的实际 `IInputContext`。
 
-只有当前窗口中的目标View成为served View，IMM才会把它当作编辑器。
+Android 11 的 `TextView` 会调用 `EditorInfo.setInitialSurroundingText()`；该方法对识别出的文本、Web 和数字密码 variation 清空这份初始周围文本，并把过长文本裁到 2048 个 UTF-16 code unit 左右。这个保护只约束初始快照：当前启用的 IME 仍处在敏感信任边界，活动 `InputConnection`并未因此整体不可查询，`FLAG_SECURE`也主要约束截屏而非 IME 协议。
 
-`showSoftInput(view, ...)`调用前会执行`checkFocus()`；若这个View不是当前served对象，就直接返回false。
+View 回调返回后，IMM 重新加锁检查“served 仍是原 View”且 `mServedConnecting`仍为真。这不是数字代际检查；失败时只是不发布本轮结果，也不会替刚创建、尚未包装的原始 `InputConnection`调用 `closeConnection()`。成功才：
 
-因此常见失败：View还没attach、Window还没获得焦点，或者刚调用`requestFocus()`但焦点同步尚未完成，就立即请求显示键盘。
+- 根据旧 `mCurrentTextBoxAttribute` 是否为空设置 `INITIAL_CONNECTION`；它不是“第一次显示键盘”。
+- deactivate 旧的 `ControlledInputConnectionWrapper`。
+- 优先采用具体 `InputConnection.getHandler()` 的 Looper，否则使用 View Looper。
+- 计算 `missingMethods`，把兼容能力表交给远端。
+- 用新的 wrapper 作为 `IInputContext`调用 IMMS。
 
-## 7. Window焦点和View焦点是两层资格
+`ControlledInputConnectionWrapper.isActive()`只检查客户端级 IMM active状态和自身是否 finished，不比较 served View、bind sequence或 start token。旧 wrapper在新 View的 `onCreateInputConnection()`执行期间仍可能 active；成功复核后才调用 deactivate，而专用 Handler不同时 deactivate也只是排入 close message。Binder句柄仍存在与真正退休完成不是同一个时刻。
 
-View获得局部焦点，并不自动证明它所属窗口是系统当前IME目标。
+## 5. IMMS 怎样拒绝冒名客户端、错用户和错屏
 
-系统还要结合WMS记录的窗口焦点，防止后台窗口仅靠伪造View状态抢输入法。
+IMM 创建时已通过 `addClient()`登记 `IInputMethodClient`、一个客户端级 dummy `IInputContext`、UID、PID 和 self-reported display，并给 client Binder 注册 death recipient。后续入口不会只相信一次调用携带的数据。
 
-可以把资格理解为：
+`startInputOrWindowGainedFocus()`的主要校验顺序是：
+
+1. WindowToken 必须非空；失败返回预定义且非 null 的 `InputBindResult.NULL`，其 result code 是 `ERROR_NULL`、sequence 是 -1。
+2. 跨用户 `EditorInfo.targetInputMethodUser`要求 `INTERACT_ACROSS_USERS_FULL`，目标用户还必须正在运行。
+3. `client.asBinder()`必须能在 `mClients`找到已登记的 `ClientState`。
+4. WMS 从 WindowToken 得到的 display 必须等于客户端登记的 display。
+5. `isInputMethodClientFocus(uid, pid, displayId)`必须认可调用进程确有当前 IME 焦点。
+6. 调用用户必须是当前 profile；真正的用户切换则返回 waiting 状态。
+7. 进入 `startInputUncheckedLocked()`后再核验 `EditorInfo.packageName`属于客户端 UID，以及 UID 仍被允许访问该 display。
+
+因此有两层不同事实：App 内 `ImeFocusController`决定哪个 View 想当编辑器；system_server 让 WMS 判断该 UID/PID/display 是否确实拥有可服务的窗口焦点。后台 App 不能只靠自己的 View 状态抢走 IME。
+
+显示位置也不是机械跟随客户端。`computeImeDisplayIdForTarget()`会把默认/无效 ID 归到 fallback display；某个显示不允许承载系统装饰或不满足安全条件时，也可能在 fallback display 显示 IME。跨显示且没有 ActivityView 坐标矩阵时，IMMS把 `REQUEST_CURSOR_UPDATES`记成缺失，避免把不可换算的光标坐标交给 IME。
+
+`showSoftInput()`和 `hideSoftInput()`允许一个尚未成为 `mCurClient`、但已登记且被 WMS 认定有焦点的客户端发请求，以覆盖“Window 已聚焦而输入绑定尚未完成”的竞态。反过来，client 已经等于 `mCurClient`时走快路径，不重新查询一次 WMS焦点；IMMS这一层也不直接比较传入 WindowToken是否等于 `mCurFocusedWindow`，标准 App IMM此前的 served/token门承担了正常调用约束。
+
+未知 client在 start入口实际抛 `IllegalArgumentException`，并不返回 `ERROR_INVALID_CLIENT`。不要因为 `InputBindResult.ResultCode`枚举里存在某个名字，就推断当前路径一定使用它。
+
+## 6. `softInputMode`是焦点策略，不是无条件显示命令
+
+当焦点窗口变化时，IMMS把 `softInputMode`、是否文本编辑器、是否前向导航、adjust 模式、屏幕大小和 target SDK 放在一起判断。先区分两个掩码：state 决定自动 show/hide 倾向，adjust 决定窗口如何适配 IME；`ADJUST_RESIZE`在这里还参与 `doAutoShow`，但不等于任何时刻都自动弹键盘。
+
+| state | r48 的关键条件 |
+| --- | --- |
+| `UNSPECIFIED` | 非编辑器或不适合 auto-show 时可隐藏；编辑器 + resize/大屏 + forward navigation 才隐式显示 |
+| `UNCHANGED` | 不主动改变可见意图 |
+| `HIDDEN` | 只在 forward navigation 分支隐藏 |
+| `ALWAYS_HIDDEN` | 新焦点窗口时隐藏 |
+| `VISIBLE` | forward navigation 且 visible 请求被允许时显示 |
+| `ALWAYS_VISIBLE` | visible 请求被允许且不是同一已聚焦窗口时显示 |
+
+对 target SDK P 及以上，`VISIBLE`与 `ALWAYS_VISIBLE`还要求 start flags 同时含 `VIEW_HAS_FOCUS` 和 `IS_TEXT_EDITOR`；老目标版本保留兼容放行。`IS_TEXT_EDITOR`来自 `onCheckIsTextEditor()`，它与稍后创建出的 `InputConnection`是否非空仍是两个观察。
+
+需要 auto-show 的 IMMS分支会先 `startInputUncheckedLocked()`，再 `showCurrentInputLocked()`。源码这样排序是为了让键盘在显示前先知道 EditorInfo 和编辑目标；需要换窗口并隐藏旧 IME 时，则先处理旧可见状态，避免新编辑器初始化挡住旧窗口消失。它不是所有 API交错的全局保证：App显式 `showSoftInput()`调用 `checkFocus()`时，若完整 start被重投到另一个 Looper，show仍可先进入 IMMS。
+
+同一窗口已聚焦且仍是文本编辑器时有早返回路径：有 EditorInfo 就直接重新 start，只有 focus 报告则返回 `SUCCESS_REPORT_WINDOW_FOCUS_ONLY`。不要假设每次 `startInputOrWindowGainedFocus()`都会重新执行完整 state switch。
+
+## 7. 选择、绑定 IME 与三类 token
+
+`mCurMethodId`来自当前用户的输入法设置，指向实现 `android.view.InputMethod` Service 的组件。若当前 IME/显示不能复用，IMMS：
+
+1. 清理旧 method 与 WindowToken。
+2. 创建 `Intent(InputMethod.SERVICE_INTERFACE)`并指定组件。
+3. `bindServiceAsUser()`发起主连接。
+4. 绑定请求成功后记录 `mCurId`，创建 `mCurToken`并让 WMS登记 `TYPE_INPUT_METHOD` WindowToken。
+5. 先返回 `SUCCESS_WAITING_IME_BINDING`，等待 `onServiceConnected()`。
+
+绑定成功发起不等于 Service 已连接；WindowToken 登记也不等于 IME 窗口已绘制。Service 的 `onCreate()`会构造 `SoftInputWindow`和根布局，真正收到 `initializeInternal()`后才设置 token、更新 display，并把 decor 设为 `INVISIBLE`后调用 `Dialog.show()`把窗口先加进 WMS。这样 Insets controllable listener 可以在真正可见前建立；输入 View 和候选 View 仍可按需创建。
+
+三类 token 不要合并：
+
+| token | 生命周期与用途 | 不提供的保证 |
+| --- | --- | --- |
+| IME WindowToken `mCurToken` | 一次当前 IME/显示绑定；授权 `TYPE_INPUT_METHOD` 窗口，并校验 privileged operations 来自当前 IME | 某个 App show 请求仍是最新 |
+| `startInputToken` | 每次 attach 创建，弱映射到当时 focused window；IME 在处理 start 前报告回来，供 IMMS更新 `mLastImeTargetWindow` | 不与 latest sequence 比较 |
+| show/hide input token | 每次可见请求创建，弱映射到请求 App WindowToken；IMS原样带回 `applyImeVisibility()` | 不验证“这是最后一笔请求”，map miss 也没有独立错误返回 |
+
+后两类 token 是 provenance key，不是代际闩锁。`applyImeVisibility()`先用 IME WindowToken确认调用者仍是当前 IME，再以 show/hide token 查原始窗口；show 的 WMS post-layout 还有目标一致性检查，而 hide 最终可作用于该 display 当前 control target。把它们写成“自动拒绝一切过期请求”会高估 r48 的保护。
+
+## 8. Session 的异步闭环与 `InputBindResult`
+
+相同 IME ID 和显示下有三种常见状态：
+
+| IMMS 状态 | 同步返回 | 后续动作 |
+| --- | --- | --- |
+| 当前客户端已有 `curSession` | `SUCCESS_WITH_IME_SESSION` | 立即 attach 新输入 |
+| 已有顶层 `IInputMethod`，尚无 Session | `SUCCESS_WAITING_IME_SESSION` | 开一对 `InputChannel`并请求 `createSession()` |
+| 主 Service 已 bind，但尚未得到接口 | `SUCCESS_WAITING_IME_BINDING` | 3秒窗口内等 `onServiceConnected()`；超过后才落入重连 |
+
+`onServiceConnected()`只证明拿到顶层 `IInputMethod`。IMMS先发 `initializeInternal(WindowToken, displayId, privilegedOps)`，再为当前客户端请求 Session。`requestClientSessionLocked()`用 `InputChannel.openInputChannelPair()`创建两端，并用 `sessionRequested`避免同一 ClientState 重复申请。
+
+Session callback 有一个容易读错的所有权边界：`MethodCallback`只捕获 `mMethod`和 system_server 端 channel，没有捕获发起请求时的 `ClientState`。`onSessionCreated()`只核对返回的 method Binder仍是当前 IME；若回调时 `mCurClient`已经换成另一个客户端，它会清理并把该 Session装到**回调当下的当前客户端**，不是必然废弃。只有当前 method 不匹配、没有当前客户端或用户切换等分支才会丢弃并 dispose channel。
+
+`attachNewInputLocked()`随后按当前状态完成：
 
 ```text
-View层：谁是这个View树里的编辑器？
-Window层：谁是系统认可的IME目标窗口？
+尚未 bind 到当前客户端 → oneway bindInput(InputBinding)
+每次 attach              → 新建 startInputToken 并记录 target
+                         → oneway startInput(actual IInputContext, EditorInfo, restarting)
+仍有 mShowRequested       → 再安排 show
+                         → 返回 Session、dup channel、IME id、mCurSeq
 ```
 
-## 8. `canStartInput()`的含义
+`InputChannel`主要承载发给 IME Session 的输入事件及完成通知；文本的 `commitText()`不走这里，而走 `IInputContext`。App 收到新的 channel 会替换并 dispose旧端；system_server/远程 IME各自也有明确的 dup/dispose 边界。
 
-IMM检查served View通常要求它的Window拥有焦点；Android 11源码也为Autofill UI显示场景保留例外。
+IMMS 每次 start 都递增正数 `mCurSeq`。App 的 `MSG_BIND`只有在 `res.sequence == mBindSequence`时才安装异步返回的 Session；不匹配时会 dispose不属于当前 channel 的返回端。sequence保护的是绑定回调，不会给每一笔 `IInputContext.commitText()`自动加代际标签。
 
-这说明“输入上下文是否能开始”与“一个View对象是否存在”不是同一个问题。
+## 9. `bindInput`、`startInput`和输入 View 是三层生命周期
 
-## 9. `startInputInner()`为何先取出View再释放锁
+一个 IME Service 可服务多个先后出现的 App 客户端；一个客户端又可在多个编辑器间切换。因此：
 
-入口：
+- `bindInput(InputBinding)`是客户端级。IMMS切换当前客户端时先对旧端 `unbindInput()`，再对新端 bind。`InputBinding`包含客户端级连接 Binder、UID 和 PID。
+- `startInput(actual IInputContext, EditorInfo, restarting)`是编辑器级。同一 App 从搜索框切到消息框，可以不重建 Service，却发生新的 start。
+- `onStartInputView()`是 UI 级。只有输入 View真正开始服务当前编辑器时才调用。
 
-```java
-boolean startInputInner(@StartInputReason int startInputReason,
-        @Nullable IBinder windowGainingFocus, ...)
-```
+IME 侧 `IInputMethodWrapper`收到 oneway Binder 调用后，统一交给 IME 主线程。处理 start 时，它把 App 的 `IInputContext`包装成远端 `InputConnectionWrapper`，应用 `missingMethods`兼容信息，并先让 IMS通过 privileged operations报告 `startInputToken`对应的目标，然后才进入 `startInput()`或 `restartInput()`。
 
-源码先在`mH`锁中取得served View，然后释放锁，再调用View代码。
+`InputMethodService.doStartInput()`的顺序是：非 restart 时先结束上一输入；设置 `mStartedInputConnection`和 EditorInfo；调用 `onStartInput()`；若 decor 已可见且正在显示输入 View，再调用 `onStartInputView()`。若尚不可见但启用了实验性的 pre-render 条件，则可能预先构建和绘制不可见窗口。
 
-原因是`View.onCreateInputConnection()`属于应用代码，可能复杂、重入或触发新的焦点变化；持有IMM内部锁调用它容易死锁并放大锁竞争。
+`getCurrentInputConnection()`优先返回编辑器级 `mStartedInputConnection`；没有时才退到 `bindInput()`留下的客户端级 `mInputConnection`。后者通常源自 IMM 登记时的 dummy context，不能把它和当前 EditText 的连接视作同一个对象。
 
-## 10. 为什么必须回到View自己的线程
+典型 hidden-to-shown 路径中，start 先于 show，因此 `onStartInput()`先于 `onStartInputView()`；但重启时窗口可能已显示，配置变化也会重建 UI。正确不变量是生命周期层次和局部调用顺序，而不是“进程一生只调用一次”的全局序列。
 
-`startInputInner()`检查：
+## 10. `showSoftInput()`的布尔值与四套状态账
 
-```java
-Handler vh = view.getHandler();
-if (vh.getLooper() != Looper.myLooper()) {
-    vh.post(() -> mDelegate.startInput(startInputReason, null, 0, 0, 0));
-    return false;
-}
-```
+App IMM 先确认 served View，再同步调用 IMMS。IMMS若发现 client 不是 `mCurClient`，会回查登记并让 WMS确认它当前有焦点，以允许“焦点已到、start 尚未完成”的合法窗口。
 
-创建`InputConnection`会读取或操作View状态，必须在驱动该View树的Looper上执行。
+`showCurrentInputLocked()`的实际顺序很重要：
 
-这里返回false不是永久失败，而可能只是“本次调用已转投正确线程”。
+1. 立即令 `mShowRequested = true`。
+2. 无障碍策略要求不显示时返回 `false`。
+3. 根据 App flags 更新 `mShowExplicitlyRequested`和 `mShowForced`。
+4. system 未 ready 时返回 `false`。
+5. 有 `mCurMethod`时创建 show token、安排 `MSG_SHOW_SOFT_INPUT`、令 `mInputShown = true`、增加 visible bind，并返回 `true`。
+6. 只有连接卡住超过阈值才强制 unbind/rebind；其余尚在连接的情况返回 `false`，但保留 show 意图。
 
-## 11. 没有Handler意味着什么
+这带来三条非对称语义：
 
-如果`view.getHandler()`为null，通常说明View已脱离窗口或状态已改变。
+- `true`只是 IMMS进入安排分支。跨进程 `IInputMethod`是 oneway；即使发送处抛出 `RemoteException`，`handleMessage()`也吞掉异常，而调用分支仍可把 `mInputShown`设为真并返回真。
+- `false`可能已修改 `mShowRequested`，甚至部分 flag 账；等 Session attach 时仍可能重放。
+- `mVisibleConnection`只是额外的可见优先级绑定，不创建第二个 IMS，也不证明窗口可见。
 
-IMM会关闭当前输入，避免旧IME继续停留在屏幕上却没有有效编辑器。
+App 的 `SHOW_FORCED`/`SHOW_IMPLICIT`不会原封不动交给 IMS。IMMS先把它们记成服务端历史，再由 `getImeShowFlags()`转换为 `InputMethod.SHOW_EXPLICIT`和 `InputMethod.SHOW_FORCED`。因此排查 hide policy 应看 IMMS账，而不是只看 IME最后收到的整数。
 
-## 12. EditorInfo是谁填写的
+## 11. IMS 怎样接受 show、准备 UI 和回复 `ResultReceiver`
 
-IMM先创建`EditorInfo`并填入框架可以确认的字段：
+跨进程 show 到达 `IInputMethodWrapper`后被投递到 IME 主线程。wrapper 调 `showSoftInputWithToken()`，临时设置 `mSystemCallingShowSoftInput`和 `mCurShowInputToken`，在同步处理完成后立即清掉；target SDK R 及以上的 IME若绕开系统路径直接调用自己的 `InputMethodImpl.showSoftInput()`，会被要求改用 `requestShowSelf()`。
 
-```java
-EditorInfo tba = new EditorInfo();
-tba.packageName = view.getContext().getOpPackageName();
-tba.autofillId = view.getAutofillId();
-tba.fieldId = view.getId();
-InputConnection ic = view.onCreateInputConnection(tba);
-```
-
-随后具体View会继续填充`inputType`、`imeOptions`、初始选区等编辑器信息。
-
-## 13. 为什么是`getOpPackageName()`
-
-源码注释明确：系统要检查上报包名与调用UID是否一致。
-
-这不是仅供IME显示提示的字符串，它进入了system_server的安全校验。
-
-## 14. EditorInfo与InputConnection的区别
-
-`EditorInfo`是本次输入开始时的描述快照，例如：
+IMS 先记录 `wasVisible`，再执行 `dispatchOnShowInputRequested(flags, false)`。默认策略会拒绝不适合的隐式请求，例如实体键盘场景或会突兀进入 fullscreen 的隐式显示；IME作者也可覆写该策略。只有返回真才执行：
 
 ```text
-这是文本、数字还是密码字段
-Enter键显示“搜索”“下一步”还是“完成”
-初始选区在哪里
-编辑器属于哪个package/field
+showWindow(true)
+  → 防重入
+  → prepareWindow：decor 逻辑可见、初始化、fullscreen、input frame、懒建 View
+  → startViews：必要时 onStartInputView
+  → 上报本地 IME window status
+  → onWindowShown，更新 pre-render/window 标志
+  → 必要时 mWindow.show() 请求窗口绘制
+applyVisibilityInInsetsConsumerIfNecessary(true)
+  → 新 Insets 模式才把 show token 带回 system_server
 ```
 
-`InputConnection`是持续可调用的操作接口，例如：
+`SoftInputWindow`对象和根布局在 Service `onCreate()`已有，WindowToken到达时又把 invisible decor 预先加进 WMS；`onCreateInputView()`与 `onCreateCandidatesView()`仍按需发生。因此“Service connected”“Window object exists”“Window added invisible”“键盘子 View 已创建”“Window visible”是五个状态。
+
+show 处理末尾总会按本地状态调用 `setImeWindowStatus()`，再比较 `wasVisible`与 `isVisible`决定 ResultReceiver 的四种结果。这个结果可能在 WMS尚未通过 post-layout门、Insets尚未拿到 control时发出；`SoftInputWindow.show()`还会吞掉过期 token 导致的 `BadTokenException`并停止后续重试，所以本地 shown 结果更不是窗口添加或物理显示的硬证明。IMMS前置拒绝、oneway投递失败或 IME死亡时，ResultReceiver也没有必达保证。
+
+## 12. 新 Insets 模式怎样把 IME 的 show 变成动画
+
+当 `ViewRootImpl.sNewInsetsMode > NEW_INSETS_MODE_NONE`，IMS不靠 `mWindow.show()`单独决定最终可见性，而是用 privileged operation 把 show token带回 IMMS。r48 的 mode 1仅把 IME迁到新机制，mode 2使用完整新 Insets，系统属性缺省值是 mode 2；两种非零模式都进入这里：
 
 ```text
-读取光标前文本
-设置composing text
-提交最终文本
-删除周围字符
-移动选区
-执行editor action
+IMS applyImeVisibility(showToken, true)
+  → IMMS 校验当前 IME WindowToken
+  → mShowRequestWindowMap[showToken] 找原请求 WindowToken
+  → WMS showImePostLayout(windowToken)
+  → WindowState.getImeControlTarget()
+  → ImeInsetsSourceProvider.scheduleShowImePostLayout(controlTarget)
+  → 等 IME window 已 drawn、givenInsets 不 pending，且 target 条件满足
+  → DisplayContent.mInputMethodControlTarget.showInsets(ime, fromIme=true)
+  → App或远程控制目标进入 InsetsController 动画
 ```
 
-## 15. `onCreateInputConnection()`可以返回null
+Provider 的 post-layout不是固定延时。它检查 IMMS认为的来源 target 与 DisplayContent 的 IME target/control target关系，并等待 IME窗口已经 layout/draw；同一 Activity 内 target变化还有一次重新检查分支。条件未满足时 runner保留到后续 traversal。新的 hide 只有在 token 映射出的请求窗口仍能被 WMS解析时，才会在由该窗口归一化出的 display中止 pending show；映射或窗口已失效时没有这一步。
 
-返回null表示这个View当前没有提供文本编辑协议。
+`fromIme=true`让 `ImeInsetsSourceConsumer.requestShow()`无条件返回 `SHOW_IMMEDIATELY`；随后 `collectSourceControls()`才决定已有 control时复制它并建立动画 runner，还是在 control为空时只更新 requested visibility、等待 control。如果客户端自己从 `WindowInsetsController.show(ime())`发起，consumer则可能先调用 `InputMethodManager.requestImeShow()`，并在没有 control时记录 awaiting-control，等待服务端完成上述链路。
 
-Window仍可向系统报告焦点，但不会形成可供IME编辑的文本连接。这也是“窗口焦点存在”和“文本输入已建立”必须分开的原因。
+最终动画使用的 leash、requested visibility、server/client `InsetsState`、Surface transaction 和物理 present都由第 230—231 章描述的分层协议完成。本章这里只增加一个关键入口：IMS本地 UI准备在先，WMS post-layout批准在后；`mImeWindowVis`或 ResultReceiver先变化，不会把后面的边界压成同步调用。
 
-## 16. 释放锁后为什么还要二次核对
+## 13. hide 的标志、状态清理和 Surface 收尾
 
-调用应用代码期间，用户可能点了另一个View。
+App `hideSoftInputFromWindow()`先校验 served WindowToken。IMMS再校验当前/聚焦客户端，并在真正派发前执行历史 flag policy：
 
-IMM重新进入锁后检查：
+| hide flag | 拒绝条件 |
+| --- | --- |
+| `HIDE_IMPLICIT_ONLY` | 此前是 explicit 或 forced show |
+| `HIDE_NOT_ALWAYS` | 此前是 forced show |
+| `0` | 不受这两道历史门限制 |
 
-```java
-if (servedView != view || !mServedConnecting) {
-    return false;
-}
-```
+通过 flag 门后，r48只要有当前 method，且 `mInputShown`为真或 `mImeWindowVis`含 `IME_ACTIVE`，就创建 hide token并安排 oneway hide。这是对 Eclair以来行为的兼容：show 已安排而 IME状态上报尚未到时，App仍应能立刻撤销。原始 hide flags只在 IMMS用于判断，真正发给 `IInputMethod.hideSoftInput()`的 flags固定为 `0`。
 
-这是一种典型的“锁外调用 + 锁内版本复核”。否则旧View晚返回的InputConnection可能覆盖新焦点。
+随后 IMMS不等待 IME：撤销 visible bind，并清 `mInputShown`、`mShowRequested`、`mShowExplicitlyRequested`、`mShowForced`。若没达到 should-hide 条件，它返回 `false`但仍执行这组清理；只有前两道 flag policy早返回时才保留原账。
 
-## 17. INITIAL_CONNECTION不是“第一次显示键盘”
-
-当`mCurrentTextBoxAttribute == null`时，IMM添加`INITIAL_CONNECTION`。
-
-它描述输入连接的初始/重启语义，不描述IME窗口是否第一次可见。
-
-## 18. 旧InputConnection为什么要deactivate
-
-切换编辑器时，旧`ControlledInputConnectionWrapper`调用`deactivate()`，最终关闭连接。
-
-之后IME即使保留旧Binder句柄，调用`commitText()`也会因为连接inactive而被拒绝，避免文字写入已失焦页面。
-
-## 19. `ControlledInputConnectionWrapper`是什么
-
-它继承`IInputConnectionWrapper`，把App内的普通`InputConnection`包装成`IInputContext` Binder端点。
-
-其`isActive()`同时要求：
-
-```java
-return mParentInputMethodManager.mActive && !isFinished();
-```
-
-所以“Binder对象还活着”并不代表编辑连接仍有效。
-
-## 20. InputConnection方法运行在哪个线程
-
-如果具体InputConnection实现了`getHandler()`，IMM使用它的Looper；否则退回View Handler的Looper。
-
-于是IME进程发来的Binder调用不会直接在App Binder线程池随意修改View，而会被`IInputConnectionWrapper`转成Message，投递到指定Looper。
-
-## 21. missingMethods是兼容能力表
-
-IMM通过`InputConnectionInspector.getMissingMethodFlags(ic)`记录实现缺失的方法。
-
-系统把这些位传给IME，避免新IME把旧应用未实现的接口误当作可用能力。
-
-跨显示且无法建立坐标变换时，IMMS还会把`REQUEST_CURSOR_UPDATES`标为缺失，防止光标锚点坐标被误用。
-
-## 22. App进入system_server的主Binder调用
-
-IMM调用：
-
-```java
-mService.startInputOrWindowGainedFocus(
-        startInputReason, mClient, windowGainingFocus,
-        startInputFlags, softInputMode, windowFlags,
-        tba, servedContext, missingMethodFlags, targetSdkVersion);
-```
-
-这里同时提交窗口身份、客户端Binder、EditorInfo和IInputContext。
-
-## 23. 为什么把“窗口获得焦点”和“开始文本输入”合在一个入口
-
-同一次焦点切换可能只有Window变化，也可能同时有文本编辑器可用。
-
-IMMS统一处理后，才能按`softInputMode`、前后窗口、是否文本编辑器和targetSdk进行一致决策。
-
-## 24. IMMS第一道检查：WindowToken不能为null
-
-无WindowToken就没有可验证的系统窗口身份，也无法建立IME target和show/hide归属。
-
-因此入口立即返回空结果，而不是仅凭packageName继续。
-
-## 25. 多用户不是取调用方字符串
-
-若`EditorInfo.targetInputMethodUser`与调用用户不同，调用者必须有`INTERACT_ACROSS_USERS_FULL`，且目标用户正在运行。
-
-普通App不能借EditorInfo把输入路由到任意用户的IME。
-
-## 26. IMMS核对客户端登记
-
-App初始化IMM时会向IMMS登记`IInputMethodClient`、`IInputContext`、UID、PID和self-reported display id。
-
-之后每次start/show/hide都不能只相信本次参数，而要回到登记的`ClientState`。
-
-## 27. self-reported display还要与WMS事实核对
-
-Android可有物理屏、虚拟屏和嵌入式ActivityView。
-
-IMMS验证调用UID是否允许出现在所报display，并通过WMS判断客户端是否真是该显示上的IME焦点。
-
-## 28. 最关键的防抢焦点校验
-
-IMMS调用：
+IMS 主线程收到 hide 后先在新模式调用 `applyImeVisibility(false)`。有效当前 IME且 `mCurClient`仍存在时，IMMS才把请求交给 WMS：
 
 ```text
-WindowManagerInternal.isInputMethodClientFocus(uid, pid, displayId)
+hide token → IMMS 映射原请求窗口
+  → WMS.hideIme(window, current-client display)
+  → 若 window 可解析：按其 control target归一化 display，并中止 pending show
+  → 若该 display/current control target存在：hideInsets(ime, fromIme=true)
+  → 若该 display存在：Provider.mImeShowing = false
 ```
 
-后台App即使拿着自己的IMM Binder，也不能仅靠调用`showSoftInput()`让系统把当前IME交给自己。
+非 pre-render 路径随后清本地 show flags并 `doHideWindow()`。旧 Insets 模式会直接 `mWindow.hide()`；新模式的 `hideWindow()`只结束输入/候选 View生命周期、更新逻辑可见状态，并把 input View派发为 `GONE`，让 leash动画保留 Surface。
 
-## 29. 包名与UID再次核验
+隐藏动画完成后，`ImeInsetsSourceConsumer`还有两个独立动作：`notifyImeHidden()`经当前 Session让 IMS `requestHideSelf(0)`同步服务端账；`removeImeSurfaceFromWindow()`经 IMMS核对当前 focused window和 enabled Session，再让 IMS在 `!mShowInputRequested && !mWindowVisible`时调用 `mWindow.hide()`把 decor 置为 `GONE`，触发后续窗口与 Surface隐藏回收。这个调用返回仍不证明 Surface已经移除或该状态已经 present；hide API返回、IMS本地 hidden、Insets终帧和 Surface收尾因此不能互换。
 
-进入`startInputUncheckedLocked()`后：
+IMMS 的 hide flag policy若早返回，请求不会派发到 IMS：API同步返回 `false`，这个 `ResultReceiver`也不会由 IMS回调。请求真正到达 IMS后，结果码只比较处理前后的本地可见状态；状态本来就 hidden时可能返回 unchanged，Surface动画是否结束不参与计算。它不是 SurfaceFlinger present fence。
 
-```java
-if (!InputMethodUtils.checkIfPackageBelongsToUid(
-        mAppOpsManager, cs.uid, attribute.packageName)) {
-    return InputBindResult.INVALID_PACKAGE_NAME;
-}
-```
+## 14. 一个字符怎样回写，以及连接怎样失效
 
-App进程填写的EditorInfo仍是非可信输入，system_server必须校验。
+IME按键通常调用 `getCurrentInputConnection().setComposingText()`、`commitText()`或 `performEditorAction()`。这是 IME进程里的 `com.android.internal.view.InputConnectionWrapper`，内部持有 App 的 `IInputContext` Binder，而不是 `EditText`对象。
 
-## 30. IME显示在哪块屏
-
-`computeImeDisplayIdForTarget()`检查目标显示是否可承载系统装饰和IME。
-
-默认/无效显示回落到默认显示；不支持系统装饰或不满足安全条件的显示也会回落，而不是机械跟随客户端displayId。
-
-## 31. 客户端切换时做什么
-
-若`mCurClient != cs`，IMMS会解绑旧客户端，并在设备interactive时通知新客户端active。
-
-同时序列号`mCurSeq`递增，帮助App拒绝旧的异步绑定结果。
-
-## 32. 三种“已经连接”的快路径
-
-当前IME ID和显示不变时：
+写操作链如下：
 
 ```text
-已有client session → 直接attachNewInputLocked
-已有IME Binder、尚无session → 请求创建session，返回等待session
-Service已bind、尚未拿到IME Binder → 返回等待binding
+IME InputConnectionWrapper.commitText("中", 1)
+  → oneway IInputContext.commitText
+  → App IInputConnectionWrapper.dispatchMessage(DO_COMMIT_TEXT)
+  → 若调用线程不是目标 Looper，则排队；同 Looper可直接执行
+  → 再取真实 InputConnection并检查 isActive
+  → EditableInputConnection → BaseInputConnection.replaceText
+  → 移除/设置 composing span，替换选区，计算新光标
+  → TextWatcher、布局、绘制在后续发生
 ```
 
-这解释了为何startInput可能立即拿到session，也可能异步稍后通过`onBindMethod()`收到。
+IME侧 `commitText()`在 oneway Binder调用未抛 `RemoteException`时就返回 `true`，没有 App编辑结果 callback。App handler稍后可能发现连接 inactive而丢弃，所以这个布尔值连“Editable已修改”都不能证明，更不证明字符已显示。
 
-## 33. InputBindResult不是简单成功/失败
+查询操作不同。`getTextBeforeCursor()`等仍先发 oneway 请求，但附带结果 callback；IME端 wrapper用 `CancellationGroup.Completable`最多等待 2000 ms，把它包装成同步样式 API。超时返回 null/0，`unbindInput()`会 `cancelAll()`唤醒等待者。所谓“异步查询”应理解为传输协议是 callback，而不是调用方一定立即返回。
 
-重要结果包括：
+连接切换时 App IMM的旧 wrapper执行 `closeConnection()`：在目标 Handler上尝试调用真实连接支持的 close；即使底层没有实现该方法，wrapper最终也会将内部连接置空并标 finished。普通编辑请求要求 active；`finishComposingText()`特意允许在 inactive阶段继续清组合态，直到 finished。若具体 InputConnection选择了不同 Handler，已排在 close前的旧消息仍可能先执行；sequence并不标记这些编辑命令。
 
-```text
-SUCCESS_WITH_IME_SESSION
-SUCCESS_WAITING_IME_SESSION
-SUCCESS_WAITING_IME_BINDING
-ERROR_NOT_IME_TARGET_WINDOW
-INVALID_PACKAGE_NAME
-INVALID_DISPLAY_ID
-NO_IME
-```
+标准 TextView中，`setComposingText()`保留 `SPAN_COMPOSING`，`commitText()`替换当前组合区或选区并移除组合态；`performEditorAction()`进入 `TextView.onEditorAction()`，不等同于无条件发送 Enter。现代软键盘的文本输入主路是编辑协议，不是一串模拟 KeyEvent。
 
-把所有非null结果都当作“键盘已经显示”是错误的。
+进程死亡也分层收尾：
 
-## 34. 为什么需要sequence
+- App client Binder死亡：IMMS移除 ClientState、清它的 Session/channel；若它是当前客户端则向 IME发 `unbindInput()`并清当前 client，但不等同于注销用户选择的 IME Service。
+- IME Service意外断开：IMMS清所有 client Session和当前 method，但保留主 binding、Intent与 IME WindowToken；它记录新的 bind时刻，把 `mShowRequested`重置为当时的 `mInputShown`，再令 `mInputShown=false`并解绑当前客户端。系统重启已绑定 Service后，App收到 matching unbind且仍 active时也会重新 start。
+- 异步 Session晚到：只按当前 method和当前 client规则处理，不能靠“它最初为谁申请”来推断归属。
 
-IME Service绑定和session创建都是异步过程。
+## 15. 九组 macOS 只读源码练习
 
-用户可能在结果回来前切换Activity或View。`mCurSeq`/`mBindSequence`让客户端识别回调是否仍属于当前输入代际。
+以下脚本只读源码。每段都可在 macOS 自带 Bash 3.2或 Zsh 5.9运行；可把另一个源码根作为第一个参数传入。
 
-## 35. 选择哪个输入法
-
-IMMS以当前用户设置中的`mCurMethodId`查`InputMethodInfo`。
-
-该ID通常对应一个实现`android.view.InputMethod` Service的组件，不是任意前台Activity。
-
-## 36. 绑定IME Service的Intent
-
-源码创建：
-
-```java
-mCurIntent = new Intent(InputMethod.SERVICE_INTERFACE);
-mCurIntent.setComponent(info.getComponent());
-```
-
-还附带系统输入法设置入口的`PendingIntent`与客户端标签。
-
-## 37. IME WindowToken何时创建
-
-Service bind成功发起后，IMMS创建`mCurToken`，并让WMS登记：
-
-```java
-mIWindowManager.addWindowToken(
-        mCurToken, LayoutParams.TYPE_INPUT_METHOD, displayId);
-```
-
-IME之后只能用这个系统授予的Token创建输入法窗口。
-
-## 38. 为什么show请求另建dummy token
-
-IME WindowToken证明“这是当前IME服务”。
-
-每次show/hide请求又创建独立token，并映射回发起请求的App Window。源码注释强调它是dummy token，避免IME把客户端WindowToken拿去向App窗口层级注入窗口。
-
-## 39. Service连接只是拿到IInputMethod
-
-`onServiceConnected()`取得`IInputMethod` Binder，记录IME UID，然后发送`MSG_INITIALIZE_IME`。
-
-此时还不等于有了当前客户端session，也不等于输入法窗口已经创建或显示。
-
-## 40. `initializeInternal()`交给IME什么
-
-系统把IME WindowToken、目标displayId和受控的privileged operations接口交给IME。
-
-IME可以通过这些特权操作报告状态或请求系统行为，但系统仍以Token校验它是否是当前IME。
-
-## 41. 为什么每个客户端要创建Session
-
-IMMS为客户端与当前IME创建一对`InputChannel`，再请求IME`createSession()`。
-
-Session把“输入法服务整体生命周期”与“某个App客户端的输入交互”分开。
-
-## 42. InputChannel不是commitText通道
-
-InputChannel主要承载KeyEvent/MotionEvent等输入事件及完成回执。
-
-`commitText()`这类文本编辑命令走`IInputContext` Binder。两条数据路径不能混成一条。
-
-## 43. Session创建完成后的回路
-
-IME回调`onSessionCreated()`后，IMMS：
-
-```text
-确认仍是当前IInputMethod
-→ 保存SessionState(method/session/channel)
-→ attachNewInputLocked()
-→ IInputMethodClient.onBindMethod(InputBindResult)
-```
-
-如果期间已换IME或换客户端，废弃session并dispose其channel。
-
-## 44. `attachNewInputLocked()`先bindInput
-
-一个IME切换到新客户端时，IMMS先发送`MSG_BIND_INPUT`，把`InputBinding`交给IME。
-
-`InputBinding`包含连接Binder及客户端UID/PID；它描述“当前绑定的是哪个客户端”。
-
-## 45. bindInput与startInput不同
-
-`bindInput()`是客户端级绑定。
-
-`startInput()`是编辑器级开始。一个客户端内从搜索框切到消息框，可以仍是同一个bind，却发生新的start/restart input。
-
-## 46. startInputToken解决什么问题
-
-每次attach新输入时，IMMS创建新的`startInputToken`，记录它对应的目标窗口，并加入启动历史。
-
-IME收到start时先通过privileged operations报告该Token，使系统可校验异步报告属于哪次输入启动。
-
-## 47. IMMS怎样调用IME的startInput
-
-主线程消息最终执行：
-
-```java
-session.method.startInput(startInputToken, inputContext,
-        missingMethods, editorInfo, restarting, shouldPreRenderIme);
-```
-
-`inputContext`正是App侧`ControlledInputConnectionWrapper`的Binder接口。
-
-## 48. IME侧startInput进入哪里
-
-`IInputMethodWrapper`把Binder调用切到IME主线程，再进入`InputMethodService.InputMethodImpl.dispatchStartInputWithToken()`。
-
-它根据`restarting`调用`startInput()`或`restartInput()`，最终触发输入法开发者熟悉的：
-
-```text
-onStartInput(EditorInfo, restarting)
-onStartInputView(EditorInfo, restarting)
-```
-
-后者只有输入View真正开始时才发生。
-
-## 49. `getCurrentInputConnection()`拿到的是什么
-
-IME侧获得的是对App编辑器的远端包装，不是App View对象。
-
-输入法不能跨进程直接持有`EditText`，只能通过InputConnection协议读取有限文本上下文并提交编辑命令。
-
-## 50. 建立输入与显示键盘是两条相关状态机
-
-可以建立InputConnection但不显示IME，例如硬件键盘存在、窗口策略要求隐藏，或仅报告文本焦点。
-
-也可能已记录show请求，但IME Service尚在绑定，窗口暂时还没有出现。
-
-## 51. `softInputMode`在哪里起作用
-
-IMMS在窗口焦点变化时读取Window的`softInputMode`：
-
-```text
-STATE_UNSPECIFIED
-STATE_UNCHANGED
-STATE_HIDDEN / ALWAYS_HIDDEN
-STATE_VISIBLE / ALWAYS_VISIBLE
-ADJUST_RESIZE等adjust策略
-```
-
-它结合前向导航、是否真正文本编辑器、targetSdk和大屏/resize条件决定自动show/hide。
-
-## 52. `STATE_VISIBLE`不是无条件显示
-
-Android 11会检查目标窗口是否确实声明并获得文本编辑器焦点。
-
-新版目标应用不能仅靠一个窗口属性，让非编辑窗口在获得焦点时任意拉起IME。
-
-## 53. 为什么先start input再show
-
-键盘显示后必须知道当前EditorInfo和InputConnection，才能选择布局、动作键和提交目标。
-
-因此新窗口需要显示时，IMMS通常先建立输入，再发show；若需要隐藏旧IME，则会先处理旧窗口隐藏，避免显示状态串到新目标。
-
-## 54. App显式调用`showSoftInput()`
-
-客户端代码先做display fallback、`checkFocus()`和served View校验：
-
-```java
-if (!hasServedByInputMethodLocked(view)) {
-    return false;
-}
-return mService.showSoftInput(
-        mClient, view.getWindowToken(), flags, resultReceiver);
-```
-
-所以传入同窗口里另一个尚未served的View也可能失败。
-
-## 55. IMMS如何验证show调用
-
-若调用client不是当前`mCurClient`，IMMS不会立即允许，而是从已登记客户端中查找，并向WMS确认它当前确有IME焦点。
-
-这允许“输入尚未完全建立但窗口已经获得焦点”的合法竞态，同时挡住后台客户端。
-
-## 56. show标志怎样记账
-
-`showCurrentInputLocked()`先设置`mShowRequested=true`。
-
-标志规则：
-
-```text
-SHOW_FORCED → explicitly requested + forced
-没有SHOW_IMPLICIT → explicitly requested
-SHOW_IMPLICIT → 仅隐式请求
-```
-
-这些账会决定后续某种hide请求能不能抵消本次show。
-
-## 57. 无障碍可以请求不显示软键盘
-
-若`mAccessibilityRequestingNoSoftKeyboard`为true，IMMS拒绝show。
-
-因此只从App/IME两端排查“为什么不弹键盘”可能漏掉系统策略层。
-
-## 58. `mCurMethod != null`才真正派发show
-
-IMMS拿到当前IME Binder后，才发送`MSG_SHOW_SOFT_INPUT`。
-
-若Service仍在连接，可保留show requested；连接超时还可能强制unbind/rebind，但当前调用未必返回true。
-
-## 59. show返回true准确表示什么
-
-在r48中，当`mCurMethod != null`且消息被安排给IME时，IMMS设`mInputShown=true`并返回true。
-
-它不保证：
-
-```text
-IME已经处理消息
-IME接受onShowInputRequested
-IME窗口已draw
-Insets动画已完成
-SurfaceFlinger已present该帧
-```
-
-## 60. 为什么可见时再做一次Service bind
-
-IMMS用`mVisibleConnection`和更高的可见绑定优先级再次绑定当前IME Service。
-
-这不是第二个IME实例，而是让进程管理知道当前IME对用户可见；隐藏时会撤销这层visible bind。
-
-## 61. show消息在哪个线程执行
-
-IMMS用Handler消息把操作放到自己的主线程，再通过`IInputMethod.showSoftInput()`跨Binder进入IME。
-
-IME侧`IInputMethodWrapper`再投递到IME主线程，最终调用`InputMethodService.InputMethodImpl.showSoftInput()`。
-
-## 62. 为什么每次show有showInputToken
-
-IMMS创建token并记录`showInputToken → app windowToken`。
-
-IME把该token带回`applyImeVisibility()`，system_server即可验证“这次可见请求是否仍属于当前合法目标”，避免过期IME请求操作新窗口。
-
-## 63. IME可以拒绝show
-
-`InputMethodService`调用：
-
-```java
-if (dispatchOnShowInputRequested(flags, false)) {
-    showWindow(true);
-    applyVisibilityInInsetsConsumerIfNecessary(true);
-}
-```
-
-输入法的`onShowInputRequested()`可以根据硬件键盘、配置或自身策略返回false。
-
-## 64. `showWindow(true)`做了哪些准备
-
-大致顺序：
-
-```text
-防重入
-→ prepareWindow：初始化、fullscreen模式、创建输入/候选View
-→ startViews：必要时onStartInputView
-→ 更新IME window status
-→ onWindowShown
-→ mWindow.show()请求IME窗口绘制
-```
-
-这仍是窗口和绘制请求阶段，不是硬件present确认。
-
-## 65. IME UI什么时候创建
-
-`prepareWindow()`第一次需要时调用`onCreateCandidatesView()`；输入View则由标准视图初始化/更新流程按需创建。
-
-输入法Service已启动不等于键盘View早已完整创建。
-
-## 66. `onStartInput()`与`onStartInputView()`的先后
-
-先建立编辑器时触发`onStartInput()`。
-
-只有决定显示输入View并开始它时，才触发`onStartInputView()`。因此输入法业务不要假设每次`onStartInput()`后键盘一定可见。
-
-## 67. Android 11新Insets模式如何接管IME可见性
-
-当新Insets模式启用，IMS调用privileged operation：
-
-```java
-mPrivOps.applyImeVisibility(showOrHideToken, setVisible);
-```
-
-system_server把请求交给WMS/IME Insets控制目标，随后走第230、231章的`ImeInsetsSourceConsumer`和动画控制链。
-
-## 68. 旧模式与新模式的hide差异
-
-`hideWindow()`中：
-
-```text
-新Insets模式 → Insets API负责client/server visibility，不直接mWindow.hide()
-旧模式 → InputMethodService直接mWindow.hide()
-```
-
-所以看到`hideWindow()`没有调用`mWindow.hide()`，不能误判为Android 11键盘无法隐藏。
-
-## 69. 从show到屏幕出现的完整时序
-
-```mermaid
-sequenceDiagram
-    participant V as "App View"
-    participant IMM as "App IMM"
-    participant INSETS as "App ViewRoot / InsetsController"
-    participant IMMS as "system_server IMMS"
-    participant IMS as "IME InputMethodService"
-    participant WMS as "WMS / Insets"
-    participant SF as "SurfaceFlinger / Display"
-    V->>IMM: requestFocus + showSoftInput
-    IMM->>IMMS: showSoftInput(client, windowToken)
-    IMMS->>IMMS: 校验client与WMS焦点
-    IMMS-->>IMM: true（请求已安排）
-    IMMS->>IMS: IInputMethod.showSoftInput(showToken)
-    IMS->>IMS: onShowInputRequested + showWindow
-    IMS->>WMS: applyImeVisibility(showToken, true)
-    WMS->>INSETS: 分发IME Insets State/Control
-    INSETS->>INSETS: Insets动画逐帧更新leash
-    INSETS->>WMS: finish后回报requested visibility
-    WMS->>SF: Surface transactions
-    SF-->>V: 后续刷新周期物理呈现
-```
-
-图中最早的true与最后的物理呈现之间，隔着多个进程、线程和帧边界。
-
-## 70. ResultReceiver也不是present fence
-
-IME处理show/hide后，根据处理前后`isInputViewShown()`等逻辑返回：
-
-```text
-RESULT_SHOWN
-RESULT_HIDDEN
-RESULT_UNCHANGED_SHOWN
-RESULT_UNCHANGED_HIDDEN
-```
-
-它描述IME观察到的窗口/输入View状态变化，不是SurfaceFlinger硬件present时间戳。
-
-## 71. hide客户端先校验WindowToken
-
-`hideSoftInputFromWindow()`要求当前served View存在，且其WindowToken与调用参数完全相同。
-
-旧Activity保存的token无法随意隐藏新Activity正在使用的IME。
-
-## 72. HIDE_IMPLICIT_ONLY的精确语义
-
-如果本次IME由显式请求或forced请求显示，带`HIDE_IMPLICIT_ONLY`的隐藏请求会被拒绝。
-
-它适合取消自动弹出的键盘，不适合推翻用户/应用明确要求的显示。
-
-## 73. HIDE_NOT_ALWAYS的精确语义
-
-若当前是`SHOW_FORCED`，带`HIDE_NOT_ALWAYS`的请求不会隐藏。
-
-注意r48历史标志的行为与后续Android版本可能变化，读其他版本时要重新核源。
-
-## 74. 为什么`mInputShown`和`mImeWindowVis`会短暂不一致
-
-`mInputShown`在IMMS安排show消息时已更新；`mImeWindowVis`要等IME进程异步报告。
-
-源码注释说明，为兼容自Eclair以来的行为，只要`mInputShown`或IME_ACTIVE表明可能显示，就接受hide请求。
-
-## 75. hide怎样进入IME
-
-IMMS创建`hideInputToken`并发送`IInputMethod.hideSoftInput()`。
-
-IME侧先调用`applyVisibilityInInsetsConsumerIfNecessary(false)`，非pre-render路径清理show flags并执行`doHideWindow()`。
-
-## 76. hide立即清哪些system_server状态
-
-IMMS撤销visible bind，并清理：
-
-```text
-mInputShown
-mShowRequested
-mShowExplicitlyRequested
-mShowForced
-```
-
-但这依然可能早于IME处理IPC、Insets动画和屏幕呈现完成。
-
-## 77. 输入法点击字母后走哪条路
-
-键盘View的按键逻辑通常调用：
-
-```java
-getCurrentInputConnection().commitText(text, 1);
-```
-
-IME持有的远端包装把它转为`IInputContext.commitText()` Binder调用，进入App的`IInputConnectionWrapper`。
-
-## 78. `commitText()`为什么不会在Binder线程直接改View
-
-App侧Stub收到请求后：
-
-```java
-dispatchMessage(obtainMessageIO(DO_COMMIT_TEXT,
-        newCursorPosition, text));
-```
-
-目标Looper处理`DO_COMMIT_TEXT`时再次检查连接active，然后调用真实`InputConnection.commitText()`。
-
-## 79. 真实TextView如何修改Editable
-
-TextView对应的`EditableInputConnection`/`BaseInputConnection`会处理组合区、替换文本与新光标位置。
-
-修改Editable可能触发TextWatcher、布局和下一帧绘制；因此`commitText()`返回也不等于字符像素已经present。
-
-## 80. composing text与commit text不同
-
-拼音输入“zhong”时，IME可不断调用`setComposingText()`更新尚未确认的组合区。
-
-用户选中“中”后再`commitText()`或结束组合。编辑器必须保留组合span语义，而不能把每次候选更新都当作最终文本。
-
-## 81. editor action不是一定提交换行
-
-键盘右下角“搜索/发送/完成”可能调用`performEditorAction()`。
-
-App侧TextView会根据监听器和输入配置处理它；只有没有被业务消费且配置允许时，才可能退化为Enter/换行逻辑。
-
-## 82. 文字回写完整时序
-
-```mermaid
-sequenceDiagram
-    participant K as "IME键盘View"
-    participant IMS as "InputMethodService"
-    participant RIC as "远端InputConnection"
-    participant STUB as "App IInputContext Stub"
-    participant LOOP as "编辑器Looper"
-    participant EIC as "EditableInputConnection"
-    participant TV as "TextView / Editable"
-    K->>IMS: 用户选择字符“中”
-    IMS->>RIC: commitText("中", 1)
-    RIC->>STUB: Binder IInputContext.commitText
-    STUB->>LOOP: post DO_COMMIT_TEXT
-    LOOP->>LOOP: 检查connection仍active
-    LOOP->>EIC: commitText
-    EIC->>TV: 替换组合区、移动光标
-    TV-->>TV: TextWatcher / layout / draw
-```
-
-## 83. 查询文本为何常有异步回调
-
-IME可能调用`getTextBeforeCursor()`、`getSelectedText()`等。
-
-跨进程不能直接同步共享Editable对象；r48内部接口把查询投递到编辑器Looper，再用结果callback回IME，避免在错误线程读文本。
-
-## 84. 密码字段的安全边界
-
-IME本来就处在高度敏感的位置，可以接收当前编辑器协议和输入事件。
-
-系统通过用户明确启用IME、当前IME选择、UID/WindowToken/焦点校验限制参与者；但用户仍应只启用可信输入法。`FLAG_SECURE`主要限制截图，并不能让IME无法看到用户在密码编辑器中的输入。
-
-## 85. IME进程死亡会怎样
-
-Binder调用可能抛`RemoteException`，IMMS的ServiceConnection也会断开。
-
-系统清理当前method/session/channel并按当前焦点重新连接；App侧不能把一次拿到的`IInputMethodSession`当作永久对象。
-
-## 86. App进程死亡会怎样
-
-IMMS给客户端Binder注册死亡通知。
-
-客户端死亡后移除`ClientState`、解绑输入并释放相关session/InputChannel，避免IME继续向不存在的编辑器发送命令。
-
-## 87. 切换View时为何旧输入偶尔“晚到”
-
-链路中有多个异步队列：App View Looper、App Binder线程、system_server主线程、IME Binder线程、IME主线程。
-
-框架用served View复核、sequence、start/show/hide token、active connection和当前method Binder身份多重过滤过期消息。
-
-## 88. 五个“完成”时刻
-
-| 时刻 | 只能说明什么 |
-|---|---|
-| `startInputInner()`返回 | 本轮客户端启动逻辑已同步处理或已转投线程 |
-| `InputBindResult.SUCCESS_WITH_IME_SESSION` | 客户端拿到当前IME session |
-| `showSoftInput()`返回true | IMMS已接受并安排给当前IME |
-| ResultReceiver收到`RESULT_SHOWN` | IME处理后观察到输入View状态已变为shown |
-| Insets动画finish / Surface present | 动画逻辑结束 / 像素在后续显示周期真实呈现 |
-
-这些时刻不能互相替代。
-
-## 89. 常见误解一：`requestFocus()`后立即show一定成功
-
-不一定。Window焦点、served View更新、InputConnection创建和IME绑定都可能仍在异步推进。
-
-应优先让窗口生命周期与Insets API表达可见意图，而不是用固定延时猜系统状态。
-
-## 90. 常见误解二：IME通过KeyEvent输入所有字符
-
-现代软键盘主要通过InputConnection的composing/commit协议编辑文本。
-
-KeyEvent仍用于硬件按键、兼容路径或特定控制键，但把中文候选输入理解成一串模拟KeyEvent会丢失组合文本语义。
-
-## 91. 常见误解三：InputMethodService运行在system_server
-
-通常不是。它是被选中输入法应用中的Service，运行在IME应用进程。
-
-IMMS才在system_server，负责仲裁与桥接。
-
-## 92. 常见误解四：IME Window是目标Activity的子View
-
-不是。IME拥有独立`TYPE_INPUT_METHOD`窗口和Surface层级，由WMS按照IME target、Insets和动画进行定位。
-
-它覆盖/挤压目标窗口，但不加入目标Activity的View树。
-
-## 93. 常见误解五：hide返回后布局已恢复
-
-hide请求接受、IME状态清理、Insets动画逐帧变化、App重新布局和最后一帧present之间仍有距离。
-
-依赖键盘高度的业务应观察WindowInsets/animation回调，而不是只看hide方法布尔返回值。
-
-## 94. 一条实用排查分层
-
-```text
-层1：View真有焦点且已attach吗？
-层2：Window是WMS当前IME target吗？
-层3：onCreateInputConnection返回非null吗？EditorInfo正确吗？
-层4：IMMS是否选到并绑定IME、创建session？
-层5：show是否被策略/无障碍/IME自身拒绝？
-层6：IME Insets control是否交付、动画是否运行？
-层7：Surface是否绘制与present？
-```
-
-按层排查比反复调用`showSoftInput()`更有效。
-
-## 95. macOS只读练习一：画出进程边界
-
-执行：
+### 练习 1：还原 focus 到 start 的入口
 
 ```bash
-cd /Users/ninebot/androidSource
-rg -n "startInputOrWindowGainedFocus|showSoftInput\(|hideSoftInput\(" \
-  frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java \
-  frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java \
-  frameworks/base/core/java/android/inputmethodservice/InputMethodService.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'void onPostWindowFocus(View focusedView' frameworks/base/core/java/android/view/ImeFocusController.java
+grep -n -F 'public boolean checkFocus(boolean forceNewFocus, boolean startInput)' frameworks/base/core/java/android/view/ImeFocusController.java
+grep -n -F 'boolean startInputInner(@StartInputReason int startInputReason,' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'vh.post(() -> mDelegate.startInput' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
 ```
 
-要求：给每个命中标注App、system_server或IME进程，并标出Binder边界。
+把四个命中连起来，并解释为何“post后返回 false”不代表永久失败。
 
-## 96. macOS只读练习二：验证线程切换
-
-执行：
+### 练习 2：区分描述快照和编辑协议
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '1850,2015p' \
-  frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
-sed -n '120,175p' \
-  frameworks/base/core/java/com/android/internal/view/IInputConnectionWrapper.java
-sed -n '330,352p' \
-  frameworks/base/core/java/com/android/internal/view/IInputConnectionWrapper.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'tba.packageName = view.getContext().getOpPackageName();' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'InputConnection ic = view.onCreateInputConnection(tba);' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'outAttrs.setInitialSurroundingText(mText);' frameworks/base/core/java/android/widget/TextView.java
+grep -n -F 'InputConnection ic = new EditableInputConnection(this);' frameworks/base/core/java/android/widget/TextView.java
+grep -n -F 'if (isPasswordInputType(inputType)) {' frameworks/base/core/java/android/view/inputmethod/EditorInfo.java
 ```
 
-要求：解释View Handler、Binder线程与`DO_COMMIT_TEXT`目标Looper各承担什么。
+分别标出 IMM、TextView和 EditorInfo负责的字段，并说明密码保护只覆盖哪份数据。
 
-## 97. macOS只读练习三：手推等待binding/session
-
-执行：
+### 练习 3：逐层列出 IMMS 的信任校验
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '2390,2645p' \
-  frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'if (windowToken == null) {' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'final ClientState cs = mClients.get(client.asBinder());' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'if (cs.selfReportedDisplayId != windowDisplayId) {' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'if (!mWindowManagerInternal.isInputMethodClientFocus(' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'if (!InputMethodUtils.checkIfPackageBelongsToUid(' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
 ```
 
-构造三种状态：`mCurMethod=null`、`mCurMethod!=null但curSession=null`、`curSession!=null`，分别写出返回的InputBindResult和后续回调。
+按“身份、窗口事实、编辑器声明”三列整理命中，指出哪一步仍使用 Binder调用身份。
 
-## 98. macOS只读练习四：核对show/hide完成语义
-
-执行：
+### 练习 4：手推 `softInputMode` 决策
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '3160,3335p' \
-  frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
-sed -n '690,760p' \
-  frameworks/base/core/java/android/inputmethodservice/InputMethodService.java
-sed -n '2080,2265p' \
-  frameworks/base/core/java/android/inputmethodservice/InputMethodService.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'final boolean doAutoShow =' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'case LayoutParams.SOFT_INPUT_STATE_UNSPECIFIED:' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'case LayoutParams.SOFT_INPUT_STATE_VISIBLE:' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'case LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE:' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'static boolean isSoftInputModeStateVisibleAllowed' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodUtils.java
+grep -n -F 'if (targetSdkVersion < Build.VERSION_CODES.P) {' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodUtils.java
 ```
 
-要求：分别标出“IMMS接受”“IME处理”“Insets可见请求”“窗口状态变化”和“源码没有提供硬件present保证”的位置。
+构造“P+、非文本编辑器、forward navigation、ADJUST_RESIZE”和“P+、文本编辑器、无 forward navigation”两例，写出 `VISIBLE`分支是否 show。
 
-## 99. 自测题
+### 练习 5：跟踪 binding、WindowToken 和 Session
 
-1. 为什么View焦点和WMS确认的IME焦点都需要？
-2. EditorInfo与InputConnection各自解决什么问题？
-3. 为什么IME的`commitText()`不会直接在App Binder线程修改TextView？
-4. `SUCCESS_WAITING_IME_BINDING`与`SUCCESS_WITH_IME_SESSION`有什么不同？
-5. `showSoftInput()`返回true为什么不能证明键盘已出现在屏幕上？
-6. bindInput、startInput和onStartInputView为何不是同一生命周期？
-7. showInputToken与IME WindowToken分别防什么问题？
-8. 新Insets模式下`hideWindow()`为什么可能不调用`mWindow.hide()`？
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'mCurToken = new Binder();' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'mIWindowManager.addWindowToken(mCurToken, LayoutParams.TYPE_INPUT_METHOD,' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'void requestClientSessionLocked(ClientState cs) {' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'InputChannel[] channels = InputChannel.openInputChannelPair' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'void onSessionCreated(IInputMethod method, IInputMethodSession session,' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'InputBindResult attachNewInputLocked' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+```
 
-## 100. 自测题答案
+指出 Session callback携带了什么、没携带什么，并解释客户端切换时为什么不能假定它必然被废弃。
 
-1. View焦点确定App内部编辑器，WMS焦点确认系统当前合法目标，两层共同防状态竞态和后台抢占。
-2. EditorInfo是编辑器能力/属性快照；InputConnection是持续的双向编辑协议。
-3. IInputConnectionWrapper把Binder请求投递到InputConnection指定Handler或View Looper，并在执行前检查active。
-4. 前者表示Service接口仍在异步绑定；后者表示当前客户端已拿到可用IME session和必要通道。
-5. true只表示IMMS已接受并安排请求，后面还有IME策略、窗口、Insets动画、Surface提交和显示周期。
-6. bindInput绑定客户端，startInput绑定当前编辑器，onStartInputView只在输入UI真正开始时触发。
-7. WindowToken授权IME创建TYPE_INPUT_METHOD窗口；每次show/hide token把异步可见请求绑定到当前合法App窗口和请求代际。
-8. 新模式由WMS/Insets Consumer控制IME Source与leash，直接隐藏Window会绕开统一动画与状态协议。
+### 练习 6：核对 Binder 方向和等待语义
 
-## 101. 复读后补强：最容易混淆的状态表
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'oneway interface IInputMethod {' frameworks/base/core/java/com/android/internal/view/IInputMethod.aidl
+grep -n -F 'oneway interface IInputContext {' frameworks/base/core/java/com/android/internal/view/IInputContext.aidl
+grep -n -F 'oneway interface IInputMethodClient {' frameworks/base/core/java/com/android/internal/view/IInputMethodClient.aidl
+grep -n -F 'private static final int MAX_WAIT_TIME_MILLIS = 2000;' frameworks/base/core/java/com/android/internal/view/InputConnectionWrapper.java
+grep -n -F 'int SUCCESS_WAITING_IME_BINDING = 2;' frameworks/base/core/java/com/android/internal/view/InputBindResult.java
+grep -n -F 'if (mBindSequence < 0 || mBindSequence != res.sequence) {' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+```
 
-| 变量/信号 | 所在侧 | 含义 | 不保证什么 |
-|---|---|---|---|
-| `mServedView` | App IMM | 当前准备接受IME服务的View | WMS已认可它 |
-| `mCurMethod` | IMMS/App IMM | 已拿到当前IME接口或session接口 | IME窗口可见 |
-| `mShowRequested` | IMMS/IMS各有同名概念 | 已记录显示意图 | 请求已物理呈现 |
-| `mInputShown` | IMMS | 已把show安排给IME的历史状态 | `mImeWindowVis`已同步 |
-| `mImeWindowVis` | IMMS | IME上报的ACTIVE/VISIBLE状态 | Insets动画或present完成 |
-| requested visibility | Insets客户端/服务端 | 当前控制目标希望显示/隐藏 | Source Surface此刻已到终点 |
+为每个命中写出调用者能观察到的完成点；特别区分 oneway edit与 callback + 2秒等待的 query。
 
-同名或近义变量分布在不同进程，阅读时必须写出对象前缀。
+### 练习 7：审计 show 的非对称返回值
 
-## 102. 复读后补强：r48的几个版本边界
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'mShowRequested = true;' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'if (mAccessibilityRequestingNoSoftKeyboard) {' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'mShowRequestWindowMap.put(showInputToken, windowToken);' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'MSG_SHOW_SOFT_INPUT, getImeShowFlags(), reason' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'mInputShown = true;' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'if (mShowRequested) {' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+```
 
-- 本章结论以Android 11 r48的新旧Insets并存实现为准，后续版本公开IME Insets API和show/hide限制已有演化。
-- r48仍保留`SHOW_FORCED`、`HIDE_IMPLICIT_ONLY`、`HIDE_NOT_ALWAYS`等历史记账，不应把其他版本文档直接套到这里。
-- `ResultReceiver`结果来自IME处理前后状态比较，不是WMS或SurfaceFlinger的present回执。
-- `InputChannel`与`IInputContext`是两条不同通路：前者承载输入事件/session，后者承载文本编辑协议。
+分别推演“无障碍拒绝”“Service绑定中”“已有 mCurMethod”三条路径，记录返回值和被修改的字段。
 
-## 103. 本章结论
+### 练习 8：找到 show/hide 进入 Insets 的真正门
 
-一次软键盘交互由两条相反方向的链闭合：
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'public void showSoftInputWithToken' frameworks/base/core/java/android/inputmethodservice/InputMethodService.java
+grep -n -F 'applyVisibilityInInsetsConsumerIfNecessary(true' frameworks/base/core/java/android/inputmethodservice/InputMethodService.java
+grep -n -F 'public void showImePostLayout' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+grep -n -F 'void scheduleShowImePostLayout(InsetsControlTarget imeTarget)' frameworks/base/services/core/java/com/android/server/wm/ImeInsetsSourceProvider.java
+grep -n -F 'target.showInsets(WindowInsets.Type.ime(), true' frameworks/base/services/core/java/com/android/server/wm/ImeInsetsSourceProvider.java
+grep -n -F 'dc.mInputMethodControlTarget.hideInsets(' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+```
+
+画出 show等待 layout/draw而 hide会中止 pending show的分叉，并在图中单列 ResultReceiver时刻。
+
+### 练习 9：验证字符回写和失活收尾
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'mIInputContext.commitText(text, newCursorPosition);' frameworks/base/core/java/com/android/internal/view/InputConnectionWrapper.java
+grep -n -F 'case DO_COMMIT_TEXT: {' frameworks/base/core/java/com/android/internal/view/IInputConnectionWrapper.java
+grep -n -F 'ic.commitText((CharSequence)msg.obj, msg.arg1);' frameworks/base/core/java/com/android/internal/view/IInputConnectionWrapper.java
+grep -n -F 'content.replace(a, b, text);' frameworks/base/core/java/android/view/inputmethod/BaseInputConnection.java
+grep -n -F 'mCancellationGroup.cancelAll();' frameworks/base/core/java/android/inputmethodservice/IInputMethodWrapper.java
+grep -n -F 'public void onServiceDisconnected(ComponentName name)' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+```
+
+说明 `commitText()`在哪一行已经对 IME返回 true，哪一行才可能改 Editable，以及连接失效时 query与 edit分别靠什么收口。
+
+## 16. 用六条时间线收束排查
+
+把本章压成六条互不替代的时序：
 
 ```text
-显示链：
-View焦点 → IMM创建EditorInfo/InputConnection
-→ IMMS校验并选择/绑定IME → 创建Session与IME WindowToken
-→ IMS创建IME窗口 → WMS/Insets动画显示
+焦点线：
+Window 可用 IME → current ViewRoot → next served → served → startInputInner
 
-编辑链：
-IME键盘操作 → 远端InputConnection/IInputContext Binder
-→ App指定Looper → 真实InputConnection
-→ Editable变化 → 布局、绘制与显示
+协议线：
+EditorInfo 快照 + InputConnection → IInputContext → IMMS校验 → IME远端 wrapper
+
+绑定线：
+bindService → IInputMethod → initialize/WindowToken → createSession
+→ attach(bindInput, startInput) → InputBindResult/onBindMethod
+
+显示线：
+IMMS mShowRequested → oneway show → IMS本地 UI/status/ResultReceiver
+→ showImePostLayout → control target → Insets动画 → Surface present
+
+编辑线：
+IME commit/composing/query → IInputContext → App目标 Looper
+→ active检查 → Editable → View绘制
+
+隐藏线：
+IMMS flag门与提前清账 → oneway hide → IMS本地 hidden
+→ WMS abort pending show/hideInsets → 动画终帧 → notify/remove Surface
 ```
 
-真正掌握这一章的标志，不是背出类名，而是任何时候都能回答：当前状态属于哪个进程、哪个对象、哪个请求代际，以及它究竟只保证“请求已受理”，还是已经走到窗口、动画、Surface或物理呈现。
+最后用这张表定位现象：
 
-## 104. 下一章预告
+| 现象 | 第一组检查 | 不应直接得出的结论 |
+| --- | --- | --- |
+| `showSoftInput()` 为 `false` | served View、WMS焦点、绑定状态、无障碍策略、`mShowRequested` | 键盘之后一定不会出现 |
+| 有 `SUCCESS_WAITING_*` | ServiceConnection、Session callback、sequence | 当前 Session 已可用 |
+| `onStartInput()`到了但无键盘 | show flag、`onShowInputRequested()`、WindowToken、post-layout门 | InputConnection创建失败 |
+| ResultReceiver为 `RESULT_SHOWN` | IME本地状态、WMS target、Insets control和动画 | 像素已 present |
+| IME的 `commitText()`为 `true`但没字 | App wrapper active/finished、目标 Handler、旧连接排队 | App Editable已经成功修改 |
+| hide返回后仍短暂可见 | IMS本地状态、pending show、Insets动画、Surface移除 | hide请求未被处理 |
 
-下一章继续深入`InputConnection`、`IInputContext`、组合文本、批量编辑、光标锚点和编辑状态同步，专门解释IME与TextView之间的双向编辑协议。
+真正掌握这条链，不是记住“IMM调用IMMS、IMMS调用IMS”，而是能随时回答四个问题：**当前字段属于哪个进程和对象；这次 Binder是同步、oneway还是 callback等待；token只证明来源还是也证明最新代际；眼前的完成点停在意图、绑定、UI、Insets、Surface提交还是物理呈现。**

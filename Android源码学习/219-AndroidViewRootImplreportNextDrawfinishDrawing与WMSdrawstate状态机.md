@@ -1,171 +1,124 @@
 # 219 Android ViewRootImpl reportNextDraw、finishDrawing 与 WMS draw state 状态机
 
-> 源码版本：Android 11 / `android-11.0.0_r48`  
-> 学习方式：macOS 只读源码追踪，不编译、不刷机、不把推演写成真机结论  
-> 前置章节：第 213、214、215、217、218 章
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`。
+>
+> 本章只做静态源码核对：可以证明客户端何时登记并结清绘制回报、WMS 怎样推进单个 WindowState 的 draw state，以及 show 事务何时被准备；不能据此声称 SurfaceFlinger 已 latch、HWC 已 present 或面板已经扫描。第 220 章再接 Activity 级 `allDrawn`、`reportedDrawn`、`nowVisible` 与启动完成回调。
 
-## 1. 本章要解决什么问题
+第 218 章已经看到 starting window 可在真实窗口进入 `performShowLocked()` 时开始清理。本章反向追真实窗口：**一次 `reportNextDraw()` 为什么既不是一帧，也不是完成；`finishDrawing()` 返回为什么仍不能证明窗口已经显示；`DRAW_PENDING → COMMIT_DRAW_PENDING → READY_TO_SHOW → HAS_DRAWN` 每一步究竟关闭哪本账？**
 
-“Activity首帧画完了”在口头交流里看似简单，源码中却至少涉及App、WMS、SurfaceFlinger和显示硬件四套不同进度。
+## 1. 固定普通首次硬件窗，再给每个完成点取唯一名字
 
-本章只把中间一段彻底拆清：`ViewRootImpl` 为什么要报告下一次绘制，`IWindowSession.finishDrawing()`如何进入WMS，窗口又如何经历 `DRAW_PENDING → COMMIT_DRAW_PENDING → READY_TO_SHOW → HAS_DRAWN`。
+先固定 `L_normal`：普通跨进程 Activity 的首个可见主窗口；新建非 BLAST Surface；硬件渲染已启用、Surface有效、本帧可画且swap成功；没有根 `SurfaceHolder`、子 `SurfaceView` 或额外 `WindowCallbacks`；`OnPreDraw` 不取消；WMS、App transition 与 policy 最终均允许显示；全程无异常。
 
-## 2. 先给出最短主线
+| 点 | 精确定义 | 仍不能推出 |
+|---|---|---|
+| `S_alloc` | WMS 创建窗口 SurfaceControl，draw state 进入 DRAW_PENDING，初始带 HIDDEN | App 已拿到可写 Java Surface |
+| `R_first` | 同步 relayout 把 `RELAYOUT_RES_FIRST_TIME` 返回给 ViewRootImpl | 这是 WindowState 一生第一次 relayout |
+| `D_arm` | `reportNextDraw()` 首次把根绘制债加一并置 `mReportNextDraw=true` | traversal 已开始 |
+| `V_draw` | `performDraw()` 捕获本轮 report 标志并进入绘制 | Buffer 已 queue |
+| `Q_buf` | 固定硬件路线的 swap 已把窗口 Buffer 交给 producer queue | SurfaceFlinger 已 latch |
+| `H_done` | HWUI frame-complete callback 在 RenderThread 侧被调用 | GPU fence、SF latch 或 present 已完成 |
+| `U_done` | callback 投到 App UI Handler 后执行 `pendingDrawFinished()`，根债归零 | WMS 找得到原 WindowState |
+| `B_enter` | 普通 App 的同步 `IWindowSession.finishDrawing()` 进入 system_server | draw state 一定会变化 |
+| `W_commit` | WMS 在 global lock 内把该窗从 DRAW_PENDING 改为 COMMIT_DRAW_PENDING | placement 已运行 |
+| `Q_place` | WMS 已合并一次 surface-placement 请求 | AnimationThread 已处理该请求 |
+| `B_return` | 同步 AIDL 调用回到 App | Window 已 READY/HAS |
+| `W_ready` | placement 调 `commitFinishDrawingLocked()`，状态成为 READY_TO_SHOW | Activity 聚合门已满足 |
+| `A_gate` | 固定路线中 Activity 的真实窗口计数使 `allDrawn` 成立 | 下一轮 show 已成功 |
+| `W_has` | `performShowLocked()` 通过自身门并把状态置为 HAS_DRAWN | SurfaceControl show 已成功 |
+| `X_show` | `prepareSurfaceLocked()` 成功执行 show，并把相关 transaction 合入 WMS 全局事务 | SF 已消费这笔事务 |
+| `F_latch` | SF 为这扇窗取得可用于合成的 Buffer | show 状态已同时生效 |
+| `P_real` | 可归因于该真实窗口的 present fence signal | 用户业务语义已经完成 |
 
-```text
-WMS创建隐藏Surface并把draw state设为DRAW_PENDING
-  → ViewRootImpl收到首次relayout或redraw请求
-  → reportNextDraw()登记一笔待报告绘制
-  → performDraw()生产窗口帧
-  → reportDrawFinished()跨Binder调用finishDrawing
-  → WMS改为COMMIT_DRAW_PENDING并请求SurfacePlacement
-  → commitFinishDrawingLocked()改为READY_TO_SHOW
-  → 满足Activity/Transition/Policy条件后performShowLocked()
-  → draw state改为HAS_DRAWN
-  → prepareSurfaceLocked()才把隐藏Surface提交为show
-```
-
-这条线里的每个箭头都有条件，不能把它压缩成“draw后立即show”。
-
-## 3. 全链路时序图
-
-```mermaid
-sequenceDiagram
-    participant WMS as "system_server / WMS"
-    participant App as "App UI线程 / ViewRootImpl"
-    participant RT as "App RenderThread"
-    participant SF as "SurfaceFlinger"
-    WMS->>WMS: "createSurfaceLocked：DRAW_PENDING，Surface隐藏"
-    WMS-->>App: "relayout FIRST_TIME 或 IWindow.resized(reportDraw=true)"
-    App->>App: "reportNextDraw + drawPending"
-    App->>RT: "ThreadedRenderer.draw"
-    RT->>SF: "queueBuffer 或 BLAST Transaction.setBuffer"
-    RT-->>App: "FrameCompleteCallback（异步硬件渲染路径）"
-    App->>WMS: "IWindowSession.finishDrawing"
-    WMS->>WMS: "COMMIT_DRAW_PENDING + requestTraversal"
-    WMS->>WMS: "SurfacePlacement：READY_TO_SHOW"
-    WMS->>WMS: "performShowLocked：HAS_DRAWN"
-    WMS->>SF: "SurfaceControl show/alpha/matrix transaction"
-    SF-->>SF: "后续latch、compose、present"
-```
-
-## 4. 第一个关键结论：finishDrawing不是SurfaceFlinger接口
-
-`finishDrawing` 定义在Framework的 `IWindowSession.aidl`，App通过Window Session Binder把“客户端已完成本轮需报告的绘制”告诉WMS。
-
-它不是App直接通知SurfaceFlinger“这帧已经显示”，也不是HWC present fence回调。
-
-## 5. 第二个关键结论：draw state属于WMS窗口账本
-
-五个draw state定义在：
+固定路线的客户端与服务端主链是：
 
 ```text
-frameworks/base/services/core/java/com/android/server/wm/
-    WindowStateAnimator.java
+S_alloc < R_first < D_arm < V_draw < Q_buf < H_done < U_done
+U_done < B_enter < W_commit < Q_place < B_return
+Q_place < W_ready < A_gate < W_has < X_show
+Q_buf < F_latch
 ```
 
-状态记录在system_server里的 `WindowStateAnimator.mDrawState`，并不等于App `View` 的dirty、RenderNode录制状态或BufferQueue slot状态。
+`B_return` 与 `W_ready` 不应互相强排：Binder路径在锁内调用 `requestTraversal()`，已有调度时会合并、layout defer时只登记延迟请求，只有未defer且此前未调度时才新post到AnimationThread；锁释放后，已获调度的AnimationThread也可能在Binder返回前取得锁。最终物理可见还需要 `X_show` 对应的transaction到达SF，并与 `F_latch` 汇合后再compose/present；因此Java主链不能补写一条不存在的 `X_show < F_latch` 或 `W_has = P_real`。
 
-## 6. 五态总览
+本章随后会逐项放宽 `L_normal`。FIRST_TIME、`resized(reportDraw=true)`、软件绘制、SurfaceHolder、SurfaceView、BLAST sync、窗口移除与重复回报都可能改变局部顺序，但不会改变“六本账不能合并”这个结论。
 
-```mermaid
-stateDiagram-v2
-    [*] --> NO_SURFACE
-    NO_SURFACE --> DRAW_PENDING: "createSurfaceLocked / resetDrawState"
-    DRAW_PENDING --> COMMIT_DRAW_PENDING: "客户端finishDrawing"
-    COMMIT_DRAW_PENDING --> READY_TO_SHOW: "SurfacePlacement提交draw完成"
-    READY_TO_SHOW --> HAS_DRAWN: "窗口满足显示条件"
-    READY_TO_SHOW --> READY_TO_SHOW: "仍被Activity/Transition条件阻挡"
-    HAS_DRAWN --> DRAW_PENDING: "特定重绘/可见性/旋转等待"
-    HAS_DRAWN --> NO_SURFACE: "Surface销毁"
+## 2. 客户端债、Buffer、窗口五态、Activity 聚合、事务与 present 是六本账
+
+一句“首帧画完”经常同时指向六个不同对象：
+
+| 账本 | 代表字段或对象 | 回答的问题 |
+|---|---|---|
+| ViewRoot 回报账 | `mReportNextDraw`、`mDrawsNeededToReport` | 客户端是否还欠 WMS 一次 draw report |
+| 图形生产账 | UI DisplayList、RenderThread、BufferQueue slot/fence | 内容是否录制、提交或 queue |
+| WindowState draw 账 | `WindowStateAnimator.mDrawState` | WMS 对单扇窗口认可到哪个阶段 |
+| Activity 聚合账 | `mNumInterestingWindows`、`mNumDrawnWindows`、`allDrawn` | 一组真实窗口是否满足 Activity 级门 |
+| SurfaceControl 事务账 | hidden/show、alpha、matrix、post-draw transaction | 哪些 layer 状态已 stage/apply |
+| 显示账 | SF latch、composition、HWC present fence | 哪个 Buffer 何时真正出现在屏幕 |
+
+`finishDrawing` 定义在 Framework 的 `IWindowSession.aidl`。普通 App 用 Window Session Binder把“这一轮需要回报的客户端绘制债已经收口”交给 WMS；它不是 App 直接调用 SurfaceFlinger，更不是 present fence 回调。
+
+同样，`mDrawState` 只存在于 system_server 的 `WindowStateAnimator`。它不等于 View dirty、RenderNode 录制状态、GraphicBuffer slot、SurfaceController 的 shown 值或 Activity 的 `reportedDrawn`。诊断时必须先说字段属于哪本账，再解释它能证明到哪里。
+
+## 3. WMS 先创建隐藏 Surface；五态是可重入流程，不是一次性枚举
+
+r48 的五个状态是：
+
+| 状态 | 本层含义 | 关键否定 |
+|---|---|---|
+| `NO_SURFACE` | WMS 当前不把这扇窗视为持有可用窗口 Surface | 不保证 SF 层级中绝无保留旧 layer |
+| `DRAW_PENDING` | Surface 已建立绘制目标，WMS 等客户端完成报告 | 不保证 App 已开始 draw |
+| `COMMIT_DRAW_PENDING` | WMS 接受了从 DRAW_PENDING 发来的 finish | 尚未由 placement 提交为 drawn |
+| `READY_TO_SHOW` | placement 已提交 draw 完成，`isDrawnLw()`开始为 true | 仍可能被 Activity、transition、policy 或可见性挡住 |
+| `HAS_DRAWN` | `performShowLocked()` 已通过自身状态门并安排显示 | show 调用可能尚未执行或失败，更不是 present |
+
+首次创建时，`createSurfaceLocked()`先 `setHasSurface(false)`，再调用 `resetDrawState()`把状态置为 DRAW_PENDING；创建 SurfaceControl 的初始 flag包含 `SurfaceControl.HIDDEN`。只有构造成功后 `mHasSurface`才置 true；资源不足或其他构造异常会把状态退回 NO_SURFACE。若方法一开始就发现已有 `mSurfaceController`，则直接返回旧controller，不执行这次reset。
+
+`resetDrawState()`还会在窗口属于 Activity 且 Activity 当前不处于 transition 动画时清 `allDrawn`。这防止新一轮 Surface 沿用上一轮 Activity 聚合结果，但它也说明 draw state 和 Activity state 仍是两级账。
+
+最小状态图是：
+
+```text
+NO_SURFACE --create成功--> DRAW_PENDING
+DRAW_PENDING --有效finish--> COMMIT_DRAW_PENDING
+COMMIT_DRAW_PENDING --placement--> READY_TO_SHOW
+READY_TO_SHOW --全部显示门通过--> HAS_DRAWN
+任意有Surface状态 --destroy--> NO_SURFACE
+HAS_DRAWN/READY/... --orientation、drag resize或显式等待重画--> DRAW_PENDING
 ```
 
-## 7. NO_SURFACE的准确含义
+代码还允许 READY_TO_SHOW 在多轮 placement 中原地等待；`commitFinishDrawingLocked()`也接受 COMMIT 与 READY 两种输入。它不是只走一次且永不回头的线性状态机。
 
-`NO_SURFACE` 表示WMS对外认为这个窗口当前没有可用窗口Surface。
+## 4. FIRST_TIME、resized reportDraw、BLAST 与显式请求是四种回报需求
 
-源码还提醒：即使内部为了平滑切换保留了旧Surface，对外状态仍可能被置为 `NO_SURFACE`；所以它是WMS生命周期语义，不是“SurfaceFlinger中绝无任何相关Layer”的绝对物理断言。
+最常见需求来自同步 relayout。`relayoutVisibleWindow()`在“此前不可见”或“当前还未 `isDrawnLw()`”时加 `RELAYOUT_RES_FIRST_TIME`；格式无法原地修改、drag resize需要保留旧 Surface 时也会再加这个 bit。
 
-## 8. DRAW_PENDING的准确含义
+所以 FIRST_TIME 不是 WindowState 对象一生仅一次，也不保证收到它时状态恰好是 DRAW_PENDING。一个已画过但重新从不可见变可见的窗口仍可得到它；之后的 `finishDrawing()`可能因状态已是 HAS_DRAWN而不推进五态。
 
-源码注释写得很明确：Surface已经创建，但窗口尚未完成绘制，在此期间Surface保持隐藏。
-
-“隐藏”很重要：WMS先给App一个可绘制目标，避免未初始化或半成品内容直接露出。
-
-## 9. COMMIT_DRAW_PENDING的准确含义
-
-App已经调用 `finishDrawing`，WMS接受了这次报告，但尚未在下一次布局/SurfacePlacement事务中把它推进成可显示状态。
-
-它是“报告已收到、等待WMS提交”的中间态。
-
-## 10. READY_TO_SHOW的准确含义
-
-WMS已在SurfacePlacement中提交draw完成，窗口内容从draw state角度已准备好。
-
-但Activity可能还在等待其他窗口，AppTransition也可能要求一组窗口一起出现，所以READY不等于已经show。
-
-## 11. HAS_DRAWN的准确含义
-
-`performShowLocked()` 满足条件后把状态改成 `HAS_DRAWN`，并安排动画事务。
-
-源码注释把它称为窗口第一次在screen上shown，但做性能分析时仍应保持分层：这是WMS的show/drawn账本，不是可靠的HWC present fence signal，更不是面板整屏扫描完成。
-
-## 12. Surface创建时状态怎样进入DRAW_PENDING
-
-`WindowStateAnimator.createSurfaceLocked()`先确认没有已有 `mSurfaceController`，随后调用：
+WMS还有一条反向请求：`IWindow`声明为oneway，所以普通跨进程客户端异步接收；同进程local Stub则可能在调用线程内联进入客户端。`WindowState.reportResized()`先计算
 
 ```java
-resetDrawState();
+reportDraw = drawState == DRAW_PENDING
+        || useBLASTSync()
+        || !mRedrawForSyncReported;
 ```
 
-而 `resetDrawState()` 的核心就是：
+随后通过oneway `IWindow.resized(...)`发给客户端。`ViewRootImpl.W`把参数转给 `dispatchResized()`；drag-resize且使用多线程renderer时，后者可先在当前调用线程同步通知 `WindowCallbacks`，然后才选择 `MSG_RESIZED_REPORT`并投递App UI Handler。无论跨进程还是同进程，真正的 `reportNextDraw()`都在消息处理时执行。若调用发生在同一进程，代码复制可变Rect与Configuration，避免发送方继续复用同一对象。
 
-```java
-mDrawState = DRAW_PENDING;
-```
+四种需求并排看更清楚：
 
-## 13. 新建Surface默认为什么隐藏
+| 来源 | 客户端入口 | 是否保证 WMS 为 DRAW_PENDING |
+|---|---|---|
+| relayout FIRST_TIME | traversal处理 relayout结果 | 否；“此前不可见”也可触发 |
+| `resized(reportDraw=true)` | `MSG_RESIZED_REPORT` | 否；BLAST或首次sync report也可触发 |
+| `RELAYOUT_RES_BLAST_SYNC` | `reportNextDraw()` + `setUseBLASTSyncTransaction()` | 否；它还服务另一套transaction同步账 |
+| `setReportNextDraw()` | 本地 `reportNextDraw()`并 `invalidate()` | 否；这是给SystemUI/WMS交互使用的隐藏接口 |
 
-创建SurfaceControl时初始flags含 `SurfaceControl.HIDDEN`。
+`reportResized()`在调用 client 前就把 `mRedrawForSyncReported=true`；RemoteException时不会靠这个字段自动重发同一请求。需求的产生、客户端收到消息、客户端结债和WMS状态接受必须分别观察。
 
-这使“分配绘制目标”和“允许用户看到”成为两个独立步骤：App可以先提交完整Buffer，WMS再选择合适的整体时机show。
+## 5. reportNextDraw只给根请求加一笔债；真正协议是计数归零
 
-## 14. resetDrawState还会影响Activity.allDrawn
-
-如果窗口属于Activity，且Activity没有正处于Transition动画，`resetDrawState()`会调用 `ActivityRecord.clearAllDrawn()`。
-
-这避免Activity沿用上一代窗口内容的 `allDrawn=true`，误认为新Surface已准备完成。
-
-## 15. 首次relayout怎样要求App报告下一次draw
-
-WMS的 `relayoutVisibleWindow()`在窗口此前不可见或当前还没drawn时返回：
-
-```java
-result |= (!wasVisible || !isDrawnLw())
-        ? RELAYOUT_RES_FIRST_TIME : 0;
-```
-
-这个bit由同步relayout返回给App。
-
-## 16. FIRST_TIME不应按字面理解成对象一生仅一次
-
-窗口首次可见当然会拿到它；但格式改变无法原地完成、drag resize需保留旧Surface等路径也会重新附加 `RELAYOUT_RES_FIRST_TIME`。
-
-它更接近“这一代可见Surface需要一次完成绘制报告”。
-
-## 17. ViewRootImpl在哪里消费FIRST_TIME
-
-首次Traversal接近draw前，`ViewRootImpl`检查relayout结果：
-
-```java
-if ((relayoutResult & RELAYOUT_RES_FIRST_TIME) != 0) {
-    reportNextDraw();
-}
-```
-
-它不是当场调用finishDrawing，而是要求“下一次真正draw完成后再报告”。
-
-## 18. reportNextDraw本身做什么
+核心代码很短：
 
 ```java
 private void reportNextDraw() {
@@ -174,733 +127,348 @@ private void reportNextDraw() {
     }
     mReportNextDraw = true;
 }
-```
 
-第一次从false变true时登记一笔pending；重复请求只保持boolean，不重复为同一个根窗口请求加账。
-
-## 19. mReportNextDraw是门，不是完成标志
-
-它表示下一次draw具有“必须回报WMS”的额外职责。
-
-`mReportNextDraw=true`时甚至还没开始执行 `performDraw()`，因此不能拿它当“首帧已画”的证据。
-
-## 20. mDrawsNeededToReport为什么是计数器
-
-ViewRootImpl除了自己的根窗口帧，还可能要等 `SurfaceView`、WindowCallbacks或SurfaceHolder redraw callback完成。
-
-因此“这一轮可以告诉WMS了”不是简单boolean，而是所有参与者的待完成数归零。
-
-## 21. drawPending与pendingDrawFinished必须配平
-
-```java
 void drawPending() {
     mDrawsNeededToReport++;
 }
+```
 
-void pendingDrawFinished() {
-    if (mDrawsNeededToReport == 0) throw ...;
-    if (--mDrawsNeededToReport == 0) reportDrawFinished();
+`mReportNextDraw`是“下一轮 draw带回报职责”的门。它从 false变 true时只为根请求加一次；保持 true期间的重复请求会合并，不再重复加根债。因此它不是帧数，也不是完成标志。
+
+`mDrawsNeededToReport`才是余额。根 View、SurfaceView 等参与者可以继续增加它；每个完成者调用：
+
+```java
+if (mDrawsNeededToReport == 0) {
+    throw new RuntimeException(
+            "Unbalanced drawPending/pendingDrawFinished calls");
+}
+mDrawsNeededToReport--;
+if (mDrawsNeededToReport == 0) {
+    reportDrawFinished();
 }
 ```
 
-多完成一次会直接抛出 `Unbalanced drawPending/pendingDrawFinished calls`，说明这个计数是协议不变量。
+在没有其他未结余额时多结一次会直接抛异常，少结一次则不会进入 `reportDrawFinished()`；若存在重叠余额，多余旧完成也可能悄悄减掉另一笔债。这段协议本身没有“某个回调超时后替它减一”的逻辑；外部的transition、freeze或其他timeout也不能改写成同一笔客户端计数已正确闭合。
 
-## 22. WMS还可通过resized回调要求重绘报告
+当上一轮异步回报尚未执行、`mReportNextDraw`已经在 `performDraw()`尾部清为 false时，新请求可以再加一笔根债。计数器因此能表达重叠余额，但这里没有给每笔债附带可见的generation id；阅读竞态必须沿具体callback和余额变化，而不是只看boolean。
 
-`WindowState.reportResized()`计算 `reportDraw`，并通过 `IWindow.resized(...)`回调App。
+## 6. report需求可穿透stopped与display-off，却不能穿透不可见和PreDraw取消
 
-`ViewRootImpl.W`是Binder接收端，它把回调转给 `dispatchResized()`，再投递到UI线程。
+`performTraversals()`对 report有几处特别放行：
 
-## 23. Binder线程不直接改ViewRoot状态
+- layout条件使用 `!mStopped || mReportNextDraw`，所以欠报告时 stopped window仍可 measure/layout；
+- `performDraw()`只在 display off且没有report时早退，因此report可以让关屏状态继续完成协议；
+- `fullRedrawNeeded = mFullRedrawNeeded || mReportNextDraw`，正常report路线会强制整窗dirty；
+- 硬件绘制前会暂时 `threadedRenderer.setStopped(false)`，尾部再恢复到 `mStopped`。
 
-`dispatchResized()`选择：
-
-```java
-reportDraw ? MSG_RESIZED_REPORT : MSG_RESIZED
-```
-
-消息进入ViewRoot Handler；只有UI线程处理 `MSG_RESIZED_REPORT`时才调用 `reportNextDraw()`。
-
-## 24. 为什么同进程回调还要复制Rect
-
-`dispatchResized()`检查Binder caller pid；如果是同进程调用，会主动复制 `Rect`、`MergedConfiguration`等可变对象。
-
-这说明“没有进程边界”不等于可以安全共享调用方随后会复用的可变参数。
-
-## 25. WMS的reportDraw条件不只看DRAW_PENDING
-
-r48中包含：
+但 report不是无条件通行证。traversal先计算：
 
 ```java
-mDrawState == DRAW_PENDING
-        || useBLASTSync()
-        || !mRedrawForSyncReported
+cancelDraw = dispatchOnPreDraw() || !isViewVisible;
 ```
 
-因此reportDraw有时是为了同步resize/BLAST事务，并不总表示一个全新的WindowState首次Surface。
+可见窗口的 PreDraw listener取消时，只重新 `scheduleTraversals()`；`mReportNextDraw`和根债保留到后续成功draw。窗口不可见时不会因report强行执行 `performDraw()`。若 `mView==null`，`performDraw()`也会在清flag和结债之前返回。
 
-## 26. 旋转或drag resize会重新进入DRAW_PENDING
+这组边界解释了两类“卡在客户端”的现场：一类是请求已经登记，但下一轮traversal反复被 PreDraw取消；另一类是View/可见性/Surface生命周期已改变，根本没有进入能清理该flag的尾段。只看到 `D_arm`不能推导 `V_draw`。
 
-`updateResizingWindowIfNeeded()`发现orientation changing或drag-resizing状态变化时，会把窗口draw state重新设为 `DRAW_PENDING`并清Activity `allDrawn`。
+## 7. 硬件路径用异步callback结根债；callback不是GPU或present fence
 
-系统要等App按新几何重绘后再解除冻结或完成resize，不能沿用旧尺寸Buffer的完成状态。
+进入 `performDraw()`后，代码先把当前值捕获到局部 `reportNextDraw`。后续异步callback据此决定是否调用 `pendingDrawFinished()`，不会再读取届时的全局boolean；但真正递减的仍是无generation的总余额，所以这个局部值也不能标识某一笔具体债。
 
-## 27. BLAST_SYNC结果也会触发reportNextDraw
+ThreadedRenderer启用时，只要本轮含BLAST sync、frame-commit callback或report需求，就安装 frame-complete callback。正常report路线的顺序是：
 
-ViewRootImpl看到 `RELAYOUT_RES_BLAST_SYNC`时同时执行：
+```text
+UI线程设置callback
+→ ThreadedRenderer.draw把工作交给RenderThread
+→ CanvasContext draw/swap
+→ RenderThread侧Java callback
+→ finishBLASTSync
+→ UI Handler.postAtFrontOfQueue
+→ pendingDrawFinished
+```
+
+`postAtFrontOfQueue`不会中断当前正在执行的UI消息；它只让回调在能够再次取消息时优先。`performDraw()`尾部先把 `mReportNextDraw=false`，根债仍要等这个UI callback才真正归零。
+
+若 `draw()`返回不能使用异步回报，代码撤掉callback、执行 `finishBLASTSync(true)`；尾段只有在“根SurfaceHolder存在且根Surface有效”时才改走下一节的holder callback，否则用 `ThreadedRenderer.fence()`加同步收口并直接 `pendingDrawFinished()`。这里 `draw()`的boolean回答“能否走异步报告”，不是一张通用的“像素绘制成功证书”；软件绘制成功也返回false，Surface无效或硬件重建失败同样可落到非异步直接结债路径。
+
+HWUI自身进一步限制了callback语义：`CanvasContext`在swap后留下“是否应使用真正completion fence”的疑问；callback在 `didSwap`时触发，而通用的skip-empty-frame分支也会主动触发callback，避免等待者永远悬挂。`reportNextDraw`通常强制full redraw，所以固定首次路线不是空dirty分支；但callback这个机制本身仍不能升级成GPU fence、SF latch或HWC present。
+
+`DrawFrameTask`会先把callback移入`CanvasContext`。若本帧`canDrawThisFrame=false`，或真正draw后`didSwap=false`，本帧不会调用该callback；它可留到以后一次成功swap或空帧收口。RT callback本身与UI侧`ThreadedRenderer.draw()`何时返回没有通用先后，只有它投递的UI Runnable不能穿过当前仍在执行的traversal。
+
+## 8. WindowCallbacks、根SurfaceHolder与SurfaceView用三种方式加入等待
+
+“Decor draw结束”不是所有窗口内容都完成。r48另有三套协调：
+
+| 参与者 | 怎样加入 | 怎样释放 | 与根计数的关系 |
+|---|---|---|---|
+| `WindowCallbacks` | `requestDrawWindow()`按callback数创建 `CountDownLatch`并调用 `onRequestDraw` | callback调用 `reportDrawFinish()`做 `countDown` | 不直接增加 `mDrawsNeededToReport`；UI线程在结根债前阻塞等latch |
+| 根 `SurfaceHolder` 且根Surface有效 | ViewRoot自己不画Surface，创建 `SurfaceCallbackHelper` | helper完成计数达到expected后发 `MSG_DRAW_FINISHED` | 释放根请求原有的那笔债；Surface无效时不走helper |
+| 子 `SurfaceView` | 每次 `redrawNeeded`先 `viewRoot.drawPending()` | helper完成计数达到expected后经 `runOnUiThread()`条件调度，再调用 `viewRoot.pendingDrawFinished()` | 为每个待报告SurfaceView额外加债；Handler为空时可能当前线程内联 |
+
+`SurfaceCallbackHelper`对 `Callback2`调用 `surfaceRedrawNeededAsync(holder, drawingFinished)`；默认实现会同步调用旧 `surfaceRedrawNeeded()`再执行完成Runnable。不是 `Callback2`的项在这个helper里直接计为收齐；没有callback时也立即完成。
+
+WindowCallbacks的latch没有本地timeout。以DecorView为例，有BackdropFrameRenderer时把请求交给它；没有renderer且需要report时，attached状态下会立即 `reportDrawFinish()`。若某个参与者不按约定回调，UI可卡在 `await()`；若等待被interrupt，代码只记日志并继续。latch的完成接口既不校验参与者身份也没有generation token：同一参与者重复countDown可冒充另一参与者提前放行，迟到旧完成也可能命中新一轮latch。
+
+SurfaceView则维护自己的 `mPendingReportDraws`。完成Runnable可从任意线程到来，`onDrawFinished()`再调用 `runOnUiThread()`：Handler存在且当前Looper不同时才post，已经在同一Looper时内联，Handler为null时也在当前线程内联。因此正常attached路径通常回到UI Looper，detach后的迟到callback却没有这项线程保证。detach还会主动循环清空尚欠的本地report并偿还ViewRoot余额；所以即使`mReportNextDraw=false`，SurfaceView单独增加的债归零也能触发`finishDrawing()`，而且“detach收口”不代表新像素产生。
+
+`SurfaceCallbackHelper`没有timeout、callback身份去重、one-shot或generation保护：Callback2不执行完成Runnable会一直欠账，同步抛异常会中断收集；同一callback重复执行可能先替尚未完成者提前凑满计数，而计数达到expected后的每个后续完成又会再次执行最终Runnable。对根holder而言，后续重复的 `MSG_DRAW_FINISHED`若遇不到新债会触发unbalanced异常；若恰有新一代债，反而可能错误偿还新债。SurfaceView自己的多余完成在本地余额为零时会被挡住并记错误，但迟到旧callback若撞上新一代`mPendingReportDraws>0`，也可能误偿还新账。由此可见，`mDrawsNeededToReport==0`表示参与协议的回调已按算术收齐，不验证参与者身份、代际归属或每个生产者是否真的画了正确像素。
+
+## 9. reportDrawFinished跨的是同步AIDL边界，返回值却不给App成功证明
+
+余额归零后，ViewRoot调用：
 
 ```java
-reportNextDraw();
-setUseBLASTSyncTransaction();
-mSendNextFrameToWm = true;
+mWindowSession.finishDrawing(mWindow, mSurfaceChangedTransaction);
 ```
 
-这次报告还承担“将Buffer与几何事务捆在同一个同步边界”的职责。
+`IWindowSession`本身不是 oneway，`finishDrawing`也没有 oneway修饰。对普通跨进程 App，这是同步Binder调用；与之相反，WMS回调客户端的 `IWindow`整个接口是 oneway。system_server内的窗口客户端还可能走同进程本地调用，所以“必经Binder驱动线程切换”也不是普遍事实。
 
-## 28. setReportNextDraw是特殊系统接口
+同步只说明调用方等待服务端方法返回。接口返回 `void`，ViewRoot还吞掉 `RemoteException`；App既拿不到“WindowState是否仍存在”，也拿不到“draw state是否从DRAW_PENDING前进”的布尔确认。
 
-ViewRootImpl还提供隐藏方法 `setReportNextDraw()`，内部调用 `reportNextDraw()`并invalidate。
+`mSurfaceChangedTransaction`可携带客户端希望与draw完成同步的Surface变更。普通非BLAST首次finish时，WindowStateAnimator会把它merge到 `mPostDrawTransaction`，直到真正show时再并入WMS全局事务；若draw state已不是DRAW_PENDING，非空transaction反而会被直接 `apply()`，而五态保持不变。
 
-源码注释明确警告：它仅用于SystemUI/WMS在亮屏等场景等待下一帧，不是普通业务代码随意调用的性能标记API。
+WMS在服务端锁内调用 `requestTraversal()`后才结束这次调用；该请求可能与已有调度合并，也可能因layout defer只记为延迟请求，并不保证本次新投一个Handler消息。因此逻辑请求点 `Q_place < B_return`，但 `B_return`与AnimationThread真正处理placement没有通用先后：global lock释放后可以竞速。同步Binder返回更不能覆盖稍后的transaction apply、SF latch或present。
 
-## 29. stopped窗口为什么仍可能执行布局和绘制
+`doDie()`还有一条清理特例：移除ViewRoot前若最后一次relayout返回FIRST_TIME，会直接用null transaction调用 `finishDrawing`，避免服务端继续等一扇马上销毁的窗。这再次说明finish是协议收口，不等于新Buffer产生。
 
-许多Traversal条件写成：
+## 10. Session只转发；WMS在global lock里决定这次finish是否有效
 
-```java
-!mStopped || mReportNextDraw
+`Session.finishDrawing()`是薄入口，直接调用 `WindowManagerService.finishDrawingWindow()`。WMS先 `Binder.clearCallingIdentity()`，再在 `mGlobalLock`内按Session和 `IWindow`查 WindowState。
+
+| 服务端现场 | WMS结果 | App可见结果 |
+|---|---|---|
+| client已无对应WindowState | 查找返回null，什么也不推进 | 同步void仍正常返回 |
+| state正是DRAW_PENDING | `win.finishDrawing()`返回true | 请求wallpaper/layout/placement，void返回 |
+| state不是DRAW_PENDING | 常规状态不变；非空post transaction可能直接apply | void返回，无法区分重复/过期 |
+| BLAST sync活跃 | transaction先进入BLAST同步账，再尝试普通draw-state推进 | void返回，不代表sync listener已完成 |
+
+只有 `win.finishDrawing(...)`返回true时，WMS才根据wallpaper flag补layout change、调用 `setDisplayLayoutNeeded()`并 `requestTraversal()`。后者若发现 `mTraversalScheduled=true`就直接合并返回；否则先置scheduled，layout defer时增加延迟请求计数，未defer时才把 `mPerformSurfacePlacement`投到WMS AnimationThread。
+
+placement还可能被“正在layout”、等待configuration、display尚未ready等条件推迟。由此得到严格下界：有效finish最多在本次同步调用内证明 `W_commit`与 `Q_place`；无效finish连COMMIT都不能证明。
+
+WMS这里不读取BufferQueue的frame number是否已latch，也不等待present fence。它信任窗口协议，再把显示一致性交给后续状态、聚合与Surface事务。
+
+## 11. finishDrawingLocked只认DRAW_PENDING；重复回报仍可能处理transaction
+
+非BLAST窗口最终进入 `WindowStateAnimator.finishDrawingLocked()`。核心规则是：
+
+```text
+state == DRAW_PENDING
+  → state = COMMIT_DRAW_PENDING
+  → merge非空postDrawTransaction
+  → return true
+
+state != DRAW_PENDING
+  → draw state不变
+  → 非空postDrawTransaction立即apply
+  → return false
 ```
 
-如果WMS正在等待一笔draw报告，即使ViewRoot处于stopped状态，也必须允许这一轮推进，否则系统与客户端会互相等待。
+所以 `finishDrawing`不是“把任意状态推进一格”。WMS收到时若状态已不是DRAW_PENDING，重复callback、重新可见窗口的FIRST_TIME或普通迟到回报都不会推进五态；窗口已销毁且查找不到时同样被丢弃。但接口没有generation：旧callback若恰好撞上新一代DRAW_PENDING，服务端会把它当成当前有效finish并错误推进到COMMIT。
 
-## 30. display off为什么也有例外
+`COMMIT_DRAW_PENDING`之所以单列，是为了把“客户端报告已被WMS接受”和“WMS在统一placement事务中提交该报告”分开。它已经满足 `isDrawFinishedLw()`，却还不满足 `isDrawnLw()`。
 
-`performDraw()`通常在display state为OFF时早退，但条件同样保留：
+post-draw transaction也不能代替五态。首次有效finish的transaction可能一直留在 `mPostDrawTransaction`，直到Surface真正show；重复finish携带的新transaction则可立即apply，即使state不动。诊断“transaction已apply”与“Window已READY/HAS”必须取不同证据。
 
-```java
-if (displayOff && !mReportNextDraw) return;
+## 12. BLAST sync在五态旁边再开一套transaction完成账
+
+本章固定路线排除BLAST，但r48已经有可选同步支线。WMS在relayout结果加 `RELAYOUT_RES_BLAST_SYNC`后，ViewRoot会同时：
+
+```text
+reportNextDraw
+→ setUseBLASTSyncTransaction
+→ mSendNextFrameToWm = true
 ```
 
-已有待报告请求时不能单纯因为屏幕关闭就吞掉协议完成。
+下一帧由RenderThread使用 `mRtBLASTSyncTransaction`。frame-complete callback执行 `finishBLASTSync(!mSendNextFrameToWm)`：若这笔sync要回WMS，RT transaction会merge进 `mSurfaceChangedTransaction`，再随 `finishDrawing`送回；其他请求可以在客户端直接apply。
 
-## 31. PreDraw取消会发生什么
+服务端 `WindowState.finishDrawing()`若发现 `mUsingBLASTSyncTransaction`，先把post transaction merge进 `mBLASTSyncTransaction`，置 `mNotifyBlastOnSurfacePlacement=true`，然后仍调用 animator 的普通finish函数，但传null transaction。也就是说：
 
-如果 `OnPreDrawListener`返回取消且View仍可见，ViewRoot不会执行本轮 `performDraw()`，而是重新 `scheduleTraversals()`。
+- BLAST transaction ready与WindowState draw state是两本账；
+- state只有原本为DRAW_PENDING时才到COMMIT；
+- `notifyBlastSyncTransaction()`在 `prepareSurfaces()`阶段通知等待者，不是present通知；
+- view visibility变GONE、窗口remove或BLAST timeout会调用 `immediatelyNotifyBlastSync()`，用于防止同步集合永久等待，不证明新内容画出。
 
-`mReportNextDraw`仍保留，待下一轮真正允许draw时再完成，避免把未生产的帧报告给WMS。
+不能把BLAST timeout写成“强制窗口显示”，也不能把 `onTransactionReady`写成HWC完成。它只闭合一组待合并SurfaceControl transaction的协调协议。
 
-## 32. reportNextDraw会强制full redraw
+## 13. placement先把COMMIT变READY；普通Activity常需下一轮才能HAS
 
-```java
-final boolean fullRedrawNeeded =
-        mFullRedrawNeeded || mReportNextDraw;
-```
-
-当系统要求一次可确认的完整绘制时，不能只依赖一小块旧dirty区域恰好更新。
-
-## 33. performDraw先捕获原始report标志
-
-代码保存：
-
-```java
-boolean reportNextDraw = mReportNextDraw;
-```
-
-这是给异步FrameComplete callback使用的快照，避免回调晚到时误读后续另一轮请求的boolean。
-
-## 34. 硬件渲染为何优先异步报告
-
-有ThreadedRenderer且启用时，ViewRoot给HWUI设置 `FrameCompleteCallback`。
-
-UI线程提交DisplayList给RenderThread并不代表Buffer已经完成swap/queue；等RenderThread执行完本轮更符合“客户端完成draw”的协议意图。
-
-## 35. FrameCompleteCallback在哪个线程触发
-
-native `CanvasContext`在RenderThread绘制和swap路径调用callback，经JNI回Java。
-
-ViewRoot callback本身不直接操作UI状态，而是用Handler `postAtFrontOfQueue()`把 `pendingDrawFinished()`送回UI线程。
-
-## 36. postAtFrontOfQueue仍不是同步回调
-
-它提高完成消息在UI消息队列中的优先级，但不会跨越当前正在执行的UI消息。
-
-所以“RenderThread完成”与“App发出finishDrawing Binder调用”之间仍可有调度间隔。
-
-## 37. FrameComplete不等于GPU完成或物理显示
-
-r48 `CanvasContext`在swap路径后调用callback，同时源码附近仍有：
-
-```cpp
-// TODO: Use a fence for real completion?
-markFrameCompleted();
-```
-
-因此不能把这个名称扩张成GPU fence signal、SF latch、HWC present或面板scanout。
-
-## 38. skip empty frame也会触发FrameComplete
-
-如果dirty为空且允许跳过空帧，HWUI为了不让等待者永久挂住，会直接调用并清理FrameComplete callbacks。
-
-这进一步证明callback首先是一个软件协议完成点，不是“一定提交了新像素Buffer”的绝对保证。
-
-## 39. canUseAsync失败时怎样回退
-
-如果 `draw()`返回不能使用异步报告，ViewRoot清掉FrameComplete callback、结束相应BLAST sync处理，然后走后面的同步完成分支。
-
-这防止一笔pending被留给永远不会到来的异步callback。
-
-## 40. 软件渲染怎样报告完成
-
-没有异步硬件报告时，ViewRoot在draw返回后直接调用 `pendingDrawFinished()`。
-
-如果ThreadedRenderer对象存在但本轮未异步使用，还会先调用renderer `fence()`，收紧CPU继续前进与渲染工作之间的边界。
-
-## 41. SurfaceHolder窗口需要等外部回调
-
-如果根窗口本身通过 `SurfaceHolder`管理有效Surface，ViewRoot使用 `SurfaceCallbackHelper.dispatchSurfaceRedrawNeededAsync()`。
-
-只有所有SurfaceHolder callbacks调用完成runnable，才用 `MSG_DRAW_FINISHED`回到UI线程减账。
-
-## 42. SurfaceView会给根窗口额外加账
-
-`SurfaceView`需要redraw时执行：
-
-```java
-mPendingReportDraws++;
-viewRoot.drawPending();
-```
-
-SurfaceView的surface redraw callbacks全部完成后，才调用 `viewRoot.pendingDrawFinished()`。
-
-## 43. 为什么不能只等DecorView画完
-
-一个Activity视觉上可能由根窗口Buffer加一个或多个独立SurfaceView Layer共同组成，例如视频、相机预览或游戏画面。
-
-若根View一提交就报告完成，WMS可能show出一个背景已好但视频Layer尚空的组合画面。
-
-## 44. WindowCallbacks又是一套协调机制
-
-多线程窗口渲染路径可通过 `onContentDrawn()`和 `onRequestDraw()`参与绘制。
-
-ViewRoot创建 `CountDownLatch(mWindowCallbacks.size())`，各callback最终经 `reportDrawFinish()`倒数。
-
-## 45. CountDownLatch等待点需要谨慎理解
-
-当 `mReportNextDraw`仍为true时，`performDraw()`会等待 `mWindowDrawCountDown.await()`。
-
-这是客户端内部参与者的同步，并不是WMS全局锁等待；但错误实现的WindowCallback若不完成，仍可能卡住App UI线程。
-
-## 46. mReportNextDraw何时清零
-
-draw执行后，ViewRoot进入：
-
-```java
-if (mReportNextDraw) {
-    mReportNextDraw = false;
-    ...
-}
-```
-
-清boolean并不立刻代表Binder finishDrawing已发出；异步硬件、SurfaceHolder或SurfaceView仍可能持有pending计数。
-
-## 47. drawPending计数何时真正归零
-
-根请求、SurfaceView和其他异步redraw各自完成时调用 `pendingDrawFinished()`。
-
-只有最后一个参与者把 `mDrawsNeededToReport`减到0，才进入 `reportDrawFinished()`。
-
-## 48. reportDrawFinished是真正的App→WMS边界
-
-```java
-mWindowSession.finishDrawing(
-        mWindow, mSurfaceChangedTransaction);
-```
-
-`mWindow`是IWindow客户端token，WMS用它在当前Session中找到准确的WindowState。
-
-## 49. finishDrawing是oneway吗
-
-r48的AIDL声明是普通返回void的方法，没有 `oneway`关键字。
-
-因此App Binder调用会等待system_server执行该事务并返回；但返回只表示WMS处理完这次Binder调用，不表示后续SurfacePlacement、SF合成或硬件present完成。
-
-## 50. RemoteException为什么被忽略
-
-ViewRoot捕获RemoteException后不再补救，因为WMS Binder服务若已失效，单个窗口的draw完成报告也失去正常接收者。
-
-这不是“finishDrawing绝不会失败”，只是Framework在系统服务异常场景下没有可恢复的普通窗口协议。
-
-## 51. mSurfaceChangedTransaction有什么作用
-
-Surface创建或替换回调可把相关 `SurfaceControl.Transaction`变化写入这笔事务。
-
-App将它和finishDrawing一起交给WMS，目的是让“新内容完成”与相关Surface变化在WMS选择的事务时机合并，而不是随意提前apply。
-
-## 52. Session只是薄Binder入口
-
-`Session.finishDrawing()`几乎只做一件事：
-
-```java
-mService.finishDrawingWindow(this, window,
-        postDrawTransaction);
-```
-
-真正的校验、状态更新和布局请求都在WMS及WindowState中。
-
-## 53. WMS为什么clearCallingIdentity
-
-`finishDrawingWindow()`先保存并清除Binder调用者身份，最后恢复。
-
-随后WMS执行布局和系统内部逻辑时使用system_server身份，避免把App uid意外带进系统内部调用链。
-
-## 54. WMS如何找窗口
-
-```java
-windowForClientLocked(session, client, false)
-```
-
-同时使用Session和IWindow客户端标识找WindowState，避免另一个Session拿任意IWindow引用修改不属于它的窗口状态。
-
-## 55. 窗口已移除时怎样处理
-
-若找不到WindowState，`finishDrawingWindow()`什么也不推进。
-
-这允许迟到的FrameComplete或Surface redraw callback安全落地：窗口生命周期已经结束时，旧完成报告不会复活窗口。
-
-## 56. WMS状态修改运行在哪个锁内
-
-窗口查找、`win.finishDrawing()`、wallpaper/layout标志与requestTraversal都在 `mGlobalLock`内完成。
-
-App侧渲染不持这把锁；Binder进入后才对WMS全局窗口账本做短小、串行更新。
-
-## 57. WindowState.finishDrawing先处理BLAST分支
-
-非BLAST sync时直接调用：
-
-```java
-mWinAnimator.finishDrawingLocked(postDrawTransaction)
-```
-
-使用BLAST sync时先把客户端事务merge进 `mBLASTSyncTransaction`，标记稍后在SurfacePlacement通知，再以null推进传统draw state。
-
-## 58. DRAW_PENDING怎样变成COMMIT_DRAW_PENDING
-
-`finishDrawingLocked()`只在当前状态恰好是 `DRAW_PENDING`时执行：
-
-```java
-mDrawState = COMMIT_DRAW_PENDING;
-layoutNeeded = true;
-```
-
-并把非null postDrawTransaction merge进WMS保存的post-draw事务。
-
-## 59. 为什么finishDrawing不直接改HAS_DRAWN
-
-WMS还需要在统一SurfacePlacement事务里检查Activity是否allDrawn、窗口是否ready for display、AppTransition是否正在等待，以及policy visibility、父窗口、销毁状态等条件。
-
-客户端只负责报告自己的绘制，不应单方面决定系统窗口何时露出。
-
-## 60. 重复finishDrawing怎样处理
-
-如果状态已不再是 `DRAW_PENDING`，第二次finishDrawing不会重复推进状态。
-
-但传入的postDrawTransaction不能一直滞留；源码选择立即 `apply()`，避免把不属于当前pending draw代际的事务拖到未知未来。
-
-## 61. finishDrawing返回true代表什么
-
-返回值只是 `layoutNeeded`：本次确实把 `DRAW_PENDING`推进到 `COMMIT_DRAW_PENDING`，需要安排SurfacePlacement。
-
-它不表示窗口已经show，也不作为App侧API返回值暴露。
-
-## 62. wallpaper窗口为什么附带layout change
-
-若完成绘制的窗口带 `FLAG_SHOW_WALLPAPER`，WMS设置 `FINISH_LAYOUT_REDO_WALLPAPER`。
-
-窗口内容可改变wallpaper target与可见关系，因此不能只更新自身Surface。
-
-## 63. requestTraversal怎样继续状态机
-
-WMS标记display layout needed并调用 `mWindowPlacerLocked.requestTraversal()`。
-
-这会安排后续统一的SurfacePlacement，而不是在当前App Binder调用栈里深度完成所有窗口布局与Surface提交。
-
-## 64. App拿到finishDrawing返回时到了哪一步
-
-正常首次路径中，至少WMS已经记录 `COMMIT_DRAW_PENDING`并安排Traversal。
-
-但后续 `commitFinishDrawingLocked()`通常还没执行，因此此时甚至不一定已经是READY_TO_SHOW。
-
-## 65. SurfacePlacement在哪推进COMMIT状态
-
-`DisplayContent.applySurfaceChangesTransaction()`逐窗口处理；有Surface时调用：
+有效finish请求placement后，DisplayContent遍历有Surface的窗口并调用：
 
 ```java
 winAnimator.commitFinishDrawingLocked();
+activity.updateDrawnWindowStates(w);
 ```
 
-这发生在WMS组织显示事务的统一阶段。
-
-## 66. commitFinishDrawingLocked接受哪两个状态
-
-只有当前是 `COMMIT_DRAW_PENDING`或 `READY_TO_SHOW`才继续。
-
-允许READY再次进入，是因为窗口可能上一轮已经ready，但Activity整体或Transition条件当时还不允许show。
-
-## 67. COMMIT怎样变成READY
-
-方法先无条件把符合条件的状态写成：
+`commitFinishDrawingLocked()`接受 COMMIT_DRAW_PENDING或READY_TO_SHOW，先统一写READY。无Activity的窗口可以立即尝试 `performShowLocked()`；starting window也被特判立即尝试。普通Activity窗口则必须先满足：
 
 ```java
-mDrawState = READY_TO_SHOW;
+activity.canShowWindows()
+    == allDrawn
+       && !(isAnimating(PARENTS)
+            && hasNonDefaultColorWindow());
 ```
 
-然后再判断Activity及窗口显示条件，决定是否调用 `performShowLocked()`。
+在 `L_normal`的首轮placement里，`allDrawn`起初通常为false，所以主窗先停在READY；紧接着 `updateDrawnWindowStates()`把READY视为 `isDrawnLw()`并计入真实窗口。遍历结束后，`updateAllDrawn()`还要求`numInteresting>0`、所有相关子窗都已被评估、`numDrawn>=numInteresting`且`!isRelaunching()`，才置 `allDrawn=true`并要求额外layout pass。下一轮 `commitFinishDrawingLocked()`再次处理READY，才有机会进入HAS。
 
-## 68. Activity窗口为什么不能各自随到随show
+这不是所有窗口的绝对两轮定律：Activity可能已有满足的聚合状态，starting/non-Activity有特例，多窗口加入顺序、relaunch、freezing、transition与layout循环也会改变轮次。可证的是职责顺序：单窗READY先成为Activity计数输入，Activity聚合结果再反过来开放普通窗口show。
 
-对普通Activity窗口，条件是：
+`COMMIT_DRAW_PENDING`若placement尚未执行会停留；`READY_TO_SHOW`若Activity聚合、广色域transition或后续可见性门不满足也会停留。下一章专门展开聚合字段与启动回调，本章只把它作为单窗五态之外的一道门。
 
-```java
-activity == null
-        || activity.canShowWindows()
-        || type == TYPE_APPLICATION_STARTING
-```
+## 14. HAS_DRAWN仍早于实际show；四个drawn谓词也不是同义词
 
-`activity.canShowWindows()`通常要求 `allDrawn`，这样同一个Activity的一组重要窗口可以在统一时机显示。
+`WindowState.performShowLocked()`的顺序很容易被方法名误导：
 
-## 69. Starting Window为什么例外
+1. 先检查 `showToCurrentUser()`；
+2. READY/HAS且属于Activity时，真实窗先调用 `onFirstWindowDrawn()`，starting窗调用 `onStartingWindowDrawn()`；
+3. 再要求状态正是READY且 `isReadyForDisplay()`为true；
+4. 应用enter animation，把状态置HAS_DRAWN并 `scheduleAnimationLocked()`；
+5. 后续 `prepareSurfaceLocked()`才尝试 `showSurfaceRobustlyLocked()`并合并post-draw transaction。
 
-`TYPE_APPLICATION_STARTING`不等待真实Activity所有窗口allDrawn。
+`isReadyForDisplay()`还检查waiting-to-show transition、parent/client/token visibility、policy visibility、Surface存在、未destroy，以及动画兜底。即使状态已READY，它仍可能返回false。
 
-它存在的目的就是尽快遮住启动空档；若也等待真实窗口集合完成，就失去preview价值。
+HAS也不保证 `showSurfaceRobustlyLocked()`成功。`performShowLocked()`先写HAS；稍后的show失败时 `mLastHidden`仍可保留，后续prepare再重试。因此用dump看到HAS最多证明WMS状态机已越过show门，不能证明SurfaceController shown，更不能证明SF/HWC结果。
 
-## 70. canShowWindows还考虑广色域过渡
+四个相似谓词的口径是：
 
-r48实现要求 `allDrawn`，并在父级正做Transition动画且存在非默认color mode窗口时暂缓。
+| 谓词 | r48状态要求 | 还叠加的主要条件 |
+|---|---|---|
+| `isDrawFinishedLw()` | COMMIT、READY或HAS | 有Surface且未destroy |
+| `isDrawnLw()` | READY或HAS | 有Surface且未destroy |
+| `hasDrawnLw()` | 仅HAS | 不额外验证shown/present |
+| `isDisplayedLw()` | 先满足 `isDrawnLw()` | policy、parent、Activity requested visibility或animation |
 
-源码注释说明这是为了避免过渡中途切换wide-color-gamut显示配置产生卡顿。
+尤其 `isDisplayedLw()`允许READY，因此名字里的displayed也不是SurfaceController show回执。定位故障时可按第一处停点分类：
 
-## 71. allDrawn不是“所有WindowState无条件全算”
+| 现场 | 首要怀疑 | 不能直接下的结论 |
+|---|---|---|
+| 长停DRAW_PENDING | report未到、PreDraw/参与者债未闭合、client消息丢失 | App一定没有queue任何Buffer |
+| 长停COMMIT | placement被defer/配置门阻塞，或现场截在调度间隙 | finish没有进入WMS |
+| 长停READY | Activity/allDrawn、transition、visibility或policy门 | Buffer没有生产 |
+| HAS但Surface仍hidden | prepare/show失败或尚未处理transaction | present已经完成 |
+| show与Buffer均有证据仍黑 | SF latch、composition、secure/alpha/z-order、HWC/present链 | 应回头重复调用finish |
 
-ActivityRecord按 `mightAffectAllDrawn()`、`isInteresting()`、可见性、freezing、destroying等条件选择窗口。
+真正的可见汇合是两条支路：`Q_buf → F_latch`提供内容，`W_has → X_show`提供显示状态；它们在SF合成中汇合后才可能到 `P_real`。任一Java字段都不能独自替代这个join。
 
-starting window单独记录 `startingDisplayed`，不计入真实Activity interesting window完成数。
+## 15. 九组 macOS 只读源码练习
 
-## 72. 主窗口怎样成为interesting基线
+以下命令从AOSP根目录执行，只读文件，不要求编译或设备。每个 `rg -e`备选都应独立命中；行号只负责定位，真实顺序要按调用关系重建。
 
-每个WMS transaction sequence首次统计时，若找到不含starting的main window，`mNumInterestingWindows`先置为1。
-
-其他满足条件的非主窗口再累加；drawn数达到interesting数且所有子窗口都已评估，Activity才可 `allDrawn=true`。
-
-## 73. READY_TO_SHOW为何可能停留多轮
-
-第一个真实Window finishDrawing后可以先到READY，但Activity还有另一个interesting窗口未drawn。
-
-下一轮SurfacePlacement仍会调用commit方法；直到 `allDrawn`或其他门满足，才真正performShow。
-
-## 74. updateAllDrawn为什么再请求一次layout
-
-Activity从not-all-drawn变成allDrawn时会 `setLayoutNeeded()`。
-
-源码注释直接说明：强制再来一轮layout，让先前停在READY_TO_SHOW的窗口再次进入 `commitFinishDrawingLocked()`并调用show。
-
-## 75. checkAppWindowsReadyToShow又做什么
-
-Activity检测allDrawn变化；旋转冻结场景会show all并结束freeze，普通场景设置动画layout change。
-
-如果Activity不在opening apps且已允许显示，会直接遍历 `showAllWindowsLocked()`。
-
-## 76. AppTransition如何延迟窗口出现
-
-`WindowState.isReadyForDisplay()`开头检查：token正在waitingToShow且AppTransition已设置时返回false。
-
-因此即使单窗READY、Activity allDrawn，窗口仍可等待过渡统一启动。
-
-## 77. isReadyForDisplay还有哪些门
-
-窗口必须有Surface、policy允许可见、未destroying，父窗口和客户端可见；或者当前正通过Transition/父级动画维持可见语义。
-
-draw完成只是众多显示条件之一。
-
-## 78. performShowLocked先做哪件容易忽略的事
-
-方法在真正检查READY之前，如果当前状态已经是HAS_DRAWN或READY且属于Activity，会回调：
-
-- 普通真实窗口：`ActivityRecord.onFirstWindowDrawn()`；
-- starting window：`ActivityRecord.onStartingWindowDrawn()`。
-
-随后才检查是否能从READY实际show。
-
-## 79. onFirstWindowDrawn为何可能早于SurfaceControl show提交
-
-它绑定的是WMS `performShowLocked()`流程，不是SF present回调。
-
-此处会标记 `firstWindowDrawn=true`、移除starting window并更新reported visibility，所以“首真实窗口交接”仍属于WMS事务组织阶段。
-
-## 80. performShowLocked怎样进入HAS_DRAWN
-
-满足 `READY_TO_SHOW && isReadyForDisplay()`后，WMS应用enter animation，强制下次surface prepare更新alpha，并写：
-
-```java
-mWinAnimator.mDrawState = HAS_DRAWN;
-mWmService.scheduleAnimationLocked();
-```
-
-## 81. HAS_DRAWN后为何Surface仍可能尚未show
-
-实际 `SurfaceControl.show()`在 `WindowStateAnimator.prepareSurfaceLocked()`看到 `mDrawState == HAS_DRAWN`且 `mLastHidden`时执行。
-
-也就是说draw state改变与show命令组织虽相邻，源码仍把它们拆成独立步骤。
-
-## 82. showSurfaceRobustlyLocked成功后发生什么
-
-WMS清 `mLastHidden`，处理保留Surface、替换窗口与wallpaper可见性，并把相关Transaction交给SurfaceFlinger。
-
-SF随后还要按VSync应用事务、latch Buffer、选择合成路径并present。
-
-## 83. isDrawFinishedLw与isDrawnLw并不相同
-
-`isDrawFinishedLw()`接受：
-
-```text
-COMMIT_DRAW_PENDING / READY_TO_SHOW / HAS_DRAWN
-```
-
-`isDrawnLw()`只接受：
-
-```text
-READY_TO_SHOW / HAS_DRAWN
-```
-
-所以收到finishDrawing后、SurfacePlacement提交前，窗口是draw-finished但还不算WMS drawn。
-
-## 84. hasDrawnLw更加严格
-
-`hasDrawnLw()`只检查 `mDrawState == HAS_DRAWN`。
-
-命名相似的方法实际用于不同决策；阅读调用者时必须核对具体谓词，不能凭中文“画完”互换。
-
-## 85. isDisplayedLw还叠加可见性
-
-它要求 `isDrawnLw()`、policy visibility、父窗口可见或动画条件等。
-
-因此 `HAS_DRAWN`只是draw state维度；窗口可能因policy、用户、父层级或动画仍不构成当前displayed窗口。
-
-## 86. Activity reportedDrawn怎样计算
-
-`updateReportedVisibilityLocked()`遍历非starting、可见且未destroying的窗口，统计interesting与drawn。
-
-drawn数达到interesting数后调用 `onWindowsDrawn(true, elapsedRealtimeNanos())`，进而通知ActivityMetricsLogger和等待启动的调用方。
-
-## 87. starting window不会让Activity reportedDrawn提前完成
-
-`WindowState.updateReportedVisibility()`明确跳过 `TYPE_APPLICATION_STARTING`。
-
-所以启动Splash已经显示可以让Transition先ready，却不会被当成真实Activity的windows drawn完成。
-
-## 88. startingDisplayed在哪里置true
-
-ActivityRecord的drawn状态统计发现当前窗口正是startingWindow且 `isDrawnLw()`时，通知starting-window metric并设 `startingDisplayed=true`。
-
-这至少要等starting窗口到READY/HAS_DRAWN，不是StartingData创建或addWindow成功就置true。
-
-## 89. firstWindowDrawn与reportedDrawn的差别
-
-`firstWindowDrawn`在第一个真实窗口走 `performShowLocked()`时即可置true，并触发starting window交接。
-
-`reportedDrawn`要求Activity统计范围内的interesting窗口整体满足，因此有多个窗口时二者可不同时发生。
-
-## 90. allDrawn与reportedDrawn也不完全相同
-
-`allDrawn`服务于WMS何时允许Activity窗口成组show；`reportedDrawn`来自reported visibility统计并向启动度量/等待者报告。
-
-二者都依赖窗口draw状态，但统计函数、历史保持规则和消费者不同。
-
-## 91. r48 BLAST sync试图解决什么
-
-resize时若Buffer尺寸内容和Surface位置/裁剪分两笔事务到达，用户可能看到一帧错位。
-
-BLAST sync把RenderThread产生的Buffer事务导向 `mRtBLASTSyncTransaction`，再随finishDrawing交给WMS的同步事务集合。
-
-## 92. ViewRoot的两阶段BLAST boolean为何必要
-
-源码注释给出竞态：第一轮draw在等callback时，第二轮又设置sync请求；若只用一个boolean，第一轮callback可能清掉第二轮请求。
-
-因此 `mNextDrawUseBLASTSyncTransaction`由performDraw消费，`mNextReportConsumeBLAST`由finish callback消费。
-
-## 93. mSendNextFrameToWm区分哪两类sync
-
-它标记这次BLAST sync由WMS请求。
-
-若只是SurfaceView等App内部sync，应由App apply；若WMS请求，ViewRoot把RenderThread事务merge到 `mSurfaceChangedTransaction`，通过finishDrawing交给WMS。
-
-## 94. WMS何时通知BLAST事务ready
-
-WindowState在 `prepareSurfaces()`中调用 `notifyBlastSyncTransaction()`。
-
-如果本层还有children sync set，先setReady等待集合；没有本地集合时直接回调waiting listener，仍由同步框架决定整组事务何时ready。
-
-## 95. BLAST timeout意味着什么
-
-WMS启动WindowState BLAST sync时会设置超时消息，避免客户端永不finishDrawing导致整组WindowOrganizer事务无限等待。
-
-超时是协议逃生通道，不意味着没按时完成的内容突然变成正确或已经显示。
-
-## 96. doDie里的特殊finishDrawing
-
-ViewRoot销毁时若最后一次relayout返回FIRST_TIME，会直接调用 `finishDrawing(window, null)`，再销毁Surface。
-
-这是避免WMS永久等一笔已不可能正常绘制的报告；不能把它解释成窗口临死前真的生产了完整新帧。
-
-## 97. 常见误解一：finishDrawing等于onDraw返回
-
-不等。View.onDraw只是在UI线程录制或软件绘制的一环；硬件路径还要等RenderThread，SurfaceView等参与者还要各自完成，最后才跨Binder报告。
-
-## 98. 常见误解二：finishDrawing返回等于屏幕出现
-
-不等。它通常只推进到COMMIT_DRAW_PENDING，后面还有SurfacePlacement、Activity整体门、Transition、SurfaceControl show、SF latch/compose和HWC present。
-
-## 99. 常见误解三：HAS_DRAWN就是present fence signal
-
-不等。HAS_DRAWN在system_server的 `performShowLocked()`中写入；它不是SurfaceFlinger从HWC得到的present fence状态。
-
-## 100. 常见误解四：每次invalidate都调用finishDrawing
-
-不对。普通动画或invalidate可以持续提交Buffer，但只有WMS/系统明确要求report next draw的轮次才走这套完成报告协议。
-
-## 101. 常见误解五：一个Activity只有一个待绘制对象
-
-不对。Activity可能有主窗口、附属窗口、SurfaceView、WindowCallbacks；WMS和ViewRoot分别用interesting计数、pending report计数协调不同层级的参与者。
-
-## 102. 常见误解六：READY_TO_SHOW一定下一行就HAS_DRAWN
-
-不对。Activity allDrawn、wide-color transition、waitingToShow、policy visibility、父窗口和用户显示条件都可能让窗口停留READY多轮。
-
-## 103. 故障推理：长时间停在DRAW_PENDING
-
-优先检查App是否收到FIRST_TIME或 `MSG_RESIZED_REPORT`、Traversal是否被不断PreDraw取消、UI/RenderThread是否卡住、SurfaceView callback是否忘记完成。
-
-此时根因通常还在客户端未发出有效finishDrawing，不能先归咎于SF合成。
-
-## 104. 故障推理：长时间停在COMMIT_DRAW_PENDING
-
-说明WMS已收到客户端报告，却没完成下一次SurfacePlacement提交。
-
-检查WMS traversal是否被安排、全局锁/WindowPlacer是否阻塞，以及窗口是否仍有Surface；这与App业务onDraw慢已经不是同一层。
-
-## 105. 故障推理：长时间停在READY_TO_SHOW
-
-检查Activity `allDrawn`、interesting窗口数、opening apps/AppTransition、`waitingToShow`、policy/parent visibility、destroying和wide-color transition条件。
-
-此时客户端单窗内容已被WMS视为drawn，但系统还在等“可以整组露出”的条件。
-
-## 106. 故障推理：HAS_DRAWN但用户仍说黑屏
-
-继续向下检查SurfaceControl是否真正show、alpha/crop/layer、SF是否latch到目标Buffer、CLIENT/DEVICE合成、acquire/present fence、物理Display与遮挡Layer。
-
-HAS_DRAWN只能帮你排除一部分App→WMS draw协议问题，不能终止图形链诊断。
-
-## 107. macOS只读练习一：手抄五态转换
+### 练习 1：确认隐藏Surface与五态初始值
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '175,205p' \
-  frameworks/base/services/core/java/com/android/server/wm/WindowStateAnimator.java
+test -f frameworks/base/services/core/java/com/android/server/wm/WindowStateAnimator.java
+rg -n -F -e 'static final int NO_SURFACE = 0' -e 'static final int DRAW_PENDING = 1' -e 'static final int COMMIT_DRAW_PENDING = 2' -e 'static final int READY_TO_SHOW = 3' -e 'static final int HAS_DRAWN = 4' -e 'void resetDrawState()' -e 'mDrawState = DRAW_PENDING;' -e 'int flags = SurfaceControl.HIDDEN;' -e 'mDrawState = NO_SURFACE;' frameworks/base/services/core/java/com/android/server/wm/WindowStateAnimator.java
 ```
 
-为每个状态写下“谁写入、进入条件、下一消费者”，尤其比较COMMIT和READY。
+回答：state存在哪个进程？创建失败后为何不能保留DRAW_PENDING？HIDDEN把“可画”与“可见”分开到哪一层？
 
-## 108. macOS只读练习二：追App报告链
+### 练习 2：列出四种report需求并区分线程
 
 ```bash
-cd /Users/ninebot/androidSource
-rg -n 'reportNextDraw|drawPending|pendingDrawFinished|reportDrawFinished|finishDrawing' \
-  frameworks/base/core/java/android/view/ViewRootImpl.java \
-  frameworks/base/core/java/android/view/SurfaceView.java
+test -f frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+rg -n -F -e '!wasVisible || !isDrawnLw()' -e 'RELAYOUT_RES_FIRST_TIME' -e 'mWinAnimator.mDrawState == DRAW_PENDING || useBLASTSync()' -e 'mClient.resized' -e 'mRedrawForSyncReported = true' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+rg -n -F -e 'RELAYOUT_RES_BLAST_SYNC' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+rg -n -F -e 'MSG_RESIZED_REPORT' -e 'RELAYOUT_RES_FIRST_TIME' -e 'RELAYOUT_RES_BLAST_SYNC' -e 'private void reportNextDraw()' -e 'public void setReportNextDraw()' frameworks/base/core/java/android/view/ViewRootImpl.java
 ```
 
-画出根窗口、SurfaceView、RenderThread callback三者如何共同把计数减到0。
+回答：FIRST_TIME为何不是对象一生一次？`resized`在哪个线程接收、在哪个线程置flag？哪些来源不要求state恰为DRAW_PENDING？
 
-## 109. macOS只读练习三：追WMS状态推进
+### 练习 3：验证boolean门与计数债的不同
 
 ```bash
-cd /Users/ninebot/androidSource
-rg -n 'finishDrawingWindow|finishDrawingLocked|commitFinishDrawingLocked|performShowLocked' \
-  frameworks/base/services/core/java/com/android/server/wm
+test -f frameworks/base/core/java/android/view/ViewRootImpl.java
+rg -n -F -e 'boolean mReportNextDraw;' -e 'int mDrawsNeededToReport = 0;' -e 'void drawPending()' -e 'mDrawsNeededToReport++;' -e 'void pendingDrawFinished()' -e 'Unbalanced drawPending/pendingDrawFinished calls' -e 'mDrawsNeededToReport--;' -e 'reportDrawFinished();' frameworks/base/core/java/android/view/ViewRootImpl.java
 ```
 
-逐个标注所在类、是否持WMS全局锁、是否处于Surface transaction和返回值真实含义。
+回答：重复 `reportNextDraw`何时合并？SurfaceView增加的是flag还是余额？多结和少结分别怎样表现？
 
-## 110. macOS只读练习四：比较三个drawn谓词
+### 练习 4：追PreDraw、full redraw与硬件异步回报
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '1875,1910p' \
-  frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+test -f frameworks/base/core/java/android/view/ViewRootImpl.java
+rg -n -F -e '!mStopped || mReportNextDraw' -e 'dispatchOnPreDraw() || !isViewVisible' -e 'mFullRedrawNeeded || mReportNextDraw' -e 'boolean reportNextDraw = mReportNextDraw' -e 'needFrameCompleteCallback' -e 'setFrameCompleteCallback' -e 'handler.postAtFrontOfQueue' -e 'setFrameCompleteCallback(null)' -e 'mAttachInfo.mThreadedRenderer.fence()' frameworks/base/core/java/android/view/ViewRootImpl.java
+rg -n -F -e 'Properties::skipEmptyFrames' -e 'Use a fence for real completion?' -e 'if (didSwap)' frameworks/base/libs/hwui/renderthread/CanvasContext.cpp
 ```
 
-自己列一张表，对比 `isDrawFinishedLw()`、`isDrawnLw()`、`hasDrawnLw()`分别接受哪些状态，再各找一个调用者。
+回答：PreDraw取消为何保留债？callback从哪条线程回到UI？为何frame-complete不是present fence？
 
-## 111. 源码导航：App端
+### 练习 5：核对三类额外参与者怎样结账
+
+```bash
+test -f frameworks/base/core/java/android/view/SurfaceView.java
+rg -n -F -e 'mPendingReportDraws++;' -e 'viewRoot.drawPending();' -e 'viewRoot.pendingDrawFinished();' -e 'runOnUiThread(this::performDrawFinished)' frameworks/base/core/java/android/view/SurfaceView.java
+rg -n -F -e 'mWindowDrawCountDown = new CountDownLatch' -e 'onRequestDraw(mReportNextDraw)' -e 'mWindowDrawCountDown.await()' -e 'reportDrawFinish()' frameworks/base/core/java/android/view/ViewRootImpl.java
+rg -n -F -e 'mFinishDrawingExpected = callbacks.length' -e 'surfaceRedrawNeededAsync' -e 'mRunnable.run();' frameworks/base/core/java/com/android/internal/view/SurfaceCallbackHelper.java
+```
+
+回答：WindowCallbacks为何不直接加根计数？Callback2遗漏完成Runnable会卡哪一层？根SurfaceHolder与子SurfaceView各结哪笔债？
+
+### 练习 6：证明resized是oneway而finishDrawing是同步void
+
+```bash
+test -f frameworks/base/core/java/android/view/IWindowSession.aidl
+rg -n -F -e 'oneway interface IWindow' -e 'void resized' frameworks/base/core/java/android/view/IWindow.aidl
+rg -n -F -e 'void finishDrawing(IWindow window' -e 'postDrawTransaction' frameworks/base/core/java/android/view/IWindowSession.aidl
+rg -n -F -e 'mWindowSession.finishDrawing' -e 'catch (RemoteException e)' -e 'mSurfaceChangedTransaction' frameworks/base/core/java/android/view/ViewRootImpl.java
+rg -n -F -e 'public void finishDrawing' -e 'mService.finishDrawingWindow' frameworks/base/services/core/java/com/android/server/wm/Session.java
+```
+
+回答：普通App在哪个方向等待Binder reply？void返回为何不证明WindowState仍存在？system_server本地窗口为何未必切驱动线程？
+
+### 练习 7：手推WMS接纳、重复finish与post transaction
+
+```bash
+test -f frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+rg -n -F -e 'void finishDrawingWindow' -e 'Binder.clearCallingIdentity()' -e 'windowForClientLocked(session, client, false)' -e 'win.finishDrawing(postDrawTransaction)' -e 'win.setDisplayLayoutNeeded()' -e 'mWindowPlacerLocked.requestTraversal()' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+rg -n -F -e 'if (mDrawState == DRAW_PENDING)' -e 'mDrawState = COMMIT_DRAW_PENDING;' -e 'mPostDrawTransaction.merge' -e 'postDrawTransaction.apply();' -e 'return layoutNeeded;' frameworks/base/services/core/java/com/android/server/wm/WindowStateAnimator.java
+```
+
+回答：哪种finish才调用 `requestTraversal()`请求placement？重复finish携带transaction时哪本账变、哪本账不变？App怎样区分这些结果？
+
+### 练习 8：从placement追到READY、Activity门与真实show
+
+```bash
+test -f frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+rg -n -F -e 'commitFinishDrawingLocked()' -e 'activity.updateDrawnWindowStates(w)' -e 'activity.updateAllDrawn()' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+rg -n -F -e 'boolean canShowWindows()' -e 'allDrawn &&' -e 'mDisplayContent.setLayoutNeeded()' frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F -e 'boolean performShowLocked()' -e 'onFirstWindowDrawn' -e '!isReadyForDisplay()' -e 'mDrawState = HAS_DRAWN' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+rg -n -F -e 'showSurfaceRobustlyLocked()' -e 'mergeToGlobalTransaction(mPostDrawTransaction)' frameworks/base/services/core/java/com/android/server/wm/WindowStateAnimator.java
+```
+
+回答：普通首窗为何常先停READY？`onFirstWindowDrawn`为何早于真正show尝试？HAS后还有哪两级证据才到present？
+
+### 练习 9：比较四个谓词并闭合BLAST逃生路径
+
+```bash
+test -f frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+rg -n -F -e 'boolean isReadyForDisplay()' -e 'public boolean isDisplayedLw()' -e 'public boolean isDrawFinishedLw()' -e 'public boolean isDrawnLw()' -e 'public boolean hasDrawnLw()' -e 'mUsingBLASTSyncTransaction' -e 'mNotifyBlastOnSurfacePlacement = true' -e 'void immediatelyNotifyBlastSync()' -e 'mWmService.mH.sendNewMessageDelayed' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+rg -n -F -e 'WINDOW_STATE_BLAST_SYNC_TIMEOUT' -e 'ws.immediatelyNotifyBlastSync()' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+```
+
+回答：COMMIT、READY、HAS分别让哪些谓词为true？`isDisplayedLw`为何可早于show？BLAST timeout关闭的是哪本账？
+
+## 16. 用“债—状态—聚合—事务—物理”五问收口，并把下一章边界留清
+
+先记住八条不变量：
+
+1. `reportNextDraw`第一次只增加一笔根债；重复flag会合并，SurfaceView等参与者才能继续增加余额。
+2. report需求有FIRST_TIME、resized、BLAST与显式接口四个来源；它们都不保证WMS当时恰为DRAW_PENDING。
+3. PreDraw取消时债可保留；stopped与display-off在有report时可被穿透，不可见窗口仍不会强画。
+4. 硬件frame-complete callback在report分支可经RenderThread到UI结清客户端债，同一callback还可处理BLAST sync与captured frame-commit callbacks；这些用途都不是GPU/SF/HWC fence。
+5. 普通跨进程 `finishDrawing`是同步void AIDL；有效调用只把DRAW_PENDING推进到COMMIT并请求或登记placement，App拿不到成功位。
+6. placement把COMMIT变READY；普通Activity还要经过 `allDrawn`、transition与visibility门，READY可停多轮。
+7. `performShowLocked`先写HAS，`prepareSurfaceLocked`才真正尝试show；show成功也只是Surface transaction证据。
+8. 内容支路 `Q_buf → F_latch` 与显示支路 `W_has → X_show`必须在SF汇合，可靠present证据不能由任何Java draw字段代替。
+
+现场诊断按五问推进：
 
 ```text
-frameworks/base/core/java/android/view/ViewRootImpl.java
-frameworks/base/core/java/android/view/SurfaceView.java
-frameworks/base/core/java/com/android/internal/view/SurfaceCallbackHelper.java
-frameworks/base/core/java/android/view/IWindowSession.aidl
-frameworks/base/core/java/android/view/IWindow.aidl
-frameworks/base/graphics/java/android/graphics/HardwareRenderer.java
-frameworks/base/libs/hwui/renderthread/DrawFrameTask.cpp
-frameworks/base/libs/hwui/renderthread/CanvasContext.cpp
+客户端是否登记了report债，余额由谁持有？
+→ finish是否真的让目标Window从DRAW到COMMIT？
+→ placement是否把它推进READY，Activity聚合门是否打开？
+→ HAS之后show transaction是否成功stage并提交？
+→ 对应Buffer何时latch、compose并取得present fence？
 ```
 
-## 112. 源码导航：WMS端
-
-```text
-frameworks/base/services/core/java/com/android/server/wm/Session.java
-frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
-frameworks/base/services/core/java/com/android/server/wm/WindowState.java
-frameworks/base/services/core/java/com/android/server/wm/WindowStateAnimator.java
-frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
-frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
-```
-
-## 113. 复读修订一：状态名中的“shown”只能在本层解释
-
-初稿最容易把WindowStateAnimator注释里的“shown on the screen”直译成物理面板已经扫描。
-
-复读源码后应限定为WMS首次show/drawn账本：真正硬件显示仍须结合SF事务、latch、HWC present返回与present fence signal。
-
-## 114. 复读修订二：FrameComplete不是严格GPU fence
-
-HWUI名称看起来很强，但r48源码自己保留“Use a fence for real completion?” TODO，空帧跳过时也主动触发callback。
-
-因此本章只把它描述为RenderThread/HWUI本轮软件完成协议，不把它升级为物理显示证据。
-
-## 115. 复读修订三：reportDraw不总是首次Surface
-
-首次relayout只是最常见入口；orientation、drag resize、preserved surface、WindowOrganizer/BLAST sync和显式SystemUI请求也会要求下一次draw报告。
-
-所以排查日志时必须同时看触发原因和当前draw state代际。
-
-## 116. 复读修订四：finishDrawing可能不推进状态
-
-只有当前状态为DRAW_PENDING时，`finishDrawingLocked()`才进入COMMIT并返回layoutNeeded。
-
-迟到或重复报告在其他状态下不会重新走首次显示状态机；在非BLAST sync路径中，携带的普通post-draw transaction会立即apply，避免错误滞留到下一代draw。
-
-## 117. 本章最终心智模型
-
-可以把整个协议记成三层账本：
-
-1. App账本：`mReportNextDraw + mDrawsNeededToReport`，回答“本轮所有客户端参与者是否完成”；
-2. WMS单窗账本：五态，回答“这个WindowState从隐藏Surface到允许show走到哪里”；
-3. Activity组账本：`allDrawn / firstWindowDrawn / reportedDrawn`，回答“一组窗口是否可一起出现以及启动等待是否可结束”。
-
-三层账本完成后，下面仍有SF/HWC显示流水线。
-
-## 118. 本章结论与下一章
-
-`reportNextDraw`是一次需回报绘制的登记，`finishDrawing`是App对WMS的客户端完成确认，五态则让WMS把“Surface存在”“客户端报告”“系统提交”“整组可显示”“已安排show”逐层分开。最重要的诊断原则是：先判断卡在哪一层账本，再决定向App、WMS还是SF继续追。
-
-下一章进入第220章“Android Activity allDrawn、reportedDrawn、nowVisible与启动完成回调”，把本章已经出现的Activity级多窗口聚合、启动度量和等待者唤醒继续拆细。
+这条链能把“App已调用finish”“WMS说drawn”“Activity整体可展示”“Surface已show”和“像素已present”拆成可核对的完成点。下一章继续上移一层：Android Activity `allDrawn`、`reportedDrawn`、`nowVisible`与启动完成回调。

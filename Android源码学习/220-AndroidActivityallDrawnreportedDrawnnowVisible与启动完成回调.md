@@ -1,211 +1,116 @@
 # 220 Android Activity allDrawn、reportedDrawn、nowVisible 与启动完成回调
 
-> 源码版本：Android 11 / `android-11.0.0_r48`  
-> 学习方式：macOS只读核对，不在当前Mac上实际编译AOSP  
-> 前置章节：第 217、218、219 章
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`。
+>
+> 本章只做静态源码核对：可以证明 WMS 怎样聚合一个 Activity 的窗口、怎样产生 drawn/visible 边沿、怎样结束启动计时与两类 `WaitResult`；不能据此声称 SurfaceFlinger 已 latch、HWC 已 present 或用户已经看到某个像素。第 221 章再进入 `AppTransitionController` 的 opening/closing apps 与转场启动条件。
 
-## 1. 本章为什么必须单独讲
+第 219 章停在单扇 `WindowState` 的 `READY_TO_SHOW`、`HAS_DRAWN` 与 SurfaceControl show 事务。本章把观察尺度抬到 `ActivityRecord`：**`allDrawn`、`reportedDrawn`、`mDrawn`、`reportedVisible`、`nowVisible` 为什么不是同一个“完成”，`am start -W` 又究竟等哪一张表？**
 
-上一章解决的是一个 `WindowState`如何从隐藏Surface走到 `HAS_DRAWN`。但Activity并不等于一个窗口，也不只有一个“可见”boolean。
+## 1. 固定一次启动，先给各完成点命名
 
-r48的 `ActivityRecord`同时维护 `allDrawn`、`mDrawn`、`reportedDrawn`、`reportedVisible`、`nowVisible`、`mVisible`、`mVisibleRequested`等状态。它们名字相近，服务的消费者却完全不同。
+先固定 `L_open`：普通 Activity 启动；真实主窗口可正常完成绘制；没有 relaunch、进程死亡、窗口转移或异常；旧版 AppTransition 最终开始；启动计时序列有效。特殊路径随后逐一放宽。
 
-## 2. 本章最终要回答的四个问题
+| 点 | 精确定义 | 仍不能推出 |
+|---|---|---|
+| `V_req` | `setVisibility(true)` 已写 `mVisibleRequested=true` | Activity 容器已经提交可见 |
+| `C_allow` | `mClientVisible=true`，客户端可见性控制不再阻止 App 窗口生产；若字段发生变化才分发 | 一定发生过一次 true 回调，或客户端已经画完 |
+| `W_ready` | 真实窗口已是 `READY_TO_SHOW` 或 `HAS_DRAWN`，`isDrawnLw()` 为 true | Activity 的窗口集合已经齐备 |
+| `A_ready` | `ActivityRecord.allDrawn` 由窗口组装门置 true | `reportedDrawn` 已产生边沿 |
+| `V_commit` | `commitVisibility(true, ...)` 已令 `mVisible=true` | Activity Surface transaction 已被显示系统消费 |
+| `R_draw` | reported 聚合产生 drawn 正边沿，`onWindowsDrawn(true, ...)` 写 `mDrawn=true` | 整个 launch sequence 已完成 |
+| `R_vis` | reported 聚合产生 visible 正边沿，`onWindowsVisible()` 写 `nowVisible=true` | 屏幕已经 present |
+| `M_draw` | `ActivityMetricsLogger.notifyWindowsDrawn(r, ...)` 返回当前 transition 快照；delay由这次 r 到达更新，Activity元数据取序列的 latest record | transition 的另一扇门已经打开，或 snapshot元数据就是 r |
+| `M_done` | transition-start 与 pending-Activity-empty 两门都满足 | 后台日志已经落盘 |
+| `W_ret` | 某个同步 `WaitResult` 的循环退出 | 退出原因一定是目标 Activity 新绘制 |
+| `P_real` | 可归因于目标内容的 present fence signal | Framework 中上述任一 boolean 可单独证明它 |
 
-1. WMS怎样判断Activity的一组重要窗口都已drawn？
-2. 为什么 `allDrawn=true`后还要再走一轮布局？
-3. `reportedDrawn`、`mDrawn`与 `nowVisible`分别是谁的账本？
-4. `am start -W`一类同步等待究竟被哪个回调唤醒？
-
-## 3. 先看总关系图
-
-```mermaid
-flowchart TD
-    W["各WindowState进入READY_TO_SHOW或HAS_DRAWN"] --> A["updateDrawnWindowStates<br/>统计interesting/drawn"]
-    A --> B{"全部相关Window已被评估且drawn数足够？"}
-    B -->|是| C["ActivityRecord.allDrawn=true"]
-    C --> D["再请求一轮layout/show all windows"]
-    D --> E["updateReportedVisibilityLocked"]
-    E --> F["reportedDrawn边沿变化"]
-    E --> G["reportedVisible边沿变化"]
-    F --> H["onWindowsDrawn → mDrawn=true"]
-    G --> I["onWindowsVisible → nowVisible=true"]
-    H --> J["ActivityMetricsLogger + START_SUCCESS等待者"]
-    I --> K["TASK_TO_FRONT可见等待者 + 系统可见性消费者"]
-```
-
-这不是严格单向流水线：visibility、transition、窗口增删和销毁会让其中一些状态重新变false。
-
-## 4. 先把八个相近字段分组
+固定路线中可以写出这些局部关系：
 
 ```text
-请求/容器显示：mVisibleRequested、mVisible
-客户端可见：mClientVisible
-成组显示门：allDrawn、mLastAllDrawn
-向上报告去重：reportedDrawn、reportedVisible
-对ATMS/度量暴露：mDrawn、nowVisible
+setVisibility(true)建立 V_req，并在等待opening draw前确保C_allow
+若mClientVisible原本已true，C_allow可以早于V_req且不会重新分发
+W_ready < A_ready < 额外layout/show机会
+
+reported聚合的普通正边沿：R_draw < R_vis
+R_draw < M_draw
+transition-start 与 pending-empty（任意先后）共同决定 M_done
 ```
 
-阅读源码时先问“这是哪一组”，比背字段中文翻译更可靠。
+不能补写一条通用的 `A_ready < R_draw`。`updateReportedVisibilityLocked()`还有 relayout、移窗、首个真实窗口、转场提交和动画结束等入口；反过来，`allDrawn`也可能被 starting-window 转移复制，或被 closing-app 路径强制置 true。两套聚合共享窗口状态，却不是上下游固定流水线。
 
-## 5. mVisibleRequested表示期望
+## 2. 九个近似字段分属七本账，两个 allDrawn 还同名不同物
 
-它表示系统当前希望这个Activity的Surface被保留或变为可见。
+| 账本 | 字段或对象 | 所有者 | 回答的问题 |
+|---|---|---|---|
+| 可见性请求 | `mVisibleRequested` | `ActivityRecord` | 系统当前想不想让这个 Activity 可见 |
+| 客户端控制 | `mClientVisible` | `ActivityRecord` | 最近一次希望窗口客户端采用哪种 app visibility |
+| 容器提交 | `mVisible` / `isVisible()` | `ActivityRecord` | Activity 容器的逻辑可见性是否已经 commit |
+| 成组放行 | `allDrawn`、`mLastAllDrawn` | `ActivityRecord` | 真实窗口集合是否满足整体 show/unfreeze 的门，以及该门的上次值 |
+| reported 边沿 | `reportedDrawn`、`reportedVisible` | `ActivityRecord` | 上一次已消费的窗口聚合结果是什么 |
+| 上层状态 | `mDrawn`、`nowVisible` | `ActivityRecord` | metrics、同步等待和生命周期消费者当前看见什么 |
+| 启动序列 | `TransitionInfo.mPendingDrawActivities` | `ActivityMetricsLogger` | 同一次 launch sequence 中还有哪些 ActivityRecord 欠 windows-drawn |
 
-源码注释特意说它有时比真正visible更早：AppTransition尚未执行时，系统已经请求打开Activity，但容器Surface还在等待统一切换。
+最容易混淆的是两个 `allDrawn`：
 
-## 6. mVisible表示已提交的容器可见性
+- `ActivityRecord.allDrawn`聚合该 Activity 下的 `WindowState`，用于窗口成组放行；
+- `TransitionInfo.allDrawn()`只检查 `mPendingDrawActivities.isEmpty()`，聚合同一次启动序列里的 `ActivityRecord`。
 
-`ActivityRecord.isVisible()`在r48中直接返回私有字段 `mVisible`。
+同名不意味着同一集合、同一时刻或同一消费者。以后说“完成”时，至少要附上拥有者和集合元素类型。
 
-`setVisible()`改变它并schedule animation；Activity自身SurfaceControl在 `prepareSurfaces()`中依据它决定show/hide。
+## 3. requested、client 与 committed visibility 可以长期不相等
 
-## 7. mClientVisible表示告诉App什么
+`setVisibility(true, deferHidingClient)`先从 opening/closing 集合移除自己，清 `waitingToShow`，再写 `mVisibleRequested=true`。变为可见时，即使已经设置 AppTransition、稍后才统一提交，代码也会先调用 `setClientVisible(true)`：否则系统一边等待 opening app 绘制，一边又不允许客户端生产窗口，协议会自锁。重复请求 invisible 另有提前返回分支，不能套用这段顺序。
 
-即使系统正在准备AppTransition，也要先 `setClientVisible(true)`，让App窗口开始绘制。
+`setClientVisible()`只有在值实际改变且隐藏未被 defer 时，才更新字段并递归执行 `sendAppVisibilityToClients()`。落到 `WindowState` 后，普通窗口通过 `IWindow.dispatchAppVisibility(clientVisible)`通知客户端；隐藏时还会先 detach 客户端附加的 child surfaces。starting window 是例外：当 client visibility 变 false 时，它不会随真实 App 窗口一起被这条调用隐藏。
 
-否则WMS一边等opening app的窗口drawn，一边又让客户端保持不可见，双方会形成逻辑死等。
+r48 构造 `ActivityRecord`时显式令 `nowVisible=false`、`mDrawn=false`，却令 `mClientVisible=true`。因此第一次 `setClientVisible(true)`可能无操作；不能把字段初值解释成“已成功送达一次 true 回调”。它是控制状态，不是带确认的消息日志。
 
-## 8. mVisibleRequested与mVisible为何会短暂不同
+若转场已经设置且允许动画，`setVisibility()`把 Activity 放入 `mOpeningApps`或 `mClosingApps`后直接返回。此时常见状态是：
 
-`setVisibility(true)`先写requested，并把Activity放入opening apps；若AppTransition已设置，会return，暂不 `commitVisibility(true)`。
+```text
+mVisibleRequested = true
+mClientVisible    = true
+mVisible          = false
+waitingToShow     = true
+```
 
-Transition真正ready后，`AppTransitionController.handleOpeningApps()`才提交mVisible并show窗口。
+稍后 `commitVisibility()`才通知 child window 的 app visibility 变化、调用 `setVisible()`并同步 `mVisibleRequested`。`setVisible()`改变 `mVisible`并 schedule animation；`prepareSurfaces()`又在 `isVisible()`为 true，或 Activity自身/祖先正运行“排除 SCREEN_ROTATION 类型后的其他动画”时，向同步 transaction stage Activity SurfaceControl 的 show，否则 stage hide。这里 `PARENTS`包含容器自身与祖先，不是只查 parent；`isAnimatingExcluding`也不是“正在屏幕旋转”的判断。
 
-## 9. nowVisible不是mVisible的别名
+所以三者分别是“请求”“客户端生产开关”“容器逻辑提交”。即使 `mVisible=true`，也只到 WMS transaction 准备侧，不能跨越 SurfaceFlinger latch、composition 与 HWC present。
 
-`nowVisible`由 `onWindowsVisible()`设置，前提是Activity统计范围内的窗口实际满足WMS visible条件。
+## 4. 第一套聚合在 surface placement 中统计，但 evaluated 不是每轮位图
 
-容器已经 `mVisible=true`但子窗口还未drawn，`nowVisible`仍可为false。
+`RootWindowContainer.performSurfacePlacementNoTrace()`先递增全局 `mTransactionSequence`，再进入各 Display 的 surface changes。对每扇有 Surface 的窗口，`DisplayContent`先调用 `commitFinishDrawingLocked()`，随后才调用其 Activity 的 `updateDrawnWindowStates(w)`；后者返回 true 时，把 Activity 去重加入临时链表。窗口遍历结束后，链表中的 Activity 才执行 `updateAllDrawn()`。
 
-## 10. mDrawn也不是allDrawn的别名
-
-`mDrawn`在 `onWindowsDrawn(boolean)`中更新，主要供ActivityMetricsLogger、启动跟踪和可见性判断使用。
-
-`allDrawn`则是控制Activity窗口何时可成组show的内部门，二者来源和生命周期不同。
-
-## 11. reportedDrawn与reportedVisible是边沿记忆
-
-`updateReportedVisibilityLocked()`每次重新统计窗口后，与上一次 `reportedDrawn/reportedVisible`比较。
-
-只有boolean发生变化才调用 `onWindowsDrawn`、`onWindowsVisible`或 `onWindowsGone`，避免每次relayout都重复通知。
-
-## 12. mLastAllDrawn同样是边沿记忆
-
-`checkAppWindowsReadyToShow()`先比较：
+只要没有命中 `allDrawn && !mFreezingScreen`的提前返回，每个新 transaction sequence 第一次碰到该 Activity 时会重置：
 
 ```java
-if (allDrawn == mLastAllDrawn) return;
-mLastAllDrawn = allDrawn;
+mNumDrawnWindows = 0;
+startingDisplayed = false;
+mNumInterestingWindows = findMainWindow(false) != null ? 1 : 0;
 ```
 
-它用于只在Activity的allDrawn发生变化时执行show/unfreeze动作，不是另一个独立“更晚完成”状态。
+主窗口被预占一个 interesting 名额，遍历到它时不会重复增加；其他满足条件的窗口才逐个增加。这个预占是“只要能找到非 starting main window就占一位”，并不先检查它此刻是否 `isInteresting()`。因此“GONE窗口不阻塞”只适合描述普通非主窗口；一个仍被 `findMainWindow(false)`找到、但不满足 interesting/drawn 的主窗口可以让基线那一位一直欠着。
 
-## 13. 两套聚合不要混在一起
+更关键的是 `mDrawnStateEvaluated`。`updateDrawnWindowStates()`一进入就把当前 `WindowState`标为已评估，但这个 bit **不会随 `mTransactionSequence`每轮清零**；r48 只在 `WindowState.onParentChanged()`中清 false。它回答的是“这个新挂入当前 parent 的直接 child 是否至少被父级考虑过”，用来阻止刚加入、尚未遍历的 child 让集合提前闭合；每轮重新统计的是两个数字，不是这组 bit。
 
-```mermaid
-flowchart LR
-    subgraph GroupA["成组显示聚合"]
-        A1["mNumInterestingWindows"] --> A3["allDrawn"]
-        A2["mNumDrawnWindows"] --> A3
-        A3 --> A4["canShowWindows / showAllWindows"]
-    end
-    subgraph GroupB["向上报告聚合"]
-        B1["UpdateReportedVisibilityResults"] --> B2["reportedDrawn / reportedVisible"]
-        B2 --> B3["mDrawn / nowVisible"]
-        B3 --> B4["metrics / WaitResult / lifecycle consumers"]
-    end
-```
+因此 dump 中 `drawnStateEvaluated=true`不能翻译成“本次 placement 已走到它”，`mNumDrawnWindows`也不能在 `allDrawn=true && !mFreezingScreen`的快速返回之后继续当成实时统计。
 
-两套都遍历WindowState，却使用不同的筛选、历史保持与消费者。
+## 5. allDrawn 的筛选、starting window 与精确公式
 
-## 14. allDrawn统计运行在什么阶段
+第一套聚合依次经过两层判断：
 
-`DisplayContent.applySurfaceChangesTransaction()`逐窗口调用 `ActivityRecord.updateDrawnWindowStates(w)`。
+| 判断 | r48 条件 | 作用 |
+|---|---|---|
+| `mightAffectAllDrawn()` | on-screen，或类型为 base/drawn application；且不在 exit animation、不 destroying | 决定是否值得影响成组 drawn，并参与“所有 child 已考虑”检查 |
+| `isInteresting()` | 有 Activity、App 未死亡、未命中 Activity/window freezing 排除、client view 为 VISIBLE | 决定是否真计入 interesting/drawn 数字 |
+| `isDrawnLw()` | 有 Surface、不 destroying，draw state 为 `READY_TO_SHOW`或`HAS_DRAWN` | 决定这一名额是否已经 drawn |
 
-它发生在WMS SurfacePlacement里，和单窗 `commitFinishDrawingLocked()`处于同一轮统一窗口事务处理。
+`COMMIT_DRAW_PENDING`仍不算 drawn；`READY_TO_SHOW`已经算。这和第 219 章一致：这里认证的是 WMS 可放行内容，不要求窗口已 `performShowLocked()`，更不要求 present。
 
-## 15. 每轮统计如何重置
+starting window 单独处理。它不进入真实 Activity 的 interesting/drawn 数字；只有外层仍是 `!allDrawn`、该窗 `mightAffectAllDrawn()`且它自己 `isDrawnLw()`时，代码才调用 `notifyStartingWindowDrawn()`并令 `startingDisplayed=true`。这可以给 transition readiness 和 starting-window delay 提供信息，但不会凭空产生真实窗口的 `reportedDrawn`、结束 windows-drawn 等待或输出 `Displayed`。
 
-ActivityRecord比较WMS的 `mTransactionSequence`：
-
-```java
-if (mLastTransactionSequence != mWmService.mTransactionSequence) {
-    mNumDrawnWindows = 0;
-    startingDisplayed = false;
-    mNumInterestingWindows = findMainWindow(false) != null ? 1 : 0;
-}
-```
-
-计数属于当前WMS transaction sequence，不能跨轮简单累加。
-
-## 16. 主窗口为何先占一个interesting名额
-
-只要找到不包含starting window的main window，interesting初值就是1。
-
-遍历到主窗口时不会再次加一；这样base application window成为Activity完整画面的基本门槛。
-
-## 17. 其他窗口何时增加interesting
-
-窗口必须先 `mightAffectAllDrawn()`，再满足 `isInteresting()`。
-
-如果它不是main window，Activity才递增 `mNumInterestingWindows`；这可把可见的附属应用窗口纳入成组显示等待。
-
-## 18. mightAffectAllDrawn审查什么
-
-窗口是on-screen或属于base/drawn application类型，同时不能正在exit animation，也不能destroying。
-
-它先回答“这个WindowState是否可能影响Activity的allDrawn决策”。
-
-## 19. isInteresting又审查什么
-
-窗口必须属于Activity、App未死亡、没有处于应忽略的freezing状态，并且客户端View visibility为VISIBLE。
-
-因此一个存在于层级中的GONE窗口不必阻挡allDrawn。
-
-## 20. 为什么两层筛选不合并
-
-`mightAffectAllDrawn()`还被 `allDrawnStatesConsidered()`用于判断所有相关child是否已经过本轮评估；`isInteresting()`用于实际计数。
-
-一个窗口可能值得“被评估”，但因当前visibility或freezing不成为必须drawn的interesting目标。
-
-## 21. 哪些draw state算已drawn
-
-`WindowState.isDrawnLw()`接受 `READY_TO_SHOW`或 `HAS_DRAWN`，同时要求有Surface且未destroying。
-
-所以Activity聚合并不要求每个窗口已经物理show；READY已经足以说明内容可参与整体放行。
-
-## 22. COMMIT_DRAW_PENDING为何还不计drawn
-
-此时App finishDrawing已到WMS，但统一SurfacePlacement尚未把单窗提交成READY。
-
-若现在就增加drawn数，会破坏“所有窗口在同一系统事务阶段准备好”的边界。
-
-## 23. starting window为何单独处理
-
-若遍历窗口正是 `startingWindow`，它不进入真实Activity的interesting/drawn计数。
-
-只要starting window `isDrawnLw()`，系统记录starting-window metric并设 `startingDisplayed=true`。
-
-## 24. Splash显示为何不能完成allDrawn
-
-Splash只是一张临时preview，真实Activity可能仍没有main window Buffer。
-
-如果starting window也算interesting drawn，系统会过早移除启动等待、错误报告Displayed，并让真实窗口交接失去意义。
-
-## 25. drawnStateEvaluated解决什么竞态
-
-WindowState每次进入 `updateDrawnWindowStates()`先标记“本轮已评估”。
-
-Activity不能只看数字相等，因为遍历早期可能尚有另一个child没有处理；数字暂时相等并不代表集合已经完整。
-
-## 26. allDrawnStatesConsidered怎样兜底
-
-它遍历所有child：只要某窗口might affect all drawn但还未设置evaluated，就返回false。
-
-这相当于集合完整性检查，避免用半轮统计提前做allDrawn决策。
-
-## 27. updateAllDrawn的完整条件
+最后的门是：
 
 ```java
 numInteresting > 0
@@ -214,663 +119,408 @@ numInteresting > 0
         && !isRelaunching()
 ```
 
-四项全部满足才把 `allDrawn=true`。
+四项分别防止空集合真值、刚挂入 child 未被考虑、drawn 名额不足以及 relaunch 期间沿用不完整集合。源码明确使用 `>=`而非 `==`；所以 dump 中 drawn大于interesting本身不挡门，但代码也没有提供“多出来的是哪扇窗”的业务承诺。
 
-## 28. 为什么必须numInteresting大于0
+## 6. allDrawn 的结果是再给 show 一次机会，不是上屏回执
 
-没有任何真实interesting窗口时，`0 >= 0`在数学上为真，但不能据此宣称Activity已经画完。
+`updateAllDrawn()`置 true 后做两件事：给 Display 标记 `setLayoutNeeded()`，并向 WMS Handler 投递 `NOTIFY_ACTIVITY_DRAWN`。额外 layout 要求正常循环中的后续 placement 再给刚进入 `READY_TO_SHOW`的窗口一次 `performShowLocked()`机会，但它不是唯一 show 路径：下面的 animator检查可直接 `showAllWindowsLocked()`，opening app又由 AppTransition接管。
 
-源码用显式大于0挡住这种空集合误判。
+动画循环中的 `WindowAnimator`还会遍历 Display 调 `checkAppWindowsReadyToShow()`。该方法用 `mLastAllDrawn`做边沿记忆：
 
-## 29. 为什么使用大于等于而非严格相等
+- false 边沿只更新记忆并返回；
+- true 且 Activity 正冻结时，show all windows、停止 freeze，并请求 wallpaper layout；
+- 普通 true 边沿请求 animation layout；若 Activity 不在 `mOpeningApps`且 `canShowWindows()`，立即 show all windows；
+- `canShowWindows()`仍会挡住“Activity自身或祖先正在动画，且存在非默认色彩窗口”的情况；这里的 `PARENTS`同样包含自身。
 
-计数可能受窗口层级和本轮遍历时机影响；决策只需确保已drawn数量覆盖所有interesting目标。
+若 Activity仍在 `mOpeningApps`，show由 AppTransition接管。r48 的 opening 处理顺序是 `commitVisibility(true, false)`、`updateReportedVisibilityLocked()`、清 `waitingToShow`，然后在 Surface transaction 中 `showAllWindowsLocked()`。这甚至允许无动画窗口先形成 reported visible 边沿、后调用 show，直接证明 `nowVisible`不是 SurfaceControl shown 回执。动画选择与 opening/closing readiness 留到第 221 章。
 
-真正的安全性还由完整评估和筛选条件共同保证，不依赖一个脆弱的严格等式。
+`performShowLocked()`内部还有一处更细的顺序：它先检查 `showToCurrentUser()`，失败便清 policy flag并返回。通过用户门后，当 draw state 为 READY/HAS 且不是 starting window 时，它先调用 `onFirstWindowDrawn()`；后者会移除 starting window并重算 reported。代码随后才检查 `mDrawState == READY_TO_SHOW && isReadyForDisplay()`，通过后才写 `HAS_DRAWN`。所以 reported重算甚至可以发生在本次 show readiness失败之前，不能拿 callback名字反推 show成功。
 
-## 30. relaunching为何阻止allDrawn
+WMS Handler 的 `NOTIFY_ACTIVITY_DRAWN`也不是 metrics 的 `onWindowsDrawn`。它只携带 token、没有 generation；清掉 `allDrawn`也不会撤销已经排队的旧消息。消息异步进入 ATMS，按 token 找仍在栈中的 record，再调用 `ActivityStack.notifyActivityDrawnLocked()`；这里服务的是 translucent-Activity conversion 的 undrawn 集合及其独立 timeout。record 已不在栈中时就无事发生。
 
-Activity配置重建期间，旧窗口与新窗口可能短暂交叠，当前计数不能代表新实例的完整视觉结果。
+最后，`allDrawn=true`并非总是 draw 证据：closing-app 为了启动退出动画会强制写 true；starting-window 转移也会在源 Activity 已 true 时复制它。它会在重新显示隐藏/stopped Activity、非 transition-animation 下的窗口 draw-state reset、replacement、特定最后窗口移除、orientation 或 drag-resize 分支被清 false。
 
-等relaunch结束后再确认，避免把旧Surface当作新Activity已经完成。
+## 7. 第二套聚合由多条路径触发，筛选规则完全不同
 
-## 31. allDrawn变true后为何setLayoutNeeded
+`updateReportedVisibilityLocked()`复用一个 `UpdateReportedVisibilityResults`，先 reset，再让每个直接 child `WindowState`递归汇总。`WindowState.updateReportedVisibility()`先处理自己的 child windows，再判断自身；所以结果可以包含 attached child window，而不是只看主窗口。
 
-前一轮可能已有窗口停在 `READY_TO_SHOW`，因为当时 `activity.canShowWindows()`看见allDrawn仍为false。
+它不是 `allDrawn`之后唯一的一步。relayout、窗口移除、首个真实窗口 drawn、opening/closing commit、窗口动画结束等路径都能调用它。方法名带 `Locked`但自身不获取锁；这些生产路径依靠 caller 已持有 WM/ATMS 共享 global lock。等待者也在同一把锁上 `wait()`，写字段并 `notifyAll()`之后，必须等生产者释放锁，等待线程才能重获锁并检查条件。
 
-设置layout needed强制下一轮再次调用 `commitFinishDrawingLocked()`，这时窗口才可进入 `performShowLocked()`。
-
-## 32. NOTIFY_ACTIVITY_DRAWN消息是什么
-
-allDrawn变true后WMS Handler还收到 `H.NOTIFY_ACTIVITY_DRAWN`。
-
-WMS Handler把token转给 `ActivityTaskManagerService.notifyActivityDrawn()`；r48中它会进入Root Task的 `notifyActivityDrawnLocked()`，用于例如半透明Activity转换时等待下层Activity重绘完成。它不是App的 `Activity.reportFullyDrawn()`，也不是SF present回调。
-
-## 33. checkAppWindowsReadyToShow何时运行
-
-WindowContainer/SurfacePlacement流程观察 `allDrawn`与 `mLastAllDrawn`变化后调用该方法。
-
-它将“计数已经足够”转为“停止冻结或允许整组窗口show”的动作。
-
-## 34. 冻屏场景怎样处理
-
-若Activity正 `mFreezingScreen`，系统调用 `showAllWindowsLocked()`、停止freezing并触发布局变化。
-
-旋转时旧画面不能永远冻结；但解除必须等待新几何下的重要窗口drawn。
-
-## 35. 普通场景怎样处理
-
-系统设置 `FINISH_LAYOUT_REDO_ANIM`。
-
-如果Activity不在opening apps且 `canShowWindows()`为true，就立即show all；若在opening apps，则由AppTransition统一放行。
-
-## 36. canShowWindows并不只等于allDrawn
-
-r48还检查父级Transition动画中是否存在非默认color-mode窗口。
-
-广色域显示配置的中途变化可能导致jank，因此即使allDrawn也可短暂延迟show。
-
-## 37. AppTransition ready怎样消费allDrawn
-
-opening app满足transition ready条件后，`handleOpeningApps()`依次：
-
-1. `commitVisibility(true, false)`；
-2. `updateReportedVisibilityLocked()`；
-3. 清 `waitingToShow`；
-4. 在Surface transaction中 `showAllWindowsLocked()`。
-
-## 38. 为什么Transition前先让客户端可见
-
-`setVisibility(true)`在等待Transition时已经 `setClientVisible(true)`。
-
-客户端可以构建和绘制窗口，容器mVisible及最终Surface show则留到过渡统一时机，这正是请求、生产、展示三阶段分离。
-
-## 39. closing app为何强制allDrawn=true
-
-`handleClosingApps()`明确写 `app.allDrawn = true`，目的是让关闭动画不被“窗口还没画完”阻塞。
-
-这个赋值服务于退出动画调度，不能当成应用真的完成了一次新绘制的性能证据。
-
-## 40. allDrawn何时被清除
-
-常见入口包括：Activity重新变为visible时需要新一轮窗口、WindowStateAnimator reset draw state、窗口移除、旋转/resize和某些relaunch路径。
-
-因此它是可重复代际状态，不是ActivityRecord一生只从false变true一次。
-
-## 41. 显示请求如何重置旧draw state
-
-Activity从隐藏变可见且客户端此前也隐藏时，会遍历已有 `HAS_DRAWN`窗口调用 `resetDrawState()`，并重置content insets提示。
-
-这样WMS保证收到新的reportDrawn，而不是看到旧Surface就立即移除starting window。
-
-## 42. transferred starting window为何会复制allDrawn
-
-启动窗口跨ActivityRecord转移时，源码可把旧record的allDrawn、firstWindowDrawn、reportedVisible等状态带到新record。
-
-这是一次显式的交接优化，不代表这些字段在普通Activity间共享。
-
-## 43. transfer状态要按源码逐项看
-
-transfer复制 `reportedVisible`，但并没有简单地把所有draw/visibility字段完全克隆。
-
-这提醒我们：不能因为两个字段通常相关，就假设迁移、relaunch或token替换时必然同步变化。
-
-## 44. 第二套聚合从updateReportedVisibilityLocked开始
-
-它先reset一个复用的 `UpdateReportedVisibilityResults`，再让每个WindowState递归贡献：
-
-```text
-numInteresting / numDrawn / numVisible / nowGone
-```
-
-这是Activity对上层报告状态的重新计算。
-
-## 45. UpdateReportedVisibilityResults为何复用对象
-
-窗口布局和动画期间该统计会频繁执行，复用对象减少system_server热路径临时分配。
-
-`reset()`必须同时清三个计数并把 `nowGone=true`恢复为保守初始值。
-
-## 46. reported统计会跳过哪些窗口
-
-WindowState遇到以下情况直接不贡献自身：
-
-- app freezing；
--客户端View不是VISIBLE；
-- `TYPE_APPLICATION_STARTING`；
-- destroying。
-
-但它会先递归统计child窗口。
-
-## 47. reported的interesting含义更直接
-
-通过上述过滤的WindowState直接 `numInteresting++`。
-
-它不像allDrawn那套先以main window占基线、再判断 `mightAffectAllDrawn/isInteresting`；两套数字不能互相对照推断。
-
-## 48. reported的drawn怎样判断
-
-仍调用 `isDrawnLw()`，即READY_TO_SHOW或HAS_DRAWN，并要求Surface有效且未destroying。
-
-如果drawn，`numDrawn++`并把 `nowGone=false`。
-
-## 49. reported的visible为何排除动画中窗口
-
-只有drawn且不处于Transition/父级动画时才 `numVisible++`。
-
-动画中窗口可能仍在屏幕上，但系统暂缓把最终稳定visible边沿报告给Activity级消费者。
-
-## 50. nowGone并不等于mVisibleRequested=false
-
-如果窗口虽未drawn但正在Transition动画，统计仍把 `nowGone=false`。
-
-它表达“窗口集合是否已经真正消失、允许报告状态回退”，不是单纯复制请求可见性。
-
-## 51. Activity级nowDrawn公式
+对每一扇递归到的窗口，以下任一条件成立就完全排除：
 
 ```java
-boolean nowDrawn = numInteresting > 0
-        && numDrawn >= numInteresting;
+mAppFreezing
+|| mViewVisibility != View.VISIBLE
+|| mAttrs.type == TYPE_APPLICATION_STARTING
+|| mDestroying
 ```
 
-这一次的interesting来自reported统计，不是allDrawn的 `mNumInterestingWindows`。
+通过筛选后先 `numInteresting++`，再按下表贡献：
 
-## 52. Activity级nowVisible公式
+| 单窗状态 | `numDrawn` | `numVisible` | 对 `nowGone` |
+|---|---:|---:|---|
+| `isDrawnLw()`且 `isAnimating(TRANSITION \| PARENTS)`为 false | +1 | +1 | 置 false |
+| `isDrawnLw()`且上述检查为 true | +1 | +0 | 置 false |
+| 未 drawn、但上述检查为 true | +0 | +0 | 置 false |
+| 未 drawn、上述检查也为 false | +0 | +0 | 不改变 |
+| 被筛选排除 | +0 | +0 | 不改变 |
+
+这里的 `numVisible`没有调用 `isDisplayedLw()`，不检查 policy visibility、`performShowLocked()`、SurfaceController shown、SF latch 或 present。它只是“drawn 且没有指定动画”的计数名，必须按代码定义读，而不能按英文直觉升级。
+
+## 8. raw 公式与 sticky 规则解释了抖动，也暴露了 nowGone 的反直觉
+
+汇总后的原始候选值是：
 
 ```java
-boolean nowVisible = numInteresting > 0
+rawDrawn = numInteresting > 0 && numDrawn >= numInteresting;
+rawVisible = numInteresting > 0
         && numVisible >= numInteresting
         && isVisible();
 ```
 
-窗口全部稳定visible还不够，Activity容器自身 `mVisible`也必须已经提交为true。
+`rawVisible`比 `rawDrawn`多要求所有 interesting window 不在指定动画，并要求 Activity 的 `mVisible=true`。它仍不要求物理显示。
 
-## 53. 为什么drawn不额外要求Activity isVisible
+接着应用 sticky 规则：若 `nowGone=false`，任何 false 候选都恢复为旧的 `reportedDrawn/reportedVisible`；true 候选仍可以上升。这样，一扇仍 drawn 或仍动画的窗口在 replacement/transition 中不会让已经报告的 true 因瞬时计数不足而掉下去。
 
-drawn回答“内容是否完成”，窗口在Transition等待或容器尚未最终show时也可以成立。
+`nowGone`这个名字尤其危险。它初始为 true，却只会被“通过筛选且 drawn，或通过筛选且 animating”的窗口改成 false。因此：
 
-visible则必须把容器状态纳入，二者有意允许不同步。
+- 存在一扇通过筛选、但未 drawn 且不动画的窗口时，`nowGone`仍可能为 true；
+- 只剩 starting、freezing、destroying 或 client view非VISIBLE窗口时，它也可能为 true；
+- 只要任意合格窗口 drawn/animating，它就变 false并启用 sticky。
 
-## 54. 历史保持规则是最容易漏掉的一段
+所以它不是“Activity 已经没有 WindowState”的事实位，而是“本次聚合是否允许旧 reported true 回落”的控制量。当它保持 true 时，一扇仍存在但未 drawn、非动画的窗口足以让 reported 状态下降；sticky 不是永久 latch。
 
-```java
-if (!nowGone) {
-    if (!nowDrawn) nowDrawn = reportedDrawn;
-    if (!nowVisible) nowVisible = reportedVisible;
-}
-```
+## 9. 两个边沿的写入顺序不对称，转移与死亡还能绕过边沿
 
-只要Activity尚未真正gone，统计不会因为一轮临时窗口变化轻易把已报告drawn/visible翻回false。
-
-## 55. 为什么需要这种sticky语义
-
-动画、窗口替换、短暂层级调整可能让某一轮即时计数下降。
-
-若每次都向上报告visible→invisible→visible，ATMS等待者、GC调度和启动度量会收到抖动的生命周期信号。
-
-## 56. 何时允许reported状态变false
-
-只有 `nowGone=true`时不再沿用旧 `reportedDrawn/reportedVisible`。
-
-窗口确实消失或销毁后，统计可触发 `onWindowsDrawn(false)`与 `onWindowsGone()`，为下一次可见代际清账。
-
-## 57. reportedDrawn变化时做什么
+r48 的核心顺序是：
 
 ```java
 if (nowDrawn != reportedDrawn) {
-    onWindowsDrawn(nowDrawn, elapsedRealtimeNanos());
+    onWindowsDrawn(nowDrawn, SystemClock.elapsedRealtimeNanos());
     reportedDrawn = nowDrawn;
+}
+if (nowVisible != reportedVisible) {
+    reportedVisible = nowVisible;
+    if (nowVisible) onWindowsVisible();
+    else onWindowsGone();
 }
 ```
 
-时间戳在状态边沿处取 `elapsedRealtimeNanos()`，供启动度量计算相对delay。
+drawn 分支先调用 consumer：`onWindowsDrawn()`一进入就写 `mDrawn=drawn`，正边沿还会运行 metrics 与 waiter；返回后才写 `reportedDrawn`。因此这些同步 consumer 执行时可观察到“新 `mDrawn`、旧 `reportedDrawn`”。
 
-## 58. reportedVisible变化时做什么
+visible 分支相反：先写 `reportedVisible`，再由 callback 写 `nowVisible`。在一次普通 false→true 汇总里，visible公式蕴含 drawn，且 drawn 分支排在前面，所以 `mDrawn=true`先于 `nowVisible=true`。这只是该方法的一次普通调用顺序，不是所有路径的全局不变量。
 
-这条分支先把 `reportedVisible`写成新值，再在true边沿调用 `onWindowsVisible()`、false边沿调用 `onWindowsGone()`。
+三类绕行必须单独记：
 
-这层字段是“上一次已处理边沿”，而 `nowVisible`是onWindowsVisible/onWindowsGone最终写给ActivityRecord的状态。
+- `transferStartingWindow()`中“源已有 startingWindow 与 startingSurface”的分支复制 `reportedVisible`，并可复制 `allDrawn`、`firstWindowDrawn`、容器/请求/client visibility，却不复制 `reportedDrawn`、`mDrawn`或`nowVisible`；若目标 record 得到 `reportedVisible=true`而自身 `nowVisible=false`，下一次 raw visible 仍为 true时不会再产生 visible 边沿，二者可继续分离；仅搬运 pending starting data 的另一分支没有这组复制；
+- Activity destroy 路径直接写 `nowVisible=false`，不要求先写 `reportedVisible`；
+- 进程死亡但保留 dead window/record 时，`ActivityStack`直接令 `nowVisible=mVisibleRequested`，因此它可以在没有当前真实 draw 正边沿时为 true。
 
-## 59. onWindowsDrawn先更新mDrawn
+这些字段没有共同 generation id。看日志时必须先确认 ActivityRecord 实例、转移/重建路径和具体写点，不能只按字段名字拼一条时间线。
 
-无论drawn参数真假，第一行都是：
+## 10. mDrawn 与 nowVisible 的消费者不同，且都停在 Framework 语义层
 
-```java
-mDrawn = drawn;
-```
+`onWindowsDrawn(false, ...)`只把 `mDrawn`清 false并返回，不会发送“负的启动完成”。正边沿则按顺序查询 metrics、可能结束同步等待、停止 launch ticking，并把 Task 记为曾可见。
 
-若为false立即return；只有true边沿才进入启动度量和等待者完成逻辑。
+| consumer | 触发条件 | 结果 |
+|---|---|---|
+| `ActivityMetricsLogger.notifyWindowsDrawn` | 每个 reported drawn 正边沿都会尝试 | 更新序列delay并尝试移除首个匹配 pending Activity；可无匹配，也可能返回 null |
+| `reportActivityLaunchedLocked` | metrics snapshot 有效，或该 record 正是 DisplayArea top-running | 收口全局 START_SUCCESS 等待表；fallback 可携带 invalid delay/state |
+| `stopWaitingForActivityVisible` | 与上一项同一条件分支 | 收口匹配 Component 的 TASK_TO_FRONT visible wait |
+| `finishLaunchTickingLocked` | drawn 正边沿 | 停止 Activity 的 launch tick |
+| `Task.setHasBeenVisible(true)` | drawn 正边沿且有 Task | 记录 Task 曾达到该 Framework 阶段 |
 
-## 60. mDrawn=false为何不向Metrics报告一次结束
+`onWindowsVisible()`则无条件先尝试 `stopWaitingForActivityVisible(this)`，随后仅在 `nowVisible`原为 false 时写 true、记录 uptime 的 `lastVisibleTime`并安排 App GC；`onWindowsGone()`写 false。
 
-一次启动完成事件只关心首次窗口绘制成功；之后窗口gone不是另一个app-start完成事件。
+`completeResumeLocked()`若发现 `nowVisible`已经 true，也会尝试停止**已经存在**的 component waiter。它不是“先可见、后注册”的补救：直接 `START_TASK_TO_FRONT`分支在注册前先检查 `nowVisible && RESUMED`，该检查才覆盖前置状态；注册和等待发生在 global lock 内。
 
-后续重新启动若需跟踪，会建立新的TransitionInfo和pending draw集合。
+另一个消费者是 `RootWindowContainer.allResumedActivitiesVisible()`：必须至少找到一个 resumed Activity，并要求每个 resumed record 的 `nowVisible=true`。动画结束后，这可让系统继续安排 stopping/finishing Activity，而不必等一个可能迟迟不到的 idle。这里仍只是在调度 Framework 生命周期工作。
 
-## 61. onWindowsVisible怎样更新nowVisible
+## 11. Metrics 的 pending Activity 集合与 transition-start 构成双门
 
-它先尝试停止TASK_TO_FRONT可见等待，然后仅在 `!nowVisible`时：
+`TransitionInfo`用 `LinkedList<ActivityRecord> mPendingDrawActivities`记录同一 launch sequence 还欠 drawn 的 Activity。设置“最近启动 Activity”时，只有它不是连续重复的同一 record、不是 `noDisplay`且当时 `mDrawn=false`，才加入链表；已 drawn 与 no-display Activity 不欠这一门。
 
-```java
-nowVisible = true;
-lastVisibleTime = uptimeMillis();
-scheduleAppGcsLocked();
-```
+trampoline 可以让 A→B 等多个 Activity 合并进同一 transition。`TransitionInfo.allDrawn()`没有窗口统计，只返回链表是否为空。`notifyWindowsDrawn(r, timestamp)`找到 active info 后：
 
-重复visible统计不会不断刷新lastVisibleTime。
+1. 用传入的 elapsed-realtime 时间计算并覆盖 transition 的 windows-drawn delay；
+2. `removePendingDrawActivity(r)`尝试移除链表中首个匹配；若 r只是当前 `mLastLaunchedActivity`而不在pending中，这一步可以无操作；
+3. 生成 transition snapshot；其 Activity元数据来自 `mLastLaunchedActivity`，不保证就是本次通知参数 r；
+4. 若 transition-start 已记录且链表现在为空，才 `done(false, ...)`。
 
-## 62. onWindowsGone怎样更新nowVisible
-
-它简单地把 `nowVisible=false`，并打印相应调试信息。
-
-nowVisible因此参与Activity是否真正可见、停止旧Activity和等待task-to-front等更高层决策。
-
-## 63. nowVisible为何与RESUMED分开
-
-生命周期RESUMED说明服务端/客户端生命周期调度进度；nowVisible说明WMS窗口聚合已达到可见边沿。
-
-Activity可以先RESUMED后窗口可见，也可能在转场中窗口仍可见但生命周期正在PAUSING。
-
-## 64. completeResumeLocked如何使用nowVisible
-
-Activity完成服务端resume收尾时，如果 `nowVisible`已经为true，会立即停止等待可见。
-
-这处理“窗口比某条等待注册/生命周期收尾更早完成”的竞态，避免漏唤醒。
-
-## 65. RootWindowContainer如何使用nowVisible
-
-`allResumedActivitiesVisible()`遍历所有display/task display area/stack的resumed Activity。
-
-只要任意resumed Activity的nowVisible为false就返回false；这影响前一个Activity何时可以继续stop/finish处理。
-
-## 66. nowVisible仍不是物理面板证据
-
-它来自WMS窗口drawn、动画和容器visible统计。
-
-没有读取SurfaceFlinger present fence，更不知道显示面板扫描到第几行，因此不能作为精确“用户已看到像素”的硬件时间点。
-
-## 67. ActivityMetricsLogger还有自己的allDrawn
-
-`TransitionInfo.allDrawn()`只是：
-
-```java
-mPendingDrawActivities.isEmpty()
-```
-
-它与 `ActivityRecord.allDrawn`同名但完全不是同一字段：前者聚合一次启动序列中的ActivityRecord，后者聚合一个Activity里的WindowState。
-
-## 68. 同名allDrawn的三层语义
+另一方向，`notifyTransitionStarting()`第一次记录 transition delay/reason；重复通知被忽略。若此时 pending 已空，也立即成功 `done`。所以两门顺序无关：
 
 ```text
-WindowState级：isDrawnLw，单窗口READY/HAS_DRAWN
-ActivityRecord.allDrawn：同一Activity的重要Window集合
-TransitionInfo.allDrawn()：同一launch sequence待绘制Activity集合为空
+pending activities empty ─┐
+                          ├─> successful transition done
+transition-start logged ──┘
 ```
 
-源码阅读必须带上拥有者类型。
+一次成功的 `notifyWindowsDrawn`可以在整个序列 done 之前返回 transition snapshot，于是调用它的 `onWindowsDrawn`已经能够用该 snapshot 的 delay/launchState结束同步 waiter；`reportActivityLaunchedLocked()`收到的 record仍是调用方自身。A→B合并序列中若A先draw，delay可由A的timestamp更新，而 snapshot里的Activity元数据已经是latest B。这更不等于后台 `Displayed`日志已经输出。
 
-## 69. Metrics为何可能等多个Activity
+链表本身也没有通用 identity 去重，只挡连续重复的 `mLastLaunchedActivity`。静态上若同一 record 以 A→B→A 非连续回到序列、两次加入时都仍 `mDrawn=false`，链表可出现两个 A；一次 `remove(r)`只移除首个匹配，而 reported drawn 正边沿通常只来一次。排查序列迟迟不 empty 时，这是一条值得核对的 r48 边界，而不是可以忽略的集合性质。
 
-连续trampoline启动可被合并为同一个TransitionInfo。
+## 12. starting、取消、日志与 observer 各有自己的完成边界
 
-每次 `setLatestLaunchedActivity()`遇到尚未mDrawn、非noDisplay Activity，就把它加入 `mPendingDrawActivities`。
+`notifyStartingWindowDrawn()`只在首次命中时记录 `mStartingWindowDelayMs`，不从 pending draw 链表移除 Activity。starting preview 因此既不是 windows-drawn，也不会单独输出 `Displayed`。
 
-## 70. noDisplay Activity为何不进入pending draw
+新启动通知若发现目标 `mDrawn && isVisible()`，metrics 会认为无法测量 draw delay并 abort。启动中 visibility 变为不再 requested或 finishing 时，会先从 pending移除该 Activity；若它是序列最后启动者，还异步回到 global lock 检查 Task 中是否仍有 `mVisibleRequested && !mDrawn && !finishing`的 Activity，没有就 cancel/abort。清空 pending与成功完成不是同义词：成功仍要求 transition-start 门。
 
-它按定义没有需等待的窗口；若加入集合，永远收不到真实windows drawn回调。
+`done(false, ...)`才进入 `logAppTransitionFinished()`；它先做 snapshot，在序列值得记录时投递 transition log，并总是把 `logAppDisplayed()`任务投到 `BackgroundThread`。r48 的 `logAppDisplayed()`只接受 WARM/COLD，HOT transition 进入后台任务后直接返回。因此同步 `WaitResult`已返回、observer已排队、甚至 transition已 done，都不能保证 logcat 有一行 `Displayed`。
 
-系统必须将“参与启动控制流”和“会产生显示窗口”分开。
+Launch observer 注册表也明确把所有回调按顺序投到后台 Handler，避免在 WM critical section 中运行未知 observer。它保持 observer 事件的异步顺序，但调用者不会等 observer 实际消费后才继续。
 
-## 71. 已经mDrawn的Activity为何不重复加入
+`mLastTransitionInfo`还有一处所有权边界：r48 只在新建 `TransitionInfo`时把当时的 launched record放入映射；随后 trampoline 的 `setLatestLaunchedActivity()`不为新 record补同类映射。因而不能假定合并进序列的每个后续 Activity 都能以自己为 key 找到 fully-drawn info。
 
-热启动时目标可能已有完整窗口。
+## 13. START_SUCCESS 等的是无目标身份的全局表，不是目标专属 Future
 
-Metrics不应把旧已drawn Activity重新当成必须等待的新首帧；如果启动时它已drawn且visible，跟踪甚至会直接abort为不可测。
+`ActivityStarter.waitForResult()`收到 `START_SUCCESS`时，把调用者的 `WaitResult`加入 `mWaitingActivityLaunched`，然后在 ATMS global lock 上循环等待，条件为：result尚未变成 `START_TASK_TO_FRONT`、未 timeout、`who==null`。`wait()`释放锁；被唤醒后重获同一锁，再重新判断，因而能抵抗无关 `notifyAll()`。
 
-## 72. notifyWindowsDrawn如何更新启动账本
+但这张表没有 Activity/component key。`reportActivityLaunchedLocked()`从尾到头移除**全部**条目，把同一个 Activity、time与launchState写给所有 `who==null`的 waiter，然后 `notifyAll()`；它刻意不改原 result。
 
-它找到Active TransitionInfo，计算从launch start到传入timestamp的delay，移除当前Activity的pending项，并生成snapshot。
+`reportWaitingActivityLaunchedIfNeeded()`遇到嵌套启动结果 `START_DELIVERED_TO_TOP`或`START_TASK_TO_FRONT`时也移除整张表：
 
-返回snapshot让ActivityRecord即使不是整条transition最后一个Activity，也能拿到自己的drawn delay。
+| 收口源 | `result` | `who` | 时间/状态 |
+|---|---|---|---|
+| 有效 windows-drawn snapshot | 保持原值 | 报告该 record 的 Component | snapshot delay；COLD/WARM/HOT |
+| top-running fallback | 保持原值 | top record Component | invalid delay，launchState=-1 |
+| idle timeout | 保持原值 | timeout关联 record（若非空） | timeout=true、invalid delay、-1 |
+| 嵌套 DELIVERED_TO_TOP | 改为该 result | 填当前 Component | 不由这里补完整计时 |
+| 嵌套 TASK_TO_FRONT | 改为该 result | 可仍为 null | 循环仅凭 result 已可退出 |
 
-## 73. Metrics transition何时真正done
+这意味着并发 `startActivityAndWait`/`am start -W`等待者可能被同一次完成广播一起收口，不能解释成每项严格绑定最初目标。`InterruptedException`也只被吞掉后继续按条件循环，不是一个完成结果。
 
-需要同时满足：
+直接 `START_DELIVERED_TO_TOP`根本不进表：立即写 `who`、`totalTime=0`；其 `launchState`可能保留默认值。正常 snapshot能给三种 launch state；降级路径可给 `-1`，shell层应准备把未知值显示为 UNKNOWN，而不是强行归类。
 
-1. AppTransition已经 `notifyTransitionStarting()`；
-2. `mPendingDrawActivities`已经为空。
+## 14. TASK_TO_FRONT 另用 Component 表，而且没有有效的本地 timeout
 
-两个事件谁先来都可以：后到的一方负责调用 `done()`。
+直接 `START_TASK_TO_FRONT`先只按 `attachedToProcess()`写 HOT或COLD，没有 WARM。若 Activity已 `nowVisible && RESUMED`，立即写 Component与 `totalTime=0`；否则注册 `WaitInfo(component, result)`到 `mWaitingForActivityVisible`，再在 global lock 上等待。
 
-## 74. 为什么transition start和windows drawn是双门
+源码注释直说这里的 timeout变量当前不会被设置。因此这张表没有独立有效超时；`activityIdleInternal(fromTimeout=true)`调用的只是 `reportActivityLaunchedLocked()`，只能清上一节的全局 launched 表，不能清 component-visible 表。
 
-窗口可能极快drawn，早于动画正式开始；也可能动画已经开始，窗口很晚才drawn。
+component waiter 的收口路径是：
 
-只有两边都到齐，日志才能同时拥有transition reason/start delay和最终windows drawn delay。
+- `onWindowsVisible()`总会尝试停止；
+- `onWindowsDrawn()`仅在 metrics snapshot有效或 record为top-running时停止；
+- `completeResumeLocked()`在 waiter已存在且 `nowVisible=true`时停止；
+- `cleanupActivity()`用 `INVALID_DELAY`停止，保证 record清理时协议能退出。
 
-## 75. starting window metric是旁路时间点
+`stopWaitingForActivityVisible()`按 `ComponentName`从尾到头匹配并完成所有命中项，不按 `ActivityRecord`实例、task、启动 generation 或 FIFO绑定。同一 Component 的多实例/并发等待可以被一个 record 一起收口。默认无显式 time 的调用还会读取 `getLastDrawnDelayMs(r)`，它可能是 invalid，也可能来自保留的 last-transition 映射。
 
-`notifyStartingWindowDrawn()`只记录第一次starting window delay，不从pending real activity集合移除项目。
+所以两张表必须分开排障：
 
-Splash出现可改善感知等待，却不能替代真实Activity windows drawn。
+| 表 | 注册入口 | 匹配粒度 | idle timeout是否收口 |
+|---|---|---|---|
+| `mWaitingActivityLaunched` | START_SUCCESS | 无目标身份；全表广播 | 是 |
+| `mWaitingForActivityVisible` | 直接 TASK_TO_FRONT 且尚未 visible/resumed | ComponentName；完成所有匹配项 | 否 |
 
-## 76. mDrawn如何参与Metrics启动建账
+任一等待返回都只证明它的退出条件被某条路径满足；cleanup、fallback、嵌套 result 都可能在没有新像素 present 的情况下终止协议。
 
-`TransitionInfo.setLatestLaunchedActivity()`只对 `!r.mDrawn`的显示型Activity加pending。
+## 15. reportFullyDrawn 是业务可用声明，既非 reportedDrawn 也非 present
 
-`notifyActivityLaunched()`若发现Activity已经 `mDrawn && isVisible()`，认为无法测得此次windows drawn delay并abort跟踪。
+App 调用 `Activity.reportFullyDrawn()`时，客户端先把 `mDoReportFullyDrawn=false`，再同步调用 ATMS，随后在同一个 try 块里执行 `VMRuntime.notifyStartupCompleted()`。普通重复调用被 one-shot flag忽略；Activity pause/stop也会把该 flag清 false。若 Binder 抛 `RemoteException`，同一 try 块后面的 VMRuntime通知也不会执行。
 
-## 77. Activity变不可见时Metrics如何避免永等
+ATMS在 global lock 内按 token找 record；不存在就返回。存在时，`ActivityMetricsLogger.logAppTransitionReportedDrawn()`用 `mLastTransitionInfo.get(r)`找启动信息：没有映射就忽略。若该 transition 的 pending draw Activity 还未空且尚未保存 callback，它只存一个 `mPendingFullyDrawn` Runnable并返回 null。
 
-`notifyVisibilityChanged()`发现Activity不再visible requested或finishing，会从pending draw集合移除它。
+这个 deferred Runnable只在**成功**的 `logAppTransitionFinished()`路径运行；abort分支不会运行它。还有一个反直觉边界：pending尚未空、但第一个 Runnable 已经存在时，对同一映射 record 的第二次 server-side 调用不会再进入保存分支，而会继续记录。正常 `Activity` API 的 one-shot会抑制这种重复；合并序列中的后续 record通常又没有自己的 `mLastTransitionInfo`映射，因此这主要说明 server guard不是通用去重，不能据此虚构一个常规“第二 Activity复用 callback”的路径。成功后递归计算 deferred fully-drawn 时，代码采用 `mWindowsDrawnDelayMs`作为 startup time，而不是 App 最早调用 Binder 的时刻。这把过早的业务声明下移到系统 windows-drawn 下界。
 
-若最新launched Activity所在Task中也没有任何仍应draw的Activity，异步 `checkVisibility()`会cancel并abort这次transition。
+客户端却不会等待后台 metrics 真正写出：只要 ATMS Binder方法正常返回，即使服务端刚把 Runnable存起来，它就继续通知 VMRuntime。只有某次直接 `ActivityRecord.reportFullyDrawnLocked()`调用从 logger拿到非空 snapshot时，wrapper才会调用 `reportActivityLaunchedLocked()`，从而可能用 fully-drawn delay收口仍存在的全局 START_SUCCESS waiter。日后由成功 transition运行的 deferred Runnable只递归进入 logger并丢弃返回值，不会再经过这个 wrapper，也就不会自行收口 waiter。
 
-## 78. 为什么checkVisibility异步再持锁检查
+因此三个概念必须分开：
 
-visibility变化与Activity/Task层级可能继续改变，不能只用通知瞬间的半成品状态作最终取消决定。
-
-Handler稍后在全局锁内重新取Active Transition和Task中待draw Activity，降低竞态误判。
-
-## 79. reportFullyDrawn与reportedDrawn不是一回事
-
-`reportedDrawn`是WMS内部窗口统计边沿；`Activity.reportFullyDrawn()`是App主动声明业务可用状态。
-
-前者自动发生，后者需要应用选择合适时机调用，通常晚于首窗口drawn。
-
-## 80. reportFullyDrawn过早时怎样处理
-
-如果Metrics的pending Activity集合还未清空，系统保存 `mPendingFullyDrawn` Runnable并暂不记fully-drawn。
-
-等windows drawn与transition完成后再执行，避免fully drawn时间早于首窗口完成。
-
-## 81. 过早fully-drawn最终采用哪个时间
-
-r48发现存在pending fully drawn时，最终使用 `mWindowsDrawnDelayMs`作为startupTime。
-
-这是防早报下界，并不证明业务真实可用恰好发生在windows drawn时刻。
-
-## 82. 启动同步等待有两张表
-
-`ActivityStackSupervisor`维护：
-
-- `mWaitingActivityLaunched`：通常等待START_SUCCESS新启动的windows drawn；
-- `mWaitingForActivityVisible`：TASK_TO_FRONT场景按Component等待目标可见/drawn。
-
-两者不要混成一个“am start等待列表”。
-
-## 83. START_SUCCESS怎样等待
-
-`ActivityStarter.waitForResult()`把WaitResult加入 `mWaitingActivityLaunched`，随后在ATMS global lock上wait。
-
-循环直到结果变TASK_TO_FRONT、timeout或 `who != null`。
-
-## 84. onWindowsDrawn怎样唤醒START_SUCCESS
-
-ActivityRecord拿到有效TransitionInfoSnapshot，或自己仍是display area的top running Activity时，调用：
-
-```java
-reportActivityLaunchedLocked(false, this,
-        windowsDrawnDelayMs, launchState);
+```text
+reportedDrawn / mDrawn：WMS窗口统计边沿
+reportFullyDrawn：App声明重要数据与UI已可用，并受metrics规则校正
+present：显示系统和硬件的物理完成
 ```
 
-Supervisor填WaitResult并 `notifyAll()`。
+## 16. 九组只读练习、排障顺序与下一章边界
 
-## 85. 为什么允许top running但metrics info无效
+下面命令只搜索或打印源码，不修改工作树。路径与模式均针对本章的 r48 基线。
 
-Activity可能因中间visibility变化没有有效metrics snapshot，但同步调用者仍在等待目标启动结果。
-
-如果它仍是当前top running，系统用INVALID_DELAY等降级信息唤醒，避免等待者永久挂住。
-
-## 86. reportActivityLaunchedLocked填哪些字段
-
-它为尚无who的WaitResult写：
-
-- `timeout`；
-- 实际Activity component；
-- `totalTime`；
-- cold/warm/hot `launchState`。
-
-它特意不修改原始 `result`。
-
-## 87. START_DELIVERED_TO_TOP为何不等draw
-
-Intent只投给已经top的Activity，不会有新的launch/window drawn信号。
-
-所以WaitResult立即写component、`totalTime=0`并返回。
-
-## 88. START_TASK_TO_FRONT为何先检查nowVisible
-
-如果目标Activity已经 `nowVisible && RESUMED`，bring-to-front无需再等，totalTime为0。
-
-否则注册component级 `waitActivityVisible()`，等待后续drawn或visible边沿。
-
-## 89. TASK_TO_FRONT等待为何drawn和visible都能停止
-
-`onWindowsDrawn(true)`在有效Metrics或当前仍为top-running的完成分支中，会调用带windows-drawn delay的 `stopWaitingForActivityVisible()`；`onWindowsVisible()`也会调用默认版本。
-
-谁先满足相应路径谁就填WaitResult并notifyAll，避免对转场/可见统计顺序作单一假设。
-
-## 90. component匹配意味着什么
-
-`WaitInfo.matches()`按目标Component匹配等待项。
-
-这张表不是简单FIFO取第一项；同一组件的多个等待可在一次状态变化中一起完成。
-
-## 91. cleanup时为何用INVALID_DELAY停止等待
-
-Activity被清理时，真实可见完成已经不可能发生。
-
-Supervisor仍移除匹配等待项、填component和INVALID_DELAY并唤醒，保证同步API有终止路径。
-
-## 92. idle timeout又是一条逃生路径
-
-Activity长时间不报告idle时，`activityIdleInternal(... fromTimeout=true)`会调用 `reportActivityLaunchedLocked()`，使用INVALID_DELAY与未知launch state结束等待。
-
-这不是把idle当drawn，而是防止启动同步等待和launch wakelock无限拖住。
-
-## 93. 等待完成仍不等于硬件显示
-
-WaitResult由WMS/ATMS窗口drawn或visible账本完成。
-
-它没有等待SurfaceFlinger present fence signal，因此适合Framework启动延迟，不适合精确光子到屏幕测量。
-
-## 94. 一次冷启动的四级完成
-
-```mermaid
-sequenceDiagram
-    participant App as "目标App"
-    participant WMS as "WMS"
-    participant Metrics as "ActivityMetricsLogger"
-    participant Waiter as "同步启动调用者"
-    App->>WMS: "finishDrawing(main window)"
-    WMS->>WMS: "Window READY / ActivityRecord.allDrawn"
-    WMS->>WMS: "reportedDrawn边沿 → mDrawn=true"
-    WMS->>Metrics: "notifyWindowsDrawn(timestamp)"
-    Metrics-->>WMS: "TransitionInfoSnapshot / delay"
-    WMS->>Waiter: "reportActivityLaunchedLocked + notifyAll"
-    WMS->>WMS: "reportedVisible边沿 → nowVisible=true"
-    Note over App,Waiter: "顺序可因Transition和多窗口变化，不应把相邻步骤写成同一时刻"
-```
-
-## 95. 为什么mDrawn可能先于nowVisible
-
-READY_TO_SHOW已经满足isDrawnLw，但窗口可能仍在opening transition或动画中，不计stable visible。
-
-因此启动windows-drawn metric可先完成，nowVisible稍后在动画/容器可见条件满足时变true。
-
-## 96. nowVisible能否先于mDrawn
-
-按reported统计公式，numVisible只在窗口isDrawnLw时增加，所以一次正常false→true边沿中visible建立以drawn为前提。
-
-但历史sticky、状态transfer和不同调用轮次会使观察日志不宜仅凭打印顺序推导所有内部写入顺序。
-
-## 97. reportedDrawn为何可能在READY_TO_SHOW时为true
-
-因为 `isDrawnLw()`接受READY。
-
-WMS认为内容已完整、可以参与整体显示，即可结束drawn统计；SurfaceControl show和HWC present属于后续显示层。
-
-## 98. 常见误解一：allDrawn表示屏幕所有窗口
-
-不对。它只属于某个ActivityRecord，并只统计满足筛选条件的WindowState。
-
-状态栏、导航栏、其他Activity、wallpaper、IME和别的Display都不是这一个boolean的“全部”。
-
-## 99. 常见误解二：allDrawn与Metrics allDrawn相同
-
-不对。一个聚合WindowState，一个聚合launch sequence里的ActivityRecord。
-
-同名方法必须写出拥有者：`ActivityRecord.allDrawn`与 `TransitionInfo.allDrawn()`。
-
-## 100. 常见误解三：nowVisible就是onResume完成
-
-不对。RESUMED是Activity生命周期状态，nowVisible是WMS窗口聚合状态。
-
-二者相互协作但由不同回调和条件推进。
-
-## 101. 常见误解四：reportedVisible是客户端收到的visibility
-
-不完全对。它是ActivityRecord内部“上一次窗口聚合visible结果”的记忆，用来决定是否触发onWindowsVisible/Gone。
-
-客户端visibility由 `mClientVisible`和 `dispatchAppVisibility()`另一条链处理。
-
-## 102. 常见误解五：startingDisplayed可以完成Displayed日志
-
-不对。它可让AppTransition认为opening app已有preview并开始，但reported visibility明确排除starting window。
-
-真实windows drawn仍等待非starting窗口。
-
-## 103. 常见误解六：closing app的allDrawn=true证明它刚绘制
-
-不对。AppTransitionController会为关闭动画强制设置allDrawn，纯属控制流放行。
-
-性能诊断必须查看WindowState draw state和实际windows-drawn metric，而非孤立读boolean。
-
-## 104. 故障推理：Window已HAS_DRAWN但Activity allDrawn仍false
-
-检查是否还有另一个interesting窗口、是否所有child都被本轮评估、Activity是否isRelaunching，以及计数是否在新的transaction sequence重置。
-
-不要只盯main window；Dialog/附属窗口可能进入聚合集合。
-
-## 105. 故障推理：allDrawn=true但nowVisible=false
-
-检查Activity容器mVisible是否已commit、是否仍在opening apps/waitingToShow、窗口是否处于Transition动画、policy/parent visibility，以及reported visible统计是否尚未再次运行。
-
-这是“内容准备好但展示边沿未完成”的典型分层状态。
-
-## 106. 故障推理：mDrawn=true但同步启动仍未返回
-
-检查WaitResult属于 `mWaitingActivityLaunched`还是component级visible表，TransitionInfo是否有效、目标Activity是否仍top running、who是否已被其他start result路径填写，以及global lock等待条件。
-
-还要防止把另一个ActivityRecord的mDrawn误认成当前等待目标。
-
-## 107. 故障推理：starting window出现但Displayed很慢
-
-startingDisplayed只说明preview已drawn。
-
-继续检查真实main window的finishDrawing、Activity allDrawn、reportedDrawn、Metrics pending draw集合；白屏持续时间常由这段真实窗口链决定。
-
-## 108. 故障推理：reportedVisible反复抖动
-
-正常动画期间sticky逻辑应抑制临时下降。
-
-若日志确实反复true/false，检查窗口是否真正gone、Activity/token是否重建或transfer、容器visibility是否反复commit，以及是否混看了不同ActivityRecord实例。
-
-## 109. macOS只读练习一：画两套聚合表
+### 练习 1：确认字段所有者与初值
 
 ```bash
 cd /Users/ninebot/androidSource
-sed -n '5434,5570p' \
+rg -n -F \
+  -e 'private boolean mVisible;' \
+  -e 'boolean nowVisible;' \
+  -e 'boolean mDrawn;' \
+  -e 'boolean mVisibleRequested;' \
+  -e 'private boolean reportedDrawn;' \
+  -e 'boolean reportedVisible;' \
+  -e 'mClientVisible = true;' \
   frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
 ```
 
-把 `updateReportedVisibilityLocked()`与 `updateDrawnWindowStates()`使用的筛选、计数、输出各写成一张表。
+分别标注“请求、client control、容器提交、边沿记忆、上层状态”，并解释为什么构造时 client true不等于已送达一次回调。
 
-## 110. macOS只读练习二：核对allDrawn完整条件
+### 练习 2：追 requested 到 commit 的分叉
 
 ```bash
 cd /Users/ninebot/androidSource
-sed -n '3915,3975p' \
+rg -n -F \
+  -e 'mVisibleRequested = visible;' \
+  -e 'setClientVisible(true);' \
+  -e 'appTransition.isTransitionSet()) {' \
+  -e 'commitVisibility(visible, true /* performLayout */);' \
+  -e 'void commitVisibility(boolean visible, boolean performLayout)' \
+  -e 'setVisible(visible);' \
   frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
 ```
 
-解释numInteresting>0、all children considered、drawn覆盖和not relaunching缺一项分别会造成什么误判。
+画出“无转场立即commit”和“加入opening/closing后return”两条路线。
 
-## 111. macOS只读练习三：追WaitResult唤醒
+### 练习 3：定位第一套聚合的 placement 入口
 
 ```bash
 cd /Users/ninebot/androidSource
-rg -n 'mWaitingActivityLaunched|waitActivityVisible|stopWaitingForActivityVisible|reportActivityLaunchedLocked' \
-  frameworks/base/services/core/java/com/android/server/wm/ActivityStarter.java \
-  frameworks/base/services/core/java/com/android/server/wm/ActivityStackSupervisor.java
+rg -n -F -e 'mWmService.mTransactionSequence++;' \
+  frameworks/base/services/core/java/com/android/server/wm/RootWindowContainer.java
+rg -n -F \
+  -e 'winAnimator.commitFinishDrawingLocked();' \
+  -e 'activity.updateDrawnWindowStates(w);' \
+  -e 'activity.updateAllDrawn();' \
+  frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
 ```
 
-分别画START_SUCCESS、DELIVERED_TO_TOP、TASK_TO_FRONT的wait/notify条件。
+按源码行号确认单窗commit、逐窗计数、遍历后Activity闭门的顺序。
 
-## 112. macOS只读练习四：区分两个allDrawn
+### 练习 4：证明 evaluated 不随 transaction sequence 重置
 
 ```bash
 cd /Users/ninebot/androidSource
-rg -n 'boolean allDrawn|void updateAllDrawn|mPendingDrawActivities' \
-  frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java \
+rg -n -F \
+  -e 'setDrawnStateEvaluated(false /*evaluated*/);' \
+  -e 'boolean getDrawnStateEvaluated()' \
+  -e 'boolean mightAffectAllDrawn()' \
+  frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+rg -n -F \
+  -e 'mLastTransactionSequence != mWmService.mTransactionSequence' \
+  -e 'allDrawnStatesConsidered()' \
+  frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+```
+
+把 parent-change bit与每轮数字清零分别写成一句话。
+
+### 练习 5：为 reported 单窗贡献制作真值表
+
+```bash
+cd /Users/ninebot/androidSource
+rg -n -F \
+  -e 'void updateReportedVisibility(UpdateReportedVisibilityResults results)' \
+  -e 'mAttrs.type == TYPE_APPLICATION_STARTING' \
+  -e 'results.numInteresting++;' \
+  -e 'results.numDrawn++;' \
+  -e 'results.numVisible++;' \
+  -e 'results.nowGone = false;' \
+  frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+```
+
+特别写出“存在、合格、未drawn、非动画”时为什么 `nowGone`仍不被清 false。
+
+### 练习 6：核对 raw、sticky 与不对称写序
+
+```bash
+cd /Users/ninebot/androidSource
+rg -n -F \
+  -e 'boolean nowDrawn = numInteresting > 0 && numDrawn >= numInteresting;' \
+  -e 'boolean nowVisible = numInteresting > 0 && numVisible >= numInteresting && isVisible();' \
+  -e 'nowDrawn = reportedDrawn;' \
+  -e 'nowVisible = reportedVisible;' \
+  -e 'onWindowsDrawn(nowDrawn, SystemClock.elapsedRealtimeNanos());' \
+  -e 'reportedDrawn = nowDrawn;' \
+  -e 'reportedVisible = nowVisible;' \
+  frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+```
+
+说明 consumer分别能看见哪一边的新旧值，并给出 normal false→true 的局部顺序。
+
+### 练习 7：找出强制、复制与直接覆盖
+
+```bash
+cd /Users/ninebot/androidSource
+rg -n -F \
+  -e 'app.allDrawn = true;' \
+  frameworks/base/services/core/java/com/android/server/wm/AppTransitionController.java
+rg -n -F \
+  -e 'reportedVisible = fromActivity.reportedVisible;' \
+  -e 'if (fromActivity.allDrawn) {' \
+  -e 'nowVisible = false;' \
+  frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F -e 'r.nowVisible = r.mVisibleRequested;' \
+  frameworks/base/services/core/java/com/android/server/wm/ActivityStack.java
+```
+
+逐项回答它是否携带窗口draw证据、是否触发 callback、是否复制 consumer字段。
+
+### 练习 8：验证 Metrics 双门和异步输出
+
+```bash
+cd /Users/ninebot/androidSource
+rg -n -F \
+  -e 'mPendingDrawActivities.add(r);' \
+  -e 'return mPendingDrawActivities.isEmpty();' \
+  -e 'info.removePendingDrawActivity(r);' \
+  -e 'info.mLoggedTransitionStarting && info.allDrawn()' \
+  -e 'if (info.allDrawn()) {' \
+  -e 'BackgroundThread.getHandler().post(() -> logAppDisplayed(infoSnapshot));' \
   frameworks/base/services/core/java/com/android/server/wm/ActivityMetricsLogger.java
 ```
 
-为每一个结果写出集合元素类型：WindowState还是ActivityRecord。
+分别模拟“先draw后transition-start”和“先transition-start后draw”，确认只成功done一次。
 
-## 113. 源码导航
+### 练习 9：对照两张 waiter 表与 fully-drawn
+
+```bash
+cd /Users/ninebot/androidSource
+rg -n -F \
+  -e 'mWaitingActivityLaunched.add(mRequest.waitResult);' \
+  -e 'r.nowVisible && r.isState(RESUMED)' \
+  -e 'waitActivityVisible(r.mActivityComponent, mRequest.waitResult);' \
+  frameworks/base/services/core/java/com/android/server/wm/ActivityStarter.java
+rg -n -F \
+  -e 'WaitResult w = mWaitingActivityLaunched.remove(i);' \
+  -e 'if (w.matches(r.mActivityComponent)) {' \
+  -e 'stopWaitingForActivityVisible(r, WaitResult.INVALID_DELAY);' \
+  frameworks/base/services/core/java/com/android/server/wm/ActivityStackSupervisor.java
+rg -n -F \
+  -e 'public void reportFullyDrawn()' \
+  -e 'mDoReportFullyDrawn = false;' \
+  -e 'VMRuntime.getRuntime().notifyStartupCompleted();' \
+  frameworks/base/core/java/android/app/Activity.java
+```
+
+为每个返回点注明“draw正边沿、visible正边沿、直接结果、timeout、cleanup或业务声明”，不要只写“启动完成”。
+
+排障时按这个顺序最省力：
+
+1. 先用 `ActivityRecord`实例与 token把日志归属分开，确认是否发生 starting-window transfer、relaunch、destroy或进程死亡保留；
+2. 若卡在成组show，检查 main-window预占、`mNumInterestingWindows/mNumDrawnWindows`、`allDrawnStatesConsidered()`与 opening-app归属；
+3. 若 `allDrawn=true`但上层未动，单独重建 reported 的筛选、raw值、`nowGone`和sticky结果，不假设两套聚合相连；
+4. 若 `mDrawn=true`但启动序列未done，检查 `mPendingDrawActivities`是否还有别的 record或重复项，以及 transition-start门；
+5. 若同步命令不返回，先辨认它在全局 launched 表还是 Component表；后者没有本地有效timeout；
+6. 若只缺 `Displayed`，先确认是否HOT，再考虑后台Handler时序；
+7. 若问题是“画面何时真的出现”，离开这些boolean，转向 SurfaceFlinger transaction、Buffer latch、composition与present fence证据。
+
+源码导航：
 
 ```text
+frameworks/base/services/core/java/com/android/server/wm/RootWindowContainer.java
+frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
 frameworks/base/services/core/java/com/android/server/wm/WindowState.java
 frameworks/base/services/core/java/com/android/server/wm/WindowStateAnimator.java
-frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
 frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
 frameworks/base/services/core/java/com/android/server/wm/AppTransitionController.java
 frameworks/base/services/core/java/com/android/server/wm/ActivityMetricsLogger.java
+frameworks/base/services/core/java/com/android/server/wm/LaunchObserverRegistryImpl.java
 frameworks/base/services/core/java/com/android/server/wm/ActivityStarter.java
+frameworks/base/services/core/java/com/android/server/wm/ActivityStack.java
 frameworks/base/services/core/java/com/android/server/wm/ActivityStackSupervisor.java
-frameworks/base/services/core/java/com/android/server/wm/RootWindowContainer.java
+frameworks/base/services/core/java/com/android/server/wm/ActivityTaskManagerService.java
+frameworks/base/core/java/android/app/Activity.java
 frameworks/base/core/java/android/app/WaitResult.java
 ```
 
-## 114. 复读修订一：不把nowVisible说成真实像素present
+本章的最小心智模型是：`allDrawn`关“WindowState集合能否成组放行”；reported字段关“重算结果是否形成新边沿”；`mDrawn/nowVisible`关“Framework消费者现在采用什么状态”；Metrics的同名 `allDrawn()`关“launch sequence还有没有Activity欠账”；两张 `WaitResult`表又各自定义同步调用何时退出。它们都不是 present fence。
 
-初稿若把“windows visible”直译为用户已经看到，会越过WMS到SF/HWC之间的剩余流水线。
-
-修订后只称其为WMS Activity级窗口可见边沿；需要光子到屏幕证据时仍应使用显示侧trace/fence或外部测量。
-
-## 115. 复读修订二：不把两套interesting窗口数混用
-
-allDrawn统计以main window预占基线并使用mightAffect/isInteresting；reported visibility统计通过另一组排除条件后直接计数。
-
-两处变量都叫interesting，不代表数量在同一轮必然相等。
-
-## 116. 复读修订三：mDrawn并非永久true
-
-窗口真正gone后，reportedDrawn可产生false边沿，`onWindowsDrawn(false)`会把mDrawn清回false。
-
-它只是Activity当前窗口绘制聚合状态，也为后续启动代际提供正确输入。
-
-## 117. 复读修订四：WaitResult完成存在降级路径
-
-最理想路径使用ActivityMetricsLogger的windows-drawn delay和launch state；但metrics无效、Activity清理或idle timeout时可用INVALID_DELAY结束等待。
-
-同步命令返回证明Framework等待协议终止，不自动证明采样字段全部有效。
-
-## 118. 本章最终心智模型
-
-把Activity显示过程记成四本账：
-
-1. requested账：系统想不想显示，客户端是否开始生产；
-2. group-ready账：同一Activity的重要窗口是否全部READY；
-3. reported账：窗口集合的drawn/visible边沿是否已经向上处理；
-4. launch账：一次启动序列里的所有Activity是否完成，哪些同步等待者可以被唤醒。
-
-同一个“完成”一词必须附带账本名称。
-
-## 119. 本章结论与下一章
-
-`ActivityRecord.allDrawn`负责把多个WindowState聚合成可成组show的门；`reportedDrawn/reportedVisible`负责去重和稳定窗口统计边沿；`mDrawn/nowVisible`则把结果交给启动度量、同步WaitResult与系统生命周期决策。它们都发生在WMS/ATMS语义层，不能越级等同于SurfaceFlinger或显示硬件完成。
-
-下一章进入第221章“Android AppTransitionController opening/closing apps与转场启动条件”，继续追allDrawn、startingDisplayed、startingMoved如何共同决定旧版AppTransition何时ready、如何选动画目标和提交可见性。
+下一章进入第 221 章“Android AppTransitionController opening/closing apps 与转场启动条件”，继续追 `allDrawn`、`startingDisplayed`、`startingMoved`怎样参与 readiness，opening/closing 集合怎样选动画目标并提交可见性。

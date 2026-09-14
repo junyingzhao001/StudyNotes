@@ -1,896 +1,489 @@
 # 251 Android PackageManagerService启动、Settings账本与系统包扫描链
 
 > 源码版本：Android 11 / `android-11.0.0_r48`  
-> 学习方式：macOS只读核源，不编译、不运行AOSP
+> 学习方式：macOS 只读核源，不编译、不运行 AOSP
 
-## 1. 本章要解决什么
+## 1. 先把问题改写成“调和”，而不是“找 APK”
 
-Android开机时，PackageManagerService（下文简称PMS）要回答的不是“磁盘上有哪些APK”这么简单，而是：
+PackageManagerService（下文简称 PMS）启动时，不是在空白内存里枚举几个目录。它要把四类事实合成一个可查询、可执行的新包世界：
 
-```text
-上次开机记住了哪些包、appId、签名和用户状态？
-本次系统镜像、APEX挂载点和/data/app实际出现了什么？
-系统预装包若被/data更新版覆盖，应当保留哪一个？
-OTA删除、更新版损坏、包路径变化时，旧账怎样与磁盘调和？
-PMS对象构造完成、Binder可查询、systemReady和应用数据就绪是否是同一时刻？
-```
+| 事实 | r48 中的主要载体 | 能回答什么 | 不能单独回答什么 |
+|---|---|---|---|
+| 上次认可的全局身份 | `Settings`、`packages.xml`、`PackageSetting` | appId、shared UID、签名关系、旧路径、系统更新基线 | 当前 APK 的组件声明是否仍存在 |
+| 本次磁盘内容 | APK、APEX、`ParsedPackage` | 当前 Manifest、版本与代码路径；签名信息的收集时点随候选路径变化 | 跨重启 appId、每用户安装态 |
+| 每用户差异 | package restrictions、runtime permissions | installed、stopped、enabled、运行时授权 | 包代码是否真的还在磁盘 |
+| 平台策略 | `SystemConfig`、分区 scan flag、权限与 overlay 配置 | system/vendor/product/privileged 等身份规则 | 某个候选最终一定会被采用 |
 
-## 2. 一句总纲
+因此本章唯一主问题是：**SystemServer 主线程怎样读取旧账、扫描系统与数据候选、处理系统更新版和 OTA 分叉，最后把哪些完成事实分别交给 Binder、`systemReady()` 与第三方启动屏障？** 单个 APK 内部怎样经过 parse、scan、reconcile、commit，留到第 252 章。
 
-```text
-SystemServer准备依赖
-→ PMS读取Settings旧账
-→ 扫描APEX、overlay、framework和各系统分区
-→ 扫描/data/app更新与普通应用
-→ 调和旧账、系统基线、数据更新版和用户状态
-→ 写回Settings
-→ 发布Package Binder
-→ 稍后systemReady，再等待异步应用数据准备
-```
+r48 的主线程顺序可压成：前置服务 → `PackageManagerService.main()` → 构造期读账 → APEX/系统/data 扫描与调和 → 提交 app-data Future → 构造内调用主账写入 → 构造返回 → 用户类型白名单处理 → 依次注册 `package`、`package_native` → 稍后调用 PMS `systemReady()` → 更晚在 AMS callback 中 join app-data，并在已提交时 join WebView Future → 推进第三方服务 boot phase。
 
-## 3. 为什么要先学启动链
+这里特意写“提交 Future”而不是“完成 Future”：它从构造中段就可能并行执行，只有后面的 join 位置固定。还要先记住九个不同观察点：
 
-安装一个APK只是PMS的增量事务；开机扫描却要重建全局内存事实。后续阅读安装、卸载、权限、Intent解析、shared UID、APEX和应用数据时，都默认这次重建已经完成。
-
-若不知道启动阶段，就很容易把`PackageSetting`误当成Manifest解析结果，把`packages.xml`误当成包清单，或把`ServiceManager.addService()`误当成所有包数据都已准备完毕。
-
-## 4. 本章边界
-
-本章关注“服务启动、持久化账本、目录扫描与全局调和”。单个APK如何经过`PackageParser2`、`ScanRequest`、`ReconcileRequest`变成`PackageSetting`，留到第252章逐字段展开。
-
-## 5. 源码地图
-
-```text
-frameworks/base/services/java/com/android/server/SystemServer.java
-frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
-frameworks/base/services/core/java/com/android/server/pm/Settings.java
-frameworks/base/services/core/java/com/android/server/pm/ParallelPackageParser.java
-frameworks/base/services/core/java/com/android/server/pm/parsing/PackageParser2.java
-frameworks/base/services/core/java/com/android/server/pm/PackageSetting.java
-frameworks/base/services/core/java/com/android/server/pm/ApexManager.java
-frameworks/base/core/java/android/content/pm/PackagePartitions.java
-frameworks/base/core/java/com/android/server/SystemConfig.java
-frameworks/base/core/java/android/os/ServiceManager.java
-```
-
-## 6. 先建立五个“完成点”
-
-```text
-A. PMS对象已构造
-B. Settings已读取且启动扫描/调和已完成
-C. package/package_native Binder已发布
-D. PMS.systemReady()方法已执行完成
-E. 异步应用数据已准备完，第三方应用可以启动
-```
-
-在r48中，A和B都发生在巨大构造函数返回前；C发生在`main()`尾部；D由SystemServer稍后调用；E还要等`waitForAppDataPrepared()`。
-
-## 7. 启动里程碑总图
-
-```mermaid
-sequenceDiagram
-    participant SS as SystemServer main thread
-    participant SC as SystemConfig init pool
-    participant PMS as PackageManagerService
-    participant PP as ParallelPackageParser pool
-    participant SM as ServiceManager
-    participant AD as App-data future
-    SS->>SC: submit SystemConfig.getInstance
-    SS->>SS: start Installer/AMS/DisplayManager
-    SS->>PMS: PackageManagerService.main(onlyCore)
-    PMS->>PMS: constructor reads Settings
-    PMS->>PP: parse system and data package paths
-    PP-->>PMS: parse results in completion order
-    PMS->>PMS: serial scan/reconcile/commit and write Settings
-    PMS-->>SS: constructor/main continues
-    PMS->>SM: publish package + package_native
-    SS->>PMS: systemReady()
-    PMS->>AD: non-core app-data preparation continues asynchronously
-    SS->>PMS: waitForAppDataPrepared()
-    SS->>SS: PHASE_THIRD_PARTY_APPS_CAN_START
-```
-
-## 8. PMS运行在哪里
-
-PMS的Java对象运行在`system_server`进程。启动构造和目录扫描的总控逻辑运行在SystemServer主线程；APK的“解析”可进入最多4条并行线程；PMS自己的`PackageHandler`则运行在单独`ServiceThread`中，处理延迟写盘、清理等后台消息。
-
-## 9. SystemServer为何先预热SystemConfig
-
-`startBootstrapServices()`先向初始化线程池提交：
-
-```java
-SystemServerInitThreadPool.submit(
-        SystemConfig::getInstance, "ReadingSystemConfig");
-```
-
-`SystemConfig`会读取权限白名单、共享库、feature、carrier配置等大量XML。提前读可与其他bootstrap服务启动重叠。
-
-## 10. 异步预热不等于依赖消失
-
-`SystemConfig.getInstance()`在`SystemConfig.class`锁内创建单例。PMS构造函数稍后也会调用它；若后台读取仍未完成，PMS线程会在同一把类锁上等待。因此它是预取优化，不是“PMS可以在没有SystemConfig时继续”。
-
-## 11. PMS之前为什么要有Installer
-
-这里的`Installer`不是安装界面，而是system_server对`installd`的Java代理。PMS需要它创建/修复应用数据目录、处理dex和删除路径，所以SystemServer先启动Installer。
-
-## 12. 默认Display也在PMS之前
-
-SystemServer先启动DisplayManager并进入`PHASE_WAIT_FOR_DEFAULT_DISPLAY`。PMS会取默认显示的metrics用于部分资源和兼容处理，因此启动顺序本身就是依赖声明。
-
-## 13. `onlyCore`从哪里来
-
-加密设备处在最小Framework重启路径时，SystemServer可能设置`mOnlyCore=true`，再传给PMS：
-
-```java
-mPackageManagerService = PackageManagerService.main(
-        mSystemContext, installer, mFactoryTestMode != FactoryTest.FACTORY_TEST_OFF,
-        mOnlyCore);
-```
-
-## 14. `onlyCore`不是安全模式
-
-`onlyCore`要求解析器只接受Manifest含`coreApp=true`的核心包，并跳过普通`/data/app`扫描及若干非核心准备。安全模式则主要限制第三方应用运行。两者原因、筛选位置和生命周期都不同。
-
-## 15. SystemServer暂时停掉Watchdog当前线程监控
-
-PMS首次扫描可能很慢。r48在调用`PackageManagerService.main()`周围暂停并恢复Watchdog对当前线程的监控，避免正常的长启动工作被误判成SystemServer主线程死锁。
-
-这不代表PMS自己的后台Handler不受Watchdog观察；构造中会把`PackageHandler`注册给Watchdog。
-
-## 16. `main()`先创建两把锁
-
-```java
-final Object lock = new Object();
-final Object installLock = new Object();
-```
-
-随后Injector把同一组锁交给PMS、Settings、UserManager、PermissionManager和ComponentResolver，保证共享状态遵循统一锁协议。
-
-## 17. `mLock`保护什么
-
-`mLock`主要保护解析后的包状态、Settings、组件解析索引、shared user等内存数据。它非常繁忙，常规Binder查询也可能需要它，因此正常运行时应短持有。
-
-## 18. `mInstallLock`保护什么
-
-`mInstallLock`保护与`installd`和重磁盘I/O有关的安装操作。源码约束是：不要拿着`mLock`再去获取`mInstallLock`；允许持有`mInstallLock`时短暂进入`mLock`。
-
-## 19. 方法后缀就是锁注释
-
-```text
-LI  → 调用方持有mInstallLock
-LIF → 持有mInstallLock，且相关package已冻结
-LPr → 持有mLock，只读
-LPw → 持有mLock，可写
-```
-
-这不是Java语法保证，但阅读PMS时应把它当作并发合同。
-
-## 20. 为什么启动构造能长时间同时持两把锁
-
-构造函数在公开Binder发布之前，用`mInstallLock → mLock`顺序包住主要扫描与调和。此时还没有外部PackageManager客户端并发查询，能用较简单的一致性模型建立初始世界。
-
-这不是日常安装路径可以随意照搬的长锁策略。
-
-## 21. Injector的意义
-
-Injector集中创建Settings、UserManagerService、PermissionManager、AppsFilter以及其他Local/System service依赖。除便于测试替换外，更重要的是让共享锁和循环依赖在可控顺序中装配。
-
-## 22. 内部服务比公开Binder更早出现
-
-PMS构造前段就执行：
-
-```java
-mPmInternal = new PackageManagerInternalImpl();
-LocalServices.addService(PackageManagerInternal.class, mPmInternal);
-```
-
-这时尚未读取完Settings、也未扫描所有包。LocalServices消费者必须由SystemServer顺序保证不会过早读取完整包世界。
-
-## 23. 公开Binder何时发布
-
-`PackageManagerService.main()`先完整执行构造函数，再安装白名单系统包，最后：
-
-```java
-ServiceManager.addService("package", m);
-final PackageManagerNative pmn = new PackageManagerNative(m);
-ServiceManager.addService("package_native", pmn);
-```
-
-所以普通客户端能查到`package`服务时，首次扫描和构造内Settings写回已经结束。
-
-## 24. `package`与`package_native`
-
-`package`是Java侧`IPackageManager` Binder服务；`package_native`向native客户端提供较小的包管理接口。两者共享同一个PMS包世界，但接口面不同。
-
-## 25. 构造前半段还做了什么
-
-它会初始化UserManager、ComponentResolver、PermissionManager、Settings、内置shared UID、dex/ART协作对象、AppsFilter、InstantAppRegistry、共享库，以及SELinux安装策略。
-
-启动扫描不是孤立的“文件遍历器”，它依赖这些对象把扫描结果变成权限、组件和UID状态。
-
-## 26. 内置shared UID先占位
-
-PMS为`android.uid.system`、phone、log、nfc、bluetooth、shell、se、networkstack等建立shared-user记录。这些平台身份必须在解析使用它们的系统包之前存在。
-
-## 27. 扫描目录不是硬编码两个路径
-
-PMS建立`mDirsToScanAsSystem`：先放静态系统分区，再追加当前活动APEX映射出的扫描分区。
-
-静态系统分区由`PackagePartitions`描述。
-
-## 28. 系统分区的基础顺序
-
-r48的静态列表从通用、低优先级到更具体、高优先级：
-
-```text
-/system → /vendor → /odm → /oem → /product → /system_ext
-```
-
-并不是所有分区都一定支持`priv-app`或`overlay`子目录，代码通过分区属性判断。
-
-## 29. 每个分区携带身份flag
-
-`ScanPartition`不仅保存根目录，还映射`SCAN_AS_VENDOR`、`SCAN_AS_ODM`、`SCAN_AS_OEM`、`SCAN_AS_PRODUCT`、`SCAN_AS_SYSTEM_EXT`等flag。后续权限和包身份判断不能只看路径字符串。
-
-## 30. APEX中的APK怎样获得分区身份
-
-活动APEX挂载到新路径，但PMS会根据它的预安装APEX原始路径判断归属哪个基础系统分区，再创建以活动挂载点为根、带`SCAN_AS_APK_IN_APEX`的`ScanPartition`。
-
-因此“APK现在位于APEX mount下”不会丢掉vendor/product等来源属性。
-
-## 31. Settings是什么
-
-`Settings`是PMS的持久化账本与内存索引管理器。它记录“系统上次认可的包状态”，而不是重新保存APK Manifest全文。
-
-## 32. 全局文件在哪里
-
-```text
-/data/system/packages.xml
-/data/system/packages-backup.xml
-/data/system/packages.list
-```
-
-`packages.xml`是主账；backup用于写坏恢复；`packages.list`是给native/守护进程消费的扁平包与UID/数据目录信息。
-
-## 33. 每用户文件在哪里
-
-```text
-/data/system/users/<userId>/package-restrictions.xml
-/data/system/users/<userId>/package-restrictions-backup.xml
-```
-
-运行时权限还有独立的每用户持久化文件/状态，不能把所有权限都想象成在`packages.xml`里。
-
-## 34. `packages.xml`主要记什么
-
-它包含package setting、code/resource path、appId或shared UID、签名/keyset引用、安装权限、版本与构建指纹、renamed package、disabled system package等。
-
-APK里的Activity、Service、Receiver、Provider和IntentFilter仍以当前APK解析为准。
-
-## 35. `package-restrictions.xml`主要记什么
-
-同一个包对不同用户可以有不同的：
-
-```text
-installed、stopped、notLaunched、hidden、suspended
-enabled状态、组件enabled/disabled覆盖
-domain verification/app-link状态、instant-app状态等
-```
-
-所以“全局存在这个包”不等于“每个用户都安装并可启动它”。
-
-## 36. 三类事实图
-
-```mermaid
-flowchart LR
-    APK["当前磁盘事实<br/>APK/APEX Manifest与签名"] --> PARSE["PackageParser2<br/>ParsedPackage"]
-    GLOBAL["全局旧账<br/>packages.xml"] --> SET["Settings / PackageSetting"]
-    USER["每用户旧账<br/>package-restrictions.xml<br/>runtime permissions"] --> SET
-    PARSE --> REC["scan + reconcile"]
-    SET --> REC
-    POLICY["SystemConfig / 分区身份<br/>权限与共享库策略"] --> REC
-    REC --> MEM["mPackages、组件索引<br/>UID、权限、共享库"]
-    REC --> WRITE["写回新的全局账<br/>和每用户状态"]
-```
-
-## 37. 为什么不能只相信旧账
-
-OTA会改变系统镜像；用户可能安装系统应用更新；掉电可能打断写盘；坏块或手工调试可能使APK缺失。旧账只是上一轮结论，必须与当前磁盘重新核对。
-
-## 38. 为什么不能只相信目录
-
-仅看目录无法恢复稳定appId、shared UID归属、签名演进、每用户installed/stopped状态、系统更新版关系等。若每次开机都重新随机分配UID，Linux沙箱和应用数据所有权会崩溃。
-
-## 39. 读取Settings的入口
-
-构造函数在两把锁内执行：
-
-```java
-mFirstBoot = !mSettings.readLPw(
-        mInjector.getUserManagerInternal().getUsers(
-                true, false, false));
-```
-
-这里`LPw`提示会在`mLock`下修改Settings。
-
-## 40. backup为何优先
-
-若`packages-backup.xml`存在，`readLPw()`优先打开backup，并删除普通`packages.xml`。含义是上次写新主文件时未走到“成功后删除backup”，新文件可能不完整，旧backup更可信。
-
-## 41. 没有`packages.xml`怎样处理
-
-如果主文件和backup都不存在，Settings把内部版本信息设到当前值并返回`false`。PMS据此得到`mFirstBoot=true`。
-
-这比“捕获任意异常就是首次开机”精确得多。
-
-## 42. XML读取前先清什么
-
-Settings清理待解析package、签名池、key引用和installer package等临时集合，再按XML tag恢复package、shared-user、permission、updated-package、renamed-package、keyset和version信息。
-
-## 43. shared UID为什么要延迟连接
-
-`<package>`可能引用后面才出现的`<shared-user>`。读取时先把它放进pending列表，完成全局XML解析后，再按共享UID标识把PackageSetting连到SharedUserSetting。
-
-这是一种“先反序列化节点，再解析引用”的常见模式。
-
-## 44. 全局账后再读用户账
-
-只有先知道全局有哪些PackageSetting，才能把每用户restriction应用到对应包。随后PermissionManager再读取每用户runtime permission状态，并生成内核需要的包映射。
-
-## 45. 缺少某用户restriction文件
-
-r48会对该用户把已有包初始化为`installed=true`、`stopped=false`等默认状态。这是兼容/首次建立用户账本的路径，不应解读成磁盘上的每个未知APK自动安装给该用户。
-
-## 46. `readLPw()`异常边界
-
-r48里，进入XML解析后的一些XML/IO异常会被catch、记录，然后方法继续走到最终`return true`。因此：
-
-```text
-mFirstBoot == !readLPw(...)
-```
-
-并不等价于“Settings有任何解析错误就算首次开机”。这是阅读此版本必须保留的实现边界。
-
-## 47. 首次开机与升级不是一回事
-
-读取旧账后，PMS取内部VersionInfo：
-
-```java
-final VersionInfo ver = mSettings.getInternalVersion();
-mIsUpgrade = !Build.FINGERPRINT.equals(ver.fingerprint);
-```
-
-没有旧账通常是first boot；有旧账但构建指纹变化通常是upgrade。
-
-## 48. `sdkUpdated`又是另一维
-
-平台SDK版本变化用于决定权限升级等兼容工作；构建指纹变化范围更广。一次同API级别OTA可以`mIsUpgrade=true`而`sdkUpdated=false`。
-
-## 49. 升级前为何保存`mExistingPackages`
-
-PMS在扫描前保存上次已存在包名，以便扫描后判断某系统包是OTA新加入、原有包升级，还是已被移除。`systemReady()`末尾完成相关处理后才清空这份集合。
-
-## 50. 启动扫描flag
-
-基础扫描flag为：
-
-```text
-SCAN_BOOTING | SCAN_INITIAL
-```
-
-首次开机或升级还加`SCAN_FIRST_BOOT_OR_UPGRADE`。这些flag描述扫描上下文，不等于包所在分区的`SCAN_AS_SYSTEM`身份。
-
-## 51. parse flag与scan flag别混
-
-`PARSE_IS_SYSTEM_DIR`告诉解析层文件来自系统目录；`SCAN_AS_SYSTEM`、`SCAN_AS_PRIVILEGED`和分区flag告诉扫描/提交层怎样赋予系统身份和策略。它们作用阶段不同。
-
-## 52. `PackageParser2`的`onlyCore`
-
-PMS构造`PackageParser2`时传入`mOnlyCore`。底层`ParsingPackageUtils`会拒绝非`coreApp`包，所以过滤并不只是“后来扫描时不注册组件”。
-
-## 53. APEX先于普通APK
-
-PMS先让ApexManager扫描/获取APEX包元数据，再处理APEX内APK扫描分区。APEX影响可见路径、模块信息和系统包来源，必须在普通系统APK世界稳定前建立。
-
-## 54. overlay为什么先扫
-
-PMS先遍历各系统扫描分区的overlay目录，再扫framework和app目录。资源覆盖关系会影响后续系统资源/包处理，因此overlay配置不是最后随便补一遍。
-
-## 55. overlay为何逆序扫描
-
-静态分区列表从低优先级到高优先级；overlay循环按反方向走，使更具体/更高优先级分区先进入相关处理。不要把所有目录循环都假定为同一方向。
-
-## 56. `/system/framework`是特殊阶段
-
-PMS用system、privileged和`SCAN_NO_DEX`等flag扫描`/system/framework`。这里包含框架资源包和共享库相关APK，不是普通预装应用目录。
-
-## 57. `android`包是硬前提
-
-framework扫描后若找不到包名`android`，PMS抛`IllegalStateException`。这个包承载平台资源与核心身份；缺失时继续启动只会制造更难理解的错误。
-
-## 58. 每个系统分区的应用顺序
-
-对每个`ScanPartition`：
-
-```text
-若支持priv-app：先扫priv-app，附加SCAN_AS_PRIVILEGED
-再扫app，保留系统及该分区身份flag
-```
-
-“位于系统分区”与“特权应用”不是同义词；只有priv-app路径获得privileged扫描身份。
-
-## 59. OverlayConfig何时建立
-
-系统目录扫描完成到一定阶段后，PMS初始化OverlayConfig，把静态overlay、分区优先级和配置整合起来。它依赖已发现的系统内容。
-
-## 60. 为什么系统包扫描后不能马上扫完就算
-
-PMS还要处理：
-
-```text
-旧账中存在但镜像上消失的系统包
-被/data更新版覆盖的系统包
-stub系统包
-OTA新包与旧包
-期待/data出现更好版本的包
-```
-
-目录遍历只是收集事实，调和规则才决定最终包世界。
-
-## 61. 什么是updated system app
-
-系统镜像中有基础版本，用户后来把更新版安装到`/data/app`。Settings会在disabled-system-package账中保留基础系统包信息；当前活动包通常是`/data`更新版。
-
-“disabled system package”不是用户在设置页点了禁用，而是基础版本暂时被数据版替代的内部记录。
-
-## 62. `mExpectingBetter`表达什么
-
-系统扫描看见基础版本，同时旧账说明应有`/data`更新版时，PMS暂时从当前活动包集合移走系统基础版本，并把基础代码路径记入`mExpectingBetter`。
-
-意思是：“先别采用旧系统版，我期待稍后在数据分区看到更好版本。”
-
-## 63. `/data/app`何时扫描
-
-仅在`!mOnlyCore`时，系统扫描和系统包预调和之后执行：
-
-```java
-scanDirTracedLI(sAppInstallDir, 0,
-        scanFlags | SCAN_REQUIRE_KNOWN, 0,
-        packageParser, executorService);
-```
-
-这里parseFlags为0，说明它不是系统目录。
-
-## 64. `SCAN_REQUIRE_KNOWN`为什么重要
-
-启动时`/data/app`中的包通常必须已经在Settings里，并且code/resource path与账本匹配。PMS不把开机目录扫描当作“发现任意陌生APK就自动安装”的入口。
-
-更新系统应用的`mExpectingBetter`路径有相应放宽，否则数据版永远无法接替系统基线。
-
-## 65. 无效数据包为何可能被删除
-
-`scanDirLI()`遇到非系统目录里的解析/扫描失败，会调用`removeCodePathLI()`清理坏代码路径；系统目录错误则记录但不删除只读系统镜像。
-
-因此在真实设备上随意往`/data/app`塞目录并重启，不是安全的源码学习实验。
-
-## 66. 外置/adopted卷不都在这一步
-
-本次内部数据扫描核心是`/data/app`。其他存储卷会通过StorageManager监听和后续卷挂载流程接入，不能从这里只看到一个路径就断言PMS永远不管理外置应用。
-
-## 67. 并行解析器做了什么
-
-`ParallelPackageParser`使用固定最多4个线程，线程优先级为foreground；其“已完成解析结果”的阻塞队列容量为30。`scanDirLI()`为候选APK目录提交parse任务，再从该结果队列取回结果。容量30限制的是尚未被调用线程消费的结果数，不能据此推断执行器内部待执行任务队列也只有30项。
-
-## 68. 结果顺序不是目录顺序
-
-结果通过阻塞队列按“完成先后”返回。体积小的后提交APK可能先解析完成，所以不能依赖文件枚举顺序决定最终覆盖关系；真正冲突由扫描/调和规则处理。
-
-## 69. 并行解析不等于并行提交
-
-工作线程主要把磁盘内容解析成`ParsedPackage`；SystemServer主线程每取一个结果，再执行`addForInitLI()`等扫描、校验和状态提交。全局`mPackages`、Settings和组件索引并不是4条线程随意并发修改。
-
-## 70. 为什么这种分工合理
-
-XML解析和证书读取可并行消耗CPU/I/O；包名冲突、shared UID、签名、权限和组件索引需要全局一致性。并行“生产候选”，串行“决定世界”能降低锁与回滚复杂度。
-
-## 71. 解析异常怎样传播
-
-预期的`PackageParserException`会放进结果并由调用线程记录/处理；工作线程若抛出意外`Throwable`，调用端会升级为`IllegalStateException`，因为线程池内部错误可能破坏启动可信度。
-
-## 72. 线程池关闭也是一致性检查
-
-所有目录扫描结束后，PMS关闭parser并`shutdownNow()`执行器。如果仍返回未完成任务列表，就抛`IllegalStateException`。
-
-这防止主流程误以为扫描完成，而后台其实还有未消费包结果。
-
-## 73. 系统与数据扫描调和图
-
-```mermaid
-flowchart TD
-    OLD["读取旧Settings"] --> SYS["扫描APEX / overlay / framework<br/>各分区priv-app与app"]
-    SYS --> BASE{"旧账显示系统包<br/>曾被/data更新？"}
-    BASE -- 否 --> KEEP["采用当前系统候选"]
-    BASE -- 是 --> EXPECT["移开系统基础版<br/>记入mExpectingBetter"]
-    KEEP --> DATA["扫描/data/app<br/>SCAN_REQUIRE_KNOWN"]
-    EXPECT --> DATA
-    DATA --> BETTER{"数据更新版<br/>成功出现？"}
-    BETTER -- 是 --> USE_DATA["采用/data版本<br/>保留disabled system基线"]
-    BETTER -- 否 --> FALLBACK["enable system package<br/>按原分区身份重扫基础版"]
-    USE_DATA --> FINAL["共享库/ABI/权限/app-data/Settings写回"]
-    FALLBACK --> FINAL
-```
-
-## 74. “期待更好”成功时
-
-数据扫描发现合法更新版，它成为`mPackages`里的活动包；Settings仍保留基础系统包，以便卸载更新或数据版消失时恢复。
-
-## 75. “期待更好”失败时
-
-若`mExpectingBetter`中的包最终未出现在`mPackages`，PMS记录：
-
-```text
-Expected better ... but never showed up; reverting to system
-```
-
-随后重新enable基础包，并根据其原路径恢复system、privileged和vendor/product等准确flag后重扫。
-
-## 76. 为什么回退时要重新判断分区
-
-若直接用普通system flag重扫，原priv-app或product/vendor身份可能丢失，进而改变权限。代码反向搜索`mDirsToScanAsSystem`，根据基础路径重建原扫描身份。
-
-## 77. OTA删除系统基础包又是什么情况
-
-旧账可能显示某系统包曾有更新版，但新系统镜像已经移除基础包。PMS会清除disabled-system记录；若数据版仍在，则按普通数据包重扫并撤销系统特权；若数据版也不存在，则最终删除包数据。
-
-这和“基础包仍在，但期待的数据更新版坏了”是两条相反的分支。
-
-## 78. stub系统包为何最后处理
-
-stub APK是精简占位版本，可能需要解压/启用完整实现。PMS等正常系统与数据版本关系确定后才安装stub，确保真正版本优先；失败时保持stub禁用，避免占位包冒充完整功能。
-
-## 79. 扫描结束后先修共享库
-
-只有最终包集合确定后，PMS才能解析共享库提供者并为所有客户端重算library path。过早计算会把后来被数据版替换或被OTA移除的提供者写入结果。
-
-## 80. shared UID还要修ABI和SEInfo
-
-共享UID下多个包必须兼容ABI，并落入一致的SELinux域。PMS遍历SharedUserSetting，调整ABI、清理相应dex并调用`fixSeInfoLocked()`。
-
-## 81. 权限更新也要等包世界稳定
-
-PermissionManager根据最终包、声明权限、系统身份、平台版本变化和用户状态执行权限更新。系统包是否privileged、是否OTA新增，都可能改变结果。
-
-## 82. usage和compiler stats不是包真相
-
-PMS读取包使用时间与编译统计用于优化和决策；它们依附于已确认PackageSetting。缺少这些统计不会让APK Manifest消失，不能与核心Settings账混为一谈。
-
-## 83. 应用数据准备为何分两段
-
-构造内先同步调和system user的核心应用数据，返回可延后的非核心包，再向SystemServer初始化线程池提交`mPrepareAppDataFuture`，执行`installd fixupAppData`和剩余准备。
-
-这样能缩短公开服务发布前的关键路径，同时在第三方应用真正启动前设置明确等待屏障。
-
-## 84. OTA为何清code cache而保留profile
-
-系统升级后旧编译产物可能与新Framework不兼容，所以清理code cache；profile记录真实使用热点，仍可用于新版本优化，保留它能避免丢失训练信息。
-
-## 85. 构造内何时写Settings
-
-完成扫描、权限/版本更新和主要调和后，PMS更新数据库版本并调用Settings写回。这样下次启动读取的是本轮最终结论，而不是扫描前旧世界。
-
-## 86. `packages.xml`没有直接用AtomicFile
-
-r48的`Settings.writeLPr()`手工实现备份协议：
-
-```text
-若旧backup不存在：把当前packages.xml重命名为backup
-若backup已存在：保留更老backup并删除当前主文件
-写新的packages.xml
-flush + FileUtils.sync
-成功后删除backup
-失败则删除新主文件，留下backup供下次恢复
-```
-
-读源码时不要因为Android常见`AtomicFile`就想当然地套到这里。
-
-## 87. 为什么backup已存在时不覆盖
-
-backup存在说明更早一次写入可能未完成。此时当前主文件可信度较低；若再用它覆盖backup，可能把最后一个已知好版本也丢掉。
-
-## 88. `sync`解决什么、不解决什么
-
-`flush()`把Java缓冲交给内核，`FileUtils.sync()`请求把文件内容落盘；随后删除backup表示提交成功。它增强断电恢复，但不意味着所有相关文件构成一个跨文件原子事务。
-
-## 89. 主账写完还会写什么
-
-Settings随后更新kernel mapping、`packages.list`、所有用户的package restrictions和runtime permissions。每用户restriction也采用类似主文件/backup恢复协议。
-
-## 90. `packages.list`的用途
-
-它以便于native读取的形式列出包名、appId、debuggable、data path、seinfo、gids等。它不是`packages.xml`的完整替代品，也不含完整组件模型。
-
-## 91. `PMS_READY`日志到底表示什么
-
-构造函数在Settings写回附近记录`BOOT_PROGRESS_PMS_READY`。这表示PMS启动扫描关键阶段已完成，并不是Java方法`systemReady()`已经调用。
-
-名字相似是典型误导点，应沿调用位置判断语义。
-
-## 92. 构造函数退出前还有收尾
-
-PMS还会初始化installer/verifier/controller包名、InstantApp相关对象、PackageInstallerService、DexManager等，退出大锁，初始化ModuleInfoProvider，解除PackageInfo缓存失效抑制并做GC。
-
-所以“EventLog写了PMS_READY”也不等于构造函数下一行立刻返回。
-
-## 93. 缓存为何先cork后uncork
-
-批量扫描会反复改变包信息。构造开始关闭/抑制相关cache invalidation，完成全量状态建立后统一解除，可避免每加入一个包都触发昂贵的跨进程缓存抖动。
-
-## 94. `installWhitelistedSystemPackages()`的位置
-
-它在`new PackageManagerService(...)`返回后、公开Binder注册前执行。用于按系统配置处理白名单系统包的每用户安装状态。
-
-因此公开查询看到的是这一步也已处理过的状态。
-
-## 95. `systemReady()`何时调用
-
-SystemServer启动更多核心/其他服务后，才调用：
-
-```java
-mPackageManagerService.systemReady();
-```
-
-这发生在公开Package Binder发布之后。Binder可获得与PMS完成SystemServer联动初始化不是同一屏障。
-
-## 96. `mSystemReady`在方法开头就置true
-
-r48的`systemReady()`先校验调用者，然后很早执行：
-
-```java
-mSystemReady = true;
-```
-
-接着才注册Observer、处理carrier/SKU应用、清理preferred activity、通知UserManager/PermissionManager、注册存储监听、恢复staged session等。
-
-## 97. volatile标志不代表方法体已全部结束
-
-其他Binder线程一旦看到`mSystemReady=true`，`systemReady()`后半段可能仍在SystemServer主线程运行。这个flag是阶段门，不是“所有后置动作完成”的Future。
-
-## 98. `systemReady()`中的关键后置动作
-
-包括但不限于：
-
-```text
-注册Settings/PackageVerifier相关ContentObserver
-通知AppsFilter、UserManager、PackageInstaller、DexOptimizer
-禁用不适用的carrier/SKU应用
-清理失效preferred activity
-注册StorageEventListener和外部存储策略
-调和过期用户/应用数据
-通知PermissionManager ready
-注册广播
-最后恢复/应用staged sessions
-```
-
-## 99. staged session为何靠后
-
-staged安装可能影响APEX或系统组件，需要前面的包、用户、权限、存储和installer状态稳定后再恢复/应用。源码注释明确把它放在`systemReady()`末尾。
-
-## 100. 应用数据屏障还在后面
-
-SystemServer稍后调用：
-
-```java
-mPackageManagerService.waitForAppDataPrepared();
-```
-
-它等待构造期间提交的`mPrepareAppDataFuture`完成并清空引用。
-
-## 101. 为什么要在第三方应用启动前等待
-
-紧接着SystemServer才推进到`PHASE_THIRD_PARTY_APPS_CAN_START`。否则ActivityManager可能启动第三方进程，而其数据目录的owner、SELinux label或迁移尚未准备好。
-
-## 102. 四个常被混淆的ready
-
-```text
-BOOT_PROGRESS_PMS_READY：构造内启动进度事件
-ServiceManager已有package：公开Binder可查
-mSystemReady=true：systemReady方法开头的阶段标志
-waitForAppDataPrepared返回：异步应用数据屏障完成
-```
-
-它们在r48中既不同行，也不完全同义。
-
-## 103. 查询可用不等于第三方应用可运行
-
-Binder发布后，其他系统服务需要查询包信息，所以PMS必须较早可用；第三方进程启动则可以等更晚的boot phase和app-data屏障。这是把“控制面查询”与“应用执行安全”分阶段的设计。
-
-## 104. 启动失败的三种强弱层级
-
-```text
-单个系统APK解析失败：通常记录错误，不能删除只读镜像
-单个/data代码路径失败：记录并可能清理无效路径
-核心android包缺失、解析线程意外Throwable、任务未收完：抛致命异常
-```
-
-错误策略取决于能否安全降级，而不是统一catch后继续。
-
-## 105. 一条包的完整“启动认定”
-
-以一个预装应用为例：
-
-```text
-Settings恢复旧PackageSetting/appId/签名关系
-→ 系统分区发现当前APK
-→ 并行解析Manifest和签名材料
-→ 主线程按分区身份执行scan/reconcile
-→ 判断是否应让位于/data更新版
-→ 更新mPackages、组件、权限、共享库和用户状态
-→ 必要时准备数据目录
-→ 写回新Settings
-```
-
-任何单一步都不能代表完整认定。
-
-## 106. 线程与锁速查
-
-| 工作 | 主要线程 | 关键锁/屏障 |
+| 观察点 | 已能证明 | 仍不能证明 |
 |---|---|---|
-| SystemServer调用PMS main | system_server主线程 | Watchdog当前线程监控暂时暂停 |
-| 读取Settings、提交扫描结果 | system_server主线程 | 启动期`mInstallLock → mLock` |
-| 解析多个APK | ParallelPackageParser最多4线程 | 不直接并发提交全局包世界 |
-| PMS延迟写盘/后台消息 | PackageHandler线程 | 按具体LP/LI协议 |
-| 非核心app-data准备 | SystemServer init pool | `mPrepareAppDataFuture` |
-| 普通PackageManager查询 | Binder线程池 | 公开服务发布后，常短持`mLock` |
+| `Settings.readLPw()` 返回 | 走到了某条读取返回路径 | 全局 XML 内容健康、当前代码仍存在 |
+| `BOOT_PROGRESS_PMS_SCAN_END` | 主扫描段已走完 | 权限、app data、主账写入和构造已完成 |
+| 构造内 `writeLPr()` 返回 | 这次无成功返回值的写调用已经结束 | 新 `packages.xml` 一定写成、派生文件与后续白名单变化都已耐久提交 |
+| PMS 构造函数返回 | 构造尾部也已执行 | 公开 Binder 已注册 |
+| `package` 注册 | `IPackageManager` Binder 端点可被发现 | `IPackageManagerNative`的 `package_native`端点已注册、`main()` 已返回 |
+| `mSystemReady=true` | PMS 早期阶段门已打开 | `systemReady()` 方法体已走完 |
+| PMS `systemReady()` 正常返回 | 同步方法体已走到清空 `mExistingPackages` | app-data Future、白名单延迟写与 staged 验证支线都已结束 |
+| `waitForAppDataPrepared()` 返回 | 那一枚初始 Future 已终止且 join 成功 | 所有用户、所有卷、每个目录都准备成功 |
+| `PHASE_THIRD_PARTY_APPS_CAN_START` | SystemService 收到相应 boot phase | 它是全系统唯一的“进程启动位” |
 
-## 107. 磁盘、内存、服务三层速查
+## 2. SystemServer 前置依赖与 `onlyCore` 已先改变输入集合
 
-| 层 | 代表对象 | 含义 |
+PMS 的入口、巨大构造函数、后来的 `systemReady()` 和 app-data join，都是 SystemServer 主线程上的同步调用。此时主 Looper 已 `prepare`，但 `Looper.loop()` 还没有开始；“主线程”不等于这些调用已被消息队列异步化。
+
+`startBootstrapServices()` 先把 `SystemConfig.getInstance()`提交给 SystemServer 初始化线程池。PMS 构造稍后也会取同一单例；getter 在 `SystemConfig.class` 上同步，二者竞争成为唯一初始化者：后台若已持锁构造，主线程才等待；主线程若先取得锁，就自己创建实例，稍后的后台任务只复用它。它是预取，不是取消依赖。
+
+前置对象不只有 `Installer`：PlatformCompat、ActivityManager、DataLoaderManager、Incremental Service、DisplayManager 等都先建立。默认显示 boot phase 先完成，PMS 才取 display metrics。`Installer.onStart()`若一时找不到 `installd` 会投递后台重连，因此“Java Installer 服务已启动”也不等于 native 连接永远已经成功。
+
+`mOnlyCore` 来自加密中的最小 Framework 路径，不是 safe mode。它一方面让 `ParsingPackageUtils`拒绝 `coreApp=false` 的包，另一方面跳过 `/data/app` 和若干非核心准备；它改变 PMS 建出的包集合，而不只是推迟第三方进程启动。
+
+首次 PMS 扫描很慢，SystemServer 用 `try/finally` 暂停并恢复 Watchdog 对“当前线程”的观察。构造内另起的 `PackageHandler`仍会以十分钟阈值加入 Watchdog。这两个观察对象不能混为一谈。
+
+### 练习 1：标出同步入口、预取与最小包世界
+
+从以下命中点回答：SystemConfig 后台任务没结束时，PMS 能否绕过它？Watchdog 的恢复是否依赖 PMS 成功返回？`onlyCore` 是在注册完成后隐藏包，还是解析入口就拒绝包？
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F "Looper.prepareMainLooper();" "frameworks/base/services/java/com/android/server/SystemServer.java"
+grep -n -F "SystemServerInitThreadPool.submit(SystemConfig::getInstance, TAG_SYSTEM_CONFIG);" "frameworks/base/services/java/com/android/server/SystemServer.java"
+grep -n -F "SystemConfig systemConfig = SystemConfig.getInstance();" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "synchronized (SystemConfig.class) {" "frameworks/base/core/java/com/android/server/SystemConfig.java"
+grep -n -F "Installer installer = mSystemServiceManager.startService(Installer.class);" "frameworks/base/services/java/com/android/server/SystemServer.java"
+grep -n -F "mSystemServiceManager.startBootPhase(t, SystemService.PHASE_WAIT_FOR_DEFAULT_DISPLAY);" "frameworks/base/services/java/com/android/server/SystemServer.java"
+grep -n -F "Watchdog.getInstance().pauseWatchingCurrentThread(\"packagemanagermain\");" "frameworks/base/services/java/com/android/server/SystemServer.java"
+grep -n -F "mPackageManagerService = PackageManagerService.main(mSystemContext, installer," "frameworks/base/services/java/com/android/server/SystemServer.java"
+grep -n -F "Watchdog.getInstance().resumeWatchingCurrentThread(\"packagemanagermain\");" "frameworks/base/services/java/com/android/server/SystemServer.java"
+grep -n -F "if (mOnlyCoreApps && !lite.coreApp) {" "frameworks/base/core/java/android/content/pm/parsing/ParsingPackageUtils.java"
+```
+
+答案是：PMS 仍需取得同一 `SystemConfig` 单例；`finally` 负责恢复当前线程观察，即使 `main()`抛异常也会执行；`onlyCore` 在 lite parse 后就返回 `ONLY_COREAPP_ALLOWED` 错误，并非先注册再过滤。
+
+## 3. `main()`装配共享锁；LocalServices 与公开 Binder 分属两条边界
+
+`PackageManagerService.main()`先创建 `lock` 和 `installLock`，再由 Injector 分别传给协作者。Settings、UserManager、PermissionManager、ComponentResolver 与 PMS 共享 `mLock`这把状态锁；`installLock`则交给 PMS、UserDataPreparer 等安装/data 侧协作者。两把锁的职责不能概括成所有对象都共同持有：
+
+- `mLock`保护解析后的包状态、Settings、组件与 shared-user 等高争用内存，常规路径应短持有；
+- 锁协议规定常规 `LI`路径用 `mInstallLock`串行化 `installd`访问和重磁盘工作；不得持 `mLock` 再取它，可以持 `mInstallLock` 时短暂进入 `mLock`；本章后面的 r48 `fixupAppData()` worker 是实际例外；
+- `LI`、`LIF`、`LPr`、`LPw`分别表示 install lock、install lock+冻结包、package lock 读、package lock 写。这是命名合同，不是 Java 类型系统检查。
+
+启动构造按 `mInstallLock → mLock`长期持有两把锁，完成读账、扫描、调和和主写。公开 Binder 尚不可见，使这段特殊启动策略可建立单一初始世界；它不是普通安装可照搬的长锁模板。
+
+构造很早就注册 `PackageManagerInternal`，随后才读取 Settings。LocalServices 可发现只说明内部对象已有入口，不说明包世界已经完整。`PackageHandler`也在双锁区早期启动并加入 Watchdog。
+
+公开边界在构造返回之后：`main()`先注册兼容性 listener，再调用 `installWhitelistedSystemPackages()`，然后顺序注册 `package` 和 `package_native`。后者由 system_server 中的 Java 内部类 `PackageManagerNative extends IPackageManagerNative.Stub`实现，是第二个 Binder 端点，不是 native 进程。白名单处理若改变用户安装态，只安排十秒延迟的 Settings/restrictions 写；因此 Binder 首次可见时，内存已含白名单结果，磁盘却可能仍是构造内那次写入。
+
+### 练习 2：区分内部可发现、内存完成与公开可查询
+
+按源码顺序排列共享锁、LocalServices、读账、构造返回后的白名单和两个 Binder。再解释为何 `package` 已注册时不能推出 `package_native` 已注册。
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F "final Object lock = new Object();" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "final Object installLock = new Object();" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "LocalServices.addService(PackageManagerInternal.class, mPmInternal);" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "// CHECKSTYLE:OFF IndentationCheck" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "mFirstBoot = !mSettings.readLPw(mInjector.getUserManagerInternal().getUsers(" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "m.installWhitelistedSystemPackages();" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "ServiceManager.addService(\"package\", m);" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "ServiceManager.addService(\"package_native\", pmn);" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "static final int WRITE_SETTINGS_DELAY = 10*1000;" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+```
+
+完整顺序是：创建两把锁 → 构造早期注册 LocalServices → 进入启动期双锁 → `readLPw()` → 构造返回 → 应用用户类型白名单 → 注册 `package` → 注册 `package_native`。两个 `addService()`是相邻但独立的调用；第一条完成到第二条完成之间，`IPackageManager`端点可以已被发现，而 `IPackageManagerNative`端点尚不可见，`PackageManagerService.main()`也尚未返回。
+
+## 4. Settings 是连续身份账，不是 Manifest 副本
+
+生产设备上的相关持久化不能只画成一个 `packages.xml`：
+
+| 文件或输出 | 主要内容 | 启动时角色 |
 |---|---|---|
-| 当前磁盘 | APK/APEX、Manifest、签名 | 本次开机实际代码事实 |
-| 持久化旧账 | Settings、PackageSetting、用户restriction | 上次认定的身份与状态 |
-| 本轮内存 | `mPackages`、ComponentResolver、权限/库索引 | 调和后的运行时真相 |
-| 对外接口 | `IPackageManager`、`PackageManagerNative` | 查询/变更上述内存状态的服务面 |
+| `/data/system/packages.xml` | package setting、appId/shared UID、路径、签名/keyset、安装权限、版本指纹、renamed/disabled-system 记录 | 全局旧账输入 |
+| `/data/system/packages-backup.xml` | 上一次未被新提交确认替代的全局副本 | 主账恢复候选 |
+| `users/<id>/package-restrictions.xml` | installed/stopped/hidden/suspended/enabled、组件覆盖、preferred/default/cross-profile 等 | 每包、每用户差异输入 |
+| permission APEX 每用户 device-protected `runtime-permissions.xml` | 包或 shared user 的运行时授权与 flags | r48 当前运行时权限输入 |
+| `/data/system/users/<id>/runtime-permissions.xml` | 旧位置的运行时权限 | 当前文件缺失时的迁移回退 |
+| `/data/system/packages.list` | appId、user-0 data path、seinfo、GID 等扁平派生信息 | 写出给 native 消费者；PMS 启动不从它恢复包世界 |
+| kernel mapping | appId 与 excluded-user 等内核映射 | 写给内核接口；不是 PMS 启动恢复源 |
 
-## 108. 易错理解一：`packages.xml`就是安装包清单
+后文说“五本账”时，指五个逻辑责任域：主 Settings、用户 restrictions、runtime permissions、`packages.list`和 kernel mapping。main/backup 属于同一主账的恢复文件，permission APEX 当前文件与旧路径文件也属于同一 runtime-permission 账；物理文件行数不能直接当作账本数量。
 
-错。它保存稳定身份、路径、签名关系和状态；当前组件声明必须从当前APK解析并与旧账调和。旧账不能凭空复活已经不存在的APK代码。
+`packages.xml`不保存 Activity、Service、Receiver、Provider 和 IntentFilter 的现行完整模型；那些声明必须从本次 APK 解析。反过来，只解析目录也恢复不了稳定 appId、shared UID、签名演进和每用户安装态。正确模型始终是：旧账保持连续性，当前文件给出现行代码事实，scan/reconcile 决定二者能否继续绑定。
 
-## 109. 易错理解二：扫描线程池并发安装四个包
+## 5. `readLPw()`的 backup 优先不是“校验失败后再回退”
 
-错。r48主要并行parse；结果由调用线程按完成顺序串行进入`addForInitLI()`。这仍可能改变日志顺序，但不是四条线程并发改`mPackages`。
+全局读取先看 backup。只要 backup 成功 `open`，就立即调用 `delete()`清理同时存在的普通主文件，而且不检查删除返回值，然后解析 backup；若 backup 内容后来解析失败，控制流不会回头再试 main。只有 backup 自身打不开时，才会继续尝试普通文件。
 
-## 110. 易错理解三：先扫`/data/app`，再判断是不是系统更新
+主、备都不存在时，代码把 internal 与 primary-physical 两份 VersionInfo 强制到当前 SDK、数据库版本和 fingerprint，并返回 `false`。PMS 用 `mFirstBoot = !readLPw(...)`得到 first boot。这是一个具体返回协议，不是“Settings 健康度”布尔值。
 
-错。先建立系统基线与`mExpectingBetter`，再扫描`/data/app`。只有知道基础系统包，才能安全判断数据版是更新、普通应用还是异常路径。
+还有两个不对称失败点：
 
-## 111. 易错理解四：`systemReady()`之后所有数据必然就绪
+- 文件存在但找不到任何起始标签时也返回 `false`，却没有执行 `forceCurrent()`；新 Settings 实例的 `getInternalVersion()`只做 map lookup，随后 PMS 对 `ver.fingerprint`的直接访问可因 `ver == null`立刻抛 `NullPointerException`；
+- 进入解析后的 `XmlPullParserException`或 `IOException`会被记录，随后仍继续连接 pending shared user、读用户态和 runtime permissions，最后可能返回 `true`。读取没有事务回滚，已经装入的部分状态可以留下。
 
-错。其方法体本身有前后动作，且`mSystemReady`在开头置位；非核心应用数据Future还由SystemServer稍后显式等待。
+所以“有解析错误就自动当首次开机重建”是错误模型；“backup 总能救主文件”也过强。
 
-## 112. 易错理解五：`onlyCore`只是跳过启动第三方应用
+### 练习 3：推演四种 Settings 磁盘状态
 
-错。它直接影响PackageParser接受哪些包，也跳过`/data/app`扫描和部分准备。它改变PMS建立的包世界，不只是AMS启动策略。
-
-## 113. 易错理解六：backup是主文件损坏后才尝试
-
-错。r48只要发现backup存在，就优先采用它并删除普通主文件，因为backup未删除意味着前次提交没有完整确认成功。
-
-## 114. 易错理解七：系统分区应用都拥有privileged权限
-
-错。系统身份与privileged身份分开编码。普通`app`目录没有`SCAN_AS_PRIVILEGED`，只有支持的`priv-app`路径才加。
-
-## 115. 易错理解八：APEX挂载路径决定全部身份
-
-错。PMS回看预安装APEX位于哪个基础分区，把对应分区flag带到活动APEX扫描目录，再附加APK-in-APEX身份。
-
-## 116. 第一次复读：最容易卡住的概念
-
-“读取Settings”不是把旧世界原样装回内存，“扫描目录”也不是忽略旧账重建。最准确的词是“调和”：
-
-```text
-旧账提供连续身份
-当前APK提供现行声明
-分区与SystemConfig提供平台策略
-每用户账提供用户差异
-PMS把四者合成新的运行时结论
-```
-
-## 117. 第二次复读：启动顺序修订
-
-不能写成“PMS发布Binder，然后后台慢慢扫描”。r48公开`package` Binder是在巨大构造函数完成扫描、主要调和和Settings写回之后发布；但`PackageManagerInternal`确实更早注册，且app-data与`systemReady()`后置工作仍可更晚完成。
-
-## 118. 第三次复读：first boot修订
-
-不能写成“`packages.xml`解析有错误就first boot”。代码的准确表达是`mFirstBoot = !readLPw()`；文件不存在/无起始tag等会返回false，而部分解析期异常被记录后仍可能最终返回true。分析故障必须以该版本具体控制流为准。
-
-## 119. 第四次复读：并行边界修订
-
-不能写成“扫描完全串行”，因为parse确有最多4线程；也不能写成“扫描并发提交”，因为全局状态变更回到主调用线程。推荐表述是“并行解析、完成序取回、串行调和提交”。
-
-## 120. 第五次复读：ready边界修订
-
-`BOOT_PROGRESS_PMS_READY`、公开Binder、`mSystemReady`、`systemReady()`返回、app-data Future完成与第三方应用boot phase是不同观察点。讨论“PMS ready”必须说明观察者和所需保证。
-
-## 121. 版本边界
-
-本章严格描述`android-11.0.0_r48`。新Android版本已重构包解析、Computer snapshot、PackageManagerService分层、APEX/模块化与Settings持久化；类名、锁方式和启动阶段可能变化。学习设计思想可以迁移，引用行级行为必须回到目标分支核对。
-
-## 122. macOS只读练习1：画出公开服务发布边界
+分别推演：仅 main、backup 与 main 同时存在、两者都不存在、仅 main 但文件无起始标签。记录选了哪个文件、是否删除另一个、是否 `forceCurrent()`以及返回值。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '2568,2650p' \
-  frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F "if (mBackupSettingsFilename.exists()) {" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "str = new FileInputStream(mBackupSettingsFilename);" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "mSettingsFilename.delete();" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "findOrCreateVersion(StorageManager.UUID_PRIVATE_INTERNAL).forceCurrent();" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "No start tag found in package manager settings" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "catch (XmlPullParserException e) {" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "mReadMessages.append(\"Read completed successfully: \"" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "mFirstBoot = !mSettings.readLPw(mInjector.getUserManagerInternal().getUsers(" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
 ```
 
-标出构造、白名单处理、`package`与`package_native`注册顺序。回答：普通Binder客户端能看见服务时，构造函数是否已返回？
+四种结果可直接列成表：
 
-## 123. macOS只读练习2：验证Settings恢复协议
+| 磁盘状态 | 读取与删除 | 版本补全 | `readLPw()`结果 |
+|---|---|---|---:|
+| 仅 main、内容正常 | 读 main，不删另一个 | 不 `forceCurrent()` | true |
+| backup + main、backup 可打开且正常 | 读 backup，并调用删除 main | 不 `forceCurrent()` | true |
+| 两者都不存在 | 无文件可读 | internal 与 primary-physical 都 `forceCurrent()` | false |
+| 仅 main、无起始标签 | 读 main，不删另一个 | 不 `forceCurrent()` | false，随后可能在 `ver.fingerprint`解引用处崩溃 |
+
+backup+main 的关键不是比较新旧时间，而是 backup 能否打开；“没有文件”和“有文件却无起始标签”虽都返回 false，却绝不安全等价。
+
+## 6. XML 中的 `userId`其实是 appId；多用户状态在另一张账
+
+`packages.xml`有一个极易误读的历史命名：普通包的 `<package userId="...">`写的是 `pkg.appId`，共享身份的包写 `<package sharedUserId="...">`，也仍是 appId。完整 Linux UID 要到具体 Android user 下再由 `UserHandle.getUid(userId, appId)`组合，不能把 XML 属性直接当成 user 10、user 11 这样的用户号。
+
+PMS 在读账前先放入 system、phone、shell、networkstack 等内置 shared-user 记录。共享包反序列化时仍先进入 `mPendingPackages`；读完整个 XML 后，代码按 shared appId 查询 `SharedUserSetting`，命中才设置 `p.sharedUser`、复用其 appId 并加入 Settings。命中普通 setting 或完全缺失都会记录坏账，不会静默分配一个新 shared UID。
+
+shared UID 共享的是 Linux 身份和 shared-user 权限态，不会把两个包合成同一份每用户开关。每个 `PackageSetting`仍分别保存各 user 的 installed、stopped、enabled 等状态。
+
+全局节点和引用连接完后，Settings 才读用户账：若旧式 stopped 文件存在，只迁移 user 0；否则逐用户读 restrictions。某个 restrictions 文件完全缺失时，当前 `mPackages`中的所有包都会被显式设为 `installed=true`、`stopped=false`等默认值，不区分 system/data；文件中的未知包名只被跳过，不能凭一条用户记录复活全局不存在的包。
+
+runtime permissions 也由 Settings 内部的 persistence 接口同步读取。r48 首选 permission APEX 的每用户 device-protected 文件并用 `AtomicFile`；主文件不存在才读 `/data/system/users/<id>` 的旧文件，随后安排迁移写。它不是由 `packages.xml`一次性恢复的字段。
+
+### 练习 4：把 appId、shared user 与 Android user 拆开
+
+查明普通包、共享包各写哪个 XML 属性；再找到 pending 引用连接、restrictions 和 permission APEX 文件。回答：两个 shared-UID 包是否必然拥有相同的 `installed(userId)`？
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '2436,2535p' \
-  frameworks/base/services/core/java/com/android/server/pm/Settings.java
-sed -n '2982,3070p' \
-  frameworks/base/services/core/java/com/android/server/pm/Settings.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F "serializer.attribute(null, \"userId\", Integer.toString(pkg.appId));" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "serializer.attribute(null, \"sharedUserId\", Integer.toString(pkg.appId));" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "mPendingPackages.add(packageSetting);" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "p.appId = sharedUser.userId;" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "readPackageRestrictionsLPr(user.id);" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "true  /*installed*/," "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "mRuntimePermissionsPersistence.readStateForUserSyncLPr(user.id);" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "ApexEnvironment.getApexEnvironment(APEX_MODULE_NAME);" "frameworks/base/apex/permission/service/java/com/android/permission/persistence/RuntimePermissionsPersistenceImpl.java"
+grep -n -F "return new File(dataDirectory, RUNTIME_PERMISSIONS_FILE_NAME);" "frameworks/base/apex/permission/service/java/com/android/permission/persistence/RuntimePermissionsPersistenceImpl.java"
 ```
 
-分别找出写前rename到backup、成功后删除backup，以及读取时backup优先的代码。思考：为什么backup存在是一条“上次提交未确认”的信号？
+答案是否定的。shared user 连接决定共享 appId/权限载体；installed 等仍从各自 `PackageSetting`的每用户状态读取。
 
-## 124. macOS只读练习3：核对系统与数据扫描顺序
+## 7. first boot、真实 OTA、SDK 变化与 mock upgrade 是四个开关
+
+读账之后，PMS 从 internal VersionInfo 取旧 fingerprint：`mIsUpgrade`只比较它与当前 `Build.FINGERPRINT`。`sdkUpdated`则比较旧 SDK 与当前 SDK，用于权限更新；同 API 级 OTA 可以 fingerprint 变化而 SDK 不变。
+
+正常磁盘状态可先用三行表理解：
+
+| 场景 | `mFirstBoot` | `mIsUpgrade` |
+|---|---:|---:|
+| 主、备都不存在且版本被 `forceCurrent()` | true | false |
+| 健康旧账、fingerprint 不同 | false | true |
+| 健康旧账、fingerprint 相同 | false | false |
+
+畸形文件不保证落入这张安全表，因为第 5 节的返回值与 VersionInfo 建立并不总是绑定。
+
+四个开关的直接消费者要分开看：
+
+| 开关 | 来源 | 本章关键消费者 |
+|---|---|---|
+| `mFirstBoot` | `!readLPw()` | `SCAN_FIRST_BOOT_OR_UPGRADE`；非 only-core 时初始化默认 preferred/domain |
+| `mIsUpgrade` | 旧 fingerprint 与当前值不同 | 同一 scan flag、pre-N/pre-M 等迁移分支、非 only-core 的全量 code-cache 清理 |
+| `sdkUpdated` | 旧 SDK 与当前 SDK 不同 | `updateAllPermissions()`的 SDK 变化参数 |
+| `isDeviceUpgrading()` | `mIsUpgrade`或 `persist.pm.mock-upgrade` | 扫描前包名快照/用户类型白名单、版本变化包的 profile 清理 |
+
+所以 mock-upgrade 不只影响快照和白名单，也会让 `maybeClearProfilesForUpgradesLI()`清除版本变化包的 profiles；但它不会自动触发所有真实 OTA 分支：`SCAN_FIRST_BOOT_OR_UPGRADE`只看 `mIsUpgrade || mFirstBoot`，全量 code-cache 清理只看 `mIsUpgrade && !mOnlyCore`。
+
+`mExistingPackages`也不是扫描调和的分类器。它仅在 `isDeviceUpgrading()`为真时，于扫描前复制 Settings 中的包名；直接消费者是构造返回后的 `installWhitelistedSystemPackages()`。OTA 应用用户类型白名单时，它避免把升级前已经存在的系统包当作“本次新增、可以卸载”。这份集合一直保留到 `systemReady()`末尾才清空。
+
+## 8. 系统分区和活动 APEX 先被投影成带身份的扫描目录
+
+r48 的静态 `PackagePartitions`按 increasing specificity 排列：
+
+| 顺序 | 根 | priv-app | overlay | 额外 scan flag |
+|---:|---|---:|---:|---|
+| 1 | `/system` | 有 | 无 | 无分区附加位 |
+| 2 | `/vendor` | 有 | 有 | `SCAN_AS_VENDOR` |
+| 3 | `/odm` | 有 | 有 | `SCAN_AS_ODM` |
+| 4 | `/oem` | 无 | 有 | `SCAN_AS_OEM` |
+| 5 | `/product` | 有 | 有 | `SCAN_AS_PRODUCT` |
+| 6 | `/system_ext` | 有 | 有 | `SCAN_AS_SYSTEM_EXT` |
+
+PMS 先把这些静态项放入 `mDirsToScanAsSystem`，再追加活动 APEX 对应的扫描项，而不是按继承分区插回静态优先级位置。updatable APEX cache 由 `ArraySet`转成 `ArrayList`，多个活动 APEX 的相对次序也不应解释成稳定优先级。活动挂载路径本身不决定 vendor/product 身份：`resolveApexToScanPartition()`回看预安装 APEX 路径，继承匹配静态分区的目录能力与 scan flag，再加 `SCAN_AS_APK_IN_APEX`。
+
+这里要保留一个 r48 实现边界：匹配使用绝对路径字符串 `startsWith()`并取静态列表中的第一个命中，不是带路径分隔符的 canonical containment。静态 `/system`又排在 `/system_ext`之前，所以 `/system_ext/apex/...`字符串会先命中 `/system`，存在丢失 `SCAN_AS_SYSTEM_EXT`的实现风险。诊断 APEX 身份时应查看最终 `ScanPartition`，不能仅凭设计意图推断。
+
+APEX 还有两层不同扫描。在 `ApexManagerImpl`这条可更新 APEX 实现中，`scanApexPackagesTraced()`先解析 APEX 容器元数据；flattened APEX 实现的同名方法则是 no-op，活动目录由 `/apex`枚举。随后活动 APEX 内的 APK 才作为追加的 system scan partition 进入 overlay/priv-app/app 阶段。可更新实现的 only-core 容器 parse 中，只有 `ONLY_COREAPP_ALLOWED`错误会作为非 core APEX 被跳过，其他 parse 错误仍是致命异常。容器包与 APK-in-APEX 不应混叫成同一候选。
+
+## 9. 目录阶段严格串行；overlay 的逆序不能套到所有扫描
+
+双锁区建立 `SCAN_BOOTING | SCAN_INITIAL`，first boot 或真实 fingerprint upgrade 再加 `SCAN_FIRST_BOOT_OR_UPGRADE`。system candidate 另有 `PARSE_IS_SYSTEM_DIR`和 `SCAN_AS_SYSTEM`；parse flag 描述解析来源，scan flag 控制提交期身份，不能互换。
+
+实际阶段顺序如下：
+
+1. 调用 APEX 元数据扫描；可更新实现用共享 executor 解析并全部取回，flattened 实现为 no-op；
+2. 对 `mDirsToScanAsSystem`倒序扫描各自 overlay 目录；
+3. 扫 `/system/framework`，附加 `SCAN_NO_DEX | SCAN_AS_PRIVILEGED`；
+4. 若包名 `android`仍不存在，立即抛致命异常；
+5. 对同一目录表正序遍历，每个 partition 先 `priv-app`、再 `app`；
+6. 基于已发现的系统包初始化 `OverlayConfig`；
+7. `!mOnlyCore`时整理旧系统记录、updated-system 基线和 stub 候选；
+8. 同一 `!mOnlyCore`分支再扫描 `/data/app`。
+
+“overlay 倒序”只精确描述那一条循环。普通 system app 循环是正序；活动 APEX partitions 又追加在静态项之后，所以不要把所有目录阶段概括成“统一按高优先级到低优先级”。每次 `scanDirLI()`会先收齐本目录结果再返回，下一目录不会与它跨阶段并发解析。
+
+### 练习 5：从调用顺序还原完整扫描阶段
+
+把下列命中按实际执行顺序编号，并指出哪一条循环倒序、哪一条循环正序、`/data/app`受哪个条件控制。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '3060,3250p' \
-  frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F "mApexManager.scanApexPackagesTraced(packageParser, executorService);" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "for (int i = mDirsToScanAsSystem.size() - 1; i >= 0; i--) {" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "scanDirTracedLI(partition.getOverlayFolder(), systemParseFlags," "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "scanDirTracedLI(frameworkDir, systemParseFlags," "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "if (!mPackages.containsKey(\"android\")) {" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "for (int i = 0, size = mDirsToScanAsSystem.size(); i < size; i++) {" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "scanDirTracedLI(partition.getPrivAppFolder(), systemParseFlags," "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "scanDirTracedLI(partition.getAppFolder(), systemParseFlags," "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "mOverlayConfig = OverlayConfig.initializeSystemInstance(" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "scanDirTracedLI(sAppInstallDir, 0, scanFlags | SCAN_REQUIRE_KNOWN, 0," "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
 ```
 
-依次记录overlay、framework、priv-app、app和`/data/app`，再圈出`SCAN_REQUIRE_KNOWN`。不要只看调用名，还要记循环方向与flag。
+命中顺序就是：APEX 元数据入口（可更新实现解析容器，flattened 实现 no-op）→ 倒序 overlay 循环及其目录调用 → framework → 必需的 `android`检查 → 正序 partition 循环中的 priv-app、app → `OverlayConfig` → `/data/app`。只有 overlay 循环倒序，普通 system 目录循环正序；列表中的旧系统整理与 `/data/app`都受 `!mOnlyCore`控制。每个目录内部可并行 parse，但调用线程取满该目录结果后才进入下一阶段。
 
-## 125. macOS只读练习4：区分两个后置屏障
+## 10. ParallelPackageParser 并行的是 parse，不是全局提交
+
+`scanDirLI()`先 `listFiles()`，过滤 APK/目录并排除 staging 名称，然后把本目录候选提交给一个最多四线程、foreground priority 的 executor。每个工作项只构造 `ParseResult`并放入容量 30 的完成队列。30 限制的是已完成但尚未被调用线程消费的 result 数，不是 executor 的待执行任务总量。
+
+调用线程按完成顺序 `take()`，所以体积小的后提交包可以先返回；目录枚举顺序也没有被当作承诺。每个成功 result 随后在调用线程串行进入 `addForInitLI()`。`mPackages`、Settings、组件索引、签名和 shared UID 并不是四条 parse 线程同时提交。合法镜像不应在同一目录制造重复包；若人为制造 duplicate，先完成者会先改变全局状态，不能再声称冲突结果与调度顺序无关。
+
+普通 APK 目录还有一条容易被“并行解析”遮住的边界：这里的 parse flags 没有要求 worker 收集证书，`addForInitLI()`稍后在调用线程执行 `collectCertificatesLI()`。可更新 APEX 实现的容器元数据扫描则显式传 `PARSE_COLLECT_CERTIFICATES`，可在它自己的 parse worker 内收集；flattened 实现没有这一步。不能把 APEX 的例外反推给所有 APK。
+
+失败语义分三层：
+
+- `PackageParserException`成为该候选的安装错误；
+- parse 工作线程出现其他 `Throwable`，调用线程抛 `IllegalStateException`；
+- 非 system 扫描的候选只要 parse/scan 失败，`removeCodePathLI()`就可能删除无效 data code path；只读 system 镜像不会走这条删除分支。
+
+所有目录完成后，PMS 关闭 parser 并 `shutdownNow()`共享 executor；返回的 queued、尚未开始任务列表非空会被视为启动一致性错误。空列表本身不证明没有 running task；真正的完成边界来自 APEX 与每个 `scanDirLI()`此前都按各自提交数取满结果。共享 executor 的生命周期长，不等于目录之间形成跨阶段 pipeline。
+
+### 练习 6：证明“最多四线程”没有变成“四路提交”
+
+找出 result queue、submit、take、`addForInitLI()`和 data 删除点。回答：日志的完成顺序为何可以变化，Settings 的提交线程为何仍是调用 `scanDirLI()`的线程？
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '21480,21690p' \
-  frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
-sed -n '2170,2200p' \
-  frameworks/base/services/java/com/android/server/SystemServer.java
-sed -n '2338,2370p' \
-  frameworks/base/services/java/com/android/server/SystemServer.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F "private static final int QUEUE_CAPACITY = 30;" "frameworks/base/services/core/java/com/android/server/pm/ParallelPackageParser.java"
+grep -n -F "private static final int MAX_THREADS = 4;" "frameworks/base/services/core/java/com/android/server/pm/ParallelPackageParser.java"
+grep -n -F "private final BlockingQueue<ParseResult> mQueue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);" "frameworks/base/services/core/java/com/android/server/pm/ParallelPackageParser.java"
+grep -n -F "parallelPackageParser.submit(file, parseFlags);" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "ParallelPackageParser.ParseResult parseResult = parallelPackageParser.take();" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "addForInitLI(parseResult.parsedPackage, parseFlags, scanFlags," "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "throw new IllegalStateException(\"Unexpected exception occurred while parsing \"" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "removeCodePathLI(parseResult.scanFile);" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "List<Runnable> unfinishedTasks = executorService.shutdownNow();" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
 ```
 
-找出`mSystemReady=true`、`systemReady()`调用、`waitForAppDataPrepared()`以及第三方应用boot phase。用一句话描述每个点保证了什么。
+完成队列决定 result 被取出的先后，不授予 worker 修改全局包世界的职责；串行 `addForInitLI()`才是本章讨论的认定入口。
 
-## 126. 自测题
+## 11. `/data/app`必须先通过旧路径账，updated system app 才有例外
 
-1. 为什么稳定appId不能只靠本次目录扫描重新分配？
-2. `packages.xml`与`package-restrictions.xml`分别记录全局还是每用户状态？
-3. backup存在时，r48为什么不优先相信新的主文件？
-4. `mFirstBoot`与`mIsUpgrade`如何分别计算？
-5. 为什么overlay、framework、priv-app、app、data-app有明确顺序？
-6. `SCAN_AS_SYSTEM`与`SCAN_AS_PRIVILEGED`有何差别？
-7. `mExpectingBetter`如何避免坏掉的系统应用更新让应用彻底消失？
-8. 为什么说ParallelPackageParser是“并行解析、串行提交”？
-9. `PMS_READY`事件为何不等于`systemReady()`？
-10. 为什么`systemReady()`返回后仍需要app-data等待屏障？
+system 扫描结束后，PMS 已知道哪些基础系统包仍存在、哪些候选形成了 system/data 双版本关系。`mExpectingBetter`不只覆盖“用户曾更新预装包”：它也覆盖 OTA 新增 system package 与此前普通 `/data`同名包相遇、签名能力允许且 data 版本不低于 system 的路径。`addForInitLI()`会隐藏新 system candidate、建立 disabled-system 基线；稍后的系统账遍历再把基础路径放进 `mExpectingBetter`。既有 updated-system 关系也只在 system candidate 没有胜过 data 版、仍应等待 data 时进入这张表；system 版本更高则先清理 data 代码并转入采用 system 的后续 scan/reconcile/commit 路径，后段仍可能失败，不能提前宣告最终胜出。
 
-## 127. 自测题参考答案
+随后 `/data/app`使用 `SCAN_REQUIRE_KNOWN`。普通候选必须已在 Settings 中存在，并且本次 code path 同时等于账本的 code/resource path；陌生包或路径漂移不是靠开机扫目录自动安装。唯一显式放宽是包名已在 `mExpectingBetter`中，此时跳过 known-path 要求，让 data 更新版有机会接替系统基线；后面的签名、版本和 scan/reconcile 检查并没有因此全部取消。
 
-1. appId决定Linux UID和数据所有权；旧Settings提供跨重启连续身份。
-2. 前者主要是全局包/UID/签名/版本账，后者是每用户installed、stopped、enabled等差异状态。
-3. backup未删除表明上次写新主文件没有完成提交协议，旧backup是最后已知好版本。
-4. first boot取`!readLPw()`；upgrade比较Settings内部fingerprint与当前`Build.FINGERPRINT`。
-5. 先建立平台资源、覆盖和系统基线，才能按优先级、身份和更新关系调和数据包。
-6. 前者说明系统来源；后者仅用于priv-app等特权身份，两者不自动等价。
-7. 先暂存基础路径等待数据版；数据版没成功进入最终集合时，按原分区flag重新enable并扫描基础版。
-8. 工作池解析多个文件，主调用线程逐个消费结果并修改全局包状态。
-9. 它是构造内boot progress事件；Java `systemReady()`由SystemServer稍后另行调用。
-10. 非核心应用目录准备被放进异步Future，必须在第三方进程启动前显式等待。
+若 data 更新版成功进入 `mPackages`，它成为活动版本，disabled-system 记录继续保存可恢复的 system 基线。若 data parse/scan 失败，非 system 分支可先删除坏 code path；最终 `mExpectingBetter`发现包仍未出现，就反向查基础路径原属哪个 partition、是否 priv-app，重建完整 parse/scan flags，enable system setting 并重扫基础 APK。
 
-## 128. 本章总结
+这个回退也不是无条件成功：基础路径不落在已知 `app/priv-app`时会被忽略，重扫本身也可能失败。`mExpectingBetter`表达“安排一条恢复尝试”，不是最终包必然存在的证明。
 
-PMS启动的本质是一场有恢复协议的全局调和：Settings旧账维持UID、签名关系和用户状态连续性；当前APK/APEX给出现行代码事实；SystemConfig和分区flag施加平台策略；PMS先扫描系统基线，再用`/data/app`更新与普通应用补全，遇到缺失更新还能回退系统版。解析可以并行，但全局认定在启动主线程上按锁协议提交。最后，构造完成、Binder发布、`systemReady()`和应用数据就绪是多个明确屏障，而不是一个模糊的“PMS ready”。
+### 练习 7：推演“系统基线 + 坏 data 更新版”
 
-## 129. 下一章预告
+沿着 expecting、data known-path、无效路径删除和 system rescan 四段回答：最终恢复时为何必须重新找 partition，而不能只补一个 `SCAN_AS_SYSTEM`？
 
-第252章进入单包内部：`PackageParser2`怎样产出`ParsedPackage`，`ScanRequest`怎样携带旧PackageSetting与扫描flag，`ReconcileRequest`怎样裁决签名、shared UID与replace关系，最后如何提交新的PackageSetting和组件索引。
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F "mExpectingBetter.put(ps.name, ps.codePath);" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "if (scanSystemPartition && !isSystemPkgUpdated && pkgAlreadyExists" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "shouldHideSystemApp = true;" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "mSettings.disableSystemPackageLPw(parsedPackage.getPackageName(), true);" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "scanDirTracedLI(sAppInstallDir, 0, scanFlags | SCAN_REQUIRE_KNOWN, 0," "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "if (mExpectingBetter.containsKey(pkg.getPackageName())) {" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "throw new PackageManagerException(INSTALL_FAILED_PACKAGE_CHANGED," "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "removeCodePathLI(parseResult.scanFile);" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "Expected better " "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "mSettings.enableSystemPackageLPw(packageName);" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "rescanFlags = systemScanFlags | SCAN_AS_PRIVILEGED" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "scanPackageTracedLI(scanFile, reparseFlags, rescanFlags, 0, null);" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+```
+
+因为 fallback 后的 vendor/product/system_ext 与 privileged 身份会影响权限和策略；仅标 system 会丢掉基础版本原来的分区语义。
+
+## 12. OTA 删除基础包与 stub 是另一组收尾分支
+
+旧账中的 system package 在新镜像完全消失时，要区分有没有 disabled-system 基线：
+
+- 没有 disabled 记录，说明普通旧 system 包已被镜像删除；PMS移除 setting、撤掉残余权限，代码和数据由后续调和清理；
+- 有 disabled 记录但基线 code path/pkg 已消失，包名进入 `possiblyDeletedUpdatedSystemApps`。data 版若仍存在，PMS先删 disabled 记录，再移除已按旧 system 身份扫描的包，随后以普通 data flags 重扫，从而撤销 system 特权；data 版也不存在则删除剩余包数据。
+
+这和 `mExpectingBetter`的方向相反：后者是“system 基线还在，data 更新没来就退回 system”；前者是“system 基线已经没了，data 版若在就降为普通包”。把二者都叫“updated system app 回退”会丢掉安全含义。
+
+stub system app 又在这两类关系确定后最后处理。stub 是随镜像提供的精简占位包，启动调用受 `!mOnlyCore`控制，并没有 `mFirstBoot`条件，尽管方法说明以首次开机描述用途。三种失败/恢复位置不能合成一套统一回滚：
+
+| 位置 | 活动 system stub | 当前启动的处理 | 后续含义 |
+|---|---|---|---|
+| 解压在 `disableSystemPackageLPw()`前失败 | 仍在 | user 0 被设为普通 `DISABLED` | 预过滤只跳 `DISABLED_USER`，下次仍可能尝试 |
+| 已 disable/remove，data 包扫描再失败 | 已从活动集合移除 | 删除坏 data path 并记失败 | 启动 helper 不在该分支显式重装 system stub |
+| 交互式 `enableCompressedPackage()`失败 | 走另一条控制流 | 有恢复 stub 的专门代码 | 不能反推启动 helper 也会同样恢复 |
+
+源码要求 stub 最后处理，但“发现 stub”与“完整实现可用”之间仍隔着多阶段提交。
+
+最后 `mExpectingBetter.clear()`只表示这张构造期临时表不再需要；真正最终事实要看 `mPackages`、Settings 和后续写入。
+
+## 13. 扫描结束后仍要重算库、权限、shared UID 与 app data
+
+候选集合稳定后，PMS 才为所有客户端更新 shared-library path，并逐个修正 SharedUserSetting 的 ABI、dex 与 SEInfo。usage/compiler stats 是依附信息，不是包存在事实。`BOOT_PROGRESS_PMS_SCAN_END`在这之后记录，但权限更新、app-data、主账写和构造尾部还没结束。
+
+权限更新使用独立的 `sdkUpdated = oldSdk != currentSdk`，不能拿 fingerprint upgrade 代替。非 only-core 且 first boot 或 pre-M upgrade 时，才会建立默认 preferred apps/domain verification。
+
+app data 先同步处理 internal private volume、system user：文件级加密（FBE）设备只准备 device-encrypted（DE）存储，非 FBE 同时准备 DE 与 credential-encrypted（CE）存储。这里传给 `reconcileAppsDataLI()`的局部参数固定为 `onlyCoreApps=true`，不是全局 `mOnlyCore`；正常启动也用它让同步阶段先处理 core app，并返回已扫描但延后的非 core 包名。随后 PMS 在仍持 `mInstallLock → mLock`时，把一枚 `mPrepareAppDataFuture`提交给 SystemServer init pool，而且这发生在清 code cache、`writeLPr()`和 `PMS_READY`之前。
+
+这枚 Future 是一条偏序支线：
+
+- worker 的 `fixupAppData()`没有先获取 Java `mInstallLock`，可能在构造尚未返回时就执行；
+- 这次 fixup 无条件传 DE|CE flags，而逐包同步/延后准备在 FBE 设备上使用前面算出的 DE-only `storageFlags`；
+- 逐包阶段先短取 `mLock`读 setting，再单独取 `mInstallLock`准备目录，通常要等构造释放大锁；
+- deferred 列表为空时，它可能很早完成；不为空时也可能在 Binder 发布前或后完成；
+- 范围只是 internal volume、system user 的这批初始工作，不覆盖未来用户或后挂载卷；
+- `fixupAppData`与单包 `createAppData`的若干 Installer 失败会记录后继续或尝试恢复，因此 Future 成功返回不等于每个目录操作都成功。
+
+真实 fingerprint upgrade 且非 only-core 时还会清 app code cache，却保留 ART profiles。这个条件仍是 `mIsUpgrade`，不是 mock-upgrade 或单纯 SDK 变化。
+
+## 14. `writeLPr()`只原子化自己的主文件协议，不原子化整个包世界
+
+构造内 `Settings.writeLPr()`不用 `AtomicFile`写全局主账，而是手工维护 backup：
+
+1. 有 main 且无 backup：把 main rename 成 backup；rename 失败就直接返回，不写新主账；
+2. main 与旧 backup 同时存在：保留更老 backup，删除当前 main；
+3. 写新 main，`flush()`并对文件 `FileUtils.sync()`；
+4. 成功后删除 backup，再设置权限；主 XML 写入发生 `IOException`时删除部分 main，若旧主账此前已成功改名则 backup 仍保留；
+5. 主账成功之后，才分别写 kernel mapping、JournaledFile 保护的 `packages.list`、所有用户 restrictions，并为 runtime permissions 安排异步写。
+
+`writeLPr()`本身返回 `void`，rename 失败和被内部捕获的 `IOException`都不会给调用者一个“本轮成功”的布尔值；所以调用者看到它返回，只能证明这次调用结束。主文件的恢复协议很清楚，跨文件事务却不存在。主 backup 删除后，派生输出或某个用户文件仍可能失败；runtime-permission 写更只是 nominal 200ms 合并、从首个未写 mutation 起最多 2s 的调度窗口，`writeLPr()`不会等待它落盘。
+
+`packages.list`还是一个有损派生视图：无 parsed package、无 data path、path 含空格的项会被跳过；它写 appId、user-0 data path、seinfo、活跃用户聚合 GID、profileable 与 version，不检查 user 0 当前是否 installed，也不逐用户列行。它缺一项不能反推 `packages.xml`中没有该 setting，PMS 启动也不读它恢复状态。
+
+每用户 restrictions 有自己的 main/backup 协议。当前 runtime-permission 主实现则在 permission APEX 中用 `AtomicFile`；“Settings 只有一种写盘器”同样不成立。
+
+### 练习 8：给四类文件分别画提交线
+
+找到 main rename/sync/删 backup、三类后继文件协议，以及 kernel mapping 副作用。回答：`writeLPr()`返回前哪些调用在当前线程执行，哪一类只排队？`packages.list`为何不能与主 XML 共用同一提交点？
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F "if (!mSettingsFilename.renameTo(mBackupSettingsFilename)) {" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "FileUtils.sync(fstr);" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "mBackupSettingsFilename.delete();" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "writeKernelMappingLPr();" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "writePackageListLPr();" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "writeAllUsersPackageRestrictionsLPr();" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "writeAllRuntimePermissionsLPr();" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "JournaledFile journal = new JournaledFile(mPackageListFilename, tempFile);" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "mRuntimePermissionsPersistence.writePermissionsForUserAsyncLPr(userId);" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+grep -n -F "private static final long WRITE_PERMISSIONS_DELAY_MILLIS = 200;" "frameworks/base/services/core/java/com/android/server/pm/Settings.java"
+```
+
+主 XML 成功后，kernel mapping、`packages.list`和每用户 restrictions 都由当前 `writeLPr()`调用同步进入各自写函数；runtime permissions 只逐用户安排异步写，当前调用不等其落盘。主 XML、每用户 XML、JournaledFile 与 permission APEX AtomicFile 是四套文件提交协议，kernel mapping 另是内核副作用；调用顺序能建立先后，不能把它们提升成一次跨文件原子提交。
+
+## 15. `PMS_READY`、Binder、`systemReady()`与第三方 phase 不是同一个 ready
+
+构造内 `Settings.writeLPr()`调用返回后立刻记录 `BOOT_PROGRESS_PMS_READY`；由于该 API 没有成功返回值，这个 event 连“新主账一定落盘”也不能证明。构造随后还确定 installer/verifier/permission-controller 等角色包名，建立 InstantApp 与 PackageInstaller 对象，加载 DexManager，退出双锁，创建 ModuleInfoProvider，uncork package-info cache 并 GC。这个 event 不是构造函数返回通知。
+
+构造返回后，白名单处理可改变每用户内存态并排十秒延迟写，然后 `package`与`package_native`被顺序注册。普通 Java Binder 客户端看到 `package`时，启动扫描和构造确实结束、白名单内存调整也已运行；但第二个 `IPackageManagerNative` Binder 端点、延迟磁盘写以及 `main()`返回仍各有自己的下一行。
+
+SystemServer 启动更多服务后直接调用 PMS `systemReady()`。方法先把 volatile `mSystemReady`置 true，之后才注册 instant-app settings observer、处理 carrier/SKU app、清理失效 preferred activity、更新权限、注册 storage listener、调和 stale users 与孤儿 `/data/app`代码路径、通知子组件，并把 staged-session restore 放在末尾。标志不回滚；即使后段仍运行或抛错，其他线程也可能已经观察到 true。只有正常走到最后的 `mExistingPackages = null`，这次同步方法才完整返回；staged restore 还可能排队或恢复 pre-reboot verification，而实际处理受 `BOOT_COMPLETED`后的 ready 门控制，故这个返回仍不代表所有 staged 工作闭合。
+
+初始 app-data Future 早已在构造中提交。更晚进入 AMS `systemReady()`时，AMS 自己的 `mSystemReady=true`、`mProcessesReady=true`都先于 `goingCallback.run()`，所以 app-data join 不是这两个 AMS 标志的前置。callback 又先推进 `PHASE_ACTIVITY_MANAGER_READY`、启动 SystemUI 并通知多项网络服务 ready，才无超时地 `Future.get()` join app-data；中断或 Future 异常会向上抛，成功返回后才把引用清空。许多 Installer 失败已在任务内部被记录，所以 join 证明“任务终止”，不证明“每项成功”。若 `!mOnlyCore`且 WebViewUpdateService 存在，callback 还会 join 已提交的 WebView preparation，随后才发送 `PHASE_THIRD_PARTY_APPS_CAN_START`；这个 phase 后仍要启动 NetworkStack、Tethering 等，callback 返回后 AMS 才继续初始用户/应用。因此 phase、callback 返回和 AMS 两个 ready 标志都不是同一个点。
+
+### 练习 9：把所有 ready 放到一条偏序线上
+
+分别标出主账 event、白名单、两个 Binder、PMS 的早置位与正常返回、staged 收尾、AMS 两个 ready 标志、app-data join、条件式 WebView join 和第三方 phase。再回答：哪两个点之间存在“`IPackageManager`已可查、`IPackageManagerNative`尚不可查”的窗口？哪一个 Future 可能在 Binder 前就完成？
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F "EventLog.writeEvent(EventLogTags.BOOT_PROGRESS_PMS_READY," "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "m.installWhitelistedSystemPackages();" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "ServiceManager.addService(\"package\", m);" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "ServiceManager.addService(\"package_native\", pmn);" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "mPrepareAppDataFuture = SystemServerInitThreadPool.submit(() -> {" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "mSystemReady = true;" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "mInstallerService.restoreAndApplyStagedSessionIfNeeded();" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "mExistingPackages = null;" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "mSystemReady = true;" "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java"
+grep -n -F "mProcessesReady = true;" "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java"
+grep -n -F "if (goingCallback != null) goingCallback.run();" "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java"
+grep -n -F "mSystemServiceManager.startBootPhase(t, SystemService.PHASE_ACTIVITY_MANAGER_READY);" "frameworks/base/services/java/com/android/server/SystemServer.java"
+grep -n -F "ConcurrentUtils.waitForFutureNoInterrupt(mPrepareAppDataFuture, \"wait for prepareAppData\");" "frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java"
+grep -n -F "mPackageManagerService.waitForAppDataPrepared();" "frameworks/base/services/java/com/android/server/SystemServer.java"
+grep -n -F "if (!mOnlyCore && mWebViewUpdateService != null) {" "frameworks/base/services/java/com/android/server/SystemServer.java"
+grep -n -F "ConcurrentUtils.waitForFutureNoInterrupt(webviewPrep, WEBVIEW_PREPARATION);" "frameworks/base/services/java/com/android/server/SystemServer.java"
+grep -n -F "mSystemServiceManager.startBootPhase(t, SystemService.PHASE_THIRD_PARTY_APPS_CAN_START);" "frameworks/base/services/java/com/android/server/SystemServer.java"
+grep -n -F "NetworkStackClient.getInstance().start();" "frameworks/base/services/java/com/android/server/SystemServer.java"
+```
+
+第一问的窗口位于两次 `ServiceManager.addService()`之间；第二问是构造中段提交的 `mPrepareAppDataFuture`。后来的 wait 只固定 join 点，不固定实际完成发生在 Binder 前还是后。
+
+## 16. 用五本账和九个完成点排障，再交给第 252 章
+
+遇到“包丢了、UID 变了、系统更新回退、开机卡在 ready”时，按责任线取证：
+
+| 现象 | 第一检查点 | 第二检查点 | 不应直接下的结论 |
+|---|---|---|---|
+| 包在磁盘却未注册 | parse result 与 `addForInitLI()`错误 | data 包的 known path、only-core、签名/调和 | 目录存在就应自动安装 |
+| appId 或 shared UID 异常 | `packages.xml`的 `userId/sharedUserId` | pending shared-user 连接与 appId 冲突 | XML `userId`是 Android 多用户号 |
+| data 系统更新消失 | disabled-system 与 `mExpectingBetter` | data 删除日志、fallback partition flags | 任意失败都保留 data 版特权 |
+| OTA 后基础包消失 | `possiblyDeletedUpdatedSystemApps` | data 版是否按普通 flags 重扫 | 与 expecting-better 是同一方向 |
+| `packages.list`缺项 | parsed metadata、data path 与 JournaledFile | 主 Settings 和 `mPackages` | 派生表缺项等于包不存在 |
+| Binder 可查但状态尚未耐久 | 构造内 `writeLPr()` | 白名单后的十秒延迟写 | Binder 注册是全文件提交点 |
+| `mSystemReady`为 true 仍有工作 | `systemReady()`当前行 | staged/permission/storage 后置动作 | volatile 标志是方法完成 Future |
+| PMS `systemReady()`已返回仍有支线 | 末行 `mExistingPackages=null` | app-data join、白名单延迟写、staged 验证队列/异步执行 | 同步返回等于所有包相关工作闭合 |
+| 第三方 phase 尚未推进 | app-data Future | WebView Future 与 AMS callback | PMS Binder 可用即可启动所有代码 |
+
+一条包的启动认定可最后压成：旧 `PackageSetting`提供连续身份 → 当前 system/APEX/data 文件产生 `ParsedPackage` → 调用线程按分区与启动 flags 进入 `addForInitLI()` → updated-system/OTA/stub 规则选择活动版本 → shared library、ABI、SEInfo、权限与用户态收敛 → 主账及派生账分别写出 → Binder 暴露当前内存世界。任何单点都不是整条链的替代品。
+
+本章停在“全局启动世界已经建立到哪些边界”。第 252 章进入一枚候选内部，继续追 `PackageParser2`、`ScanRequest`、`ReconcileRequest`、签名/shared UID 裁决和最终 `PackageSetting`、组件索引提交。

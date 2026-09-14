@@ -80,6 +80,28 @@ for source in demos/*.cpp; do
     echo "PASS demo $number"
 done
 
+"$compiler" "${flags[@]}" structure_demo/main.cpp structure_demo/score.cpp \
+    -o build/header_source_demo
+if ! run_with_timeout 10 build/header_source_demo \
+    > "$scratch_dir/header_source_output" 2> "$scratch_dir/stderr"; then
+    cat "$scratch_dir/stderr"
+    exit 1
+fi
+diff -u structure_demo/normal.expected.txt "$scratch_dir/header_source_output"
+[[ ! -s "$scratch_dir/stderr" ]] || { cat "$scratch_dir/stderr"; exit 1; }
+
+"$compiler" "${flags[@]}" -DQUICKSTART_TRACE \
+    structure_demo/main.cpp structure_demo/score.cpp \
+    -o build/header_source_trace_demo
+if ! run_with_timeout 10 build/header_source_trace_demo \
+    > "$scratch_dir/header_source_output" 2> "$scratch_dir/stderr"; then
+    cat "$scratch_dir/stderr"
+    exit 1
+fi
+diff -u structure_demo/trace.expected.txt "$scratch_dir/header_source_output"
+[[ ! -s "$scratch_dir/stderr" ]] || { cat "$scratch_dir/stderr"; exit 1; }
+echo 'PASS header/source split and conditional compilation'
+
 expect_file_error() {
     local expected="$1"
     shift

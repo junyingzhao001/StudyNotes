@@ -1,781 +1,472 @@
 # 250 Android TouchInputMapper模式、校准、虚拟键与外接Stylus融合链
 
 > 源码版本：Android 11 / `android-11.0.0_r48`  
-> 学习方式：macOS只读核源，不编译、不运行AOSP
+> 学习方式：macOS 只读核源，不编译、不运行 AOSP
 
-## 1. 本章要解决什么
+## 1. 先把问题边界画清：本章研究控制面与两条旁路
 
-第249章追了MT slot如何变成`NotifyMotionArgs`。这一章不再重复主动作链，而是补齐决定“这块触摸设备究竟怎样工作”的控制面和两条旁路：
+第249章已经把 `EV_ABS`、MT slot、pointer id、`PointerCoords` 和 `NotifyMotionArgs` 串成了坐标生产主链。本章只追那些会改变主链语义、却不负责生产 MT 坐标的机制：
 
-```text
-.idc和内核能力如何决定DIRECT/POINTER/UNSCALED/NAVIGATION？
-DisplayViewport按port、pointer display、uniqueId、internal/external什么顺序选？
-校准参数为什么要先parse再resolve？
-size、pressure、orientation、tilt、distance和coverage怎样影响输出？
-sysfs virtualkeys如何变成KeyEvent？
-为什么从虚拟键滑回屏幕会重新开始Motion DOWN？
-只报压力/按键而不报X/Y的外接笔，怎样与触摸屏坐标融合？
-72ms、20ms和10ms三个时间常量分别解决什么？
-```
+- `.idc` 与内核能力怎样决定 `deviceType`、`DeviceMode`、`mSource` 和显示关联；
+- `DisplayViewport` 怎样被选中，何时只改内存，何时还会 reset、bump generation；
+- size、pressure、orientation、tilt、distance、coverage 怎样从原始整数变成 Motion 轴；
+- sysfs virtual-key map 怎样把屏外触点改写为 `NotifyKeyArgs`；
+- 一个只有压力、按键而没有 X/Y 的外笔，怎样借用触摸屏的坐标与 pointer id。
 
-## 2. 一句总纲
+可以先记住四个相互独立的完成点：
 
-```text
-设备能力 + 首次.idc参数
-→ 选deviceType、关联Display和mode/source
-→ 选Viewport并解析校准/range
-→ 每个SYN_REPORT先处理virtual key与external stylus旁路
-→ 再进入普通cook/dispatch
-```
+1. `configure()` 返回：本地字段已经算完，不代表消费者已收到设备变化；
+2. `bumpGeneration()`：设备描述具备被重枚举的条件；
+3. `NotifyDeviceResetArgs`：下游应终止旧输入状态；
+4. `notifyMotion()/notifyKey()`：某个具体输入事件才真正进入监听器。
 
-## 3. 总体分层图
+把这四者混成“配置完成”，是阅读本章最常见的误区。
 
-```mermaid
-flowchart TB
-    CAP["evdev properties / axes / classes"] --> PARAM["first configure: parameters"]
-    IDC["device .idc"] --> PARAM
-    PARAM --> MODE["deviceType + associated display + mode/source"]
-    CFG["InputReaderConfiguration"] --> MODE
-    MODE --> VP["findViewport + configureSurface"]
-    IDC --> CAL["parseCalibration then resolveCalibration"]
-    CAP --> CAL
-    VP --> RANGE["scale / ranges / virtual-key hit boxes"]
-    CAL --> RANGE
-    RAW["SYN_REPORT RawState"] --> VK["consume virtual key or off-screen touch"]
-    RAW --> ST["external stylus wait / fuse"]
-    VK --> COOK["cookAndDispatch"]
-    ST --> COOK
-    RANGE --> COOK
-```
+本章的总链可压缩为：EventHub 能力与配置 → `configureParameters()` → mode/source → `findViewport()` 与 `configureSurface()` → 校准与虚拟键命中框。运行期的精确次序是：touch `RawState` 排队 → external stylus id 等待/分配 → 合入外笔 buttons → virtual-key 分流 → cook 坐标与触屏轴 → 覆盖外笔 pressure/tool type → 普通 dispatch；“融合”不是一个单独调用点。
 
-## 4. 源码地图
+## 2. configure 的双点：`changes == 0` 不是不可重入保证
 
-```text
-frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp
-frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.h
-frameworks/native/services/inputflinger/reader/mapper/ExternalStylusInputMapper.cpp
-frameworks/native/services/inputflinger/reader/mapper/ExternalStylusInputMapper.h
-frameworks/native/services/inputflinger/reader/InputReader.cpp
-frameworks/native/services/inputflinger/reader/InputDevice.cpp
-frameworks/native/services/inputflinger/reader/EventHub.cpp
-frameworks/native/libs/input/VirtualKeyMap.cpp
-frameworks/native/include/input/VirtualKeyMap.h
-frameworks/native/include/input/DisplayViewport.h
-frameworks/native/services/inputflinger/tests/InputReader_test.cpp
-```
+`TouchInputMapper::configure()` 每次都会调用基类，并把整个 `InputReaderConfiguration` 复制到 `mConfig`。但四组工作受不同条件控制：
 
-## 5. 本章边界
+| 工作 | 触发条件 | 主要结果 |
+|---|---|---|
+| 参数、accumulator、原始轴、parse/resolve calibration | `!changes` | 重建能力相关状态 |
+| affine | `!changes` 或 affine change bit | 更新位置仿射矩阵 |
+| pointer/wheel velocity | `!changes` 或 pointer-speed bit | 更新速度控制器参数 |
+| surface/source/mode | `!changes` 或 display、gesture、show-touches、external-stylus bit | 可能重算 viewport、range、虚拟键 |
 
-触控板的九态pointer gesture已在第184章详述，第249章已详述MT帧、坐标和Action生成。本章只从mode选择解释为什么会进入pointer gesture，把篇幅留给配置、校准、virtual key和external stylus。
+源码在 `if (!changes)` 后写着“first time only”，它表达设计意图，却不是 r48 调用图提供的强不变量。新增 EventHub 设备时，`createDeviceLocked()` 若找到相同非空 descriptor，会复用旧 `InputDevice`、先加入新子设备，再由 `addDeviceLocked()` 对全部 mapper 调 `configure(..., 0)` 和 `reset()`。组合设备删除一个 EventHub 子设备时，`removeDeviceLocked()` 也会保留仍有子设备的同一个 `InputDevice`，对它调用 `configure(..., 0)`，随后调用 `reset()`。因此：
 
-## 6. 四种输入事实不要混
+- `InputDevice` 会清空并按当前子设备重新合并 `mConfiguration`；
+- `TouchInputMapper` 的 parameters、原始轴与 calibration 也会重新跑；
+- 旧引用若把 `changes == 0` 解释为“对象生命期恰好一次”，会漏掉组合设备扩张与收缩路径。
 
-```text
-内核能力：INPUT_PROP_DIRECT/POINTER、ABS/REL轴、BTN能力
-设备静态配置：.idc PropertyMap
-Reader运行配置：DisplayViewport、pointerGesturesEnabled、showTouches等
-运行帧状态：RawState、VirtualKeyState、StylusState
-```
+共享配置的冲突也没有稳定优先级契约。子设备保存在 `unordered_map`，`addAll()` 按迭代顺序把同名 property 替换为后加入值；若多个子设备声明同一 key，谁最后覆盖取决于无序容器遍历，不应把某个 EventHub id 或插入先后当成规则。新增/删除造成重建时，这类冲突尤其可能显形。
 
-前三类决定怎样解读第四类。
+普通非零 change bit 又是另一条路：只有 `configureSurface()` 报告 `resetNeeded` 时，mapper 才直接发 `NotifyDeviceResetArgs`。零 changes 时它不在这里发 reset，因为新增路径由 reader 在 mapper 齐备后统一 reset，组合设备收缩也由移除路径紧接着执行 `device->reset()`。相同实参值，不等于只有一种调用语境。
 
-## 7. 首次configure的特殊性
+### 练习 1：证明零 changes 存在第二种调用语境
 
-`TouchInputMapper::configure()`对`changes==0`的首次配置才执行：
-
-```cpp
-if (!changes) {
-    configureParameters();
-    mCursorScrollAccumulator.configure(getDeviceContext());
-    mTouchButtonAccumulator.configure(getDeviceContext());
-    configureRawPointerAxes();
-    parseCalibration();
-    resolveCalibration();
-}
-```
-
-这些被当作设备开启期的静态能力与参数。
-
-## 8. `.idc`不是每次刷新都重读
-
-`InputDevice::configure()`也只在首次把各subdevice的PropertyMap合并到`mConfiguration`。因此仅修改磁盘上`.idc`文本并发一个Display change，不会让旧Mapper重新parse这些静态字段；通常需要设备reopen/重建或下次启动。
-
-## 9. 动态变化有独立分支
-
-```text
-CHANGE_TOUCH_AFFINE_TRANSFORMATION → updateAffineTransformation
-CHANGE_POINTER_SPEED → 速度曲线
-DISPLAY_INFO / POINTER_GESTURE_ENABLEMENT / SHOW_TOUCHES /
-EXTERNAL_STYLUS_PRESENCE → configureSurface
-```
-
-动态刷新不等于重做所有首次解析。
-
-## 10. gestureMode默认值
-
-`INPUT_PROP_SEMI_MT`表示设备不能稳定分辨每个多指位置，默认选`single-touch`展示；其他设备默认`multi-touch`。`.idc` `touch.gestureMode=single-touch|multi-touch|default`可覆盖。
-
-## 11. deviceType的能力推导顺序
-
-```text
-INPUT_PROP_DIRECT                      → touchScreen
-else INPUT_PROP_POINTER               → pointer
-else have REL_X or REL_Y               → touchPad
-else                                  → pointer
-```
-
-最后的默认pointer是对未标注触控板的兼容选择，不表示它真有鼠标相对轴。
-
-## 12. `.idc` deviceType优先
-
-`touch.deviceType` 可写`touchScreen`、`touchPad`、`touchNavigation`、`pointer`或`default`。合法非default值覆盖能力推导；非法字符串只记warning，保留先前推导。
-
-## 13. orientationAware默认
-
-只有`touchScreen`默认`orientationAware=true`，但`touch.orientationAware` 可覆盖。它决定是否把Viewport orientation应用到输出点，也会影响是否需要关联Display。
-
-## 14. hasAssociatedDisplay的默认
-
-以下任一成立就设为true：
-
-```text
-orientationAware
-deviceType == touchScreen
-deviceType == pointer
-InputDevice通过input port关联到display port
-```
-
-`touchPad`/`touchNavigation`通常使用非Display viewport，但port关联可改变这一点。
-
-## 15. external与unique display
-
-touchScreen的`associatedDisplayIsExternal`默认来自设备是否external；`touch.displayId`可在`.idc`写Display uniqueId。这个字段只在deviceType为touchScreen时读入。
-
-## 16. wake参数
-
-外接触摸设备默认`wake=true`，内置屏默认false，避免口袋误触唤醒。`touch.wake` 可覆盖；它只在initial down或新button press时加`POLICY_FLAG_WAKE`，不是Mapper直接点亮屏幕。
-
-## 17. mode选择不等于deviceType同名映射
-
-```text
-deviceType=pointer && pointerGesturesEnabled → DEVICE_MODE_POINTER
-deviceType=touchScreen && hasAssociatedDisplay → DEVICE_MODE_DIRECT
-deviceType=touchNavigation                  → DEVICE_MODE_NAVIGATION
-其他                                      → DEVICE_MODE_UNSCALED
-```
-
-例如pointer设备在全局pointer gesture关闭时会落到UNSCALED，而不是POINTER。
-
-## 18. DIRECT mode
-
-用`AINPUT_SOURCE_TOUCHSCREEN`，并根据集成stylus与external stylus能力附加source bits。坐标绑定Viewport，产出的Motion直接参与Display窗口命中。
-
-## 19. POINTER mode
-
-基础source为`AINPUT_SOURCE_MOUSE`；原始手指不是作为触摸屏指针下发，而是驱动PointerController与gesture detector。集成笔可追加STYLUS source并取得最高pointer usage优先级。
-
-## 20. NAVIGATION mode
-
-使用`AINPUT_SOURCE_TOUCH_NAVIGATION`，不与可见屏幕做绝对坐标对齐，用于触摸导航类设备。它不自动进入鼠标pointer gesture。
-
-## 21. UNSCALED mode
-
-使用`AINPUT_SOURCE_TOUCHPAD`，保留触控板类坐标语义。普通未关联Display的设备会构造与raw X/Y大小相同的non-display viewport；若InputDevice通过port显式关联Display，`findViewport()`仍可返回真实Viewport，但configureSurface的UNSCALED分支仍以raw尺寸配置输出，不把它变成DIRECT触屏。
-
-## 22. DISABLED mode
-
-X或Y轴无效，或需要关联Display却找不到Viewport时，Mapper设为DISABLED。`processRawTouches()`会清`mCurrentRawState`和pending队列，而不是继续缓存到Display恢复。
-
-## 23. source是运行结果
-
-`InputDevice::configure()`每次先把`mSources=0`，再OR所有Mapper的`getSources()`。因此InputDevice source是当前各Mapper mode/能力的聚合，不是EventHub classes的原样拷贝。
-
-## 24. mode决策图
-
-```mermaid
-flowchart TD
-    P["configured deviceType"] --> Q{"pointer and gestures enabled?"}
-    Q -->|yes| PM["POINTER / MOUSE"]
-    Q -->|no| T{"touchScreen and associated display?"}
-    T -->|yes| DM["DIRECT / TOUCHSCREEN"]
-    T -->|no| N{"touchNavigation?"}
-    N -->|yes| NM["NAVIGATION"]
-    N -->|no| UM["UNSCALED / TOUCHPAD"]
-    PM --> AX{"valid X and Y?"}
-    DM --> AX
-    NM --> AX
-    UM --> AX
-    AX -->|no| OFF["DISABLED"]
-    AX -->|yes| V{"viewport resolved?"}
-    V -->|no| OFF
-    V -->|yes| ON["configure ranges and dispatch"]
-```
-
-## 25. Viewport优先级一：Display port
-
-只要`hasAssociatedDisplay` 且InputDevice已由input port匹配display port，`findViewport()`立即返回`getAssociatedViewport()`的结果。若port存在但没找到Viewport，上层InputDevice还会把设备disable；这里不会改用内置屏。
-
-## 26. Viewport优先级二：pointer display
-
-POINTER mode优先按`mConfig.defaultPointerDisplayId`找窗口管理建议的pointer display。如果该id找不到，源码记warning后还会继续尝试uniqueId或display type，不是立即disabled。
-
-## 27. Viewport优先级三：uniqueId
-
-`.idc` `touch.displayId`非空时，直接返回`getDisplayViewportByUniqueId()`。注意：这一分支查找失败就返回nullopt，不再回退internal/external type。精确绑定失败应暴露配置错误。
-
-## 28. Viewport优先级四：display type
-
-外接touchScreen尝试EXTERNAL，找不到时warning并回退INTERNAL；预期INTERNAL而找不到时没有反向回退EXTERNAL。这个回退是非对称的。
-
-## 29. 无关联Display的Viewport
-
-`hasAssociatedDisplay=false`时不做窗口管理查找，而是用`rawWidth/rawHeight`构造non-display viewport。所以UNSCALED/NAVIGATION不会仅因物理Display还未就绪就disabled。
-
-## 30. configureSurface的两道硬门
-
-```cpp
-if (!mRawPointerAxes.x.valid || !mRawPointerAxes.y.valid) {
-    mDeviceMode = DEVICE_MODE_DISABLED;
-    return;
-}
-std::optional<DisplayViewport> newViewport = findViewport();
-if (!newViewport) {
-    mDeviceMode = DEVICE_MODE_DISABLED;
-    return;
-}
-```
-
-deviceType推导成功不代表设备一定可操作。
-
-## 31. PointerController何时建立
-
-POINTER mode需要PointerController驱动鼠标；DIRECT只在`showTouches=true`时需要它画调试小圆点。其他情况会clear强引用，不是每块触摸设备都永久持有鼠标控制器。
-
-## 32. 什么时候重算Surface
-
-只有`viewportChanged || deviceModeChanged`时，大段重算才执行：X/Y scale、translation、motion ranges、virtual key hit boxes、各类校准scale和pointer gesture参数。
-
-## 33. 重算后的协议边界
-
-这一分支设`*outResetNeeded=true`并`bumpGeneration()`。非首次configure时上层还发`NotifyDeviceResetArgs`，令Dispatcher/App不要让一条手势横跨新旧坐标系或mode。
-
-## 34. POINTER重算先abort usage
-
-POINTER mode的参数变更时，源码先`abortPointerUsage()`，再设resetNeeded。这会按当前usage合成gesture/stylus/mouse的结束事件，避免只更改速度/缩放因子却保留半条旧gesture。
-
-## 35. external stylus presence的r48细节
-
-`CHANGE_EXTERNAL_STYLUS_PRESENCE`会调`configureSurface()`并重算`mSource`中是否有`AINPUT_SOURCE_BLUETOOTH_STYLUS`。但大段重算的门仍只是viewport/mode变化；若两者都没变，该Touch Mapper不会仅因source bit变化而自己bump generation或发reset。外设add/remove本身会使Reader全局设备列表generation变化。
-
-## 36. 校准为什么分parse和resolve
-
-parse只把`.idc`字符串转成enum/数值，保留`DEFAULT`；resolve再结合实际axis是否valid选默认，并把“配了但硬件无轴”降为NONE。这避免运行时进入需要轴却无轴的分支。
-
-## 37. size可配模式
-
-```text
-default / none / geometric / diameter / box / area
-touch.size.scale
-touch.size.bias
-touch.size.isSummed
-```
-
-`scale`/`bias`作用在touch/tool major/minor上，不是所有坐标轴的全局缩放。
-
-## 38. size默认resolve
-
-只要touchMajor或toolMajor任一valid，DEFAULT解析为GEOMETRIC；两者都无效则无论`.idc`是否试图配其他size mode，都强制为NONE。
-
-## 39. major/minor轴回退
-
-touch和tool major都有时各用各的；只有一组时，另一组复用它。minor轴缺失时用对应major代替，所以不会凭空保留旧minor。
-
-## 40. GEOMETRIC
-
-major/minor乘`mGeometricScale = avg(mXScale,mYScale)`，把raw长度粗略换成Display像素尺寸。当X/Y像素密度不等时这是平均近似，不是严格的椭圆仿射。
-
-## 41. DIAMETER
-
-不乘geometric scale，只把touchMinor置为touchMajor、toolMinor置为toolMajor，把设备值解释为圆直径形式。之后仍会应用size scale/bias。
-
-## 42. AREA
-
-对major取`sqrt`并把minor设为同值，把面积型读数换成类似线性尺寸。负值直接0；它不保留原始长宽比。
-
-## 43. BOX
-
-SIZE_CALIBRATION_BOX在普size分支没有额外几何变换，major/minor保持设备语义再用scale/bias。它与后面`touch.coverage.calibration=box`不是同一个enum，不要因为都叫box就混为一条路。
-
-## 44. size scale/bias的clamp
-
-`applySizeScaleAndBias()`顺序是先乘scale、再加bias、最后小于0则clamp到0。源码不把上限clamp到1或屏幕对角线，所以配置错误可导致很大的major/minor。
-
-## 45. sizeIsSummed
-
-若显式配true且touching pointer数大于1，major/minor和size都除以touching count。它是为“硬件报多指总量”的特殊设备准备，hover pointer不算在该count里。
-
-## 46. `AXIS_SIZE`的单独归一化
-
-`size`先取major或major/minor平均，最后乘`mSizeScale`；默认scale为`1 / touchMajor.max`，没有touchMajor时才用toolMajor.max。`.idc` `touch.size.scale/bias`并不用于`AXIS_SIZE`这个归一化值。
-
-## 47. pressure parse与resolve
-
-```text
-default / none / physical / amplitude
-touch.pressure.scale
-```
-
-有pressure axis时DEFAULT→PHYSICAL；无轴时强制NONE。PHYSICAL与AMPLITUDE在r48的cook公式都是`rawPressure * mPressureScale`，区别主要是语义和配置意图。
-
-## 48. pressure默认scale
-
-没有显式`touch.pressure.scale`且raw max非0时，用`1/rawMax`。显式scale时，MotionRange pressure max也设为`scale * rawMax`，可以大于1；源码不在cook时clamp压力。
-
-这条Touch pressure公式也是`raw * scale`，不减raw axis min。所以默认归一化同样默认pressure轴从0开始；非0 min的特殊设备应用`.idc` scale与驱动合同仔细校验，而不要假设Mapper会自动减min。
-
-## 49. pressure NONE不等于永返0
-
-校准为NONE时，hover输出0，touching输出1。这给没有压感轴的普通触屏提供二值接触语义，不是把`AXIS_PRESSURE`从InputDeviceInfo中完全删除。
-
-## 50. orientation parse与resolve
-
-```text
-default / none / interpolated / vector
-```
-
-有raw orientation axis时DEFAULT→INTERPOLATED，无轴时NONE。但若tiltX与tiltY两轴都valid，后面会直接由tilt计算orientation，优先于raw orientation calibration。
-
-## 51. INTERPOLATED
-
-raw max大于0时scale为`pi/2 / max`；否则raw min小于0时为`-pi/2 / min`。cook使用`raw * scale`，MotionRange宣告约`[-pi/2, pi/2]`。它是线性假设，不会自动知道厂商的非线性角度编码。
-
-## 52. VECTOR
-
-把raw orientation的高、低4 bit分别做有符号nybble，用`atan2(c1,c2)*0.5`算方向；向量长度还会放大major、缩小minor。这是“方向+置信度影响长宽”的编码，不是普通16-bit角度。
-
-## 53. tilt成对才启用
-
-只有tiltX和tiltY都valid才`mHaveTilt=true`。两轴先减各自min/max中心，按“度→弧度”比例转换，然后用三角函数得tilt和orientation；只有一根tilt轴不会半启用。
-
-## 54. distance
-
-有distance axis时DEFAULT→SCALED，默认`mDistanceScale=1`，显式`touch.distance.scale`才改变。无轴则NONE。MotionRange的min/max/fuzz都乘这个scale，resolution仍写0。
-
-## 55. coverage box
-
-`touch.coverage.calibration=box`把toolMinor高/低16 bit解为left/right，toolMajor高/低16 bit解为top/bottom，最后写入`GENERIC_1..4`。启用coverage box时不再写普通`TOOL_MAJOR/MINOR`。
-
-## 56. coverage的一个r48 TODO
-
-X/Y会先应用policy提供的Affine transform，但coverage raw box之前留有`TODO: Adjust coverage coords?`，只做surface rotation/scale。因此有非单位Affine校准时，coverage box和点X/Y可能不完全一致；不应文档化为“已保证一致”。
-
-## 57. MotionRange是对外合同
-
-Mapper把X/Y/pressure始终加入非disabled设备信息，size/orientation/distance/tilt按have标志附加，coverage box再加GENERIC_1..4。应用用`InputDevice.getMotionRange()`看到的是解析后合同，不是evdev raw axis的原样数值。
-
-## 58. 校准顺序小结
-
-```text
-PropertyMap字符串
-→ parse enum/scale/bias/isSummed
-→ resolve against axis validity
-→ configureSurface计算scale与public ranges
-→ cookPointerData对每个pointer实施
-→ surface orientation修正轴与角度
-```
-
-## 59. virtual key不在`.idc`里定义
-
-r48从`/sys/board_properties/virtualkeys.<canonical-device-name>`读内核/板级暴露的virtual key map。`.idc`控制Touch Mapper参数，不是virtual key矩形文件。
-
-## 60. sysfs文件何时加载
-
-EventHub `openDeviceLocked()`推导出TOUCH class后尝试`loadVirtualKeyMapLocked()`。文件可读且parse成功时，设备还会增加KEYBOARD class，以便继续装载key layout把virtual scanCode映射为Android keyCode。
-
-## 61. virtual key文件格式
-
-```text
-0x01:<scanCode>:<centerX>:<centerY>:<width>:<height>
-```
-
-后五个字段是冒号分隔整数；多个键可同行或跨行，`#`开始注释。不是`0x01`的type或字段缺失会使整张map加载失败，不是只忽略单条。
-
-## 62. 定义坐标与命中坐标
-
-`VirtualKeyDefinition`的center/width/height以display coordinates表达；`configureVirtualKeys()`根据`raw touch width / raw surface width`比例换算为raw touch hit box，再加raw X/Y min。运行命中在Affine/Display旋转之前的raw pointer上完成。
-
-## 63. scanCode必须能映射
-
-`configureVirtualKeys()`对每个definition调`mapKey(scanCode,...)`。映射失败就warning并drop该键；它不会把scanCode当keyCode直传给App。
-
-## 64. hit box边界是包含的
-
-`isHit()`使用`x >= left && x <= right && y >= top && y <= bottom`。因此right/bottom是可命中边界，与常见的Android `Rect` right/bottom排他语义不同，手算不要默认减1。
-
-`findVirtualKeyHit()`按vector顺序返回第一个命中键，重叠hit box没有面积最小或距离中心最近的二次排序。
-
-## 65. virtual key只在屏外initial down识别
-
-`consumeRawTouches()`先要求last touching为空、current非空，再检查第一个pointer不在surface内。只有“一条新stroke从屏外开始”才查virtual key；手指从屏内滑到键区不会半路转成Key DOWN。
-
-## 66. 必须恰好一指
-
-屏外initial down只在touching count等于1时查hit box。多指同时从屏外开始不会挑一根手指当virtual key；只要当前帧仍被判定为off-screen initial state，该帧就被消费。若之后所有点进入surface，仍可从新Motion DOWN开始，所以不能笼统说“物理stroke后半永久丢失”。
-
-## 67. 命中后的CurrentVirtualKeyState
-
-```text
-down=true
-downTime=initial frame time
-keyCode/scanCode=映射结果
-ignored=InputReader全局quiet-time决策
-```
-
-即使ignored=true也保留down状态，以便持续消费这条物理stroke，只是不对外发Key DOWN/UP。
-
-## 68. 按住键区
-
-当前仍只有1个pointer且命中同一keyCode时直接返回true。caller会清RawPointerData，所以普通Motion链持续看不到这根手指。
-
-源码比较的是`virtualKey->keyCode == mCurrentVirtualKey.keyCode`，不是scanCode或VirtualKey对象地址。如两个重叠/相邻定义映射成同一Android keyCode，滑到另一个仍会被视为按住原键。
-
-## 69. 正常抬起
-
-current touching变空时，清`down`；非ignored则发Key UP，flags为`FROM_SYSTEM | VIRTUAL_HARD_KEY`，不加CANCELED。KeyEvent downTime仍是初次命中时间。
-
-## 70. 滑出键区或第二指加入
-
-清`down`，非ignored则发带`AKEY_EVENT_FLAG_CANCELED`的Key UP，但本帧不立即return true。源码继续向下跑，让滑回屏幕的触摸可以重新进入Motion链。
-
-## 71. 为什么滑回屏幕能产生新DOWN
-
-之前每一帧virtual-key touch都被caller清空后才复制到`mLastRawState`，所以last仍是“无pointer”。手指滑到surface内的当帧不再被消费，cook看到last空/current非空，自然生成新Motion DOWN。它不需要伪造新Linux trackingId。
-
-## 72. 屏外但不命中键
-
-初始点在surface外却没命中virtual key时，函数仍返回true，丢掉当前帧RawPointerData。这不是把超出坐标clamp到屏幕边缘；它在手指停留屏外时继续消费，但之后进入surface仍可重开一条Motion流。
-
-## 73. quiet time是Reader全局的
-
-正常屏内touch到达`consumeRawTouches()`底部时，若`virtualKeyQuietTime>0`，调用`disableVirtualKeysUntil(when + quietTime)`。时间戳保存在`InputReader::mDisableVirtualKeysTimeout`，不是每个Touch Mapper一份；所以一块屏内触摸可短暂抑制另一块设备的virtual key。
-
-## 74. ignored不是命中失败
-
-quiet time内命中时，`shouldDropVirtualKey()`返回true，Mapper仍记录该键正按下并消费stroke，但不发KeyEvent。这是“识别到但抑制”，不是“根本没找到hit box”。
-
-## 75. KeyEvent的source与display
-
-`dispatchVirtualKey()`构造`NotifyKeyArgs`，source固定为`AINPUT_SOURCE_KEYBOARD`，displayId来自当前Viewport，policy flags额外OR `POLICY_FLAG_VIRTUAL`。它不是source=TOUCHSCREEN的特殊MotionEvent。
-
-## 76. virtual key状态查询
-
-`getKeyCodeState()`/`getScanCodeState()`对当前按下的virtual key返`AKEY_STATE_VIRTUAL`，对存在但未按的返UP，其他UNKNOWN。`markSupportedKeyCodes()`也会把virtual keys标为supported；这些实现没用`sourceMask`做进一步过滤。
-
-## 77. reset如何收口virtual key
-
-`TouchInputMapper::reset()`直接把`mCurrentVirtualKey.down=false`，不在该函数内单独发virtual Key UP。但`InputDevice::reset()`在所有Mapper reset后发设备级`NotifyDeviceReset`，Dispatcher以设备协议边界清理旧输入状态。
-
-## 78. virtual key状态机文本版
-
-```text
-IDLE
-  └─屏外单指initial down命中→ DOWN_TRACKED
-       ├─quiet期：ignored=true，不发Key
-       ├─非quiet：发Key DOWN
-       ├─仍在同key区：持续消费
-       ├─抬起：发普通Key UP→IDLE
-       └─滑出/第二指：发CANCELED Key UP→允许Motion重开
-```
-
-## 79. external stylus要解决的缺口
-
-某些蓝牙/外接笔设备只报笔尖压力、侧键和笔/橡皮工具类型，真正X/Y仍由触摸屏digitizer报告。Android需把两个独立evdev节点的信息合成一根带坐标、压力和按键的stylus pointer。
-
-## 80. EventHub如何识别external stylus
-
-这是touch class判定链的第三个`else if`：设备首先不能命中`ABS_MT_POSITION_X/Y`的MT分支，也不能命中`BTN_TOUCH + ABS_X/Y`的ST分支；然后在有`ABS_PRESSURE`或`BTN_TOUCH`、且无`ABS_X/ABS_Y`时，才标`INPUT_DEVICE_CLASS_EXTERNAL_STYLUS`。源码还会取消KEYBOARD class，避免笔键同时被KeyboardInputMapper抢走。
-
-## 81. ExternalStylusInputMapper的输出
-
-它不发`NotifyMotionArgs`，而是每个SYN_REPORT组装`StylusState`：
-
-```cpp
-mStylusState.when = when;
-mStylusState.toolType = mTouchButtonAccumulator.getToolType();
-mStylusState.pressure = float(pressure) / mRawPressureAxis.maxValue;
-mStylusState.buttons = mTouchButtonAccumulator.getButtonState();
-getContext()->dispatchExternalStylusState(mStylusState);
-```
-
-它是供Touch Mapper消费的旁带状态。
-
-## 82. 无pressure axis的二值回退
-
-若`ABS_PRESSURE`无效，但TouchButtonAccumulator认为笔工具active，pressure设1，否则0。toolType未知时默认STYLUS；若按键报告eraser则可保留ERASER。
-
-## 83. 有pressure axis时的合同前提
-
-源码在axis valid分支直接用`rawPressure / maxValue`：它不减min，不检查max是否0，也不clamp。因此“归一化到[0,1]”依赖驱动提供从0开始、max非0且raw不越界的正确pressure metadata；r48不会在这里修复坏轴。
-
-## 84. StylusState是全Reader广播
-
-`InputReader::dispatchExternalStylusState()`遍历`mDevices`中的eventHub-id表项，对其指向的InputDevice每个Mapper调`updateExternalStylusState()`。非Touch Mapper的基类实现为空；所有Touch Mapper都可收到状态。r48这里没有按Display、port或descriptor建立一对一配对表；而且composite逻辑InputDevice如果被多个eventHub id指向，还可在这段遍历中收到重复调用，因此消费者不应把每次回调当唯一物理笔身份。
-
-## 85. presence与state是两件事
-
-external stylus设备add/remove时，Reader发`CHANGE_EXTERNAL_STYLUS_PRESENCE`，Touch Mapper通过设备列表得到`mExternalStylusConnected`。每帧pressure/button变化则走`StylusState`广播。一个是能力/连接性，一个是时序数据。
-
-## 86. 融合只在DIRECT mode
-
-`assignExternalStylusId()`首先要求`mDeviceMode==DIRECT && hasExternalStylus()`。POINTER触控板、NAVIGATION、UNSCALED不走这条external fusion；它们也不会因为全局有一支外接笔就任意改写某个pointer压力。
-
-## 87. 初始DOWN已有笔压
-
-若last RawState无pointer、next有pointer，且最新external pressure非0，马上把`touchingIdBits.firstMarkedBit()`记为`mExternalStylusId`，不增加等待延迟。后续该touch id会被改成stylus/eraser工具并覆盖压力。代码没有另查touching bits一定非空，它依赖“external pressure非0时digitizer同时产生了touching id”的设备合同。
-
-## 88. 初始DOWN没有笔压
-
-若已连外接笔但pressure仍0，设`fusionTimeout = touchState.when + 72ms`，请求Reader timeout并返回true停止drain pending RawState。这72ms是“等笔数据判断initial touch是否来自笔”的最大额外延迟。
-
-这个门无法在initial moment预先知道当前是笔还是手指：只要框架认为外接笔已连接且尚无笔压，普通手指initial DOWN也可能承受最多72ms判定延迟。这正是常量注释所说的“maximum latency to add to touch events”。
-
-## 89. 72ms内笔数据到达
-
-`updateExternalStylusState()`看到fusion timeout正活跃，设`mExternalStylusDataPending=true`并立即重跑`processRawTouches(false)`。此时新pressure非0，就选中touch id并交付之前被暂停的initial DOWN。
-
-## 90. 72ms超时
-
-timeout模式下初始DOWN仍没有pressure，源码调`resetExternalStylus()`清状态/id/timeout，然后把该touch当普通手指交付。稍后到达的笔压不会在这条已开始的finger stroke中途抢走id。
-
-## 91. 多指初始的假设
-
-融合不做距离匹配，因为external stylus没有X/Y；它取touching ID集中最小的第一个id。如果多指与笔尖真的同时initial down，r48只有“first marked id就是笔”的简化假设，没有更多传感器证据可用。
-
-## 92. stylus id何时释放
-
-已融合后，每个next RawState检查touching bits是否仍含`mExternalStylusId`。不含时立即设-1。释放依据是触摸屏pointer抬起，不是仅看external pressure变成0。
-
-## 93. 外接笔按键融入时机
-
-`cookAndDispatch()`刚清current cooked state后，在initialDown/policy/virtual key/cook之前，把external buttons OR进`mCurrentRawState.buttonState`。只有DIRECT、connected且stylus id有效才合并，避免游离笔按键作用到普通手指。
-
-## 94. 压力/tool type覆写时机
-
-先完成普通`cookPointerData()`，再在cooked pointer中找到stylus id。external pressure覆写`AXIS_PRESSURE`；external toolType非UNKNOWN时覆写PointerProperties的toolType。X/Y、size、orientation仍来自触摸屏digitizer。
-
-## 95. 为什么pressure=0可能保留旧值
-
-若stylus id当前仍在touching，external pressure却0，且last cooked也含该touch id，源码取上一帧cooked pressure代替0。这避免两节点时序差导致一帧突然掉到0；真正结束由touch id离开确认。
-
-## 96. 笔数据先到、touch数据后到
-
-已融合期间收到新StylusState会设`mExternalStylusDataPending`。如果此时没有新Raw touch帧可drain，安排`stylusState.when + 20ms`的timeout，给对应touch位置帧一个追上来的窗口。
-
-## 97. 20ms内touch到达
-
-pending RawState使用最新StylusState进行cook，`clearStylusDataPendingFlags()`清掉20ms timeout，不需要另造一笔Motion。事件时间以touch RawState为主，但如小于last raw time会被clamp为last time。
-
-## 98. 20ms仍没touch时的合成帧
-
-timeout分支复制`mLastRawState`，只用新的external pressure/button/tool type重做`cookAndDispatch()`。合成时间是：
-
-```text
-fusionTimeout - STYLUS_DATA_LATENCY
-= stylusState.when + 20ms - 10ms
-= stylusState.when + 10ms
-```
-
-因此10ms是无对应touch帧时人工Motion的时间偏移，不是另一次最长等待。
-
-## 99. pending RawState为什么是队列
-
-72ms初始判定可暂停第一帧，但后续触摸SYN_REPORT仍可到达。`mRawStatesPending`保留顺序，一旦笔数据到达或timeout，从头按帧drain；不会只保留最新坐标而丢掉中间动作。
-
-## 100. timeoutExpired的mode分流
-
-POINTER mode的timeout用于pointer gesture状态机；DIRECT mode才检查external stylus fusion timeout并调`processRawTouches(true)`。同一Mapper timeout回调不代表一定是stylus timeout，要先看mode与当前deadline。
-
-## 101. 三个时间常量图
-
-```mermaid
-sequenceDiagram
-    participant T as Touch digitizer
-    participant M as TouchInputMapper
-    participant S as External stylus
-    T->>M: initial touch DOWN at t0
-    alt stylus pressure already nonzero
-        M->>M: choose first touching id immediately
-        M-->>M: dispatch fused DOWN
-    else pressure absent
-        M->>M: wait at most 72ms
-        alt pressure arrives before deadline
-            S->>M: fresh pressure
-            M-->>M: drain pending touch as stylus
-        else no pressure by deadline
-            M-->>M: reset fusion state and dispatch as finger
-        end
-    end
-    S->>M: later pressure/button sample at ts
-    alt touch frame follows within 20ms
-        T->>M: new coordinates
-        M-->>M: fuse into that touch frame
-    else no touch frame
-        M->>M: synthesize from last raw state
-        Note over M: event time = ts + 10ms
-    end
-```
-
-## 102. resetExternalStylus清什么
-
-```text
-StylusState.clear(): when=LLONG_MAX, pressure=0, buttons=0, toolType=UNKNOWN
-mExternalStylusId=-1
-mExternalStylusFusionTimeout=LLONG_MAX
-mExternalStylusDataPending=false
-```
-
-它不把`mExternalStylusConnected` 改false；连接性只由重新查询external device list决定。
-
-## 103. 设备移除的顺序
-
-Reader在external stylus add/remove时发presence configuration change。`resolveExternalStylusPresence()`发现列表已空就调`resetExternalStylus()`，然后configureSurface重新计算source。已缓存的笔压/按键不应跨连接代际沿用。
-
-## 104. 融合的能力边界
-
-r48只合并pressure、buttons、toolType，不从external stylus获得X/Y、tilt、distance或唯一笔序列号。若产品需要多支笔精确配对、多Display路由或笔本身坐标，不能假设这个通用融合器已经提供。
-
-## 105. dumpsys中怎样查
-
-Touch Mapper dump会显示mode、Parameters、Virtual Keys、Raw Axes、Calibration、Affine、Viewport/Surface、各scale、last raw/cooked和Stylus Fusion状态。诊断时先看mode/viewport是否正确，再看calibration scale，最后看runtime state，避免一上来就把跳点归因于驱动。
-
-## 106. 常见错误一：deviceType就是mode
-
-错。deviceType是静态参数，mode还受pointerGesturesEnabled、associated display、X/Y轴和Viewport可用性影响。pointer deviceType可以落到UNSCALED，touchScreen也可因Viewport缺失变DISABLED。
-
-## 107. 常见错误二：改`.idc`就会被动态Display refresh重读
-
-错。parameters、raw axes和calibration parse/resolve仅首次configure执行。动态Display change只对已解析结果重做Surface/range等特定分支。
-
-## 108. 常见错误三：virtual key是屏内View热区
-
-错。r48 virtual key是sysfs板级定义，只在屏外initial down检查，命中后发source=KEYBOARD的NotifyKey。View的onTouch hit testing是另一层机制。
-
-## 109. 常见错误四：external stylus独立产生带X/Y的Motion
-
-错。ExternalStylusInputMapper仅广播StylusState，Touch Mapper把它与digitizer pointer id融合后才产生Motion。没有触摸屏坐标，这条通用路径无法独立定位笔尖。
-
-## 110. 常见错误五：72ms、20ms、10ms可以相加成每帧固定102ms延迟
-
-错。72ms只是initial touch等笔判定的上限；20ms是已融合后新笔数据等touch帧的窗口；10ms是20ms超时合成事件的timestamp offset。三者不是每帧依次sleep。
-
-## 111. macOS只读练习一：mode与Viewport决策
+先分别定位 mapper 与 device 中的“first time only”分支，再沿新增、删除两条路径找零 changes 重配和随后的 reset。回答：新加入或被移除的子设备贡献了某个 `.idc` 属性时，mapper 下一次读取的是旧合并表还是重建后的表？
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '340,620p' frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp
-sed -n '612,790p' frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F "if (!changes) { // first time only" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "if (!changes) { // first time only" "frameworks/native/services/inputflinger/reader/InputDevice.cpp"
+grep -n -F "device = deviceIt->second;" "frameworks/native/services/inputflinger/reader/InputReader.cpp"
+grep -n -F "device->configure(when, &mConfig, 0);" "frameworks/native/services/inputflinger/reader/InputReader.cpp"
+grep -n -F "device->reset(when);" "frameworks/native/services/inputflinger/reader/InputReader.cpp"
+grep -n -F "mConfiguration.clear();" "frameworks/native/services/inputflinger/reader/InputDevice.cpp"
 ```
 
-分别推演：内置DIRECT屏、外接touchScreen、pointerGesturesEnabled=false的触控板、带port但找不到Viewport的设备，写出deviceType、hasAssociatedDisplay、mode、source和最终是否disabled。
+答案是重建后的表：`InputDevice::configure(..., 0)` 先 clear，再从当前 `mDevices` 的各 `InputDeviceContext` 合并属性；新增子设备已经进入集合，被删子设备已经离开集合。
 
-## 112. macOS只读练习二：校准手算
+## 3. configureParameters：先由能力推断，再让有效 idc 覆盖
+
+`configureParameters()` 的决策顺序很重要。
+
+先别越过对象创建边界：EventHub 必须先把设备分到 `INPUT_DEVICE_CLASS_TOUCH` 或 `TOUCH_MT`，`InputDevice::addEventHubDevice()` 才会创建 Single/MultiTouchInputMapper。下面的 idc 只配置已存在的 mapper，不能把一台没有触摸 class 的任意设备凭空变成触屏。
+
+`gestureMode` 先看 `INPUT_PROP_SEMI_MT`：有该属性默认 single-touch，否则默认 multi-touch；`touch.gestureMode` 可写 `single-touch`、`multi-touch` 或 `default` 覆盖/保留。这个参数说的是 pointer gesture 的呈现能力，不会把 Protocol A 驱动改造成 Protocol B。
+
+`deviceType` 的能力推断按互斥顺序执行：
+
+1. 有 `INPUT_PROP_DIRECT` → `touchScreen`；
+2. 否则有 `INPUT_PROP_POINTER` → `pointer`；
+3. 否则有 `REL_X` 或 `REL_Y` → `touchPad`，意图是别让附着在 cursor device 上的 pad 默认移动指针；
+4. 都没有 → `pointer`。
+
+随后，合法的 `touch.deviceType` 可覆盖为 `touchScreen`、`touchPad`、`touchNavigation` 或 `pointer`；`default` 保留推断值，其他字符串只告警。`orientationAware` 默认只对 touchScreen 为真，但 `touch.orientationAware` 可覆盖。
+
+显示关联不是 `orientationAware` 的同义词。满足以下任一条件就把 `hasAssociatedDisplay` 设为真：orientation-aware、deviceType 是 touchScreen、deviceType 是 pointer，或者 `InputDeviceContext` 有 associated display port。只有 touchScreen 分支会读取 `touch.displayId`，并用设备 external 属性初始化 `associatedDisplayIsExternal`。`touch.wake` 则默认等于设备是否 external，之后也可被 idc 覆盖。
+
+一个实用反例是：把 touchPad 的 `touch.orientationAware` 配成 true，会让它进入“有关联显示”的 viewport 路径，但后面的 mode 仍可能是 UNSCALED；参数之间不是一枚总开关。
+
+## 4. DeviceMode 与 source：矩阵有优先级，也有降级分支
+
+`configureSurface()` 每次先调用 `resolveExternalStylusPresence()`，再按以下顺序选 mode/source：
+
+| 条件 | `mDeviceMode` | 基础 `mSource` | 可附加 source |
+|---|---|---|---|
+| deviceType=pointer 且 pointer gestures 开启 | POINTER | MOUSE | 本机 stylus |
+| deviceType=touchScreen 且有关联显示 | DIRECT | TOUCHSCREEN | 本机 STYLUS、全局 BLUETOOTH_STYLUS |
+| deviceType=touchNavigation | NAVIGATION | TOUCH_NAVIGATION | 无 |
+| 其余 | UNSCALED | TOUCHPAD | 无 |
+
+这张表有三个容易反向理解的点。
+
+第一，pointer type 在 `pointerGesturesEnabled=false` 时不会保持 POINTER，它落入最后的 UNSCALED/TOUCHPAD。第二，`hasStylus()` 是触摸 mapper 自己从 MT tool type 或 touch buttons 看出的能力；`hasExternalStylus()` 只是 reader 中是否存在任意未忽略的 external-stylus device，两者不是同一个发现链。第三，external stylus source 只附加给 DIRECT touchscreen；它不会让 POINTER、NAVIGATION 或 UNSCALED 进入融合状态机。
+
+mode/source 在验证 X/Y 和 viewport 之前就已写入。缺轴或找不到 viewport 时，代码只把 mode 改成 DISABLED 并提前返回；此前写入的 source 不会同步清零，旧 viewport、pointer controller、virtual keys 等缓存也没有在这两个分支统一清掉。`populateDeviceInfo()` 又会照常 addSource。因此“mode disabled”既不能推出“`getSources()==0`”，也不能推出所有旧描述字段已失效。
+
+### 练习 2：手算四组输入的 mode/source
+
+分别推导：DIRECT 属性的 MT 屏；POINTER 属性且 gestures 关闭的 pad；idc 强制 touchNavigation 的设备；有本机笔能力且连接了外接笔的 direct 屏。然后用分支顺序核对，别按枚举名字猜结果。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '775,1030p' frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp
-sed -n '1110,1245p' frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp
-sed -n '2018,2275p' frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F "mParameters.deviceType = Parameters::DEVICE_TYPE_TOUCH_SCREEN;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "mParameters.deviceType = Parameters::DEVICE_TYPE_TOUCH_PAD;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "mParameters.deviceType = Parameters::DEVICE_TYPE_TOUCH_NAVIGATION;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "mConfig.pointerGesturesEnabled" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "mSource = AINPUT_SOURCE_MOUSE;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "mSource = AINPUT_SOURCE_TOUCHSCREEN;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "mSource |= AINPUT_SOURCE_BLUETOOTH_STYLUS;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "mSource = AINPUT_SOURCE_TOUCHPAD;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
 ```
 
-设raw touchMajor max=255、当前major=64、X/Y scale为2/4，分别计算GEOMETRIC、DIAMETER、AREA的major/minor和AXIS_SIZE；再说明size scale/bias哪些值会受影响。
+DIRECT 屏是 TOUCHSCREEN；gestures 关闭的 pointer 是 UNSCALED/TOUCHPAD；强制 navigation 是 NAVIGATION/TOUCH_NAVIGATION；最后一组是 DIRECT，source 同时含 TOUCHSCREEN、STYLUS 与 BLUETOOTH_STYLUS。
 
-## 113. macOS只读练习三：virtual key状态机
+## 5. findViewport：几个“立即返回”决定了 fallback 是否存在
+
+当 `hasAssociatedDisplay` 为真，`findViewport()` 采用严格次序：
+
+1. 若有 associated display port，立即返回 `getAssociatedViewport()`；未匹配时得到空值，不再尝试其他 viewport。
+2. 若 mode 是 POINTER，先找 `defaultPointerDisplayId`；找到就返回，找不到只告警，继续向后降级。
+3. 若 idc 给了非空 `uniqueDisplayId`，立即按 unique id 返回；未匹配同样不会降级。
+4. 否则按 external/internal 类型选 viewport；external 缺失时单向退到 internal，internal 缺失时没有反向退路。
+
+当 `hasAssociatedDisplay` 为假，函数不查配置中的显示列表，而是用原始 X/Y 宽高构造 non-display viewport。
+
+所以不能把选择规则简化为“port → id → type，任何一步失败都继续”。port 与 unique-id 分支是强约束，pointer display 的失败才会继续；external→internal 又是仅此一处的单向兜底。各个 lookup 只按 port/id/type 找对象，不在这里检查 `DisplayViewport::isValid()` 或 active；“找到了”也不等于几何合法。
+
+更高一层还有一扇门：`InputDevice::configure()` 在 display-info 变化时会按 input port 查 viewport，查不到便 `setEnabled(false)`。mapper 内 `findViewport()` 的 DISABLED 与 device 层真正关闭 EventHub fd 是两种不同状态，排障时要同时看。
+
+POINTER 还有两位消费者：TouchInputMapper 找不到 `defaultPointerDisplayId` 时会继续 unique-id/type fallback；全局 `updatePointerDisplayLocked()` 给 PointerController 选 viewport 时却只退到 display 0，仍找不到就保留 controller 的旧 viewport。于是 mapper surface 与光标 controller 可以在异常配置下分叉，不能用一边的 dump 替另一边作证。
+
+### 练习 3：画出三个缺失 viewport 的不同结果
+
+比较 port 已配置但对应 viewport 缺失、unique id 已配置但找不到、external 类型 viewport 缺失但 internal 存在。分别回答是否继续 fallback、mapper 是否可能 DISABLED，以及 device 层是否可能直接 disable。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '1632,1645p' frameworks/native/services/inputflinger/reader/EventHub.cpp
-sed -n '79,155p' frameworks/native/libs/input/VirtualKeyMap.cpp
-sed -n '1045,1095p' frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp
-sed -n '1725,1836p' frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F "const std::optional<uint8_t> displayPort = getDeviceContext().getAssociatedDisplayPort();" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "return getDeviceContext().getAssociatedViewport();" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "mConfig.defaultPointerDisplayId" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "return mConfig.getDisplayViewportByUniqueId(mParameters.uniqueDisplayId);" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "viewportTypeToUse == ViewportType::VIEWPORT_EXTERNAL" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "newViewport.setNonDisplayViewport(rawWidth, rawHeight);" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "mAssociatedViewport = config->getDisplayViewportByPort(*mAssociatedDisplayPort);" "frameworks/native/services/inputflinger/reader/InputDevice.cpp"
 ```
 
-画出“屏外键区DOWN→按住→滑入屏内→Motion DOWN→UP”的NotifyKey/NotifyMotion序列，标出哪一笔Key UP带CANCELED。
+port 缺失与 unique-id 缺失都让 mapper 得到空 viewport；只有 port 情形还会在 device 层触发 enable 状态收敛。external 类型缺失可以退到 internal，不必因此禁用。
 
-## 114. macOS只读练习四：external stylus时间线
+## 6. configureSurface：重算、reset、generation 不是同一步
+
+拿到非空 viewport optional 后，代码才比较 `viewportChanged`。而且只有 viewport 对象真的变化，DIRECT/POINTER 才把旋转 viewport 还原到 natural surface，计算 logical/physical/device 尺寸、surface 边界和 `mSurfaceOrientation`；其他 mode 才改用 raw X/Y 宽高。physical 宽或高为零时只把分母修成 1 继续算，并没有拒绝这个 viewport。
+
+随后才比较 `deviceModeChanged`。mode 变化先清空 oriented ranges；POINTER 或 DIRECT+showTouches 才需要 pointer controller。`viewportChanged || deviceModeChanged` 为真时，后半段会：
+
+- 重算 X/Y scale、translate、precision 与所有 oriented ranges；
+- 重新生成 virtual-key hit boxes；
+- 更新 affine，并在 POINTER 中重算 gesture 参数、abort 旧 pointer usage；
+- 置 `*outResetNeeded=true` 并 `bumpGeneration()`。
+
+这里有一处比 source 缺口更早的 mode 交叉边界：surface 几何只受 `viewportChanged` 保护，后半段 scale/range 却受 viewport 或 mode 任一变化保护。pointer device 切换 `pointerGesturesEnabled` 可在同一个 viewport 上发生 POINTER↔UNSCALED；此时 mode 已变、viewport 对象未变，后半段会拿“旧 mode 留下的 `mRawSurfaceWidth/Height` 等字段”重算 scale/range。也就是说，mode change 会 reset/generation，不保证 mode-dependent surface geometry 已按新 mode 重建。
+
+这产生一个 r48 可观察缺口：external stylus presence change 会重跑 `configureSurface()`，也可能只让 DIRECT 屏的 `mSource` 增减 `AINPUT_SOURCE_BLUETOOTH_STYLUS`。若 viewport 和 mode 都没变，重算大块不进入，mapper 不 bump generation，也不要求 reset；`InputDevice::configure()` 却仍会从 mapper 重新 OR 出 `mSources`。因此目标触屏的 source 已变，而它自己的 `InputDevice.mGeneration` 没变。
+
+实际 presence 变化来自 external device 的 add/remove 时，那条拓扑路径会另外 bump reader 全局 generation，所以本轮末尾仍可发布整份设备列表，不能说“系统一定看不到 source”。精确结论是：通知由拓扑变化兜底，目标触屏自身的 generation/reset 并没有与 source 变化联动。
+
+另两个提前返回也在大块之前：X/Y 无效、viewport 为空都会把 mode 设为 DISABLED，却不在 mapper 内设置 resetNeeded 或 bump generation。device 层 enable/disable 可能另行产生 reset/generation，不能把它当成该提前返回自身的保证。
+
+### 练习 4：构造“source 变、目标设备 generation 不变”
+
+固定同一个 DIRECT touchscreen 与同一个 viewport，仅添加一个 external-stylus device。沿 presence change → configureSurface → source OR → viewport/mode 比较追踪。指出哪一行改变触屏 source，哪一个条件挡住触屏自身 bump；再找出为何 reader 全局 generation 仍会因设备新增而变化。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '30,110p' frameworks/native/services/inputflinger/reader/mapper/ExternalStylusInputMapper.cpp
-sed -n '1455,1723p' frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp
-sed -n '375,410p' frameworks/native/services/inputflinger/reader/InputReader.cpp
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F "resolveExternalStylusPresence();" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "mSource |= AINPUT_SOURCE_BLUETOOTH_STYLUS;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "bool viewportChanged = mViewport != *newViewport;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "if (viewportChanged) {" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "bool deviceModeChanged = mDeviceMode != oldDeviceMode;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "if (viewportChanged || deviceModeChanged) {" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "*outResetNeeded = true;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "mSources |= mapper.getSources();" "frameworks/native/services/inputflinger/reader/InputDevice.cpp"
+grep -n -F "bumpGenerationLocked();" "frameworks/native/services/inputflinger/reader/InputReader.cpp"
 ```
 
-分别推演：笔压先于touch DOWN、笔压晚30ms、笔压晚80ms、已融合后压力新帧先到但touch晚25ms。写出是否融合、是否等待、是否合成帧及合成eventTime。
+触屏改变发生在 source OR；阻挡点是最后的 viewport/mode 二选一条件。reader 的另一次变化来自新增设备路径的 `bumpGenerationLocked()`。这个例子说明 target-device generation、reader generation、source 与 reset 是四条状态线。
 
-## 115. 复读修订一：port/uniqueId回退不对称
+## 7. calibration 是两阶段决策，affine 是另一条动态配置线
 
-初稿容易笼统写成“Viewport找不到就回退内置屏”。二次对照后限定：只有按EXTERNAL type查找失败才回退INTERNAL；port和uniqueId都是精确绑定，失败直接返回空。
+`parseCalibration()` 只负责把字符串和数值装入 `Calibration`，未知字符串保留 DEFAULT 并告警。`resolveCalibration()` 再结合原始轴把 DEFAULT 收敛成可执行模式：
 
-## 116. 复读修订二：external presence不必然reset Touch Mapper
+| 类别 | 可配置模式 | 默认解析 |
+|---|---|---|
+| size | none/geometric/diameter/box/area | 有 touchMajor 或 toolMajor → geometric，否则 none |
+| pressure | none/physical/amplitude | 有 pressure → physical，否则 none |
+| orientation | none/interpolated/vector | 有 orientation → interpolated，否则 none |
+| distance | none/scaled | 有 distance → scaled，否则 none |
+| coverage | none/box | DEFAULT 永远落到 none |
 
-二次核对`configureSurface()`的大分支后确认：presence change虽会更新source，但只有viewport或mode变化才设`outResetNeeded`并bump mapper generation。不能把“进入configureSurface”等同于“必然NotifyDeviceReset”。
+显式模式也受能力裁决。例如没有 pressure 轴时，即使字符串写 physical，resolve 仍改成 none；没有 major 轴时 size 也会被改成 none。coverage 不检查独立 coverage 轴，因为 box 数据借用了 toolMajor/toolMinor 的位段，这正是它危险的地方。
 
-## 117. 复读修订三：virtual key hit box与Surface边界
+这些 idc calibration 参数在 `!changes` 分支解析；普通配置 change 不会任意重读它们。位置 affine 则不属于 `Calibration`：`updateAffineTransformation()` 在初始/零 changes、affine change bit，以及 viewport/mode 大块重算时更新。把“校准”作为单个生命周期会错过这条动态线。
 
-virtual key `isHit()`的right/bottom为包含边界；`isPointInsideSurface()`也用`<= surfaceRight/bottom`。这是r48的实现事实，不能套用Java `Rect.contains()`常见的右下排他规则。
+## 8. size 与 pressure：公式不减 min，也不统一 clamp
 
-## 118. 复读修订四：10ms不是等待窗口
+size cooking 先选择原料。若 touch/tool major 都有，各用各的 major/minor；只存在一组时，就把同一组复制给 touch 与 tool。minor 缺失便复制 major；归一化 `SIZE` 使用 touch 或 tool 的 major/minor 平均值。
 
-20ms timeout实际用于等touch数据；超时时合成event time设为`timeout-10ms`，即stylus sample后10ms。所以10ms是人工时间延迟常量，不是再调度一次10ms timer。
+之后按模式处理：
 
-## 119. Android 11 r48版本边界
+- geometric：四个 major/minor 乘 `mGeometricScale=(mXScale+mYScale)/2`；
+- area：正 major 开平方，minor 被直接设成开方后的 major；
+- diameter：minor 被设成 major；
+- box：不做上述三种形状变换；
+- 若 `touch.size.isSummed=true` 且 touching pointer 超过一个，先把四个尺寸与 size 都除以 touching count。循环中的 hover pointer 也会被这个 touching count 除，尽管 hover 本身不计入分母。
 
-```text
-parameters/raw axes/calibration仅首次configure解析
-pointer + gestures disabled会落到UNSCALED
-port/uniqueId精确Viewport查找失败不做type fallback
-只有EXTERNAL type缺失才回退INTERNAL
-size scale/bias不作用于AXIS_SIZE归一值
-pressure和size不做统一上限clamp
-coverage box未应用point Affine transform
-virtual key只检查屏外initial single touch
-virtual-key quiet time是Reader全局状态
-external stylus广播无Display/descriptor一对一配对
-initial fusion最多等72ms
-ongoing stylus sample等touch最多20ms，合成event time为sample+10ms
+`touch.size.scale/bias` 只作用于四个 major/minor，不作用于归一化 `AMOTION_EVENT_AXIS_SIZE`。后者始终再乘 `mSizeScale`；这个 scale 优先取 `1 / touchMajor.maxValue`，touchMajor 无效或 max 为 0 时才尝试 max 非零的 toolMajor，同样不减 min。area 模式开方的是 major/minor，但独立 `SIZE` 仍用开方前的平均原料归一化。
+
+pressure 的 physical 与 amplitude 在这段 r48 cook 代码里执行同一个 `rawPressure * mPressureScale`。有显式 `touch.pressure.scale` 就直接使用，并把声明 range max 设为 `scale * rawMax`；否则 raw max 非零时取倒数。没有可用 pressure calibration 时，hover 输出 0，非 hover 输出 1。MultiTouch 是否 hover 的更早判定仍可使用“pressure 轴有效且 raw pressure<=0”，不会因为 idc 把 pressure calibration 配成 none 就停止参考该 raw 轴。
+
+不要自行补上源码没有的性质：这些公式不减 axis min，也没有把输出统一 clamp 到 range。四个 major/minor 在应用 size scale、bias 后只有一条下限保护，负值会被钳到 0；独立 `SIZE`、pressure、distance 等没有共享这条保护。`SIZE` 虽声明 [0,1]，负 raw、非零 min 或越界 sample 都可能让实际值越界；major/minor 声明上限虽是 surface diagonal，scale/bias 以及后续 vector 拉伸也可能超过它。physical/amplitude 且没有显式 `touch.pressure.scale` 时，raw max 为 0 的有效 pressure 轴会留下 `mPressureScale=0`，触摸压力也成为 0；显式 scale 仍照用，calibration=none 则由 touching/hover 合成 1/0。正向越界或过大的 scale/bias 仍能让实际值越过声明范围。
+
+### 练习 5：算出一组反直觉的 size/pressure
+
+设 touchMajor=80、touchMinor=20、touchMajor.max=100、两指 touching、`size.isSummed=true`、size mode=area；另设 pressure raw=80、raw max=100、显式 pressure scale=0.02。忽略 size scale/bias。分别算 major/minor、SIZE、pressure 与声明的 pressure max。
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F "mSizeScale = 1.0f / mRawPointerAxes.touchMajor.maxValue;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "touchMajor /= touchingCount;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "touchMajor = touchMajor > 0 ? sqrtf(touchMajor) : 0;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "if (*outSize < 0) {" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.h"
+grep -n -F "size *= mSizeScale;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "pressure = in.pressure * mPressureScale;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "pressureMax = mPressureScale * mRawPointerAxes.pressure.maxValue;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "pressure = in.isHovering ? 0 : 1;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "orientation -= M_PI_2;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "rawLeft = (in.toolMinor & 0xffff0000) >> 16;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "left = float(mRawPointerAxes.x.maxValue - rawRight) * mXScale;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "left = float(mRawPointerAxes.y.maxValue - rawBottom) * mYScale;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
 ```
 
-## 120. 本章检查清单
+除以两指后 major/minor 原料为 40/10，area 输出 major=minor=√40；`SIZE=((80+20)/2)/2/100=0.25`。pressure=1.6，声明 max=2.0。两组输出并不共享同一种归一化语义。
 
-```text
-[ ] 区分deviceType、DeviceMode和source
-[ ] 按正确优先级选Viewport
-[ ] 说明静态首次配置与动态changes的边界
-[ ] 手算size/pressure/orientation/distance校准
-[ ] 区分size BOX与coverage BOX
-[ ] 解释virtual key sysfs格式和raw hit box
-[ ] 画出滑出virtual key后Motion重开
-[ ] 区分quiet ignored与未命中
-[ ] 解释external stylus为什么无法独立定位
-[ ] 区分72ms、20ms和10ms
-[ ] 列出reconfigure/reset/generation边界
+## 9. orientation、tilt、distance、coverage：同名轴并不走同一路
+
+只要 raw tiltX 与 tiltY 同时有效，tilt 路径就压过 orientation calibration。中心取各自 min/max 平均，原始数值按“度”乘 `π/180`；输出 orientation 是 `atan2(-sin(tiltX), sin(tiltY))`，tilt 是 `acos(cos(tiltX) * cos(tiltY))`。range 声明为 orientation [-π, π]、tilt [0, π/2]，计算后没有额外 clamp。
+
+没有成对 tilt 轴时：
+
+- interpolated 根据 orientation max>0 或 min<0 选择比例，把一侧极值映到 ±π/2；
+- vector 把一个字节拆成两个带符号 4-bit 分量，以 `atan2(c1,c2)/2` 求方向，并按 confidence 拉长 major、压短 minor；
+- none 在 calibration 分支先把 orientation 置 0。
+
+这个 0 还不是最终值。后面的公共 surface-orientation 分支会无条件对 orientation 做 −π/2、−π 或 +π/2；只有 `mOrientedRanges.haveOrientation=true` 才进入区间回绕。因此 calibration=none 的旋转屏仍可能把非零 ORIENTATION 写进 `PointerCoords`，同时又不对外声明 orientation range。读事件值与读 device range 必须双向核对。
+
+这里存在 SingleTouch 与 MultiTouch 的能力边界：SingleTouch 的原始轴配置会读取 `ABS_TILT_X/Y`；MultiTouch 的 `configureRawPointerAxes()` 只读 `ABS_MT_ORIENTATION`、pressure、distance 等，不给 `mRawPointerAxes.tiltX/tiltY` 赋值。因此通用基类虽然支持 tilt，r48 的 MultiTouch 路径并不会从 MT slot 产出这两个字段。
+
+distance 只是 `rawDistance * distanceScale`，默认 scale=1；range 的 min/max/fuzz 也直接乘这个 scale，所以负 scale 能得到倒序 range 与负 fuzz。
+
+coverage box 把 toolMinor 的高/低 16 位解出 left/right，把 toolMajor 解出 top/bottom；掩码拆位不做 16-bit 符号扩展，四项按 0..65535 使用。它再以自己的分支按 surface orientation 换算到 GENERIC_1..4，而不是调用点坐标的 `rotateAndScale()`。点坐标 X/Y 会先经过 affine，coverage 四边明确没有套同一 affine；180° 的 left/right 又没加 `mXTranslate`，270° 的 left/right 没加 `mYTranslate`，非零 surface offset 下也不会与点完全同变换。四边没有 clamp 或次序校验。
+
+显式 coverage=box 不检查 WIDTH major/minor 是否有效；MultiTouch minor 缺失时 slot getter 又会回退到 major，左右/上下可能复用同一 packed 字。进入 box 后输出占用 GENERIC_1..4，不再写 TOOL_MAJOR/MINOR，而且解包直接读原始 `in.tool*`，不受 size scale/bias 影响。
+
+## 10. virtual-key map：整文件解析、逐键映射、整数命中框
+
+EventHub 只对 touch class 尝试读取 `/sys/board_properties/virtualkeys.<canonicalName>`。文件可读且整份 `VirtualKeyMap::Parser::parse()` 成功，设备才保存 map，并额外带上 KEYBOARD class；文件不存在只是没有虚拟键。
+
+每条定义格式是 type `0x01` 加五个冒号分隔整数：scanCode、centerX、centerY、width、height。type 必须是字面量 `0x01`；整数用 `strtol(..., base=0)`，所以符号、十六进制和八进制都可被接受，却不校验 errno、int32 范围或宽高必须为正。`#` 只在一行开头的有效内容之前表示整行注释，尾随注释会成为行尾残留。未知 type、字段缺失、非整数或行尾残留都会返回错误，`load()` 直接返回空指针；不是“保留此前正确项、跳过坏项”。
+
+空文件或纯注释文件反而会 parse 成功；EventHub 仍把它视为“成功加载 map”并添加 KEYBOARD class，只是 definitions 为空。virtual-key sysfs 文件只在设备打开分类时加载，普通 reader reconfigure 不会重读，修改后需要走 EventHub reopen 才能生效。
+
+`configureVirtualKeys()` 再做第二层过滤：每个 scan code 必须能经 device context 的 `mapKey()` 得到 keyCode，否则只丢这一项。EventHub 实现会先查 KeyCharacterMap，再查 KeyLayout，并在成功后通过 KCM 处理 meta；因此把它简称为“只查 key layout”并不准确。成功项按文件顺序进入 `mVirtualKeys`。映射返回的 flags 被存入 `VirtualKey.flags`，但本链 dispatch 没读取它；最终 KeyEvent 的 source、policy flag 与 event flags 由 `dispatchVirtualKey()` 固定组装。
+
+命中框从显示坐标反算到 raw touch 坐标。width/height 先做整数除 2，各边再执行整数乘除，所以奇数尺寸和不能整除的比例会截断；矩形不裁剪、不去重，负尺寸可形成反向空区，极值乘法也没有溢出保护。`VirtualKey::isHit()` 四边都用 `>=/<=`，边界包含在内；重叠区域中 `findVirtualKeyHit()` 返回 vector 里的第一项。命中框不会经过 affine，这与它在 raw touch 坐标上、且 `consumeRawTouches()` 早于 `cookPointerData()` 的位置一致。
+
+前面 physical 宽高为零时改 1，只保护 viewport 换算的分母；logical/device 尺寸并未在此验证，仍可能把 `mRawSurfaceWidth/Height` 算成 0。若此时又存在 virtual-key definitions，命中框反算会出现整数除零。optional 中“有 viewport”远弱于几何安全。
+
+## 11. virtual-key 状态机：按键、触摸和取消之间怎样切换
+
+虚拟键只在一次“raw 上一帧无 touching、当前帧有 touching”的新按下中检查，而且首个触点必须位于 surface 外。一个触点命中时，`mCurrentVirtualKey.down=true`；是否真正发 KEY_DOWN 由 reader 的全局 quiet-time 门决定，但即使 ignored，整条虚拟键 stroke 仍被消费。
+
+后续帧有三类结果：
+
+- 仍只有一个触点，且命中同 keyCode：继续消费，不重复发 KEY_DOWN；
+- 所有触点抬起：若未 ignored，发 KEY_UP，然后消费这一帧；
+- 不再命中同 keyCode，或出现第二指：清除当前虚拟键；只有原键未被 quiet time 标成 ignored 时，才先发带 CANCELED 的 KEY_UP，再继续处理当前帧。
+
+“继续处理”很关键。此前虚拟键帧在 `cookAndDispatch()` 中被 clear 后才复制到 `mLastRawState`，所以 last raw 看起来没有触点。若当前点已滑回 surface 内、并且不再被 `findVirtualKeyHit()` 判为同 keyCode，DIRECT 模式会从普通 Motion 的全新 DOWN 开始；POINTER 模式则进入 pointer usage，普通单指通常先是 HOVER_MOVE，不能套用 DIRECT 的 action。若仍在屏外并命中另一虚拟键，也可能同帧取消旧键并按下新键。它不是从原按键无缝转换出的 MOVE。
+
+活动虚拟键检查早于 `isPointInsideSurface()`，所以“进入 surface”本身不是取消条件。配置错误可让 virtual-key hit box 与 surface 重叠；点即使已经在屏内，只要第一命中项仍是同 keyCode，就继续被消费。判断只比 keyCode，不比 scanCode 或 definition。反过来，重叠键按文件顺序返回第一项：当前键的矩形仍覆盖该点，也可能因为更早条目映射到不同 keyCode 而被取消。
+
+surface 与 hit box 都含边界，但初始和持有阶段的优先级相反：初始 DOWN 先要求点在 surface 之外，共享边界归普通 surface；虚拟键已经激活后先查 hit box，共享边界若仍首命中同 keyCode，就继续归虚拟键。
+
+若新 stroke 的首点在 surface 外、没有命中键，或者一开始就是多指屏外，`consumeRawTouches()` 直接消费该帧。之后只要 last raw 仍因消费而为空，仍在屏外的帧可能反复按“新按下”检查。
+
+### 练习 6：推演从 BACK 区滑入屏内
+
+假设 mapper 是 DIRECT、BACK hit box 不与 surface 重叠，并且全局 quiet time 未把这次按键标成 ignored。依次给出屏外 BACK down、仍在 BACK、滑到屏内、屏内 move、up。写出 Key 与 Motion action，并说明 Motion 为什么从 DOWN 而不是 MOVE 开始。
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F "if (mCurrentVirtualKey.down) {" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "virtualKey && virtualKey->keyCode == mCurrentVirtualKey.keyCode" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "AKEY_EVENT_FLAG_CANCELED" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "if (!isPointInsideSurface(pointer.x, pointer.y)) {" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "mCurrentVirtualKey.ignored =" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "mCurrentRawState.rawPointerData.clear();" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "mLastRawState.copyFrom(mCurrentRawState);" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
 ```
 
-## 121. 本章小结
+序列是 KEY_DOWN、无新事件、KEY_UP|CANCELED 加 Motion DOWN、Motion MOVE、Motion UP。clear 后保存的 last raw 为空，正是新 Motion stream 的边界。
 
-```text
-首次能力 + .idc
-→ deviceType / display association / calibration
-动态Reader config
-→ mode / viewport / surface / ranges
-off-screen initial touch
-→ virtual key KeyEvent或丢弃
-external pressure/buttons + digitizer X/Y
-→ 受限时窗内的stylus fusion
+## 12. quiet time 是 reader 全局时钟；reset 靠 DeviceReset 收口
+
+只要一帧未被 virtual-key/off-screen 分支消费、当前仍有 touching，且 `virtualKeyQuietTime>0`，TouchInputMapper 就调用 `disableVirtualKeysUntil(when + quietTime)`。这个 deadline 存在 `InputReader`，不是某个触屏或某个 key 的成员。因此一个屏内触摸可以压制另一块设备随后发生的虚拟键。
+
+`disableVirtualKeysUntilLocked()` 是直接赋值，不取 max。reader 通常按时间顺序处理 raw events，所以 deadline 通常向前推进；但函数自身并不保证单调。`shouldDropVirtualKeyLocked()` 使用严格 `now < deadline`，恰好等于 deadline 时允许按键。
+
+quiet-time 判断发生在新虚拟键 acquisition 中、普通触摸更新 deadline 之前，结果被锁存在 `mCurrentVirtualKey.ignored`。被判 ignored 的 virtual key 会记录 down 状态并吞掉 stroke，只是不发 DOWN/UP；状态查询仍会因为 `down=true` 报 `AKEY_STATE_VIRTUAL`。旧 deadline 到期不会补发 DOWN，新的 quiet window 也不会追溯取消已经发出的 held key。它不会在命中本帧反过来延长 quiet time。
+
+`TouchInputMapper::reset()` 只是把 `mCurrentVirtualKey.down=false`，不会单独合成 KEY_UP/CANCEL。正常 `InputDevice::reset()` 会在所有 mapper reset 后通过 `notifyReset(when)` 发设备 reset，Dispatcher 应以设备级 reset 清理旧状态。审计 trace 时，找不到成对 KeyEvent 不一定是泄漏；要继续找 DeviceReset。
+
+但增量 surface 重配是另一条路径：`TouchInputMapper::configure()` 可直接发 `NotifyDeviceResetArgs`，却不调用自身 `reset()`。若此刻虚拟键仍 down，mapper 内状态会保留；下游先收到 DeviceReset，未来物理抬起时 mapper 仍可能再发 KEY_UP。不能从通知名字反推出 mapper 已清空。
+
+全局 `mDisableVirtualKeysTimeout` 也不在 mapper/device reset 或 device removal 中清除。设备拓扑已经变化，旧屏内触摸留下的 quiet deadline 仍可短暂影响新设备。
+
+### 练习 7：区分全局 deadline 与单设备按键状态
+
+令设备 A 在 t=100ms 产生屏内触摸，quiet time=50ms；设备 B 分别用两条独立 stroke（中间完整抬起）在 t=149、150ms 尝试虚拟键。再让 mapper 在一次未抬键时 reset。判断两次是否发 KEY_DOWN，以及 reset 是否直接发 KEY_UP。
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F "getContext()->disableVirtualKeysUntil(when + mConfig.virtualKeyQuietTime);" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "mDisableVirtualKeysTimeout = time;" "frameworks/native/services/inputflinger/reader/InputReader.cpp"
+grep -n -F "if (now < mDisableVirtualKeysTimeout) {" "frameworks/native/services/inputflinger/reader/InputReader.cpp"
+grep -n -F "mCurrentVirtualKey.down = false;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "for_each_mapper([when](InputMapper& mapper) { mapper.reset(when); });" "frameworks/native/services/inputflinger/reader/InputDevice.cpp"
+grep -n -F "notifyReset(when);" "frameworks/native/services/inputflinger/reader/InputDevice.cpp"
 ```
 
-TouchInputMapper不只是“坐标乘一个系数”。它同时是设备类型解释器、Display绑定器、传感轴语义转换器，还用两个小状态机处理virtual key和external stylus的跨设备时序。
+t=149 的独立 stroke 被压制，t=150 的下一条独立 stroke 通过严格边界；若 149ms 后一直不抬起，deadline 到点不会给 ignored stroke 补 KEY_DOWN。mapper reset 本身不发 KEY_UP，设备级 reset 才是下游收口信号。
 
-## 122. 下一章预告
+## 13. ExternalStylusInputMapper：只生产状态，不生产坐标
 
-第251章转入包管理/资源/安装升级专题，首先整理`PackageManagerService`启动、`Settings`/packages.xml状态账本、系统包扫描阶段和服务ready边界。
+EventHub 把一种特殊设备归为 `INPUT_DEVICE_CLASS_EXTERNAL_STYLUS`：前面的 MT 与单点坐标分类都未命中，它有 `ABS_PRESSURE` 或 `BTN_TOUCH`，并且没有成对的 `ABS_X`、`ABS_Y`。因此“没有 X/Y”仍不是充分条件：设备若同时具备成对 `ABS_MT_POSITION_X/Y`，会先被 MT touch 分支截走，根本不会走 external-stylus 分支。命中该分支后还会移除 KEYBOARD class，以免笔按钮先被键盘 mapper 占走。这是能力分类，不是根据蓝牙 transport 名称判断。
+
+`InputDevice::addEventHubDevice()` 为该 class 创建 `ExternalStylusInputMapper`。它宣称的 source 是 STYLUS，device info 只添加 [0,1] pressure range；每个 `SYN_REPORT` 清空并重建 `StylusState`：
+
+- `when` 取这个 pen SYN 的时间；
+- tool type 取 `TouchButtonAccumulator`，UNKNOWN 会改成 STYLUS；
+- 有 raw pressure axis 时，pressure 直接是 `raw / rawMax`；
+- 没有 pressure axis 但 tool active 时是 1，否则 0；这里的 active 包含 `BTN_TOOL_PEN` 一类 proximity 状态，不只 `BTN_TOUCH`；
+- buttons 取 accumulator 当前 button state。
+
+这段归一化不减 raw min、不 clamp，也没有检查 `rawMax==0`。所以“device info 声明 0..1”不是运行值安全落在 0..1 的证明。有有效 pressure 轴时也不再检查 tool active。`configure()` 每次都重读 pressure axis、配置 button accumulator，它没有用 change mask 缩小工作。
+
+最后，mapper 不发 Motion；它只调用 `dispatchExternalStylusState()`。坐标必须来自另一台 TouchInputMapper，这就是“外接笔融合”而非一台完整坐标笔设备。触屏会先按自己的 calibration cook pressure，融合阶段再用 external pressure 直接覆盖，外笔数值不会重新走触屏的 pressure scale。
+
+## 14. 广播与配对：全局 presence、全局 state、最低 touching id
+
+external-stylus device 添加或移除时，`notifyExternalStylusPresenceChanged()` 触发全 reader 配置刷新。`getExternalStylusDevicesLocked()` 只要找到任意未忽略 external stylus，所有 TouchInputMapper 的 `mExternalStylusConnected` 就为真；没有按 display、port、descriptor 或物理邻近关系配对。
+运行状态也是全局广播。`StylusState` 只有 when、pressure、buttons、toolType，没有来源 device id。`InputReader::dispatchExternalStylusState()` 遍历 `mDevices`，对每个 `InputDevice` 调 `updateExternalStylusState()`；device 又把同一个 state 交给自己的全部 mapper。真正消费它的 TouchInputMapper 仍要求 DIRECT 且 external presence 为真。若同时连接多支外笔，它们写的是同一份 mapper 缓存，语义是全局 last-writer-wins，而非逐笔隔离。
+
+初始融合也不做几何匹配：当上一 raw state 的 `pointerCount==0`、当前不为 0，且缓存 stylus pressure 非零时，直接取 `touchingIdBits.firstMarkedBit()` 作为 `mExternalStylusId`，也就是最低 Android touching id。缓存 state 没有“必须足够新”的年龄判断；正常设备依赖 pen-up state 把 pressure 归零。
+
+这里还有组合设备放大效应。`InputReader::mDevices` 以 EventHub id 为键，同一个合并后的 `shared_ptr<InputDevice>` 可出现多次。全局广播按 map entry 遍历，因而同一逻辑设备可能收到重复 update；第一次 update 若刚释放了 72ms 待处理 DOWN，第二次相同 update 已看到 active stylus id，可能再建立 20ms data-pending timeout，最终产生一次额外的合成刷新。这是从容器结构和状态机共同推出的边界，不是“一支笔只定向通知一块屏”。
+
+### 练习 8：验证广播为何不是一对一
+
+找出 presence 枚举、state 广播、device 内 mapper 广播和初始 id 选择四层。回答：两块 direct 屏同时有新触点时，源码在哪一步选择目标屏？组合设备为什么可能多收一次相同 state？
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F "device->classes |= INPUT_DEVICE_CLASS_EXTERNAL_STYLUS;" "frameworks/native/services/inputflinger/reader/EventHub.cpp"
+grep -n -F "notifyExternalStylusPresenceChanged();" "frameworks/native/services/inputflinger/reader/InputReader.cpp"
+grep -n -F "device->getClasses() & INPUT_DEVICE_CLASS_EXTERNAL_STYLUS" "frameworks/native/services/inputflinger/reader/InputReader.cpp"
+grep -n -F "void InputReader::dispatchExternalStylusState(const StylusState& state)" "frameworks/native/services/inputflinger/reader/InputReader.cpp"
+grep -n -F "std::unordered_map<int32_t /*eventHubId*/, std::shared_ptr<InputDevice>> mDevices;" "frameworks/native/services/inputflinger/reader/include/InputReader.h"
+grep -n -F "devicePair.second->getDescriptor() == identifier.descriptor" "frameworks/native/services/inputflinger/reader/InputReader.cpp"
+grep -n -F "device = deviceIt->second;" "frameworks/native/services/inputflinger/reader/InputReader.cpp"
+grep -n -F "device->updateExternalStylusState(state);" "frameworks/native/services/inputflinger/reader/InputReader.cpp"
+grep -n -F "for_each_mapper([state](InputMapper& mapper) { mapper.updateExternalStylusState(state); });" "frameworks/native/services/inputflinger/reader/InputDevice.cpp"
+grep -n -F "mExternalStylusId = state.rawPointerData.touchingIdBits.firstMarkedBit();" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+```
+
+源码没有目标屏选择步骤；所有候选 mapper 都收广播，各自在新触摸处取最低 touching id。重复来自 `mDevices` 的 EventHub-id entry 可共享同一 `InputDevice`。
+
+## 15. 72ms、20ms、10ms：同一个 timeout 字段承载两种等待
+
+`mExternalStylusFusionTimeout` 初始为 `LLONG_MAX`，但它有两种语义。
+
+第一种是“触摸先到，等笔数据”。DIRECT 屏已知存在 external stylus，新 raw state 构成 initial down，而缓存 pressure 为 0 时，`assignExternalStylusId()` 把 deadline 设为 `touchWhen+72ms`，把 raw state 留在 `mRawStatesPending`。pressure 非零的笔 state 只要在 reader 执行 timeout callback 之前被处理，就会立即重进 `processRawTouches()`、选 id、清 deadline、正常 dispatch；代码不拿 stylus sample 的 when 与 72ms deadline 做硬截止比较。`InputReader` 同一轮又是先处理 raw events、后检查 timeout，所以一个时间戳已略晚于 deadline 的 sample 仍可能抢先完成融合。若到达的是 pressure=0，仍等原 deadline，不会延长。timeout 路径会 `resetExternalStylus()`，再把这帧当普通触摸发出。
+
+第二种是“笔数据先更新，等触摸坐标”。已有 active stylus id，或者正在等前述初始 DOWN 时，`updateExternalStylusState()` 都会把 `mExternalStylusDataPending=true` 并处理队列。只有 active stream 没有新 touch frame 消化该 state、且 timeout 当前为 `LLONG_MAX`，才把 deadline 设为 `stylusWhen+20ms`。初始 DOWN 等待期已经持有 72ms deadline，不会切换成 20ms：非零 pressure 可直接释放 pending touch，零 pressure 则继续等原 deadline。
+
+20ms 到期后复制 `mLastRawState`，以 `deadline-10ms` 作为事件时间再 cook/dispatch，等价于给第一份 stylus sample 人工加 10ms，复用最后坐标产生 pressure、tool type 或 button 更新。对 touching id 集未变的 DIRECT 屏，这会形成一次 Motion MOVE，而不会凭空创建 DOWN。
+
+三个关键边界如下：
+
+- deadline 只在当前为 `LLONG_MAX` 时建立；20ms 窗口内后来的多份 stylus state 会覆盖缓存，但不延长第一次 sample 的 deadline，合成时用最新 state、却仍用第一次 deadline 推导时间；
+- `timeoutExpired()` 判断 `mExternalStylusFusionTimeout < when`，恰好相等时只再次请求同一 deadline，需下一次更晚回调才真正处理；
+- active id 上收到 pressure=0，而上帧该 id 仍 touching 时，`applyExternalStylusTouchState()` 会保留上帧 cooked pressure；零值不是进行中 stroke 的立即归零。
+
+按钮还有一个不同于 pressure 的滞留边界：external buttons 通过按位 OR 写入当前 raw state。20ms 合成又从已经含旧 external button bit 的 `mLastRawState` 复制；若只有 pen button-release、没有新 touch frame，新的零 bit 无法用 OR 清掉旧 bit，通常要下一帧真实触摸状态重建 buttonState 后才体现释放。
+
+还有一个输入形状陷阱：initialDown 用 `pointerCount` 判断“从 0 到非 0”，选 id 却从 `touchingIdBits` 取第一位。若某实现产生纯 hover raw pointer，同时缓存 external pressure 非零，这两个集合的假设会分裂；代码没有在 `firstMarkedBit()` 前再次验证 touching 非空。
+
+### 练习 9：在一条时间线上放置三只钟
+
+情形 A：touch DOWN 在 0ms，pen pressure 在 50ms；情形 B：active stroke 中 pen samples 在 100ms 和 115ms，此间没有 touch frame。推导 dispatch 时刻、使用哪份 state、deadline 是否移动，并判断 timeout callback 恰好到 deadline 时会不会处理。
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F "EXTERNAL_STYLUS_DATA_TIMEOUT = ms2ns(72);" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "TOUCH_DATA_TIMEOUT = ms2ns(20);" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "STYLUS_DATA_LATENCY = ms2ns(10);" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "mExternalStylusFusionTimeout = state.when + EXTERNAL_STYLUS_DATA_TIMEOUT;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "mExternalStylusFusionTimeout = mExternalStylusState.when + TOUCH_DATA_TIMEOUT;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "nsecs_t when = mExternalStylusFusionTimeout - STYLUS_DATA_LATENCY;" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "if (mExternalStylusFusionTimeout < when) {" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+grep -n -F "pressure = coords.getAxisValue(AMOTION_EVENT_AXIS_PRESSURE);" "frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp"
+```
+
+A 在约 50ms 的实际处理时刻收到 pen state 后立即释放 pending DOWN，而不是等满 72ms；但发出的 Motion `when` 仍取等待中的 touch 时间 0ms（只会为不早于上一 raw state 而被抬高），不能把交付时刻和事件时间混为一谈。B 的 deadline 固定为 120ms，115ms state 覆盖缓存但不延期；真正超时后以 110ms 为合成事件时间使用 115ms 的最新 state。回调时间恰好 120ms 时严格小于不成立，只会重约，稍晚回调才处理。
+
+## 16. 用状态线排障，并把责任交给第251章
+
+面对“触摸没反应、虚拟键误触、蓝牙笔延迟或 source 不对”，建议按状态线取证，而不是从最终 Motion 倒猜：
+
+| 现象 | 第一检查点 | 第二检查点 | 容易误判之处 |
+|---|---|---|---|
+| 设备完全无 Motion | raw X/Y valid、device enable | mode、viewport 是否 DISABLED | source 非零不代表 mapper 可运行 |
+| 旋转/尺寸异常 | viewport natural/physical/logical | affine 与 calibration 分开看 | coverage 不跟随 point affine |
+| virtual key 不发 | 整份 map 是否解析成功、scanCode 是否映射 | surface 外命中、全局 quiet deadline | ignored stroke 仍会被消费 |
+| 笔 DOWN 慢约 72ms | presence 与缓存 pressure | pending raw state、timeout | 这是触摸等笔，不是固定事件延迟 |
+| 笔压力刷新约在首份笔状态后 20ms 调度 | active stylus id、dataPending | 是否缺同期间 touch frame | 严格 `<` 与调度抖动可让实际交付晚于 20ms；10ms 只是合成 eventTime 偏移 |
+| source 已变化而目标 generation 未变 | `InputDevice.mSources` | mapper/device/reader generation | topology 通知可兜底，但四者不原子联动 |
+
+源码证据入口可固定为：
+
+- mode、surface、calibration、virtual key、fusion：`frameworks/native/services/inputflinger/reader/mapper/TouchInputMapper.cpp` 与 `TouchInputMapper.h`；
+- MT 能力边界：`MultiTouchInputMapper.cpp`，单点 tilt 对照：`SingleTouchInputMapper.cpp`；
+- external stylus 状态生产：`ExternalStylusInputMapper.cpp`；
+- 全局 presence/state/quiet time：`InputReader.cpp`；
+- 组合设备聚合与 reset：`InputDevice.cpp`；
+- class 与 virtual-key sysfs 加载：`EventHub.cpp`、`frameworks/native/libs/input/VirtualKeyMap.cpp`。
+
+最终应能给出一句精确结论：`TouchInputMapper` 不是单纯的坐标缩放器；它把静态能力、可变显示配置、非统一校准、屏外按键旁路和无坐标外接笔广播收敛到同一条触摸输出链，而这些子链的完成点并不相同。
+
+下一章转入 `Android PackageManagerService启动、Settings账本与系统包扫描链`，继续沿“磁盘事实、持久账本、内存状态与对外 ready 不是同一完成点”的方法，拆解 PMS 启动。

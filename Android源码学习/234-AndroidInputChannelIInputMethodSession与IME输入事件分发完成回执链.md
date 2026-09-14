@@ -1,113 +1,58 @@
 # 234 Android InputChannel、IInputMethodSession与IME输入事件分发完成回执链
 
-> 源码版本：Android 11 / `android-11.0.0_r48`  
-> 学习方式：macOS只读核源，不编译、不运行AOSP
+本文基于 `android-11.0.0_r48`。第 233 章研究 IME怎样借 `IInputContext`修改文字；本章换到另一条常被混淆的路径：目标 App已经从窗口通道收到一枚 KeyEvent（硬件键只是典型来源）后，为什么还会把它交给当前IME过滤，并等待一份 handled回执。
 
-## 1. 本章要解决什么
+核心不变量是：**原窗口事件、App发往IME的副本、IME专用Channel的 finished signal、ViewRoot恢复后的最终处理结果和屏幕变化，是不同对象与不同完成点。2500 ms只让App放弃等待这次IME判断，不会撤销已经发送的Channel事件。**
 
-第233章解释了软键盘怎样通过`InputConnection.commitText()`写文字。本章研究另一条链：一个已经送到目标App窗口的硬件KeyEvent，为什么还要先让IME看一眼。
+版本锚点：
 
-需要回答：
+- `frameworks/base/core/java/android/view/ViewRootImpl.java`
+- `frameworks/base/core/java/android/view/ImeFocusController.java`
+- `frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java`
+- `frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java`
+- `frameworks/base/core/java/com/android/internal/view/InputBindResult.java`
+- `frameworks/base/core/java/android/inputmethodservice/IInputMethodWrapper.java`
+- `frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java`
+- `frameworks/base/core/java/android/inputmethodservice/AbstractInputMethodService.java`
+- `frameworks/base/core/java/android/inputmethodservice/InputMethodService.java`
+- `frameworks/base/core/java/android/view/InputChannel.java`
+- `frameworks/base/core/java/android/view/InputEventSender.java`
+- `frameworks/base/core/java/android/view/InputEventReceiver.java`
+- `frameworks/base/core/jni/android_view_InputEventSender.cpp`
+- `frameworks/base/core/jni/android_view_InputEventReceiver.cpp`
+- `frameworks/native/libs/input/InputTransport.cpp`
 
-```text
-ViewRootImpl把事件送IME之前和之后分别有哪些stage？
-为什么原始事件不用IInputMethodSession AIDL逐个传？
-专用InputChannel两端怎样创建并交给App和IME？
-IME怎样返回handled，App为何必须等待完成回执？
-2500ms超时后事件怎样继续？
-触摸、trackball、rotary和generic motion哪些会经过IME？
-IME反向sendKeyEvent为何不会再次进入IME形成死循环？
-```
+## 1. 先分清三种 InputChannel与两条 Binder方向
 
-## 2. 一句总纲
+本章主链只使用前两类 Channel，但排障时必须把第三类也分开：
 
-IME输入事件链是目标App输入流水线中的异步过滤阶段：
+| 通道/接口 | 方向 | 承载内容 | 谁完成它 |
+| --- | --- | --- | --- |
+| 目标窗口 `InputChannel` | InputDispatcher → App ViewRoot | 原始窗口输入事件 | App的窗口 `InputEventReceiver`最终 finish |
+| IME Session专用 `InputChannel` | App IMM → IME | 交给当前IME过滤的 Key/Motion副本 | IME的 `ImeInputEventReceiver`回 finished signal |
+| IME窗口自己的 `InputChannel` | InputDispatcher → IME窗口 ViewRoot | 用户直接触摸键盘窗口 | IME窗口自己的输入流水线 |
+| `IInputContext` Binder | IME → App | commit/composing/delete/sendKeyEvent等编辑命令 | 由第233章的App连接链执行 |
+| `IInputMethodSession` Binder | App → IME | selection、extracted text、cursor等状态/控制 | IME Session业务回调 |
 
-```text
-目标App收到窗口事件
-→ View/InputQueue的pre-IME机会
-→ IMM经专用InputChannel把事件交给当前IME Session
-→ IME主线程决定handled
-→ 完成信号沿Channel返回
-→ handled则结束，未处理则继续App post-IME分发
-```
-
-## 3. 先和文字提交链分开
-
-| 方向 | 数据 | 通道 |
-|---|---|---|
-| App → IME | 硬件KeyEvent、trackball/部分generic motion | `InputChannel` |
-| IME → App | composing/commit/delete/selection命令 | `IInputContext` Binder |
-| App → IME | selection、ExtractedText、CursorAnchorInfo等状态 | `IInputMethodSession` Binder |
-| IME → App → post-IME | IME模拟/转发KeyEvent | `InputConnection.sendKeyEvent()`，再入ViewRoot |
-
-不要因为都叫“输入”就把四条路径画成一条。
-
-## 4. 总体数据流
-
-```mermaid
-flowchart LR
-    D["InputDispatcher → App WindowInputChannel"] --> VR["ViewRootImpl QueuedInputEvent"]
-    VR --> PRE["Native/View Pre-IME"]
-    PRE --> STAGE["ImeInputStage"]
-    STAGE --> IMM["App InputMethodManager"]
-    IMM --> S["ImeInputEventSender"]
-    S -->|"IME专用InputChannel"| R["IME ImeInputEventReceiver"]
-    R --> SES["InputMethodSession"]
-    SES --> IMS["InputMethodService onKey/onMotion"]
-    IMS -->|"handled"| R
-    R -->|"finished signal"| S
-    S --> IMM
-    IMM -->|"callback"| STAGE
-    STAGE -->|"handled"| DONE["结束原事件"]
-    STAGE -->|"not handled"| POST["App Post-IME stages / View"]
-```
-
-## 5. 源码地图
-
-App输入流水线：
+一枚目标窗口 KeyEvent的过滤链是：
 
 ```text
-frameworks/base/core/java/android/view/ViewRootImpl.java
-frameworks/base/core/java/android/view/ImeFocusController.java
-frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+InputDispatcher
+  → 目标App Window Channel
+  → ViewRoot pre-IME stages
+  → App IMM / IME Session Channel publisher
+  → IME Receiver / InputMethodSession
+  → Session Channel finished signal
+  → App IMM callback
+  → ViewRoot finish，或继续 post-IME stages
+  → App最终完成原Window Channel事件
 ```
 
-会话和IME侧：
+system_server只负责建立绑定、创建Session Channel pair并交接端点，稳定期不逐枚读取和转发事件数据。IME也不是InputDispatcher之前的全局过滤器：事件先按目标窗口路由到App，才在该 ViewRoot内部经过IME stage。
 
-```text
-frameworks/base/core/java/com/android/internal/view/IInputMethodSession.aidl
-frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
-frameworks/base/core/java/android/inputmethodservice/AbstractInputMethodService.java
-frameworks/base/core/java/android/inputmethodservice/InputMethodService.java
-frameworks/base/core/java/android/inputmethodservice/IInputMethodWrapper.java
-```
+## 2. ViewRoot怎样决定从 pre-IME还是 post-IME开始
 
-通道底层桥：
-
-```text
-frameworks/base/core/java/android/view/InputChannel.java
-frameworks/base/core/java/android/view/InputEventSender.java
-frameworks/base/core/java/android/view/InputEventReceiver.java
-frameworks/base/core/jni/android_view_InputEventSender.cpp
-frameworks/base/core/jni/android_view_InputEventReceiver.cpp
-```
-
-## 6. 这里有两对InputChannel
-
-目标窗口本身有一对Window InputChannel，用于InputDispatcher→App ViewRoot。
-
-当前IME Session又有一对专用InputChannel，用于App IMM→IME。原事件先进入App，随后才被App复制/发布到IME通道。
-
-## 7. 为什么不让InputDispatcher直接把同一事件先发IME
-
-是否需要IME、当前IME session是谁、窗口是否有IME焦点、local focus mode和pre-IME View处理都属于目标App/当前绑定状态。
-
-把IME作为ViewRoot流水线中的异步stage，可以保持每个目标窗口自己的顺序和回退语义。
-
-## 8. ViewRoot输入stage顺序
-
-Android 11构建：
+r48在窗口 attach时构造固定 stage链：
 
 ```text
 NativePreImeInputStage
@@ -119,771 +64,463 @@ NativePreImeInputStage
 → SyntheticInputStage
 ```
 
-每层可返回forward、finish handled、finish not handled，异步层还可defer。
+`deliverInputEvent()`并不总从第一层开始。`QueuedInputEvent.shouldSkipIme()`遇到以下情况直接选择 `mFirstPostImeInputStage`：
 
-## 9. NativePreImeInputStage做什么
+- 已带 `FLAG_DELIVER_POST_IME`；
+- MotionEvent属于 `SOURCE_CLASS_POINTER`；
+- MotionEvent来自 `SOURCE_ROTARY_ENCODER`。
 
-若根View接管了`InputQueue`且事件是KeyEvent，先交给native activity/input queue，并等待其完成回调。
+所以触屏、鼠标类 pointer和 rotary不仅绕过 `ImeInputStage`，也绕过两个 pre-IME stage。触摸若落在IME窗口，会由InputDispatcher送给IME窗口自己的 Channel；目标App窗口里的普通触摸不会再复制给IME过滤。
 
-它不处理pointer event。
+没有被跳过的事件先走两次前置机会。`NativePreImeInputStage`只在 App提供 `InputQueue`且事件为 KeyEvent时异步调用 native input queue；`ViewPreImeInputStage`只对 KeyEvent调用 `mView.dispatchKeyEventPreIme()`。任一返回 handled都会直接结束，不再进IME或普通View分发。trackball等非pointer Motion会被这两层直接 forward，然后进入IME stage。
 
-## 10. ViewPreImeInputStage做什么
+把IME放在 ViewRoot异步stage而非让InputDispatcher先送IME，才能结合当前窗口IME焦点、local-focus模式、App自己的 pre-IME处理以及当前绑定，并在IME不处理时恢复同一窗口的后续分发。
 
-KeyEvent进入：
+## 3. ImeFocusController与IMM的三种结果怎样控制队列
 
-```java
-mView.dispatchKeyEventPreIme(event)
-```
+`ImeFocusController.onProcessImeInputStage()`先检查窗口是否拥有 `mHasImeFocus`、是否设置 `FLAG_LOCAL_FOCUS_MODE`，再取得 IMM；任一不满足都返回 `DISPATCH_NOT_HANDLED`。local-focus窗口自行管理局部焦点，不参加这条系统IME过滤链。
 
-因此应用View层在IME之前有一次拦截机会，典型是自定义输入控件观察Back键。
+`mHasImeFocus`只是“该窗口有资格把事件交给IME”的窗口级条件，不等于当前一定存在文本编辑器、有效 `InputConnection`或可发送的Session Channel。是否真能发送，还要继续看 `mCurMethod`、`mCurChannel`与Sender状态。
 
-## 11. pre-IME处理true会怎样
+IMM对外只有三种结果：
 
-事件直接`FINISH_HANDLED`，不会再送当前IME，也不会进入普通View KeyEvent分发。
+| 结果 | ViewRoot映射 | 含义 |
+| --- | --- | --- |
+| `DISPATCH_HANDLED` | `FINISH_HANDLED` | 本IME stage已同步处理，包括不进Channel的SYM特例 |
+| `DISPATCH_NOT_HANDLED` | `FORWARD` | 资格门不满足、IMM/Session/Channel不可用或同步发送失败，继续post-IME |
+| `DISPATCH_IN_PROGRESS` | `DEFER` | 保留这份 `QueuedInputEvent`，等待 callback再 finish/forward |
 
-名字里的pre表示顺序，不表示“仅记录、不能消费”。
+`mCurMethod`非 null时，第一次按下且 repeat为0的 `KEYCODE_SYM`是特殊同步分支：IMM显示输入法选择器并立即返回 handled，不写入专用Channel。没有 `mCurMethod`时，连这个特殊分支也不会进入，事件直接 not handled。
 
-## 12. ImeInputStage为何继承AsyncInputStage
+调用线程也会改变眼前的完成点。已经在 IMM主Looper时，`dispatchInputEvent()`可以立即尝试Channel发送，因而同步得到 not handled或 in progress；从其他线程调用时，它只投递 asynchronous `MSG_SEND_INPUT_EVENT`便返回 in progress。稍后即使发现 Channel为空或发送失败，也要通过 callback以 false恢复 ViewRoot，不能把最初的 in progress误读成“事件已到IME”。
 
-事件要跨进程到IME主线程，再等完成信号回来，不能在App UI线程同步阻塞。
+`ImeInputStage`继承 `AsyncInputStage`，因此队列不是窗口级严格全序。deferred事件的callback可以乱序返回；真正向后续stage传播或完成时，只会被此前尚未传播且 `deviceId`相同的事件阻塞，不同设备的事件可以越过彼此。即使某项已经收到handled或timeout callback，也可能还要等待更早的同设备事件。这里维持的是同一异步stage内的同设备顺序，不是整个窗口的全局FIFO。
 
-返回`DEFER`后，该`QueuedInputEvent`留在异步stage队列，回调到来再继续或结束。
+## 4. Session Channel pair怎样跨三进程分配所有权
 
-## 13. ImeFocusController先检查资格
-
-若窗口没有`mHasImeFocus`或设置`FLAG_LOCAL_FOCUS_MODE`，直接返回`DISPATCH_NOT_HANDLED`。
-
-local focus窗口自己管理局部焦点，不参加系统IME事件路由。
-
-## 14. 不是所有MotionEvent都送IME
-
-`QueuedInputEvent.shouldSkipIme()`规定：
-
-```java
-return event instanceof MotionEvent
-        && (event.isFromSource(SOURCE_CLASS_POINTER)
-            || event.isFromSource(SOURCE_ROTARY_ENCODER));
-```
-
-触屏、鼠标等pointer和rotary encoder从post-IME stage开始，绕过pre-IME与IME链。
-
-## 15. 为什么软键盘不先吃目标App触摸
-
-触摸已经由InputDispatcher按窗口和触摸目标路由。
-
-IME有自己的窗口时会直接收到落在IME窗口上的触摸；目标App窗口内的普通触摸不应再转发给IME过滤。
-
-## 16. 哪些MotionEvent仍可能进入IME
-
-非pointer、非rotary的MotionEvent可进入，例如trackball类或其他generic motion source。
-
-IME侧再按`SOURCE_CLASS_TRACKBALL`区分`onTrackballEvent()`，其他走`onGenericMotionEvent()`。
-
-## 17. FLAG_DELIVER_POST_IME是什么
-
-带此标志的事件直接从`EarlyPostImeInputStage`开始。
-
-它用于已经由IME产生/处理过的事件，避免再次进入pre-IME和IME阶段形成递归。
-
-## 18. IMM的三个dispatch结果
-
-```java
-DISPATCH_IN_PROGRESS = -1;
-DISPATCH_NOT_HANDLED = 0;
-DISPATCH_HANDLED = 1;
-```
-
-ImeInputStage把它们映射为DEFER、FORWARD和FINISH_HANDLED。
-
-## 19. SYM键的特殊处理
-
-若是第一次按下`KEYCODE_SYM`，IMM直接显示输入法选择器并返回HANDLED。
-
-该事件不必跨IME专用Channel。
-
-## 20. 没有当前IME session怎么办
-
-IMM的`mCurMethod == null`时返回NOT_HANDLED。
-
-事件继续走App post-IME链，不会为了等待IME绑定而卡住当前按键。
-
-## 21. 专用InputChannel何时创建
-
-IMMS请求客户端session时：
-
-```java
-InputChannel[] channels = InputChannel.openInputChannelPair(cs.toString());
-```
-
-一端随`createSession()`交给IME，一端保存在MethodCallback，session创建成功后放入`SessionState`并复制给App。
-
-## 22. system_server为何只负责交接
-
-IMMS创建Channel pair并验证IME/客户端身份，之后事件数据直接在App与IME之间走Channel。
-
-system_server不逐个读取、转发KeyEvent，减少Binder和系统服务主线程负担。
-
-## 23. Channel句柄为什么有多次dup/dispose
-
-跨Binder传递InputChannel时接收方获得底层端点的新句柄。
-
-发送方对不再使用的本地Java句柄及时`dispose()`，不会关闭其他进程已复制的有效端点；真正生命周期由各自持有的引用共同决定。
-
-## 24. IME创建Session时做什么
-
-`IInputMethodWrapper.createSession()`切到IME主线程，调用输入法的`onCreateInputMethodSessionInterface()`。
-
-返回的本地`InputMethodSession`和IME端Channel被包装成`IInputMethodSessionWrapper`。
-
-## 25. IInputMethodSession有两个角色
-
-Wrapper同时拥有：
+IMMS为一个客户端请求Session时调用 `InputChannel.openInputChannelPair()`。按 `InputChannel`契约，第0端是 publisher/server端，第1端是 consumer/client端：
 
 ```text
-IInputMethodSession.Stub：接App的selection、cursor等Binder状态消息
-ImeInputEventReceiver：接专用InputChannel里的原始输入事件
+channels[0] publisher
+  → MethodCallback暂持
+  → SessionState.channel留在system_server
+  → attach时dup一份，经InputBindResult交给App IMM
+
+channels[1] consumer
+  → IInputMethod.createSession()
+  → IME IInputMethodWrapper主线程
+  → IInputMethodSessionWrapper / ImeInputEventReceiver
 ```
 
-AIDL接口本身没有`dispatchKeyEvent()`，原始事件不走这组AIDL方法。
+IME创建的是两件配套对象：本地 `InputMethodSession`处理事件与状态，`IInputMethodSessionWrapper`既作为 `IInputMethodSession.Stub`接 Binder状态消息，又持有 consumer端 Receiver。创建回调返回后，IMMS把 session Binder和 publisher端关联进 `SessionState`，App最终同时拿到 session Binder与Channel副本。
 
-## 26. 为什么AIDL里看不到KeyEvent分发
+跨 Binder parcel的是 fd-backed句柄，不是把同一个Java对象搬过去。远程调用 `createSession()`后，system_server会 dispose自己不再使用的 consumer端本地句柄；返回 `InputBindResult`时又从 `SessionState.channel.dup()`产生用于App的副本。`dispose()`只释放当前持有者的引用，其他进程已复制的端点仍可存活，直到相关引用都关闭。
 
-`IInputMethodSession.aidl`列的是updateSelection、updateCursorAnchorInfo、displayCompletions、private command等控制/状态消息。
+这也解释了为什么 system_server保留 `SessionState.channel`却不在逐事件热路径上：它用于生命周期与再次交付，真正的 payload由 App publisher直接写给IME consumer。
 
-Key/Motion数据面由同一个session wrapper所持的InputChannel Receiver承接。
+## 5. IMM Sender何时建立 PendingEvent与2500 ms等待账
 
-## 27. App拿到哪一端
+App从 `InputBindResult`接收端点后，`setInputChannelLocked()`保存为 `mCurChannel`。第一次真正发送事件时才创建绑定到 IMM主Looper的 `ImeInputEventSender`；`InputEventSender.sendInputEvent()`必须在创建它的同一Looper线程调用。
 
-`InputBindResult`把App端Channel交给IMM。
-
-IMM的`setInputChannelLocked()`保存为`mCurChannel`，第一次发事件时创建`ImeInputEventSender`并绑定IMM主Looper。
-
-## 28. 为什么Sender必须在指定Looper调用
-
-`InputEventSender.sendInputEvent()`文档要求在它绑定的Looper线程调用。
-
-因此`dispatchInputEvent()`若不在IMM主Looper，会发异步Message切回主Looper后再真正send。
-
-## 29. 非IMM线程调用时为何立即返回IN_PROGRESS
-
-它只把`PendingEvent`投递给IMM线程，无法同步知道Channel send是否成功。
-
-最终若send失败，IMM仍通过FinishedInputEventCallback以handled=false回报ViewRoot。
-
-## 30. PendingEvent保存什么
+IMM先取得一个 `PendingEvent`，保存：
 
 ```text
-原InputEvent引用
-ViewRoot QueuedInputEvent token
-发送时的IME id
-完成callback及其Handler
-handled结果
+原App InputEvent引用
+ViewRoot的QueuedInputEvent token
+调用 `dispatchInputEvent()`时的 `mCurId`快照（只用于日志）
+FinishedInputEventCallback
+callback所属Handler
+最终handled值
 ```
 
-IME id主要用于超时日志，token让回调找回正确的ViewRoot队列项。
-
-## 31. sequence number为何关键
-
-IMM用`event.getSequenceNumber()`作为：
+主Looper上的关键顺序是：
 
 ```text
-InputEventSender发送seq
-mPendingEvents的key
-完成信号匹配key
-超时Message参数
+sender.sendInputEvent(appJavaSeq, event)
+  ├─ false → 不进pending表，按not handled回调/返回
+  └─ true  → mPendingEvents.put(appJavaSeq, p)
+             → 安排2500ms asynchronous timeout
+             → 返回DISPATCH_IN_PROGRESS
 ```
 
-它把异步发送、回执和原事件关联起来。
+这里的 true只保证**整个事件已成功发布到Session Channel**，不保证IME Receiver已经读到、Session已经调用、handled为真或原窗口事件已经完成。
 
-## 32. Java seq与native dispatcher seq并非总是同一个
+对带历史样本的 MotionEvent还有一个低层边界：native sender逐样本 publish，Channel若中途填满会整体返回 false，而且只在全部成功后才建立最终 published seq到Java seq的映射。由此可以推断，失败前的部分样本可能已经进入Channel，而App仍把原事件按 not handled继续；不能把 false解释成“IME绝对没有观察到任何字节或样本”。
 
-`InputEventReceiver`内部还有`mSeqMap`，把Java InputEvent sequence映射到Channel消费侧的dispatcher sequence。
+## 6. 四套 sequence怎样把副本和两条Channel账重新对齐
 
-finish时通过映射把正确底层seq交给native，不能仅凭对象地址确认事件。
+同一用户动作在这条链上至少涉及四套编号：
 
-## 33. `sendInputEvent()`返回true说明什么
+| 编号 | 所属对象/通道 | 用途 |
+| --- | --- | --- |
+| 原Window transport seq | InputDispatcher ↔ App Window Channel | 最终关闭原窗口投递账 |
+| App侧 `InputEvent#getSequenceNumber()` | ViewRoot/IMM | `mPendingEvents` key，也是 sender调用者 seq |
+| Session Channel `publishedSeq` | native App publisher ↔ IME consumer | 每个实际发布消息的transport编号 |
+| IME侧副本 `InputEvent#getSequenceNumber()` | IME Receiver/本地Session | `ImeInputEventReceiver.mPendingEvents`与 `EventCallback` key |
 
-InputEventSender文档：整个事件成功写入Channel。
+发送 KeyEvent时，native sender创建一个 `publishedSeq`并记录 `publishedSeq → App Java seq`。带历史的 MotionEvent可发布多个 seq；只有整单成功才把最终 published seq映射回这次App调用，consumer内部的 seq chain负责为合批样本补齐底层 finished。
 
-可能因Channel缓冲区在全部样本发布前已满而返回false。true不表示IME已处理，更不表示handled=true。
+IME native receiver把Session Channel的 `publishedSeq`（合批时是链末seq）连同新建的Java InputEvent交上来，`InputEventReceiver`再保存 `IME Java seq → publishedSeq`。本地Session回调携带IME Java seq；Wrapper用它找到那份IME事件，`finishInputEvent(event, handled)`再还原 published seq发回Channel。App native sender收到 finished后，最后由自己的映射还原 App Java seq，才能命中 IMM PendingEvent。
 
-## 34. send成功后才进入pending表
+因此日志里的 seq必须先标所属层。对象地址、`InputEvent.getId()`、App Java seq、Session published seq和原Window transport seq都不能互相替代；尤其不能把Session Channel的 published seq写成原始InputDispatcher的窗口投递编号。
 
-IMM先发布事件；成功后才：
+## 7. IME Receiver怎样调用Session，并要求每个事件闭账
+
+`IInputMethodSessionWrapper`把 `ImeInputEventReceiver`绑定到 `context.getMainLooper()`，所以标准IME的Channel回调在IME主线程。收到事件后的顺序是：
+
+1. 若 `mInputMethodSession == null`，立即 `finishInputEvent(event, false)`。
+2. 否则以IME Java seq把事件放进 Receiver自己的pending表。
+3. KeyEvent调用 `dispatchKeyEvent()`；trackball source调用 `dispatchTrackballEvent()`；其他能到达这里的 MotionEvent调用 `dispatchGenericMotionEvent()`。
+4. `EventCallback.finishedEvent(seq, handled)`找回事件、移出pending，再完成底层Channel。
+
+`AbstractInputMethodSessionImpl`默认同步调用 Service并立刻 finished，但接口允许自定义Session稍后回调，所以 Wrapper不能假设业务返回与Channel完成必在同一调用栈。未知或重复 seq会找不到pending项而被静默忽略。
+
+`InputEventReceiver`文档要求每个事件最终调用 `finishInputEvent()`，并写明完成前不会收到新事件；但native consume循环与可容纳多项的pending映射允许多个事件在途，因此实现上不能依赖严格 single-flight。漏掉finish留下的是一笔未闭的transport账，它可能持续累积并最终形成背压或填满Channel，而不保证立刻挡住下一项。
+
+若自定义Session异步处理，业务完成回调还必须切回 Receiver绑定的IME主Looper，再调用 `EventCallback.finishedEvent()`；`InputEventReceiver.finishInputEvent()`要求运行在创建Receiver的同一Looper。App的2500 ms超时只恢复原ViewRoot事件，**不会替IME闭合Session Channel的transport账**。
+
+## 8. 标准InputMethodService会怎样处理Key与Motion
+
+默认 `dispatchKeyEvent()`调用 `event.dispatch(AbstractInputMethodService.this, mDispatcherState, this)`，把 action分派到 Service的 `onKeyDown()`、`onKeyUp()`、`onKeyLongPress()`或 `onKeyMultiple()`。`DispatcherState`维持 tracking/long-press/canceled关系，Back不能只看孤立的 up。
+
+默认Back链是：
 
 ```text
-mPendingEvents.put(seq, pending)
-→ 更新trace counter
-→ 安排2500ms超时Message
-→ 返回IN_PROGRESS
+DOWN：先给可见ExtractEditText的ActionMode
+      → 若handleBack(false)认为IME UI可收起，startTracking并handled=true
+
+UP：再次给ExtractEditText
+    → 仅在isTracking且未canceled时调用handleBack(true)真正收起
 ```
 
-发送失败直接NOT_HANDLED，让App继续处理。
+`setBackDisposition()`只上报系统应展示的Back语义，r48默认 `onKeyDown()`并不会自动读取它；自定义IME必须让声明与实际回调一致。
 
-## 35. 为什么超时Message是asynchronous
+可见且活动的全屏 `ExtractEditText`是另一特例：MovementMethod先尝试移动抽取区光标，而四个DPAD方向键无论 movement是否消费都会被IME吞掉，避免底层App同时换焦点。普通非Back、非全屏特殊键默认多为 false。
 
-IMM Handler可能存在同步barrier。
+Session Channel里的 `SOURCE_CLASS_TRACKBALL`走 `onTrackballEvent()`，其他未被ViewRoot提前跳过的 Motion走 `onGenericMotionEvent()`；两者默认都返回 false。pointer与rotary早在目标App的 `shouldSkipIme()`处离开主链，不能从这两个IME回调的存在推断所有Motion都会到达。
 
-输入事件完成和超时不能被UI traversal barrier长期挡住，所以发送/超时相关Message都设为asynchronous。
+## 9. `finishInputEvent()`怎样穿过JNI回到App Sender
 
-## 36. r48的IME事件超时是多少
-
-```java
-static final long INPUT_METHOD_NOT_RESPONDING_TIMEOUT = 2500;
-```
-
-这是App侧等待IME处理一个转发事件的保护门，不等同于所有ANR类型的统一超时。
-
-## 37. 超时后怎么处理
-
-`finishedInputEvent(seq, false, true)`从pending表移除事件，记录IME id日志，然后回调ViewRoot `handled=false`。
-
-ViewRoot把原事件继续送post-IME stages，而不是永久丢弃。
-
-## 38. 迟到回执怎么处理
-
-真正完成信号晚于2500ms到达时，pending表已没有该seq：
-
-```java
-if (index < 0) return;
-```
-
-它被视为spurious/already timed out，不会第二次完成同一个ViewRoot事件。
-
-## 39. 为什么不能让迟到handled改判
-
-超时后事件可能已经被App处理并产生副作用。
-
-再接受IME迟到的handled=true会造成“一次事件既被App执行，又事后宣称被IME吞掉”的不可逆矛盾。
-
-## 40. Channel更换时怎样清PendingEvent
-
-`setInputChannelLocked()`发现端点变化：
+IME本地Session给出 handled后，Receiver的完成仍有多个阶段：
 
 ```text
-flushPendingEventsLocked
-→ dispose旧Sender
-→ dispose旧Channel
-→ 保存新Channel
+EventCallback.finishedEvent(imeJavaSeq, handled)
+→ ImeInputEventReceiver.mPendingEvents用imeJavaSeq找回event
+→ InputEventReceiver.mSeqMap以event还原Session publishedSeq
+→ native InputConsumer.sendFinishedSignal(publishedSeq, handled)
+→ App native InputPublisher.receiveFinishedSignal()
+→ publishedSeq映射回App Java seq
+→ ImeInputEventSender.onInputEventFinished(appJavaSeq, handled)
+→ IMM.finishedInputEvent()
 ```
 
-flush把所有旧事件异步按handled=false完成，使ViewRoot流水线能够继续。
+`InputEventReceiver.finishInputEvent()`必须在Receiver所绑Looper调用；它无论映射是否有效都会在末尾 `recycleIfNeededAfterDispatch()`。native发送 finished若遇到 `WOULD_BLOCK`，会把信号放进 `mFinishQueue`并监听可写事件后再发，所以“Java finish方法返回”还不等于App端已经收到信号。
 
-## 41. flush为什么不直接在锁里跑callback
+正常回到IMM后才移除 App PendingEvent、取消以该 `PendingEvent`对象为标识的timeout，并把 handled交给指定 callback Handler。callback若已在目标Looper就直接运行，否则用 asynchronous Message切过去；运行完才清字段并把容量20的包装对象放回池。
 
-回调可能进入ViewRoot并继续复杂分发。
+handled只回答“IME是否消费这份过滤副本”。它既不是文字提交结果，也不是布局、绘制、Surface提交或物理present的完成栅栏。
 
-IMM先发`MSG_FLUSH_INPUT_EVENT`，后续移出pending并在合适Handler执行callback，避免锁内重入。
+## 10. 超时、迟到finished与换Channel分别怎样收口
 
-## 42. PendingEvent池为什么存在
+r48的 `INPUT_METHOD_NOT_RESPONDING_TIMEOUT`是2500 ms。这个数是 `sendMessageDelayed()`为timeout消息设置的到期时间，不是硬实时完成点：IMM主Looper忙碌时，消息实际执行可以更晚；callback若属于另一个Handler，还要再异步切回 ViewRoot所在Looper。只有 callback真正运行，原事件才从IME stage恢复。timeout处理调用 `finishedInputEvent(seq, false, true)`：从 App pending表移除事件，用 `PendingEvent`中“调用dispatch时的 `mCurId`快照”打印warning，再向 ViewRoot callback false。这个id只是诊断字段，不是Session代数或路由保护。
 
-硬件按键/事件频繁创建短命包装对象。
+这个动作不会向IME发送取消，不会替它调用 `finishInputEvent()`，也不会从IME Receiver的pending表删除事件。超时后原ViewRoot可能已在App产生副作用；稍后IME即使发回 handled=true，App表里也找不到seq，直接按 spurious/already finished or timed out忽略，不能撤回App行为。
 
-IMM用容量20的`SimplePool`复用PendingEvent，callback运行完后清空字段再回池，减少GC压力。
+正常finished则删除与该 `PendingEvent`对象匹配的timeout Message，避免只按 message what误删其他事件。2500 ms是App侧IME过滤等待门，不是所有IME/InputDispatcher ANR的统一判定时刻；它也不会闭合卡在IME侧的Session Channel transport账。
 
-## 43. callback回哪个线程
+绑定清除或端点变化走另一条路径。`setInputChannelLocked()`以Java对象引用比较 `mCurChannel != channel`，不是比较fd或token值；变化时只为已经成功发布、已经进入 `mPendingEvents`的项逐一投递 asynchronous `MSG_FLUSH_INPUT_EVENT`，再dispose旧Sender和旧Channel。flush消息稍后同样以 handled=false执行，callback不在 IMM锁内重入 ViewRoot。真实finished若先命中，会让对应flush随后自然找不到seq；每个PendingEvent仍只完成一次。
 
-ViewRoot调用IMM时传自己的`mHandler`。
+还有一个容易漏掉的窗口：非主线程调用刚排入的 `MSG_SEND_INPUT_EVENT`尚未真正发送，因而还不在pending表，不属于这轮flush。若Channel在该消息执行前已经变化，发送逻辑会使用届时的新 `mCurChannel`/Sender；`PendingEvent.mInputMethodId`仍是最初dispatch调用时的旧id快照。这再次说明该id只供日志使用，不能充当路由或代际校验。
 
-IMM完成后若已经位于该Looper可直接run，否则发asynchronous Message回ViewRoot UI线程。
+## 11. handled怎样回到ViewRoot并形成第二层finished
 
-## 44. IME侧Receiver绑定哪个线程
-
-`IInputMethodSessionWrapper`构造：
-
-```java
-mReceiver = new ImeInputEventReceiver(
-        channel, context.getMainLooper());
-```
-
-所以标准IME输入事件回调运行在IME主Looper。
-
-## 45. InputEventReceiver的硬性完成约束
-
-文档明确：接收者处理后必须调用`finishInputEvent()`；在完成前不会收到新的输入事件。
-
-完成回执既是handled结果，也是Channel背压/顺序协议的一部分。
-
-## 46. IME Receiver为何也维护pending表
-
-收到事件后先以seq保存InputEvent，再调用本地InputMethodSession分发。
-
-本地Session可以同步或异步调用`EventCallback.finishedEvent(seq, handled)`；Wrapper届时找回原InputEvent并finish底层Channel。
-
-## 47. Session已finish时收到事件怎么办
-
-若`mInputMethodSession == null`，Receiver立即：
-
-```java
-finishInputEvent(event, false);
-```
-
-不能把事件悬挂，也不能让已销毁session继续消费。
-
-## 48. KeyEvent怎样进入InputMethodService
-
-默认`AbstractInputMethodSessionImpl.dispatchKeyEvent()`调用：
-
-```java
-event.dispatch(AbstractInputMethodService.this,
-        mDispatcherState, this);
-```
-
-KeyEvent根据action进入Service的`onKeyDown`、`onKeyUp`、`onKeyLongPress`或`onKeyMultiple`。
-
-## 49. DispatcherState做什么
-
-它维护按键跟踪、long press和up事件是否属于此前tracking的down等状态。
-
-IME默认Back处理依赖`startTracking()`和后续`event.isTracking()`，不能只看单个ACTION_UP。
-
-## 50. 默认Back down逻辑
-
-InputMethodService先让全屏ExtractEditText的文本选择ActionMode处理；否则`handleBack(false)`若可处理，就对事件`startTracking()`并返回true。
-
-这一步常只登记追踪，不一定立即隐藏窗口。
-
-## 51. 默认Back up逻辑
-
-若up仍是tracking且未canceled，调用`handleBack(true)`真正执行收起候选/输入View等Back行为。
-
-down被长按、取消或tracking丢失时，不应机械执行隐藏。
-
-## 52. BackDisposition与回调返回值区别
-
-源码文档明确：Android P以后默认`onKeyDown()`实现也不直接考虑`setBackDisposition()`标志。
-
-自定义IME需让自己的Back回调处理与向系统声明的Back disposition保持一致。
-
-## 53. fullscreen模式为何拦DPAD
-
-横屏全屏输入时，IME显示`ExtractEditText`副本。
-
-默认实现让其MovementMethod移动抽取文本光标，并总是吞掉DPAD方向键，避免底层App焦点同时移动到另一个字段。
-
-## 54. 普通非Back KeyEvent默认怎样
-
-非全屏/无特殊movement时，默认`onKeyDown/onKeyUp`通常返回false。
-
-完成信号handled=false，原事件继续进入目标App普通KeyEvent分发。
-
-## 55. trackball事件怎样处理
-
-Receiver检测`SOURCE_CLASS_TRACKBALL`，调用`dispatchTrackballEvent()`，默认进入`InputMethodService.onTrackballEvent()`并返回false。
-
-IME可覆盖它，handled=true时目标App不再处理该事件。
-
-## 56. generic motion怎样处理
-
-其余进入IME Channel的MotionEvent走`dispatchGenericMotionEvent()`和`onGenericMotionEvent()`。
-
-但pointer与rotary前面已被ViewRoot `shouldSkipIme()`过滤，所以不是所有generic motion都会抵达这里。
-
-## 57. local Session回调为何仍带seq
-
-`InputMethodSession.EventCallback.finishedEvent(seq, handled)`允许输入法实现异步完成。
-
-seq保证即使多个合成事件在队列中，完成回调也能匹配正确InputEvent。
-
-## 58. 标准默认实现是同步完成
-
-AbstractInputMethodSessionImpl调用Service回调得到boolean后，立即`callback.finishedEvent(seq, handled)`。
-
-但接口设计允许自定义Session稍后回调，因此Wrapper和App两端都保留pending表。
-
-## 59. IME finishedEvent回到哪里
-
-IME Wrapper从pending表取事件并调用`InputEventReceiver.finishInputEvent(event, handled)`。
-
-Java进入JNI，`InputConsumer.sendFinishedSignal()`把底层published sequence与handled写回Channel发送端。
-
-## 60. App Sender怎样收到完成信号
-
-JNI `InputPublisher.receiveFinishedSignal()`读回publishedSeq和handled，再回调Java：
-
-```java
-ImeInputEventSender.onInputEventFinished(seq, handled)
-```
-
-IMM据此移除PendingEvent并取消对应超时。
-
-## 61. 正常完成为什么删除超时Message
-
-`finishedInputEvent(... timeout=false)`调用：
-
-```java
-mH.removeMessages(MSG_TIMEOUT_INPUT_EVENT, p);
-```
-
-超时Message以PendingEvent对象作为obj，避免仅按what误删其他正在等待的事件。
-
-## 62. handled=true回到ViewRoot后
-
-ImeInputStage调用`finish(q, true)`，标记原QueuedInputEvent已处理，沿剩余stage只做完成传播，最终向窗口原InputChannel回执handled。
-
-目标View不会再收到普通`dispatchKeyEvent()`。
-
-## 63. handled=false回到ViewRoot后
-
-ImeInputStage调用`forward(q)`，进入Early/Native/View Post-IME stages。
-
-最终ViewPostImeInputStage才会进行Activity/View层的常规KeyEvent、MotionEvent等分发。
-
-## 64. 完整KeyEvent时序
-
-```mermaid
-sequenceDiagram
-    participant ID as "InputDispatcher"
-    participant VR as "App ViewRoot"
-    participant IMM as "App IMM/Sender"
-    participant CH as "IME InputChannel"
-    participant RX as "IME Receiver/Session"
-    participant IMS as "InputMethodService"
-    ID->>VR: Window Channel KeyEvent
-    VR->>VR: Native/View Pre-IME
-    VR->>IMM: dispatchInputEvent(event, queuedToken)
-    IMM->>CH: sendInputEvent(seq, event)
-    IMM-->>VR: DISPATCH_IN_PROGRESS
-    VR->>VR: ImeInputStage DEFER
-    CH->>RX: onInputEvent
-    RX->>IMS: event.dispatch → onKeyDown/up
-    IMS-->>RX: handled
-    RX->>CH: finishInputEvent(event, handled)
-    CH->>IMM: onInputEventFinished(seq, handled)
-    IMM->>VR: FinishedInputEventCallback
-    alt handled
-        VR->>ID: finish original event handled
-    else not handled
-        VR->>VR: post-IME → View dispatch
-        VR->>ID: finish original event with final result
-    end
-```
-
-## 65. 2500ms超时时序
-
-```mermaid
-sequenceDiagram
-    participant VR as "App ViewRoot"
-    participant IMM as "App IMM"
-    participant IME as "IME进程"
-    VR->>IMM: dispatchInputEvent
-    IMM->>IME: Channel event
-    IMM->>IMM: pending + 2500ms timeout
-    Note over IME: 卡顿或未finish
-    IMM->>IMM: timeout移除pending
-    IMM->>VR: callback handled=false
-    VR->>VR: 继续post-IME/App处理
-    IME-->>IMM: 晚到finished handled=true
-    IMM->>IMM: seq已不存在，忽略
-```
-
-## 66. 2500ms不等于IME ANR弹窗时点
-
-这里的逻辑首先保护当前App ViewRoot流水线并打印warning。
-
-系统是否判定进程ANR还受InputDispatcher、应用/IME进程状态和其他超时机制影响，不能把这一常量直接当成所有IME ANR定义。
-
-## 67. 输入事件完成也不是像素完成
-
-finish只表示逻辑事件已消费或已继续处理。
-
-若处理触发文本变化、窗口隐藏或动画，还要经历layout/draw、Surface提交和显示刷新，事件handled回执不是present fence。
-
-## 68. IInputMethodSession状态消息在哪个线程
-
-AIDL是oneway，Stub入口通过`HandlerCaller`投递到IME主线程。
-
-updateSelection、updateCursorAnchorInfo和displayCompletions不会直接在IME Binder线程调用输入法业务。
-
-## 69. 状态消息和Channel事件是否共享同一个Looper
-
-标准Wrapper的HandlerCaller与ImeInputEventReceiver都面向IME主Looper。
-
-它们来自不同IPC/FD队列，单个Looper串行执行，但跨队列的宏观到达顺序仍应按各自协议与代际理解，不能凭墙上时间猜绝对先后。
-
-## 70. Session enabled/revoked是什么
-
-IMMS切当前Session时先disable旧session、enable新session。
-
-IME本地`AbstractInputMethodSessionImpl`维护`mEnabled/mRevoked`；revoke后永远不能再enable。
-
-## 71. enabled flag是不是Channel硬防火墙
-
-基类注释要求未enabled时不执行调用，但默认`dispatchKeyEvent()`本身没有再检查`isEnabled()`。
-
-实际安全还依赖IMMS只把当前Channel交给正确客户端、切换时关闭/flush端点和finish session。不能把一个boolean当作唯一隔离层。
-
-## 72. finishSession做哪些清理
-
-IME Wrapper将本地session置null，dispose Receiver，再dispose IME端Channel。
-
-此后Binder状态消息直接忽略；若还有事件进入Receiver路径，也不能再交给旧session。
-
-## 73. App侧Channel dispose时机
-
-清除绑定、换session或IME死亡时，IMM flush pending、dispose Sender和旧Channel。
-
-仅把`mCurMethod`置null而遗留旧Sender会造成事件发往过期IME，因此清理必须成组。
-
-## 74. system_server侧finishSession
-
-IMMS调用`IInputMethodSession.finishSession()`，再清空SessionState里的session并dispose自己持有的Channel句柄。
-
-三进程各自都要释放本地引用，不能指望另一个进程GC替自己收尾。
-
-## 75. IME怎样把KeyEvent反向发给App
-
-IME调用当前`InputConnection.sendKeyEvent()`。
-
-它走第233章的`IInputContext` Binder到App编辑器Looper，BaseInputConnection最终调用IMM `dispatchKeyEventFromInputMethod()`。
-
-## 76. 反向KeyEvent为何不走IME Channel
-
-这是IME主动生成的事件，不是App请求IME先判断的原始硬件事件。
-
-App把它送入ViewRoot时设置`FLAG_DELIVER_POST_IME`，直接从post-IME开始，避免：
+IME callback回到 `ImeInputStage.onFinishedInputEvent()`后分两路：
 
 ```text
-IME sendKeyEvent
-→ ViewRoot再送IME
-→ IME再次sendKeyEvent
-→ 无限循环
+handled=true
+  → finish(q, true)
+  → 目标View不再收到普通dispatchKeyEvent
+  → ViewRoot最终完成原Window事件
+
+handled=false / timeout / send失败 / 无Session
+  → forward(q)
+  → EarlyPostIme → NativePostIme → ViewPostIme → Synthetic
+  → 事件只是获得继续分发的机会；后续stage仍可能因窗口停止、View脱离等门槛丢弃
+  → App后续可能消费，也可能最终not handled
+  → ViewRoot最终完成原Window事件
 ```
 
-## 77. App还会剥离FROM_SYSTEM标志
+第一层finished属于IME Session Channel，只释放IME过滤阶段并携带该阶段的handled。第二层属于目标窗口原Channel：仍由App的Window InputEventReceiver在全部stage结束后回给InputDispatcher。IME从未取得原Window端点的完成权。
 
-`ViewRootImpl`发现IME生成事件带`FLAG_FROM_SYSTEM`时主动清除。
+所以 IME false不是“丢事件”，App仍可能把最终窗口结果变成 handled；IME true也只是让该原事件停止进入目标View。原窗口完成之后若处理触发动画或新帧，仍要另看UI线程、RenderThread、SurfaceFlinger与显示时序。
 
-第三方IME不能把自己构造的KeyEvent冒充系统硬件事件，从而获得错误信任语义。
+## 12. IInputMethodSession状态面与Channel数据面并非同一队列
 
-## 78. 反向事件有没有原Window InputDispatcher回执
+`IInputMethodSession.aidl`是 oneway，列出 selection、extracted text、cursor、completion、private command和 `finishSession()`等方法，却没有 raw `dispatchKeyEvent()`。这些 Binder消息由 Wrapper的 `HandlerCaller`投到IME主Looper；Session Channel的 fd事件也在标准实现中落到同一主Looper，但两者来自不同消息源，不能凭调用墙钟假定跨队列的绝对先后。
 
-`dispatchKeyFromIme()`以receiver=null把合成事件入App本地队列，主要在App内分发。
+`AbstractInputMethodSessionImpl`维护 enabled/revoked：revoke会永久禁止再enable；标准 `InputMethodSessionImpl`的 selection、extracted text、cursor等多种状态回调会检查 `isEnabled()`。但基类的 raw `dispatchKeyEvent/Trackball/GenericMotion`没有这个检查，disabled本身不是Channel硬防火墙。安全还依赖IMMS只交当前端点以及切换时flush/close/finish。
 
-它不是原始InputDispatcher正在等待的那一个硬件事件；不要把二者的sequence/完成链混在一起。
+`finishSession()`本身是 oneway，Wrapper收到后仍要经 `HandlerCaller`排到IME主线程；在 `DO_FINISH_SESSION`真正执行前，后续到达Stub的调用仍可能继续入队，只有执行时看到本地Session已为 null的消息才会被丢弃。实际执行会把wrapper内的本地Session置 null，再dispose Receiver；Receiver已经持有同一个consumer端 `InputChannel`，随后wrapper对 `mChannel.dispose()`的第二次本地关闭是安全且幂等的清理。
 
-## 79. 为什么正常文字输入仍优先commitText
+这个过程不会逐项把 Receiver里尚未完成的事件回为 false。异步Session若迟到回调，Wrapper会先从自己的pending映射移除事件，再尝试在已dispose的Receiver上finish，只能警告且无法发出有效transport signal；若它永不回调，那些映射项也不会被显式逐项清空。App只能靠自身flush或timeout让原ViewRoot前进。
 
-反向sendKeyEvent要经过KeyEvent兼容分发，难以表达中文组合、候选span、富文本和精确光标语义。
+system_server的 `finishSessionLocked()`按程序顺序发出这个 oneway调用、清 `SessionState.session`并dispose自己持有的Channel引用，却不会等待IME主线程跑完 `doFinishSession()`。App在解绑/换Session时独立清理自己的Sender、Channel和pending。三方本地清理相互配合，却没有一个“所有进程都已释放”的同步ACK。native sender观察到HANGUP本身也不会自动向IMM合成一次 false callback；App侧仍要等绑定更新触发flush，或等timeout。
 
-它适合`TYPE_NULL`、控制键或需要硬件按键语义的编辑器。
+## 13. IME反向 `sendKeyEvent()`为何不会再次进入IME
 
-## 80. Back键在三层都可能被处理
+IME主动产生KeyEvent时调用当前 `InputConnection.sendKeyEvent()`。远端连接经 `IInputContext`到App编辑器Looper；App自定义 `InputConnection`可以覆盖其语义，只有采用 `BaseInputConnection`默认实现时，才会继续调用 `IMM.dispatchKeyEventFromInputMethod()`，选中目标或served ViewRoot并投递 `MSG_DISPATCH_KEY_FROM_IME`。这个本地默认实现返回false，但跨进程 `IInputContext`调用是 oneway，IME侧包装层不会得到并转交这个真实boolean。
 
-```text
-View.dispatchKeyEventPreIme
-IME InputMethodService.onKeyDown/onKeyUp
-App普通post-IME KeyEvent分发
-```
+ViewRoot在处理该消息时做两件关键事：
 
-前一层handled就不进入后一层。排查Back行为必须标明究竟哪层消费。
+1. 若事件带 `FLAG_FROM_SYSTEM`，创建去掉该位的副本，防止第三方IME冒充系统硬件来源。
+2. 以 `FLAG_DELIVER_POST_IME`入队，让 `shouldSkipIme()`直接选 post-IME起点，避免 `IME → App → IME → App`递归。这里的 `FLAG_DELIVER_POST_IME`是 `ViewRootImpl.QueuedInputEvent`内部标志，不是 `KeyEvent` flag；前一项的 `FLAG_FROM_SYSTEM`才属于 `KeyEvent`。
 
-## 81. 输入法窗口自己收到的触摸走哪条链
+这份IME主动生成的新事件以 receiver=null进入App本地队列，不是原InputDispatcher正在等待的硬件事件，也没有原Window Channel的那份finished账。若IME先消费一枚原硬件键、又主动send一枚新键，两者是“原事件完成 + 新事件本地分发”两笔独立事实，sequence不能混用。
 
-触摸点落在IME窗口时，InputDispatcher直接路由到IME Window自己的InputChannel和ViewRoot。
+`InputMethodService.sendDownUpKeyEvents()`生成的事件带 `FLAG_SOFT_KEYBOARD | FLAG_KEEP_TOUCH_MODE`。它适合 `TYPE_NULL`、控制键或硬件键兼容语义；普通文字仍应使用 composing/commit，因为KeyEvent无法完整表达中文候选、组合span、富文本和相对光标协议。
 
-这与“目标App窗口事件经IME专用session Channel过滤”是两条不同链。
+## 14. 从现象反推第一处分歧
 
-## 82. IME专用Channel不是IME Window Channel
+| 现象 | 第一组检查 | 不应直接得出的结论 |
+| --- | --- | --- |
+| App按键总延迟约2.5秒 | IME Receiver是否收到、Session是否finished、主Looper是否堵塞、Channel是否旧 | 系统已经对IME弹出ANR |
+| IME说handled但View仍收到 | 是否超时后才finished、看的是否同一seq、是否为IME主动生成的新KeyEvent | handled可事后撤回App处理 |
+| pointer从不进IME callback | `shouldSkipIme()`的pointer/rotary门、事件实际目标窗口 | IME Session失效 |
+| trackball进App不进IME | IME focus/local-focus、mCurMethod/Channel、send结果、Session enabled只是软门 | 所有Motion都应走相同路径 |
+| Channel send返回false | buffer/端点、是否为带历史样本Motion、随后ViewRoot callback | IME必然一个样本也没看见 |
+| 换IME后旧调用继续 | 先区分已发布pending与尚在 `MSG_SEND_INPUT_EVENT`中的待发送项，再核对实际Channel、flush、旧consumer是否已读及迟到finished | enabled位能撤销已发fd数据 |
+| `sendKeyEvent()`没有再次进IME | `FLAG_DELIVER_POST_IME`、目标ViewRoot、IInputContext active门 | 事件被InputDispatcher吞掉 |
+| finished后界面尚未变化 | 这是Session finished还是原Window finished、后续layout/draw/present | handled就是显示完成 |
 
-前者属于App客户端session，用于目标App→IME事件预处理。
+排查时固定记录五个维度：**事件来源与source class、当前窗口/Session身份、所属Looper、sequence命名空间、观察点只完成到哪一层。** 只看到一条“send true”“onKeyDown”“timeout”或“finished”日志，都不足以单独还原整条链。
 
-后者属于IME窗口本身，用于用户直接点击键盘按键。名称都叫InputChannel，但端点、窗口归属和事件来源不同。
+## 15. 九组 macOS 只读源码练习
 
-## 83. 为什么完成回执有两层
+以下代码块应整段作为脚本运行，只读源码，可在 macOS自带 Bash 3.2和 Zsh 5.9执行；保存后也可把另一个源码根作为第一个参数传入。
 
-```text
-第一层：IME专用Channel finished，恢复App ImeInputStage
-第二层：App完成全部stage后，向原Window Channel/InputDispatcher finish
-```
-
-IME只完成自己作为过滤器的那一段，不直接替目标App完成原始窗口事件。
-
-## 84. 事件被IME消费后原Window回执是谁发
-
-ViewRoot收到IME handled=true后标记QueuedInputEvent finished，最终仍由App的WindowInputEventReceiver完成原始InputDispatcher事件。
-
-IME不会拿到原Window Channel的完成权。
-
-## 85. Channel缓冲满时为什么按未处理回退
-
-事件没能完整送入IME，就没有可靠的IME处理结果。
-
-让App继续处理比静默丢键更合理，同时打印包含IME id和事件的warning供诊断。
-
-## 86. PendingEvent超时日志为何保存IME id快照
-
-2500ms内用户可能切换IME，`mCurId`已经变化。
-
-PendingEvent记录发送当时id，日志才能指出真正未及时响应的输入法，而不是超时时刻的新IME。
-
-## 87. 事件对象何时回收
-
-IME侧`InputEventReceiver.finishInputEvent()`完成底层信号后调用`event.recycleIfNeededAfterDispatch()`。
-
-App侧PendingEvent callback运行完才清字段回对象池；原ViewRoot QueuedInputEvent最终完成时还会按窗口输入流水线规则回收原事件。
-
-## 88. 不能提前recycle的原因
-
-Pending表、超时日志、IME Channel发布和后续App post-IME分发仍可能引用事件。
-
-对象池只复用包装PendingEvent，不代表可以提前回收底层InputEvent。
-
-## 89. 常见误解一：IInputMethodSession用Binder传每个KeyEvent
-
-不对。Session Binder传状态/控制，raw Key/Motion走Wrapper持有的专用InputChannel。
-
-InputMethodSession本地接口负责处理Receiver已经取出的事件。
-
-## 90. 常见误解二：IME是InputDispatcher之前的全局过滤器
-
-不对。事件先按窗口路由到目标App，进入该ViewRoot的pre-IME/IME stage后才交当前IME。
-
-pointer/rotary甚至直接跳过IME stage。
-
-## 91. 常见误解三：IME返回false等于事件丢失
-
-false表示IME未消费，ViewRoot继续post-IME分发给App。
-
-只有后续也无人处理，最终才以not handled完成原窗口事件。
-
-## 92. 常见误解四：2500ms后IME还能用handled=true撤回App行为
-
-不能。超时已把事件按false继续，迟到seq被忽略。
-
-这是一条单向决策门，避免重复消费。
-
-## 93. 常见误解五：sendKeyEvent是把事件放回同一Channel
-
-不是。它走IInputContext回App，再由ViewRoot以post-IME标志投递本地输入链。
-
-这样既避免环路，也清除伪造FROM_SYSTEM标志。
-
-## 94. 一个实用排查顺序
-
-```text
-事件是否被shouldSkipIme直接绕过？
-窗口是否有IME focus或处于local focus mode？
-IMM是否有mCurMethod和mCurChannel？
-sendInputEvent是否因Channel失败返回false？
-IME Receiver是否在主线程收到？
-onKey/onMotion返回handled多少？
-finished signal是否在2500ms内回来？
-ViewRoot最后是finish还是forward到post-IME？
-```
-
-## 95. macOS只读练习一：重建ViewRoot stage
+### 练习 1：重建 ViewRoot stage与跳过条件
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '1135,1165p' frameworks/base/core/java/android/view/ViewRootImpl.java
-sed -n '5590,5690p' frameworks/base/core/java/android/view/ViewRootImpl.java
-sed -n '7870,7910p' frameworks/base/core/java/android/view/ViewRootImpl.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'InputStage imeStage = new ImeInputStage(earlyPostImeStage,' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'mSyntheticInputStage = new SyntheticInputStage();' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'InputStage viewPostImeStage = new ViewPostImeInputStage(mSyntheticInputStage);' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'InputStage nativePostImeStage = new NativePostImeInputStage(viewPostImeStage,' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'InputStage earlyPostImeStage = new EarlyPostImeInputStage(nativePostImeStage);' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'InputStage viewPreImeStage = new ViewPreImeInputStage(imeStage);' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'InputStage nativePreImeStage = new NativePreImeInputStage(viewPreImeStage,' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'mFirstInputStage = nativePreImeStage;' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'mFirstPostImeInputStage = earlyPostImeStage;' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'stage = q.shouldSkipIme() ? mFirstPostImeInputStage : mFirstInputStage;' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'if ((mFlags & FLAG_DELIVER_POST_IME) != 0) {' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'mEvent.isFromSource(InputDevice.SOURCE_CLASS_POINTER)' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'mEvent.isFromSource(InputDevice.SOURCE_ROTARY_ENCODER));' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'if (mView.dispatchKeyEventPreIme(event)) {' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'final int deviceId = q.mEvent.getDeviceId();' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'if (!blocked && deviceId == curr.mEvent.getDeviceId()) {' frameworks/base/core/java/android/view/ViewRootImpl.java
 ```
 
-要求：画出KeyEvent、pointer MotionEvent和trackball MotionEvent各自从哪一stage开始、何时可能DEFER。
+分别写出 KeyEvent、pointer Motion、rotary与trackball从哪一层起步，并说明 pre-IME handled后的终点。
 
-## 96. macOS只读练习二：追Channel pair所有权
+### 练习 2：核对IME资格与三返回值
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '2685,2725p' \
-  frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
-sed -n '95,130p' \
-  frameworks/base/core/java/android/inputmethodservice/IInputMethodWrapper.java
-sed -n '20,90p' \
-  frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'if (!mHasImeFocus || isInLocalFocusMode(windowAttribute)) {' frameworks/base/core/java/android/view/ImeFocusController.java
+grep -n -F 'return imm.dispatchInputEvent(event, token, callback, mViewRootImpl.mHandler);' frameworks/base/core/java/android/view/ImeFocusController.java
+grep -n -F 'public static final int DISPATCH_IN_PROGRESS = -1;' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'public static final int DISPATCH_NOT_HANDLED = 0;' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'public static final int DISPATCH_HANDLED = 1;' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F '&& keyEvent.getKeyCode() == KeyEvent.KEYCODE_SYM' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'Message msg = mH.obtainMessage(MSG_SEND_INPUT_EVENT, p);' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'case InputMethodManager.DISPATCH_IN_PROGRESS:' frameworks/base/core/java/android/view/ViewRootImpl.java
 ```
 
-要求：列出system_server、App、IME分别持有哪一个本地Channel句柄，以及切换session时由谁dispose。
+推演“无IME焦点、主线程send失败、异线程先返回in progress、SYM首按”四种路径。
 
-## 97. macOS只读练习三：手推三种完成结果
+### 练习 3：追踪Channel pair三方所有权
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '2580,2745p' \
-  frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
-sed -n '220,275p' \
-  frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'InputChannel[] channels = InputChannel.openInputChannelPair(cs.toString());' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'MSG_CREATE_SESSION, mCurMethod, channels[1],' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'new MethodCallback(this, mCurMethod, channels[0])));' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'session.channel != null ? session.channel.dup() : null' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'if (channel != null && Binder.isProxy(method)) {' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'sessionState.channel.dispose();' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'new IInputMethodSessionWrapper(mContext, session, mChannel);' frameworks/base/core/java/android/inputmethodservice/IInputMethodWrapper.java
+grep -n -F 'new ImeInputEventReceiver(channel, context.getMainLooper());' frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+grep -n -F 'mParentIMMS.onSessionCreated(mMethod, session, mChannel);' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'if (res.channel != null && Binder.isProxy(client)) {' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+grep -n -F 'setInputChannelLocked(res.channel);' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'server channel and should be used to publish input events.' frameworks/base/core/java/android/view/InputChannel.java
+grep -n -F 'is designated as the client channel and should be used to consume input events.' frameworks/base/core/java/android/view/InputChannel.java
 ```
 
-分别推演：
+画出 publisher、consumer、system_server保留句柄与App副本，解释为什么局部dispose不等于立刻关闭所有端点。
+
+### 练习 4：验证send成功才建立等待账
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'static final long INPUT_METHOD_NOT_RESPONDING_TIMEOUT = 2500;' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'mCurSender = new ImeInputEventSender(mCurChannel, mH.getLooper());' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'if (mCurSender.sendInputEvent(seq, event)) {' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'mPendingEvents.put(seq, p);' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'mH.sendMessageDelayed(msg, INPUT_METHOD_NOT_RESPONDING_TIMEOUT);' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'if the input channel buffer filled before all samples were dispatched.' frameworks/base/core/java/android/view/InputEventSender.java
+grep -n -F 'for (size_t i = 0; i <= event->getHistorySize(); i++) {' frameworks/base/core/jni/android_view_InputEventSender.cpp
+grep -n -F 'Failed to send motion event sample on channel' frameworks/base/core/jni/android_view_InputEventSender.cpp
+```
+
+区分“完整发布、部分Motion样本可能已发布、进入pending、IME处理、finished到达”五个观察点。
+
+### 练习 5：手推timeout、迟到回执与flush
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'int index = mPendingEvents.indexOfKey(seq);' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'return; // spurious, event already finished or timed out' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'INPUT_METHOD_NOT_RESPONDING_TIMEOUT + " ms: " + p.mInputMethodId' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'mH.removeMessages(MSG_TIMEOUT_INPUT_EVENT, p);' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'finishedInputEvent(msg.arg1, false, true);' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'finishedInputEvent(msg.arg1, false, false);' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'mPendingEvents.removeAt(index);' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'Message msg = mH.obtainMessage(MSG_FLUSH_INPUT_EVENT, seq, 0);' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'private void flushPendingEventsLocked() {' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'sendInputEventAndReportResultOnMainLooper((PendingEvent)msg.obj);' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'if (mCurChannel != channel) {' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'flushPendingEventsLocked();' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'mCurSender.dispose();' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'case MSG_FLUSH_INPUT_EVENT: {' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'invokeFinishedInputEventCallback(p, handled);' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+```
+
+分别推演20 ms true、20 ms false、3000 ms true与换Channel四种结局，确认每个 App PendingEvent最多回调一次。
+
+### 练习 6：核对IME Receiver的事件分类与背压
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'channel, context.getMainLooper());' frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+grep -n -F 'if (mInputMethodSession == null) {' frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+grep -n -F 'finishInputEvent(event, false);' frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+grep -n -F 'mPendingEvents.put(seq, event);' frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+grep -n -F 'mInputMethodSession.dispatchKeyEvent(seq, keyEvent, this);' frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+grep -n -F 'mInputMethodSession.dispatchTrackballEvent(seq, motionEvent, this);' frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+grep -n -F 'mInputMethodSession.dispatchGenericMotionEvent(seq, motionEvent, this);' frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+grep -n -F 'public void finishedEvent(int seq, boolean handled) {' frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+grep -n -F 'InputEvent event = mPendingEvents.valueAt(index);' frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+grep -n -F 'finishInputEvent(event, handled);' frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+grep -n -F 'No new input events will be received' frameworks/base/core/java/android/view/InputEventReceiver.java
+grep -n -F 'status_t NativeInputEventReceiver::consumeEvents(JNIEnv* env,' frameworks/base/core/jni/android_view_InputEventReceiver.cpp
+grep -n -F 'for (;;) {' frameworks/base/core/jni/android_view_InputEventReceiver.cpp
+grep -n -F 'gInputEventReceiverClassInfo.dispatchInputEvent, seq, inputEventObj' frameworks/base/core/jni/android_view_InputEventReceiver.cpp
+```
+
+解释 custom Session漏调finished时，为何App timeout与IME transport账闭合是两件事，并说明不能把文档描述扩成实现上的严格single-flight保证。
+
+### 练习 7：验证两端sequence翻译
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'mSeqMap.put(event.getSequenceNumber(), seq);' frameworks/base/core/java/android/view/InputEventReceiver.java
+grep -n -F 'int seq = mSeqMap.valueAt(index);' frameworks/base/core/java/android/view/InputEventReceiver.java
+grep -n -F 'uint32_t publishedSeq = mNextPublishedSeq++;' frameworks/base/core/jni/android_view_InputEventSender.cpp
+grep -n -F 'mPublishedSeqMap.emplace(publishedSeq, seq);' frameworks/base/core/jni/android_view_InputEventSender.cpp
+grep -n -F 'status_t status = mInputPublisher.receiveFinishedSignal(&publishedSeq, &handled);' frameworks/base/core/jni/android_view_InputEventSender.cpp
+grep -n -F 'auto it = mPublishedSeqMap.find(publishedSeq);' frameworks/base/core/jni/android_view_InputEventSender.cpp
+grep -n -F 'status_t status = mInputConsumer.sendFinishedSignal(seq, handled);' frameworks/base/core/jni/android_view_InputEventReceiver.cpp
+grep -n -F 'nativeFinishInputEvent(mReceiverPtr, seq, handled);' frameworks/base/core/java/android/view/InputEventReceiver.java
+grep -n -F 'uint32_t seq = it->second;' frameworks/base/core/jni/android_view_InputEventSender.cpp
+grep -n -F 'gInputEventSenderClassInfo.dispatchInputEventFinished,' frameworks/base/core/jni/android_view_InputEventSender.cpp
+```
+
+给每个 seq标注“原Window transport、App Java、Session Channel `publishedSeq`或IME Java”，不要用一个编号贯穿所有层。
+
+### 练习 8：比较Binder状态门与raw事件门
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'oneway interface IInputMethodSession {' frameworks/base/core/java/com/android/internal/view/IInputMethodSession.aidl
+grep -n -F 'if (!isEnabled()) {' frameworks/base/core/java/android/inputmethodservice/InputMethodService.java
+grep -n -F 'boolean handled = event.dispatch(AbstractInputMethodService.this,' frameworks/base/core/java/android/inputmethodservice/AbstractInputMethodService.java
+grep -n -F 'public void setEnabled(boolean enabled) {' frameworks/base/core/java/android/inputmethodservice/AbstractInputMethodService.java
+grep -n -F 'if (!mRevoked) {' frameworks/base/core/java/android/inputmethodservice/AbstractInputMethodService.java
+grep -n -F 'public void revokeSelf() {' frameworks/base/core/java/android/inputmethodservice/AbstractInputMethodService.java
+grep -n -F 'mRevoked = true;' frameworks/base/core/java/android/inputmethodservice/AbstractInputMethodService.java
+grep -n -F 'mEnabled = false;' frameworks/base/core/java/android/inputmethodservice/AbstractInputMethodService.java
+grep -n -F 'mInputMethodSession = null;' frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+grep -n -F 'mReceiver.dispose();' frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+grep -n -F 'mChannel.dispose();' frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+grep -n -F 'case DO_FINISH_SESSION: {' frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+grep -n -F 'doFinishSession();' frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+grep -n -F 'private void doFinishSession() {' frameworks/base/core/java/android/inputmethodservice/IInputMethodSessionWrapper.java
+grep -n -F 'sessionState.session.finishSession();' frameworks/base/services/core/java/com/android/server/inputmethod/InputMethodManagerService.java
+```
+
+说明disabled、revoked、finish消息已发和IME主线程实际dispose四个状态为什么不能互换。
+
+### 练习 9：验证反向KeyEvent防环与去信任标志
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'mIMM.dispatchKeyEventFromInputMethod(mTargetView, event);' frameworks/base/core/java/android/view/inputmethod/BaseInputConnection.java
+grep -n -F 'ic.sendKeyEvent((KeyEvent)msg.obj);' frameworks/base/core/java/com/android/internal/view/IInputConnectionWrapper.java
+grep -n -F 'viewRootImpl.dispatchKeyFromIme(event);' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'event = KeyEvent.changeFlags(event,' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'event.getFlags() & ~KeyEvent.FLAG_FROM_SYSTEM);' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'enqueueInputEvent(event, null, QueuedInputEvent.FLAG_DELIVER_POST_IME, true);' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'if (q.mReceiver != null) {' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'q.mEvent.recycleIfNeededAfterDispatch();' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'KeyEvent.FLAG_SOFT_KEYBOARD|KeyEvent.FLAG_KEEP_TOUCH_MODE));' frameworks/base/core/java/android/inputmethodservice/InputMethodService.java
+```
+
+解释去掉 `FROM_SYSTEM`解决信任问题，而 `DELIVER_POST_IME`解决递归问题；再说明 receiver=null意味着缺少哪一笔原窗口完成账。
+
+## 16. 用三条时间线收束完成边界
 
 ```text
-IME 20ms返回handled=true
-IME 20ms返回handled=false
-IME 3000ms才返回handled=true
+正常handled=true：
+原Window事件到App → pre-IME → Session Channel完整发布 → App pending+timeout
+→ IME Java回调 → native finished直接写出或先进入mFinishQueue
+→ App publisher收到 → publishedSeq还原为App Java seq
+→ IMM移除pending并取消timeout → callback在目标Handler实际运行
+→ ImeInputStage finish(q, true)，并受同device前序事件排序约束
+→ 原Window finished → 后续画面另行完成
+
+handled=false或发送失败：
+Channel不可用/整单发送失败 → 不建立App pending → 同Looper同步NOT_HANDLED或异线程稍后callback false
+IME返回false → 已建立App pending → finished到达 → 删除pending与timeout → callback false
+→ 同步返回或callback实际运行后，ImeInputStage取得forward机会
+→ 若无更早同device事件阻塞，再进入post-IME与App常规分发
+→ App最终handled/not handled → 原Window finished
+
+timeout消息被IMM实际处理（2500 ms只是最早到期点）：
+App pending移除并安排callback false → callback运行后原事件具备向post-IME推进的条件
+→ 仍可能受更早的同device事件阻塞
+已发布的Channel事件不会被App timeout取消；若IME Receiver已经接收，其pending也不会被清除
+→ 若通道仍存活，迟到finished可关闭对应Session transport账、缓解在途债
+→ App已无对应pending，因此迟到handled不能改写timeout已确定的false决策
+→ 原事件何时实际推进，仍取决于callback执行和同device排序
 ```
 
-写出PendingEvent、超时Message、ViewRoot forward/finish和迟到seq的最终状态。
-
-## 98. macOS只读练习四：验证反向KeyEvent防环
-
-```bash
-cd /Users/ninebot/androidSource
-sed -n '2620,2660p' \
-  frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
-sed -n '5055,5088p' frameworks/base/core/java/android/view/ViewRootImpl.java
-```
-
-要求：指出`FLAG_DELIVER_POST_IME`和清除`FLAG_FROM_SYSTEM`分别解决哪一个安全/正确性问题。
-
-## 99. 自测题
-
-1. Window InputChannel与IME session InputChannel有什么区别？
-2. 为什么`IInputMethodSession.aidl`里没有dispatchKeyEvent？
-3. 哪两类MotionEvent在r48会直接跳过IME？
-4. DISPATCH_IN_PROGRESS对ViewRoot意味着什么？
-5. IME handled=false后事件去哪里？
-6. 2500ms超时后迟到handled=true为何必须忽略？
-7. IME生成的sendKeyEvent为何设置DELIVER_POST_IME？
-8. IME finished signal与原窗口事件finish为何是两层回执？
-
-## 100. 自测题答案
-
-1. 前者承载InputDispatcher到目标窗口；后者承载目标App ImeInputStage到当前IME session的过滤事件。
-2. raw event走session wrapper持有的InputChannel；AIDL负责selection/cursor等状态控制消息。
-3. `SOURCE_CLASS_POINTER`与`SOURCE_ROTARY_ENCODER` MotionEvent。
-4. 当前QueuedInputEvent在ImeInputStage异步DEFER，等待callback后才能finish或forward。
-5. 进入Early/Native/View Post-IME阶段，最终由目标App常规处理。
-6. App可能已处理并产生副作用，再改判会导致重复/矛盾消费。
-7. 该事件已经来自IME，再送IME会形成递归；标志使它从post-IME开始。
-8. 第一层只完成IME过滤子通道，第二层才由ViewRoot完成InputDispatcher交给目标窗口的原事件。
-
-## 101. 五个“完成”时刻
-
-| 时刻 | 只说明什么 |
-|---|---|
-| `sendInputEvent()`返回true | 事件完整写入IME Channel |
-| IME `onKeyDown()`返回 | IME业务给出本次同步handled判断 |
-| IME Receiver `finishInputEvent()` | 过滤子通道完成信号已发 |
-| IMM FinishedInputEventCallback | App ImeInputStage可以恢复 |
-| ViewRoot完成原QueuedInputEvent | 目标窗口输入链结束；仍不是像素present |
-
-## 102. 复读后的版本边界
-
-- r48的IME事件等待门是2500ms；其他Android版本要重新核对，不应把它当成稳定公开API。
-- `IInputMethodSession`的“session”同时关联Binder状态接口和Channel Receiver，但raw事件不经过AIDL方法。
-- pointer与rotary绕过IME是ViewRoot `shouldSkipIme()`的明确实现；IME窗口自己收到的触摸是另一条窗口路由。
-- 默认Session同步回调finished，但接口和两端pending设计允许异步完成。
-- enabled/revoked是会话契约状态，默认raw事件分发没有单独以`isEnabled()`作唯一硬门。
-
-## 103. 本章结论
-
-一枚硬件按键经过IME，不是一次普通Binder方法，而是一个带背压、序列号、超时和双层回执的异步过滤阶段：
-
-```text
-原Window事件进入App
-→ pre-IME可先消费
-→ 专用Channel交IME
-→ IME主线程返回handled
-→ finished signal恢复App stage
-→ handled则结束，false/timeout则继续post-IME
-→ ViewRoot最终完成原Window事件
-```
-
-掌握本章后，应能把“IME看见一个KeyEvent”和“IME向App提交一个字符”明确拆成InputChannel事件链与IInputContext编辑链，并能解释每一层完成回执到底释放了谁、超时后为何只能向前继续。
-
-## 104. 下一章预告
-
-下一章继续沿输入系统向下，深入InputDispatcher的焦点窗口、ANR等待队列、应用InputChannel完成回执和事件一致性，专门解释IME 2500ms局部门与系统输入ANR判定怎样相互衔接但不等价。
+真正掌握这条链，要能随时回答六个问题：**事件最初属于哪个窗口；当前走的是Window Channel、Session Channel还是 Binder；为什么它从某个stage起步；眼前的seq属于哪一层；谁还欠哪一份finished；这个handled或timeout最多证明到哪个完成点。**

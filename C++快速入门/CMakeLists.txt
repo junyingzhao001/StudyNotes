@@ -20,6 +20,19 @@ foreach(number 17 18 19 20 21)
     target_link_libraries(demo_${number} PRIVATE Threads::Threads)
 endforeach()
 
+add_library(score_rules structure_demo/score.cpp)
+target_include_directories(score_rules PUBLIC structure_demo)
+configure_course_target(score_rules)
+
+add_executable(header_source_demo structure_demo/main.cpp)
+target_link_libraries(header_source_demo PRIVATE score_rules)
+configure_course_target(header_source_demo)
+
+add_executable(header_source_trace_demo structure_demo/main.cpp)
+target_link_libraries(header_source_trace_demo PRIVATE score_rules)
+target_compile_definitions(header_source_trace_demo PRIVATE QUICKSTART_TRACE)
+configure_course_target(header_source_trace_demo)
+
 add_library(task_core project/task_store.cpp project/task_file.cpp)
 target_include_directories(task_core PUBLIC project)
 configure_course_target(task_core)
@@ -29,6 +42,8 @@ target_link_libraries(task_cli PRIVATE task_core)
 configure_course_target(task_cli)
 
 enable_testing()
+add_test(NAME header_source_demo COMMAND header_source_demo)
+add_test(NAME header_source_trace_demo COMMAND header_source_trace_demo)
 add_executable(task_store_test tests/task_store_test.cpp)
 target_link_libraries(task_store_test PRIVATE task_core)
 configure_course_target(task_store_test)

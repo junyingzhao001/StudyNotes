@@ -1,721 +1,447 @@
 # 255 Android Web Intent、autoVerify、DomainVerification与默认浏览器选择链
 
-> 源码版本：Android 11 / `android-11.0.0_r48`  
-> 学习方式：macOS只读核源，不编译、不运行AOSP
+## 1. 主问题：URL 去向由“语法、证明、策略、候选”四层共同决定
 
-## 1. 本章要解决什么
+一次 `https://example.com/path` 点击可能直接进入 App、进入默认浏览器、显示 ResolverActivity、转发到工作资料，或出现 instant installer。把这些结果都归因于 `android:autoVerify`，会把四类性质不同的事实混在一起：
 
-第254章已经解释普通隐式Intent如何匹配、排序和选择。本章专门把URL点击这一条特殊链拆开：为什么有时直接进入App，有时进入默认浏览器，有时弹出Resolver，有时又出现工作资料或Instant App候选？
+1. `IntentFilter` 语法：Activity 是否声明了当前 action、categories、scheme、host 与 path；
+2. 网站证明：HTTPS 站点是否以 Digital Asset Links 声明信任这个包名与签名证书；
+3. Settings 策略：旧版包级 main status 与当前用户的 ALWAYS、ASK、NEVER、ALWAYS_ASK、generation；
+4. 查询处置：PMS 怎样把已匹配候选分桶，何时加入默认浏览器、跨 profile 与 instant installer，最后怎样排序和选择。
 
-```text
-autoVerify=true到底只是声明，还是验证结果？
-assetlinks.json怎样把网站、包名和签名证书绑在一起？
-一个包声明多个host时，是逐host成功，还是全包一起成功？
-ALWAYS、ASK、NEVER、ALWAYS_ASK分别怎样改变候选集？
-默认浏览器为何不会无条件抢过已验证App Link？
-多个ALWAYS应用为什么仍可能确定出一个第一名？
-包升级增加或删除host时，旧状态怎样继承？
-Android 11与新版本DomainVerification最大的模型差异是什么？
-```
+准确主线是：
 
-## 2. 一句总纲
+`安装 prepare 排验证消息 → Handler 聚合包内 Web Filters/hosts → 显式广播到验证器 → HTTPS assetlinks 整批核验 → 写包级与每用户状态 → URL 查询先做普通 Filter 匹配 → 按包状态分桶并处理浏览器/profile/instant → resolve 再选单项`
 
-```text
-Manifest声明Web IntentFilter与autoVerify
-→ 安装完成后PMS聚合包内待验证host并异步广播给系统Verifier
-→ StatementService用HTTPS读取每个host的assetlinks.json
-→ 校验relation + packageName + SHA-256签名指纹，整批得出成功/失败
-→ PMS保存全局验证结果及每用户ALWAYS/ASK/NEVER/ALWAYS_ASK策略
-→ URL查询先做普通IntentFilter匹配，再按域名策略分组候选
-→ ALWAYS App Link优先；否则加入未定义App、跨profile与浏览器
-→ 默认浏览器、generation排序、ResolverActivity完成最终选择
-```
+本文固定在 Android 11 / API 30 / `android-11.0.0_r48`。这一版仍使用 `IntentFilterVerificationInfo` 与包级状态；Android 12 之后的新版 `DomainVerificationService`、逐域名状态和新 shell/API 不能反推本章。主要源码坐标为：
 
-## 3. 先分清四类对象
+- `frameworks/base/core/java/android/content/Intent.java`
+- `frameworks/base/core/java/android/content/IntentFilter.java`
+- `frameworks/base/core/java/android/content/pm/IntentFilterVerificationInfo.java`
+- `frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java`
+- `frameworks/base/services/core/java/com/android/server/pm/IntentFilterVerificationState.java`
+- `frameworks/base/services/core/java/com/android/server/pm/Settings.java`
+- `frameworks/base/services/core/java/com/android/server/pm/PackageSettingBase.java`
+- `frameworks/base/packages/StatementService/src/com/android/statementservice/`
 
-```text
-Web Intent：本次请求，通常是ACTION_VIEW + http/https URI
-Web IntentFilter：Activity声明自己能处理哪些URL
-验证事实：网站是否公开声明信任该包名和签名证书
-用户策略：这个用户希望该包always、ask、never还是always-ask
-```
+本章的终点是 PMS 形成 URL 候选与 `resolveIntent()` 结果；ATMS 的 exported、permission、Intent Firewall、AppOps 与后台启动门仍是后续执行裁决。
 
-验证事实和用户策略会相互影响，但不是同一个字段。
+## 2. 五个 Web 谓词并不等价，甚至 package 快照门还有一处命名陷阱
 
-## 4. 源码地图
+先把常用谓词逐一拆开：
 
-```text
-frameworks/base/core/java/android/content/Intent.java
-frameworks/base/core/java/android/content/IntentFilter.java
-frameworks/base/core/java/android/content/pm/IntentFilterVerificationInfo.java
-frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
-frameworks/base/services/core/java/com/android/server/pm/IntentFilterVerificationState.java
-frameworks/base/services/core/java/com/android/server/pm/PackageSettingBase.java
-frameworks/base/services/core/java/com/android/server/pm/Settings.java
-frameworks/base/services/core/java/com/android/server/role/RoleManagerService.java
-frameworks/base/packages/StatementService/src/com/android/statementservice/
-frameworks/base/packages/StatementService/src/com/android/statementservice/retriever/
-```
+| 谓词 | 当前实现真正检查的条件 |
+| --- | --- |
+| `Intent.hasWebURI()` | data 非空，scheme 非空且为 `http` 或 `https` |
+| `Intent.isWebIntent()` | `ACTION_VIEW` 加 `hasWebURI()`；不检查 BROWSABLE |
+| `IntentFilter.handlesWebUris(true)` | VIEW、BROWSABLE、至少一个 scheme，且所有 scheme 都只能是 http/https |
+| `IntentFilter.needsVerification()` | autoVerify 位为真，加 `handlesWebUris(true)` |
+| `IntentFilter.handleAllWebDataURI()` | 有 `CATEGORY_APP_BROWSER`，或者 `handlesWebUris(false)` 且没有 authority |
 
-## 5. 本章版本边界
+`handlesWebUris(false)` 允许 Filter 同时包含自定义 scheme，只要其中至少有 http/https；`true` 则遇到任一非 Web scheme 就失败。两者都不要求 authority，所以一个无 host 的泛化 Web Filter 也能满足 `needsVerification()`，后续却可能因空 host 请求而失败。
 
-Android 11 r48仍使用旧`IntentFilterVerificationInfo`与包级状态。Android 12以后引入新的DomainVerificationService、逐域名状态与新版shell/API；不能拿新版本文档反推本章源码。
+包解析结束时还计算 `pkg.isHasDomainUrls()`，它是安装验证入口的快照门。`hasDomainURLs()` 的实现连续检查 `hasAction(ACTION_VIEW)` 与 `hasAction(ACTION_DEFAULT)`，而 `ACTION_DEFAULT` 在 `Intent` 中只是 `ACTION_VIEW` 的别名；它没有按方法注释检查 `CATEGORY_DEFAULT`，也不检查 BROWSABLE 或 host。故 package 快照门、`needsVerification()` 与“有可验证域名”是三套口径。
 
-## 6. 安装验证不会阻塞APK安装结论
+通用查询侧又用 `intent.hasWebURI()` 判断是否进入 domain 分支，并不要求本次 action 是 VIEW。于是旧模型可能把包级 domain 状态用于一个能匹配 `ACTION_EDIT + https` 的候选；外层/base Intent 显式 component/package 时绕开这套分桶。selector-only package 是例外：PMS 在替换为 selector 前保存 base `pkgName`，所以 base 未限定时，selector 可先按自身 package 缩小召回范围，随后仍走 domain 分支。必须同时看调用点谓词、base/selector 与查询形态。
 
-`preparePackageLI()`在非Instant App路径调用`startIntentFilterVerifications()`，这里只向PMS Handler排入消息；安装工作本身也运行在该Handler当前任务中，所以正常情况下要等当前安装任务完成commit并返回消息循环后，验证消息才会处理。网络慢或站点失败会影响以后URL解析策略，但不参与APK安装的同步投票，也不会回滚已经完成的安装事务。
-
-严格说，消息是在prepare阶段排队，而不是在源码调用点已经commit；若多包安装后来失败，已排队消息仍可能被处理，但目标PackageSetting不存在时无法形成持久验证账。这也是“安装事务”与“安装后异步验证”并非同一原子操作的边界。
-
-## 7. 总体链路图
-
-```mermaid
-flowchart TD
-    APK["APK Manifest<br/>ACTION_VIEW + BROWSABLE + host + autoVerify"] --> PREPARE["prepare阶段排入验证消息"]
-    PREPARE --> COMMIT["当前安装任务继续scan / reconcile / commit"]
-    COMMIT --> START["Handler稍后处理验证消息"]
-    START --> AGG["按package聚合filters与hosts<br/>分配verificationId"]
-    AGG --> BROADCAST["显式广播到系统Verifier"]
-    BROADCAST --> STMT["StatementService后台线程"]
-    STMT --> HTTPS["HTTPS读取每个host<br/>/.well-known/assetlinks.json"]
-    HTTPS --> CHECK["relation + packageName + cert fingerprint"]
-    CHECK --> REPLY["verifyIntentFilter回PMS"]
-    REPLY --> GLOBAL["全局IntentFilterVerificationInfo"]
-    REPLY --> USER["每用户status + generation"]
-    URL["URL Intent查询"] --> NORMAL["普通IntentFilter匹配"]
-    NORMAL --> PARTITION["按用户domain status分组"]
-    GLOBAL --> PARTITION
-    USER --> PARTITION
-    PARTITION --> APP["App Link / 浏览器 / Resolver / 跨profile"]
-```
-
-## 8. `hasWebURI()`只检查URI scheme
-
-`Intent.hasWebURI()`要求data非null，scheme非空且等于`http`或`https`。它不要求action为VIEW，也不要求BROWSABLE category。
-
-## 9. `isWebIntent()`多检查ACTION_VIEW
-
-```java
-public boolean isWebIntent() {
-    return ACTION_VIEW.equals(mAction) && hasWebURI();
-}
-```
-
-它仍没有检查BROWSABLE。调用方若讨论“浏览器可从网页安全唤起”的语义，还应查看实际categories和Filter。
-
-## 10. r48查询分支用的是`hasWebURI()`
-
-`queryIntentActivitiesInternal()`在合并当前profile与跨profile候选时，只要`intent.hasWebURI()`就调用域名候选过滤。因此源码意义上的domain filtering范围比`isWebIntent()`略宽，不应把两者写成同义词。
-
-## 11. 一个典型App Link Filter
-
-```xml
-<intent-filter android:autoVerify="true">
-    <action android:name="android.intent.action.VIEW" />
-    <category android:name="android.intent.category.DEFAULT" />
-    <category android:name="android.intent.category.BROWSABLE" />
-    <data android:scheme="https" android:host="www.example.com" />
-</intent-filter>
-```
-
-DEFAULT服务默认隐式启动选择，BROWSABLE表达允许来自浏览器式上下文，host限定网站，autoVerify请求系统建立网站与应用的可信关联。
-
-## 12. `autoVerify=true`不是“已经验证”
-
-它只是Manifest请求位，解析后进入`IntentFilter.getAutoVerify()`。网络验证未运行、超时、站点JSON错误、签名不匹配时，它都不会自动变成可信结果。
-
-## 13. `needsVerification()`的精确公式
-
-```java
-return getAutoVerify() && handlesWebUris(true);
-```
-
-`handlesWebUris(true)`要求ACTION_VIEW、CATEGORY_BROWSABLE、至少一个scheme，并且所有scheme只能是http或https。
-
-## 14. 混合scheme Filter不能触发autoVerify
-
-一个Filter同时声明`https`与自定义`myapp`时，`onlyWebSchemes=true`检查失败，即使写了autoVerify也不会成为触发验证的Filter。将Web与自定义scheme拆成不同Filter更清楚。
-
-## 15. `hasValidDomains()`比`needsVerification()`宽一点
-
-PMS代理把Filter加入验证批次前检查BROWSABLE以及至少有http/https scheme；而外围循环先用`handlesWebUris(false)`筛选，所以实际加入项仍要求ACTION_VIEW+BROWSABLE并至少含一个Web scheme，但可以同时声明非Web scheme。
-
-## 16. 任一Filter触发，包内Web Filter一起聚合
-
-PMS先扫描包内所有Activity：只要存在一个`needsVerification()==true`，`needToRunVerify`就为true。随后它再次遍历，将所有`handlesWebUris(false)`的Filter加入同一个verificationId，而不只验证写了autoVerify的那个Filter。
-
-## 17. 为什么这是包级而非Filter级请求
-
-`IntentFilterVerificationState`只保存一个packageName、一个userId、一组Filters和一组Hosts。一个安装版本通常对应一个验证token，最终成功/失败也作用于这批Filter和包级账本。
-
-## 18. host从authority提取
-
-每个ParsedIntentInfo的`getHostsList()`进入ArraySet去重。path、port和MIME不会成为Digital Asset Links站点身份；网站所有权边界以host为核心。
-
-## 19. wildcard host会归一到根host请求
-
-`*.example.com`写入状态时仍是Manifest host；生成验证请求字符串时会去掉`*.`，用`example.com`做HTTPS验证。它不表示网络层逐个枚举所有子域名。
-
-## 20. Verifier组件怎样被选中
-
-PMS用`ACTION_INTENT_FILTER_NEEDS_VERIFICATION`查询system-only Receiver，要求包持有`INTENT_FILTER_VERIFICATION_AGENT`权限，再选Filter priority最高者作为`mIntentFilterVerifierComponent`。
-
-## 21. 为什么还要记Verifier UID
-
-发现Receiver组件只确定发送目标。真正回调时`IntentFilterVerificationState.setVerifierResponse()`还要求Binder callerUid等于安装时记录的required verifier UID，避免另一个持同权限进程猜token提交结果。
-
-## 22. 广播是显式且发给system user
-
-PMS构造验证Intent后`setComponent()`，再`sendBroadcastAsUser(..., UserHandle.SYSTEM, ...)`。验证代理不是每个应用用户各启动一份的普通隐式广播竞争者。
-
-## 23. 请求携带哪些字段
-
-```text
-verificationId
-URI scheme
-空格分隔hosts
-packageName
-```
-
-`verificationId`把异步网络结果关联回PMS内存状态。
-
-## 24. r48固定用HTTPS作为验证scheme
-
-`IntentVerifierProxy.getDefaultScheme()`直接返回`https`。即使Filter只声明http，验证代理构造的Web Asset仍从HTTPS站点读取关联声明；不要理解成“按每个Manifest scheme分别请求”。
-
-## 25. 临时白名单解决后台限制
-
-发送广播前，PMS通过DeviceIdleInternal临时白名单验证器包，并给BroadcastOptions设置同一时长，确保安装后即使处于Doze/后台限制，Verifier仍有机会启动网络服务。
-
-## 26. 这里复用了package verifier timeout配置
-
-白名单时长取`getVerificationTimeout()`，默认至少10秒。但在这条旧App Link代码里没有看到对应verificationId的延迟失败消息；它主要约束白名单窗口，不应误写成“10秒后PMS必定把域名判失败”。
-
-## 27. StatementService只是AOSP默认实现
-
-PMS依赖的是受权限保护的Verifier Receiver协议。AOSP提供`com.android.statementservice`实现；设备厂商可放入更高priority、同样满足system-only和权限要求的实现。
-
-## 28. Receiver不在主线程做网络
-
-`IntentFilterVerificationReceiver`解析广播后启动`DirectStatementService`；Service创建后台优先级HandlerThread，真正抓取和JSON解析在该Looper执行，避免BroadcastReceiver主线程阻塞。
-
-## 29. 一个请求最多10个host
-
-AOSP StatementService的`MAX_HOSTS_PER_REQUEST=10`。超过后不发任何HTTP请求，直接向PMS返回整批失败。这是r48默认验证器实现限制，不是IntentFilter语法限制。
-
-## 30. Web Asset的真实URL
-
-Retriever对每个Web Asset计算：
-
-```text
-https://<host>/.well-known/assetlinks.json
-```
-
-读取结果受内容大小、连接超时、重试和HTTP缓存策略约束。
-
-## 31. 关联relation固定为何值
-
-```text
-delegate_permission/common.handle_all_urls
-```
-
-它表达网站把处理全部匹配URL的能力委托给目标Android App，不是登录凭据、联系人或其他Digital Asset Links relation。
-
-## 32. Android App身份不只有包名
-
-Verifier通过PackageManager读取安装包签名证书的SHA-256指纹，目标Asset同时包含packageName与指纹列表。攻击者即使发布同包名APK，只要签名不同，也不能命中网站声明。
-
-## 33. assetlinks.json核心形态
-
-```json
-[
-  {
-    "relation": ["delegate_permission/common.handle_all_urls"],
-    "target": {
-      "namespace": "android_app",
-      "package_name": "com.example.app",
-      "sha256_cert_fingerprints": ["AA:BB:...:FF"]
-    }
-  }
-]
-```
-
-这里只是学习示意，真实指纹必须完整匹配安装包签名。
-
-## 34. 检查方向是“网站声明信任App”
-
-source是Web Asset，target是Android App Asset。Verifier从网站拉取Statement，寻找relation匹配且target matcher匹配包名和证书的记录。
-
-## 35. 每个host都必须成功
-
-DirectStatementService逐个source验证，只要一个host未找到关联、网络失败或解析异常，`allSourcesVerified=false`。因此r48默认实现对一个包的一批host给出整体成功/失败。
-
-## 36. `failedDomains`没有形成逐域名状态
-
-失败source列表会回传`verifyIntentFilter()`，PMS Handler把它打印到调试日志；`IntentFilterVerificationResponse.failedDomains`没有在后续写成逐host结果表。最终状态仍是一批Filters/一个包的成功或失败。
-
-## 37. 回调先过权限门
-
-Binder入口`verifyIntentFilter()`要求`INTENT_FILTER_VERIFICATION_AGENT`。通过后并不直接改Settings，而是把callerUid、code、failedDomains封装为消息发到PMS Handler串行处理。
-
-## 38. 回调再过UID门
-
-Handler找到verificationId状态后调用`setVerifierResponse(callerUid, code)`。callerUid不等required verifier UID时状态不会complete，也就不会进入`receiveVerificationResponse()`提交结果。
-
-## 39. verification code只有成功和失败有明确定义
-
-成功码映射STATE_VERIFICATION_SUCCESS，失败码映射STATE_VERIFICATION_FAILURE。其他code会让状态标记complete但内部state回到UNDEFINED，`isVerified()`为false，最终按失败路径处理。
-
-## 40. 成功后Filter对象也被标记
-
-`receiveVerificationResponse()`遍历本批ParsedIntentInfo调用`filter.setVerified(verified)`。不过URL候选过滤真正使用的是PackageSetting中的包/用户状态，不应把Filter内存位当成唯一持久事实。
-
-## 41. r48 Filter verified位存在可疑实现边界
-
-`IntentFilter.setVerified()`操作`STATE_VERIFIED`，而`isVerified()`读取的是`STATE_NEED_VERIFY`；两者常量不同。该返回值在IntentResolver中主要用于日志，域名选择依赖Settings账本，所以学习时应以包级状态链为准，并把这处视为r48源码缺口而非业务合同。
-
-## 42. 验证时序图
-
-```mermaid
-sequenceDiagram
-    participant I as Package install flow
-    participant PMS as PackageManagerService
-    participant H as PMS Handler
-    participant V as Verifier Receiver
-    participant S as DirectStatementService
-    participant W as Web hosts
-    I->>PMS: startIntentFilterVerifications(pkg,user)
-    PMS->>H: START_INTENT_FILTER_VERIFICATIONS
-    H->>H: find autoVerify trigger + aggregate all web filters
-    H->>H: create verificationId/state
-    H->>V: explicit NEEDS_VERIFICATION broadcast
-    V->>S: startService(CHECK_ALL)
-    loop every host
-        S->>W: GET /.well-known/assetlinks.json
-        W-->>S: statements or failure
-        S->>S: relation + package + cert match
-    end
-    S->>PMS: verifyIntentFilter(id, success/failure, failedSources)
-    PMS->>H: INTENT_FILTER_VERIFIED
-    H->>H: permission/UID/token + global/per-user state transition
-```
-
-## 43. 两张持久账必须分开看
-
-```text
-IntentFilterVerificationInfo：包级domains + main status，写入全局Settings
-PackageUserState：每用户domainVerificationStatus + appLinkGeneration
-```
-
-前者描述自动验证主状态，后者允许每个用户有独立选择与相对优先级。
-
-## 44. 主状态也只有一个包级值
-
-`IntentFilterVerificationInfo`保存packageName、domains集合、mMainStatus。它不是`host → status` Map；domains只记录这个包公布了哪些host。
-
-其`setStatus()`只接受UNDEFINED到NEVER（0—3），不接受ALWAYS_ASK（4）。ALWAYS_ASK是解析时可见的per-user策略，不会作为自动Verifier写入的main status。
-
-## 45. per-user状态优先于主状态
-
-URL解析路径的私有`getDomainVerificationStatusLPr()`先读PackageUserState打包long。只有高32位为UNDEFINED时，才回退到IntentFilterVerificationInfo的main status。不要与公开查询最终调用的`Settings.getIntentFilterVerificationStatusLPr()`混淆：后者直接返回per-user高位，不替调用者做这次fallback。
-
-## 46. packed long怎样编码
-
-```text
-高32位：UNDEFINED / ASK / ALWAYS / NEVER / ALWAYS_ASK
-低32位：appLinkGeneration，仅ALWAYS用于相对优先
-```
-
-因此打印或比较时不能把整个long直接当单一枚举。
-
-## 47. 五种有效per-user status
-
-```text
-UNDEFINED 0：用户未明确设置；可回退全局验证状态
-ASK 1：作为歧义候选询问
-ALWAYS 2：优先作为该包声明域名的处理者
-NEVER 3：从普通域名选择候选中排除
-ALWAYS_ASK 4：即使存在ALWAYS也强制保留歧义选择
-```
-
-数值大小不完全代表优先级，NEVER虽然是3却最差。
-
-## 48. 自动验证成功怎样更新主状态
-
-成功时main status设为ALWAYS，失败时设为ASK，并异步写全局Settings。这个main status可作为尚无显式per-user状态用户的fallback。
-
-## 49. 自动成功会把UNDEFINED/ASK用户提升到ALWAYS
-
-对本次安装user，若per-user为UNDEFINED或ASK且验证成功，PMS调用`updateIntentFilterVerificationStatusLPw(ALWAYS)`，同时分配新的generation。
-
-## 50. 自动失败怎样处理旧ALWAYS
-
-如果此前per-user为ALWAYS而新版本验证失败，普通包会被降为UNDEFINED，随后解析可回退到全局ASK；但SystemConfig `<app-link>`列出的系统包不会因此被降级。
-
-## 51. 显式NEVER与ALWAYS_ASK不会被自动结果覆盖
-
-状态转换switch的default不更新这些值。用户/管理策略的明确决定高于以后自动验证成功或失败。
-
-## 52. 安装给USER_ALL的特殊边界
-
-main status仍更新，但源码明确记录`autoVerify ignored when installing for all users`，不为`USER_ALL`直接写某个用户的per-user状态。
-
-## 53. generation是什么
-
-每次把某包设为ALWAYS，Settings把该user的`mNextAppLinkGeneration`加1并记录到PackageUserState。解析候选时它被写入ResolveInfo.preferredOrder。
-
-## 54. generation解决多个ALWAYS的相对选择
-
-若多个包都处于ALWAYS，较新的generation拥有更高preferredOrder。第254章比较器把preferredOrder放在match之前，`chooseBestActivity()`看到前两名order不同会直接选第一。
-
-## 55. generation不是验证时间戳
-
-它只是每用户单调分配的相对序号，不是wall clock，也不证明网络验证比另一应用更新；shell/设置操作把包设为ALWAYS同样会得到新generation。
-
-## 56. SystemConfig `<app-link>`是预置例外
-
-系统配置可列出受信系统包。`primeDomainVerificationsLPw()`确认包为system、收集有效domains，把全局状态留为UNDEFINED、per-user直接设为ALWAYS。
-
-## 57. 非system包不能借sysconfig预置
-
-若`<app-link>`列出非system app，PMS只打印警告并跳过。这个入口是系统镜像策略，不是第三方APK自己能声明的权限。
-
-## 58. 包升级先比较host集合
-
-PMS读取旧IntentFilterVerificationInfo，构造新domains集合，并计算旧集合是否包含新集合。只要出现新host，`hostSetExpanded=true`。
-
-## 59. ALWAYS且host未扩张可跳过重验
-
-若仍请求autoVerify、当前per-user是ALWAYS，且新host集合是旧集合的子集，PMS更新domains后直接返回。删除host不会让已验证的剩余范围失去状态。
-
-## 60. 增加host必须重新验证
-
-新增host意味着旧网站证明不能覆盖新范围；即使此前ALWAYS也会重新发送验证批次。新批次任何host失败都可能触发旧ALWAYS降级。
-
-## 61. 移除autoVerify时会清历史
-
-包此前有验证账，但新版本不再有触发autoVerify的Filter时，PMS删除验证info；只有“host未扩张且当前ALWAYS”时可选择保留当前用户状态，否则也重置policy。
-
-## 62. backup恢复可让新安装跳过网络
-
-新安装若已从备份恢复IntentFilterVerificationInfo，`!replacing && previouslyVerified`直接返回。恢复状态是一条独立信任/迁移路径，不等于本次安装现场重新联网。
-
-## 63. 设置状态的API有权限保护
-
-`updateIntentVerificationStatus()`要求`SET_PREFERRED_APPLICATIONS`，跨用户读取也受权限控制；普通第三方App不能把自己任意改成ALWAYS。
-
-## 64. shell只是受控管理入口
-
-r48提供`pm set-app-link --user ... PACKAGE always|ask|always-ask|never|undefined`与`get-app-link`。本章Mac只读练习只看解析代码，不连接设备、不修改状态。
-
-## 65. 域名状态不是普通PreferredActivity
-
-普通preferred保存IntentFilter、候选集合和目标Component；App Link状态保存于PackageUserState并在Web候选过滤阶段改写候选集合/排序。两套机制入口与持久化对象不同。
-
-## 66. 默认浏览器也不是普通PreferredActivity
-
-Android 11由RoleManager的`ROLE_BROWSER`保存角色持有者。RoleManagerService向PermissionManagerService注册DefaultBrowserProvider，PMS解析时通过PermissionManagerInternal取得该user的角色持有包。
-
-## 67. 老设置怎样迁移到Role
-
-升级设备上，LegacyRoleResolutionPolicy读取并移除Settings里的legacy default browser package，再迁移成ROLE_BROWSER holder。新代码运行时不应继续把`mDefaultBrowserApp`当唯一真相。
-
-## 68. 什么叫浏览器候选
-
-`IntentFilter.handleAllWebDataURI()`满足任一：
-
-```text
-含CATEGORY_APP_BROWSER
-或 ACTION_VIEW + BROWSABLE + http/https，且没有具体authority
-```
-
-它代表能泛化处理Web URI，而非某个网站专属App Link。
-
-## 69. host专属App不是浏览器
-
-声明`https://www.example.com` authority的Filter即使可处理网页，也不属于`handleAllWebDataURI`。它进入domain app分组，不进入浏览器`matchAllList`。
-
-## 70. 浏览器标记来自命中的具体Filter
-
-ComponentResolver生成ResolveInfo时把当前ParsedIntentInfo的`handleAllWebDataURI()`复制进去。同一Activity多个Filter命中又会按第254章规则提前去重，因此不应仅凭Activity整体声明推断保留结果的标记。
-
-## 71. URL候选先完成普通Filter匹配
-
-domain policy不会让未声明该action/scheme/host/path/category的App凭空进入结果。它只对ComponentResolver已经匹配出的ResolveInfo重新分组与筛选。
-
-## 72. 五个候选桶
-
-```text
-alwaysList
-undefinedList（包含UNDEFINED与ASK）
-alwaysAskList
-neverList
-matchAllList（浏览器）
-```
-
-跨profile候选另由`CrossProfileDomainInfo`携带最佳状态。
-
-## 73. 第一优先：有ALWAYS就先只放ALWAYS
-
-只要alwaysList非空，初始result只加入ALWAYS App Link，不加入普通ASK/UNDEFINED App，也默认不加入浏览器。
-
-## 74. 没有ALWAYS才加入ASK/UNDEFINED
-
-这时result加入undefinedList，可能加入父profile转发候选，并把`includeBrowser=true`。用户看到的是网站App候选与浏览器之间的选择。
-
-## 75. ALWAYS_ASK会打破ALWAYS直达
-
-只要存在alwaysAskList，PMS把当前result中所有preferredOrder清0，再加入ALWAYS_ASK候选并允许浏览器。这样某个ALWAYS不会凭generation直接压过“始终询问”策略。
-
-## 76. NEVER平时不进入result
-
-NEVER候选被单独保存。它既不会与ALWAYS竞争，也不会作为普通ASK选项展示；只有最后fallback组装全部candidates时再显式removeAll(neverList)。
-
-## 77. 默认浏览器何时被考虑
-
-只有`includeBrowser=true`：也就是没有ALWAYS，或存在ALWAYS_ASK。正常纯ALWAYS App Link路径不会因为设置了默认浏览器就强行加浏览器。
-
-## 78. `MATCH_ALL`会加入全部浏览器
-
-查询flags含MATCH_ALL时，PMS把matchAllList全部加入，便于管理/诊断类调用获得完整集合，而非模拟正常用户点击时的默认浏览器收敛。
-
-## 79. 普通点击优先只加入默认浏览器
-
-非MATCH_ALL时，PMS在浏览器候选里找ROLE_BROWSER包的最高priority匹配。只有它的priority不低于浏览器候选中的最大priority，才只加入这一条。
-
-## 80. 默认浏览器priority不足怎么办
-
-若另一个浏览器Filter priority更高，或根本找不到默认浏览器匹配，PMS加入所有浏览器，让后续排序/Resolver处理，避免角色身份覆盖Manifest更高的匹配优先级。
-
-## 81. `maxMatchPrio`从0开始的边界
-
-r48实现把最大浏览器priority初始为0。若默认浏览器只提供负priority匹配，它不能满足`default.priority >= maxMatchPrio`，于是不会单独收敛，最终加入所有浏览器。
-
-## 82. 空result的兜底
-
-includeBrowser后若仍没有任何结果，源码把原始candidates全部加入，再删除neverList。这处理无默认浏览器、异常分类或其他边缘情况，保证合法候选不被无意全部清空。
-
-## 83. ALWAYS列表为何还可能有多条
-
-状态按package保存，一个包可有多个匹配Activity，多个包也可同时ALWAYS。过滤阶段不强制只留一个组件，而是靠preferredOrder、priority、match与chooseBestActivity继续选择。
-
-## 84. 最近ALWAYS通常怎样胜出
-
-候选过滤给每条ALWAYS ResolveInfo写generation到preferredOrder；随后PMS重新用六级比较器排序。generation不同通常使最新启用的包排第一，并在chooseBestActivity前三字段比较时直接返回。
-
-## 85. 同包多个Activity仍可能弹Resolver
-
-同一包的多个Activity共享domain status/generation。如果priority、preferredOrder、isDefault都相同，又没有适用普通preferred，chooseBestActivity仍可能返回ResolverActivity。
-
-## 86. 默认浏览器只是浏览器桶内收敛
-
-它不会替代域名所有权验证，也不会把某浏览器变成某host的ALWAYS App Link。它解决的是“需要浏览器时选哪个泛化处理器”。
-
-## 87. App Link ALWAYS也不是永恒授权
-
-包升级扩host需重验，验证失败可能降级，用户可改为NEVER/ALWAYS_ASK，卸载或清偏好也会删除状态。ALWAYS是当前Settings事实，不是写死在APK里的能力。
-
-## 88. 跨profile URL候选
-
-若工作资料允许`ALLOW_PARENT_PROFILE_APP_LINKING`，PMS在parent user查询同一Intent，忽略泛化浏览器，计算非浏览器App候选中的最佳domain status，并合成IntentForwarder ResolveInfo。
-
-## 89. 跨profile的NEVER语义
-
-若parent候选最佳状态仍为NEVER，返回null，不提供跨profile转发。`bestDomainVerificationStatus()`还显式把NEVER当作最差值，不能按枚举数值4>3>2简单比较。
-
-## 90. 跨profile候选何时进入当前结果
-
-当前user没有ALWAYS时，可把parent转发候选与ASK/UNDEFINED结果一起加入；若当前有ALWAYS，当前已验证App通常优先，不把普通parent选项混入。
-
-## 91. Instant App在更早处决定是否尝试
-
-`isInstantAppResolutionAllowed()`对Web Intent要求host非空且Web Instant Apps未禁用；如果本地非浏览器候选已是ALWAYS或ALWAYS_ASK，或已有匹配Instant App安装，则拒绝外部Instant解析。
-
-## 92. 本地ALWAYS为何阻止Instant搜索
-
-平台已经有用户认可/验证的确定处理策略，再访问远端Instant Resolver既增加延迟和隐私暴露，也可能破坏用户选择，因此直接停止外部发现。
-
-## 93. URL选择不是单一if-else
-
-完整顺序至少包含：普通Filter语法、用户/包可见性、current/cross profile、是否允许Instant、domain分桶、默认浏览器、统一排序、preferred与Resolver。只看`filterCandidatesWithDomainPreferredActivitiesLPr()`不能解释全部结果。
-
-## 94. 候选过滤决策图
-
-```mermaid
-flowchart TD
-    C["普通匹配后的URL候选"] --> B["按status与browser分类"]
-    B --> A{"存在ALWAYS？"}
-    A -- 是 --> R1["先加入ALWAYS<br/>preferredOrder=generation"]
-    A -- 否 --> R2["加入ASK/UNDEFINED<br/>可加入parent转发"]
-    R2 --> IB["includeBrowser=true"]
-    R1 --> AA{"存在ALWAYS_ASK？"}
-    AA -- 是 --> ZERO["清零已有preferredOrder<br/>加入ALWAYS_ASK"]
-    ZERO --> IB
-    AA -- 否 --> SORT["不加入浏览器"]
-    IB --> ALL{"MATCH_ALL？"}
-    ALL -- 是 --> ABS["加入所有浏览器"]
-    ALL -- 否 --> DEF{"默认浏览器匹配且<br/>priority不低于其他浏览器？"}
-    DEF -- 是 --> ONE["只加入默认浏览器匹配"]
-    DEF -- 否 --> ABS
-    ONE --> FALL["若仍为空：全部候选减NEVER"]
-    ABS --> FALL
-    FALL --> SORT["统一ResolveInfo排序 + chooseBest"]
-```
-
-## 95. `ALWAYS_ASK`名字为何反直觉
-
-它不是“永远选择这个App”，而是“这个App的存在永远造成歧义”。即使另一个App处于ALWAYS，也要保留对话框选择机会。
-
-## 96. ASK与UNDEFINED为何进同一桶
-
-在候选过滤阶段二者都不获得直达优先级，都作为可询问的App Link候选；差异主要来自状态来源和管理语义，而非此处展示顺序。
-
-## 97. 自动失败不会直接写NEVER
-
-验证失败把主状态设为ASK，并按旧状态规则降级。NEVER代表用户/策略明确不希望该App处理，而不是网络暂时失败。
-
-## 98. 一个失败host会拖累整个包
-
-这是r48包级模型最重要的工程后果：将互不相关、部署节奏不同的许多host放入同一包验证批次，会增加整批失败概率；而failedDomains并不会让其余host单独保持成功。
-
-## 99. path不参与网站所有权验证
-
-assetlinks证明host对App身份的委托；具体`/product/42`是否匹配仍由IntentFilter path规则决定。验证成功不能扩张Manifest声明的path，Manifest path也不能替代host所有权证明。
-
-## 100. HTTP链接为什么仍走HTTPS验证
-
-App可以处理http链接，但Digital Asset Links声明必须从可信HTTPS位置获取，避免明文网络被篡改后伪造网站授权。r48代理固定scheme正体现这层安全设计。
-
-## 101. 重定向不是App Link状态本身
-
-浏览器访问URL后服务器302到自定义scheme，是浏览器/网络导航行为；PMS对原始http/https Intent的domain验证只看当前Intent data和已保存状态，不追踪未来HTTP重定向链。
-
-## 102. 签名轮换要同步网站声明
-
-Verifier用当前安装包证书指纹构造target。应用换签或使用新证书而assetlinks.json未包含兼容指纹时，关联匹配失败，即使packageName没变。
-
-## 103. 包可见性仍然存在
-
-Android 11 query结果还会经过AppsFilter/post-resolution过滤。Domain状态决定Web候选偏好，不授予调用者枚举任意包的能力。
-
-## 104. exported与permission仍在启动阶段
-
-一个Activity通过Web Filter与Domain策略进入ResolveInfo，仍不意味着任意UID可成功start。ATMS后续继续检查exported、组件permission、用户状态和其他执行策略。
-
-## 105. 易错理解一：autoVerify等于ALWAYS
-
-错。autoVerify只是请求网络验证；成功后Settings状态才可能变成ALWAYS，显式用户NEVER/ALWAYS_ASK还会被保留。
-
-## 106. 易错理解二：每个host独立保存结果
-
-错。r48默认链聚合包内hosts，所有source共同决定一次成功/失败，IntentFilterVerificationInfo只有包级main status。
-
-## 107. 易错理解三：默认浏览器总是打开所有URL
-
-错。已有ALWAYS App Link且没有ALWAYS_ASK时，浏览器通常根本不进入最终候选集。
-
-## 108. 易错理解四：NEVER数值3所以比ALWAYS 2更高
-
-错。状态不是可直接按整数排序的优先级；源码明确把NEVER视为最差并从结果删除。
-
-## 109. 易错理解五：验证成功绕过IntentFilter
-
-错。先有普通action/category/scheme/host/path匹配，后有domain policy。ALWAYS不能召回Manifest未声明的URL。
-
-## 110. 第一次复读：触发范围修订
-
-最容易误写成“只验证autoVerify所在Filter”。r48真实行为是：一个合格autoVerify Filter触发后，包内所有`handlesWebUris(false)` Filter都进入同一批次。
-
-## 111. 第二次复读：状态粒度修订
-
-不能用新Android的逐domain状态解释r48。这里domains是包级集合，main/per-user status按包保存，failedDomains主要用于日志；这是本章所有候选行为的前提。
-
-## 112. macOS只读练习1：手算Web Filter分类
+### 练习 1：把 Intent、Filter 与 package 三层谓词逐行对齐
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '550,705p' \
-  frameworks/base/core/java/android/content/IntentFilter.java
-sed -n '11195,11230p' \
-  frameworks/base/core/java/android/content/Intent.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'public boolean hasWebURI() {' frameworks/base/core/java/android/content/Intent.java
+grep -n -F 'return scheme.equals(IntentFilter.SCHEME_HTTP) || scheme.equals(IntentFilter.SCHEME_HTTPS);' frameworks/base/core/java/android/content/Intent.java
+grep -n -F 'public boolean isWebIntent() {' frameworks/base/core/java/android/content/Intent.java
+grep -n -F 'public final boolean handleAllWebDataURI() {' frameworks/base/core/java/android/content/IntentFilter.java
+grep -n -F '(handlesWebUris(false) && countDataAuthorities() == 0);' frameworks/base/core/java/android/content/IntentFilter.java
+grep -n -F 'public final boolean handlesWebUris(boolean onlyWebSchemes) {' frameworks/base/core/java/android/content/IntentFilter.java
+grep -n -F 'if (!hasAction(Intent.ACTION_VIEW)' frameworks/base/core/java/android/content/IntentFilter.java
+grep -n -F 'public final boolean needsVerification() {' frameworks/base/core/java/android/content/IntentFilter.java
+grep -n -F 'return getAutoVerify() && handlesWebUris(true);' frameworks/base/core/java/android/content/IntentFilter.java
+grep -n -F 'pkg.setHasDomainUrls(hasDomainURLs(pkg));' frameworks/base/core/java/android/content/pm/parsing/ParsingPackageUtils.java
+grep -n -F 'private static boolean hasDomainURLs(ParsingPackage pkg) {' frameworks/base/core/java/android/content/pm/parsing/ParsingPackageUtils.java
+grep -n -F 'if (!aii.hasAction(Intent.ACTION_DEFAULT)) continue;' frameworks/base/core/java/android/content/pm/parsing/ParsingPackageUtils.java
+grep -n -F 'public static final String ACTION_DEFAULT = ACTION_VIEW;' frameworks/base/core/java/android/content/Intent.java
 ```
 
-分别为“https+host”“http/https无host”“https+myapp混合scheme”“CATEGORY_APP_BROWSER”判断：`hasWebURI`、`isWebIntent`、`handlesWebUris(true/false)`、`needsVerification`和`handleAllWebDataURI`各返回什么。
+## 3. 安装只排入验证请求：commit 与网络证明不是同一事务
 
-## 113. macOS只读练习2：追安装验证批次
+普通非 instant 安装在 `preparePackageLI()` 已完成代码目录 rename 与 fs-verity 设置后调用 `startIntentFilterVerifications()`，此时后面的 scan、reconcile、commit 尚未全部结束。该方法不联网，只把 packageName、`isHasDomainUrls`、Activity 列表、replacing、userId 与 verifierUid 封进 `IFVerificationParams`，向 PMS Handler 投递 `START_INTENT_FILTER_VERIFICATIONS`。
+
+常规安装本身由 `processInstallRequestsAsync()` 投到同一个 Handler，并在该 Runnable 内持 `mInstallLock` 执行 `installPackagesLI()`。因此 prepare 中新投的验证消息通常要等当前安装 Runnable 让出 Looper 后才能处理：成功提交不是等待网站响应得出的，网络失败也不会回滚 APK。
+
+这个时序仍不是原子保证。多包安装可在较早 package 的 prepare 阶段排入消息，随后另一 package 在 scan/reconcile 失败；当前 Runnable 结束后验证消息仍会处理。若目标没有进入 `mSettings.mPackages`，创建持久 `IntentFilterVerificationInfo` 会失败，但内存验证状态与外部请求未必在同一点消失。反过来，设备没有选出 `mIntentFilterVerifierComponent` 时，入口直接返回，连消息也不会排。
+
+instant 安装明确跳过这条 App Link 验证。不要把“instant 以后也能参与 URL 解析”与“instant APK 在此安装点接受同一网络验证”混为一谈。
+
+### 练习 2：确认验证消息位于 prepare 与 commit 之间
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '1235,1480p' \
-  frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
-sed -n '17938,18125p' \
-  frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
-sed -n '20,145p' \
-  frameworks/base/services/core/java/com/android/server/pm/IntentFilterVerificationState.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private void processInstallRequestsAsync(boolean success,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mHandler.post(() -> {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'installPackagesTracedLI(installRequests);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'private PrepareResult preparePackageLI(InstallArgs args, PackageInstalledInfo res)' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'setUpFsVerityIfPossible(parsedPackage);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'startIntentFilterVerifications(args.user.getIdentifier(), replace, parsedPackage);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'private void startIntentFilterVerifications(int userId, boolean replacing, AndroidPackage pkg) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'Message msg = mHandler.obtainMessage(START_INTENT_FILTER_VERIFICATIONS);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'case START_INTENT_FILTER_VERIFICATIONS: {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'private void installPackagesLI(List<InstallRequest> requests) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'reconciledPackages = reconcilePackagesLocked(' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'commitPackagesLocked(commitRequest);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
 ```
 
-标出token、Verifier UID、filter/host聚合、显式广播和回调状态。回答：为什么一个autoVerify Filter会让同包其他Web Filter也被验证？
+## 4. 批次构造：一个合格 autoVerify 触发，包内全部 Web Filter 共同投票
 
-## 114. macOS只读练习3：核对assetlinks验证
+Handler 中的 `verifyIntentFiltersIfNeeded()` 先检查 Activity 列表和 package 快照门。新安装且 Settings 已存在恢复来的 `IntentFilterVerificationInfo` 时，会仅凭“对象存在”直接返回；这里不要求其 main status 已是成功。替换安装则继续比较旧账。
+
+随后第一轮扫描寻找触发器。只有 `needsNetworkVerificationLPr(packageName)` 允许，且至少一个 Filter 的 `needsVerification()` 为真，`needToRunVerify` 才成立。main status 为 UNDEFINED、ALWAYS、ASK 时网络验证仍被允许；其余值走默认拒绝。
+
+一旦触发，第二轮不是只收 autoVerify 所在 Filter，而是把包内所有 `handlesWebUris(false)` 的 Filter 加入同一 verificationId。每个 Filter 的 authorities 经 `getHostsList()` 汇入 `ArraySet`；path、port 与 MIME 不构成网站身份。Filter 可以同时声明非 Web scheme，而某个没有 authority 的 Web Filter会贡献零个 host。
+
+替换安装用新 domains 与旧 `IntentFilterVerificationInfo.domains` 比较。在 main status 仍允许网络验证、并且仍有合格 autoVerify 触发器的前提下，旧集合包含新集合且当前用户策略为 ALWAYS 时，可以保留状态并跳过重验；新增 host 只会令 `keepCurState` 失效，随后才进入重验。若旧 main 已是 NEVER，或 XML/Parcel 异常载入了其他非 UNDEFINED/ALWAYS/ASK 值，`needsNetworkVerificationLPr()` 会先压掉触发器，代码不会发送新请求，而会落入“曾验证、现不运行验证”的清账分支。这里有两条 r48 实现边界：
+
+- pending `IntentFilterVerificationState` 与 `mCurrentIntentFilterVerifications` 在计算 `keepCurState` 之前已经创建；早退没有撤销它们。由控制流可推得，后续另一个包调用 `startVerifications()` 时可能把这条本想跳过的旧请求一并发出；若没有后续调用，它会留在内存集合中。
+- 更新后 `hasDomainUrls == false` 会在读取旧验证账之前返回，所以“完全移除 Web 入口”并不会从这条路径清掉旧 `IntentFilterVerificationInfo` 与用户状态。
+
+这两点是当前实现的生命周期缺口，不应提升为平台设计意图。
+
+### 练习 3：验证触发扫描、全包聚合与早退位置
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '45,220p' \
-  frameworks/base/packages/StatementService/src/com/android/statementservice/IntentFilterVerificationReceiver.java
-sed -n '120,285p' \
-  frameworks/base/packages/StatementService/src/com/android/statementservice/DirectStatementService.java
-sed -n '114,215p' \
-  frameworks/base/packages/StatementService/src/com/android/statementservice/retriever/DirectStatementRetriever.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private void verifyIntentFiltersIfNeeded(int userId, int verifierUid, boolean replacing,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (!hasDomainUrls) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (!replacing && previouslyVerified) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'final boolean needsVerification = needsNetworkVerificationLPr(packageName);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (needsVerification && filter.needsVerification()) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (needToRunVerify || previouslyVerified) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (filter.handlesWebUris(false /*onlyWebSchemes*/)) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mIntentFilterVerifier.addOneIntentFilterVerification(' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'domains.addAll(filter.getHostsList());' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'hostSetExpanded = !previouslyVerified' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (needToRunVerify && keepCurState) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mCurrentIntentFilterVerifications.add(verificationId);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mCurrentIntentFilterVerifications.clear();' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
 ```
 
-找出最多host数、固定relation、HTTPS路径、packageName/证书指纹和allSourcesVerified。回答：failedSources为何没有变成PMS逐域名状态？
+## 5. 验证器发现与请求：组件、UID、token、白名单各解决不同问题
 
-## 115. macOS只读练习4：手算URL候选集
+PMS 启动时以 `ACTION_INTENT_FILTER_NEEDS_VERIFICATION` 和 package-archive MIME 查询 system-only Receiver，再检查候选包持有 `INTENT_FILTER_VERIFICATION_AGENT`，取 Filter priority 最高者作为显式组件。发现组件解决“广播发给谁”；安装时记录 verifier UID，又解决“回调由谁提交”。两者不能互相替代。
+
+r48 在这里还有一条可达的多用户断接。`USER_ALL` 会被映射到 system user，但其他安装值直接用于 `getPackageUid()`，所以 user 10 的单用户安装会记录 user 10 verifier 的完整 UID；请求却固定 `sendBroadcastAsUser(..., UserHandle.SYSTEM)`。AOSP StatementService 的 Receiver 没有 `singleUser`，其 Service 从 user 0 回调，而 `setVerifierResponse()` 比较的是完整 UID，不是 appId。结果是：非 0 用户的 user-specific 安装可收到网站检查结果，却因 UID 不同而拒绝结账，token 保持 PENDING；system user 或 `USER_ALL` 不触发这个错位。该路径并非纯理论，因为非 shell/root 安装器会被清掉 `INSTALL_ALL_USERS`，Session 随后使用具体 `userId`。
+
+每个批次分配递增 `verificationId`，创建 `IntentFilterVerificationState(verifierUid, userId, packageName)`，置为 PENDING，并保存 Filter 与 host 集合。`getHostsString()` 用空格拼接，并把 `*.example.com` 去掉 `*.` 后按根域名请求；它不枚举子域名，也不保留 path。原始 `example.com` 与 wildcard 归一后可能形成重复文本，因为去重发生在归一化之前。
+
+`startVerifications()` 先把 domains 写入或更新 Settings 中的 `IntentFilterVerificationInfo`，随后发送显式前台广播。四个 extra 是 verificationId、固定 `https` scheme、空格分隔 hosts、packageName。即使 manifest 只声明 HTTP，网站证明仍从 HTTPS 获取。
+
+发送前，PMS 用 `getVerificationTimeout()` 的时长把验证器临时加入省电白名单，并把同一时长放进 `BroadcastOptions`。默认下限是 10 秒，配置只能加长。这个 timeout 在 App Link 路径中没有对应“到点按 verificationId 自动失败”的 Handler 消息；它限制后台启动机会，不是网络验证完成期限。
+
+### 练习 4：钉住验证器筛选、token 与显式广播
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '7685,7860p' \
-  frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
-sed -n '731,790p' \
-  frameworks/base/services/core/java/com/android/server/role/RoleManagerService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private @NonNull ComponentName getIntentFilterVerifierComponentNameLPr() {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'final Intent intent = new Intent(Intent.ACTION_INTENT_FILTER_NEEDS_VERIFICATION);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'MATCH_SYSTEM_ONLY | MATCH_DIRECT_BOOT_AWARE | MATCH_DIRECT_BOOT_UNAWARE,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (best == null || cur.priority > best.priority) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'final int verificationId = mIntentFilterVerificationToken++;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mIntentFilterVerificationStates.append(verificationId, ivs);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'params.installFlags &= ~PackageManager.INSTALL_ALL_USERS;' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerService.java
+grep -n -F 'user = new UserHandle(userId);' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F '(userId == UserHandle.USER_ALL) ? UserHandle.USER_SYSTEM : userId);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'private String getDefaultScheme() {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'return IntentFilter.SCHEME_HTTPS;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'verificationIntent.setComponent(mIntentFilterVerifierComponent);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'options.setTemporaryAppWhitelistDuration(whitelistTimeout);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mContext.sendBroadcastAsUser(verificationIntent, UserHandle.SYSTEM,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (mRequiredVerifierUid == callerUid) {' frameworks/base/services/core/java/com/android/server/pm/IntentFilterVerificationState.java
+grep -n -F 'android:name=".IntentFilterVerificationReceiver"' frameworks/base/packages/StatementService/AndroidManifest.xml
+grep -n -F 'private static final long DEFAULT_VERIFICATION_TIMEOUT = 10 * 1000;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'return Math.max(timeout, DEFAULT_VERIFICATION_TIMEOUT);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
 ```
 
-构造两个ALWAYS App、一个ASK App、一个ALWAYS_ASK App、一个NEVER App和两个浏览器，分别在有/无ALWAYS_ASK、MATCH_ALL开/关时写出最终候选，并用generation解释排序。
+## 6. 回调完成协议：permission、required UID 与 token 三关之后才写账
 
-## 116. 第三次复读：默认浏览器边界修订
+验证器调用 `verifyIntentFilter(id, code, failedDomains)` 时，Binder 入口先要求 `INTENT_FILTER_VERIFICATION_AGENT`，再捕获 `Binder.getCallingUid()` 并把响应排回 PMS Handler。Handler 查不到 id 会记录无效 token；找到后仍要由 `IntentFilterVerificationState.setVerifierResponse()` 比较 caller UID 与安装时保存的 required verifier UID。
 
-默认浏览器来自ROLE_BROWSER，只在includeBrowser路径尝试收敛浏览器桶；它不是域名验证结果，也不会压过正常ALWAYS App Link。
+UID 不同不会完成状态，内存 token 也不会删除。UID 相同时，code 为 SUCCESS 得到 SUCCESS state，为 FAILURE 得到 FAILURE state；其他整数仍会把 `mVerificationComplete` 置真，但内部 state 保持 UNDEFINED，随后按 `isVerified() == false` 进入失败处置。这表明 permission 是调用资格，UID 是批次绑定，code 才是结果内容。
 
-## 117. 第四次复读：timeout边界修订
+接受响应后，`receiveVerificationResponse()` 先把每个内存 ParsedIntentInfo 设为 verified/unverified，再从 pending map 删除 token，然后更新持久账。`failedDomains` 只在 FAILURE 日志中输出，既不参与 Filter 子集更新，也不形成 `host → status` 表。
 
-验证广播使用`getVerificationTimeout()`设置临时白名单，但这段旧代码未安排同token的延迟失败消息。不能仅凭默认10秒推断PMS必然在10秒后提交ASK。
+`IntentFilter.setVerified()` 在 r48 还有一个直接可见的不一致：setter 清/写 `STATE_VERIFIED`，getter 却在 checked 后读取 `STATE_NEED_VERIFY`。IntentResolver 这里只把 getter 用于诊断日志；URL 候选真正读取 Settings 的包/用户状态。故内存 Filter 位不能作为验证真相的唯一证据。
 
-## 118. 自测题
+若正确 UID 永远不回调，当前路径既没有 token 专用 timeout，也没有别的清理分支；PENDING 可留在 `mIntentFilterVerificationStates`。token 也不绑定包版本：只要同一轮 system_server 中旧 id 仍在，迟到的正确 UID 回调就会按 packageName 查当时当前的 IVI；新旧批次重叠时，较晚被 Handler 处理的响应可以覆盖较早写入的 main status。广播白名单到期不会代替回调关闭这本账。
 
-1. `hasWebURI()`、`isWebIntent()`与`handlesWebUris(true)`各检查什么？
-2. autoVerify为何不等于验证成功？
-3. 为什么同包其他Web Filter也会进入验证批次？
-4. assetlinks.json怎样绑定网站与APK身份？
-5. r48失败域名为何不能独立保留其他域名成功？
-6. per-user status为何优先于main status？
-7. appLinkGeneration怎样影响多个ALWAYS候选？
-8. ALWAYS_ASK怎样改变ALWAYS与浏览器候选？
-9. 默认浏览器在什么条件下只保留一条？
-10. 验证成功为何仍不等于一定能启动Activity？
+## 7. StatementService 先规范输入：十个 host 上限早于网络请求
 
-## 119. 自测题参考答案
+AOSP 默认验证器只是协议的一种实现，设备厂商可以提供满足 system-only、权限和 priority 选择条件的其他 Receiver。默认 `IntentFilterVerificationReceiver` 在主线程解析四个 extra，构造固定 relation，并通过 `startService()` 把工作交给 `DirectStatementService`。
 
-1. 前者只看http/https data；第二个再要求ACTION_VIEW；Filter方法要求VIEW+BROWSABLE且scheme全为Web scheme。
-2. 它只是请求位，必须经过Verifier网络校验并写入Settings。
-3. 一处合格autoVerify只负责触发，第二轮会聚合包内全部`handlesWebUris(false)` Filter。
-4. HTTPS站点Statement用`handle_all_urls` relation指向packageName与SHA-256签名指纹。
-5. 一批host共同产生一个success/failure，旧账本只存包级状态；failedDomains主要用于日志。
-6. 用户明确选择应覆盖自动验证主结果；UNDEFINED才回退main status。
-7. ALWAYS时generation写入preferredOrder，新generation通常先排序并被直接选中。
-8. 清零已选结果order，加入ALWAYS_ASK并允许浏览器，迫使歧义选择。
-9. includeBrowser、非MATCH_ALL、ROLE_BROWSER包有匹配，且其priority不低于其他浏览器最大值。
-10. ATMS还要检查exported、permission、用户和其他启动策略。
+Receiver 用空格切 hosts，超过 10 个立即向 PMS 回整批 FAILURE，不发 HTTP。这个上限属于 AOSP StatementService，不是 manifest 或 PMS 的语法上限。PMS 已经剥过 wildcard 前缀，Receiver 又做一次同样处理；随后 `Patterns.DOMAIN_NAME` 校验每个 host，并只接受 http/https scheme。空 host、非法包名、`getPackageInfo()` 抛 `NameNotFoundException` 或 Web asset URL 构造失败都会进入显式 FAILURE 回调；证书数组为 null 等未被这两个 catch 覆盖的运行时异常则不保证回调。
 
-## 120. 本章总结与下一章预告
+`DirectStatementService` 在后台优先级 `HandlerThread` 上执行网络与 JSON 解析，避免 Receiver 主线程阻塞。它返回 `START_STICKY`，代码中没有按单个 startId 调 `stopSelf()`；这属于服务生命周期实现边界，不是验证 token 的完成信号。
 
-Android 11的Web解析建立在普通IntentFilter匹配之上：autoVerify触发PMS按包聚合Web Filters与hosts，AOSP StatementService从HTTPS `assetlinks.json`核对`handle_all_urls`、包名和签名指纹，并以整批成功/失败回写包级主状态及每用户策略。解析URL时，PMS把非浏览器候选分入ALWAYS、ASK/UNDEFINED、ALWAYS_ASK、NEVER，再把泛化浏览器单独处理；ALWAYS通常排除浏览器，ALWAYS_ASK重新制造歧义，默认浏览器只在需要浏览器时收敛浏览器桶，generation则解决多个ALWAYS的相对顺序。下一章将进入第256章“Android PackageInstallerSession创建、参数校验与多阶段提交状态机”，从PackageInstaller客户端会话一路追到PMS安装入口。
+目标 Android asset 由 packageName 与 PackageManager `GET_SIGNATURES` 返回证书的规范化 SHA-256 指纹列表组成。无签名轮换历史时，这通常是当前 signer；若包携带 signing lineage，r48 的兼容接口只返回 `pastSigningCertificates[0]`，即最旧 signer，而不是当前 signer。target matcher 要求 packageName 相同、网站声明与该接口实际返回的指纹集合至少有一个交集，并不要求两边列表全等。
+
+### 练习 5：检查 host 数量、输入拒绝与后台线程
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private static final Integer MAX_HOSTS_PER_REQUEST = 10;' frameworks/base/packages/StatementService/src/com/android/statementservice/IntentFilterVerificationReceiver.java
+grep -n -F 'private static final String HANDLE_ALL_URLS_RELATION' frameworks/base/packages/StatementService/src/com/android/statementservice/IntentFilterVerificationReceiver.java
+grep -n -F 'String[] hostList = hosts.split(" ");' frameworks/base/packages/StatementService/src/com/android/statementservice/IntentFilterVerificationReceiver.java
+grep -n -F 'if (hostList.length > MAX_HOSTS_PER_REQUEST) {' frameworks/base/packages/StatementService/src/com/android/statementservice/IntentFilterVerificationReceiver.java
+grep -n -F 'if (host.startsWith("*.")) {' frameworks/base/packages/StatementService/src/com/android/statementservice/IntentFilterVerificationReceiver.java
+grep -n -F 'if (!Patterns.DOMAIN_NAME.matcher(host).matches()) {' frameworks/base/packages/StatementService/src/com/android/statementservice/IntentFilterVerificationReceiver.java
+grep -n -F 'context.startService(serviceIntent);' frameworks/base/packages/StatementService/src/com/android/statementservice/IntentFilterVerificationReceiver.java
+grep -n -F 'mThread = new HandlerThread("DirectStatementService thread",' frameworks/base/packages/StatementService/src/com/android/statementservice/DirectStatementService.java
+grep -n -F 'mHandler.post(new ExceptionLoggingFutureTask<Void>(' frameworks/base/packages/StatementService/src/com/android/statementservice/DirectStatementService.java
+grep -n -F 'return START_STICKY;' frameworks/base/packages/StatementService/src/com/android/statementservice/DirectStatementService.java
+grep -n -F 'PackageManager.GET_SIGNATURES).signatures;' frameworks/base/packages/StatementService/src/com/android/statementservice/retriever/Utils.java
+grep -n -F 'MessageDigest.getInstance("SHA-256");' frameworks/base/packages/StatementService/src/com/android/statementservice/retriever/Utils.java
+grep -n -F 'pi.signatures[0] = signingDetails.pastSigningCertificates[0];' frameworks/base/core/java/android/content/pm/parsing/PackageInfoWithoutStateUtils.java
+```
+
+## 8. Digital Asset Links：网站是 source，安装包身份是 target
+
+每个 source Web asset 最终读取 `https://host/.well-known/assetlinks.json`。验证方向是“网站声明将某种关系授予 Android App”，不是 App 自称拥有网站。固定 relation 是 `delegate_permission/common.handle_all_urls`；target matcher 同时匹配 namespace、packageName 与至少一个共同证书指纹。
+
+网站文件中对应一条记录的概念结构是：relation 数组包含 handle-all-urls，target 的 namespace 为 `android_app`，并列出 package_name 与 `sha256_cert_fingerprints`。本章只说明字段契约，不用示例短指纹冒充可部署内容。
+
+网络实现还有一组会改变失败语义的硬边界：
+
+- 初始 URL 固定 well-known path，单响应内容上限 1 MiB；
+- connect 与 read timeout 都是 5 秒；I/O 失败最多尝试 3 次，重试间隔 3 秒；
+- HTTP 404/500 返回空内容且不按 I/O 异常重试；
+- 代码先把 follow-redirects 设真又立即设假，实际最终不自动跟随 HTTP 重定向；
+- JSON 可包含 include，递归层级上限为 1；不安全的非 HTTPS include 会被拒绝；
+- Service 安装 1 MiB `HttpResponseCache`，但“有缓存”不表示证明永远有效。
+
+Retriever 的结果还携带 HTTP 过期时间，但 `DirectStatementService` 只读取 statements，不按 `getExpireMillis()` 安排重新验证。缓存过期只影响未来抓取，不会自动撤销已经持久化的 ALWAYS。
+
+这些失败最后大多折叠成“这个 source 没找到匹配 statement”，不会把 DNS、timeout、HTTP status、JSON 错误分别写入 PMS 状态。整份 JSON 列表无法解析时会得到空结果。单个元素只有在 JSON reader 已成功消费、语义构造阶段抛 `AssociationServiceException` 时才会被跳过，此后同一文件的有效记录仍可成功；字段类型、数组内容或 reader 引发的 `JSONException`/`IOException` 会逃出逐元素循环，使整份列表折为空结果。
+
+### 练习 6：核对 URL、relation、证书与网络失败边界
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private static final String WELL_KNOWN_STATEMENT_PATH = "/.well-known/assetlinks.json";' frameworks/base/packages/StatementService/src/com/android/statementservice/retriever/DirectStatementRetriever.java
+grep -n -F 'private static final int HTTP_CONNECTION_TIMEOUT_MILLIS = 5000;' frameworks/base/packages/StatementService/src/com/android/statementservice/retriever/DirectStatementRetriever.java
+grep -n -F 'private static final int HTTP_CONNECTION_BACKOFF_MILLIS = 3000;' frameworks/base/packages/StatementService/src/com/android/statementservice/retriever/DirectStatementRetriever.java
+grep -n -F 'private static final int HTTP_CONNECTION_RETRY = 3;' frameworks/base/packages/StatementService/src/com/android/statementservice/retriever/DirectStatementRetriever.java
+grep -n -F 'private static final long HTTP_CONTENT_SIZE_LIMIT_IN_BYTES = 1024 * 1024;' frameworks/base/packages/StatementService/src/com/android/statementservice/retriever/DirectStatementRetriever.java
+grep -n -F 'private static final int MAX_INCLUDE_LEVEL = 1;' frameworks/base/packages/StatementService/src/com/android/statementservice/retriever/DirectStatementRetriever.java
+grep -n -F 'connection.setInstanceFollowRedirects(false);' frameworks/base/packages/StatementService/src/com/android/statementservice/retriever/URLFetcher.java
+grep -n -F 'if (connection.getResponseCode() != HttpURLConnection.HTTP_OK) {' frameworks/base/packages/StatementService/src/com/android/statementservice/retriever/URLFetcher.java
+grep -n -F 'if (relation.matches(statement.getRelation())' frameworks/base/packages/StatementService/src/com/android/statementservice/DirectStatementService.java
+grep -n -F '&& target.matches(statement.getTarget())) {' frameworks/base/packages/StatementService/src/com/android/statementservice/DirectStatementService.java
+grep -n -F 'Result statements = mStatementRetriever.retrieveStatements(source);' frameworks/base/packages/StatementService/src/com/android/statementservice/DirectStatementService.java
+grep -n -F '} catch (AssociationServiceException e) {' frameworks/base/packages/StatementService/src/com/android/statementservice/retriever/StatementParser.java
+grep -n -F 'The element in the array is well formatted Json but not a well-formed Statement.' frameworks/base/packages/StatementService/src/com/android/statementservice/retriever/StatementParser.java
+grep -n -F '} catch (JSONException | IOException e) {' frameworks/base/packages/StatementService/src/com/android/statementservice/retriever/DirectStatementRetriever.java
+grep -n -F 'public long getExpireMillis() {' frameworks/base/packages/StatementService/src/com/android/statementservice/retriever/DirectStatementRetriever.java
+grep -n -F 'public static boolean hasCommonString(List<String> list1, List<String> list2) {' frameworks/base/packages/StatementService/src/com/android/statementservice/retriever/Utils.java
+```
+
+## 9. 整批 AND 语义：failedSources 能诊断，却不能保存部分成功
+
+`IsAssociatedCallable` 对 source 列表逐个调用 `verifyOneSource()`。任一 source 没有 relation + target 双重匹配，或检索抛出关联异常，就加入 `failedSources` 并把 `allSourcesVerified` 置假；循环仍会继续检查其余 source。最终只有所有 source 都成功，ResultReceiver 才向 PMS 回 SUCCESS。
+
+传给 Service 的 target、relation 或 source descriptor 整体格式错误时走 `RESULT_FAIL`，Receiver 同样映射为 PMS FAILURE，但 failedDomains 为空；这不同于网站 `assetlinks.json` 解析失败所形成的单 source 不匹配。逐 host 失败则携带 source asset 的 JSON 字符串，而不是单纯 host 字符串；PMS 只把它们拼进调试日志。
+
+所以 r48 默认链的真值模型是：
+
+`每个 source 独立抓取/查 statement → 所有 source 做 AND → 一个 verificationId 只有一笔成功或失败 → 一个包级 main status`
+
+一个暂时离线的 host 会拖累同批其他已正确部署的 host，成功 host 也没有独立持久位。把部署节奏不同的大量域名塞进同一包，会提高整批失败概率；这是旧包级模型的工程后果。
+
+## 10. 两张持久账：packages.xml 的 main 与 user restrictions 的 policy
+
+全局 `IntentFilterVerificationInfo` 挂在 `PackageSettingBase` 上，记录 packageName、domains 集合与 `mMainStatus`。它写在 `/data/system/packages.xml` 对应 `<package>` 内的 `<domain-verification>`，未知包的待恢复项则暂存在顶层 `<restored-ivi>`。它不是 `host → result` Map；`setStatus()` 只接受 UNDEFINED(0)、ASK(1)、ALWAYS(2)、NEVER(3)，不接受 ALWAYS_ASK(4)。但 `readFromXml()` 与 Parcel 构造直接给 `mMainStatus` 赋值，不经过 setter；恢复或损坏输入仍可能带入 4 或其他整数。
+
+每用户 `PackageUserState` 另存 `domainVerificationStatus` 与 `appLinkGeneration`，写在 `/data/system/users/<userId>/package-restrictions.xml` 的 `<pkg>` 属性中。UNDEFINED 时 `domainVerificationStatus` 属性省略，但 generation 只要非零仍会写出；读取时两者也不做枚举或配对校验。PMS 内部查询用一个 packed long：高 32 位是 status，低 32 位是 generation。`getDomainVerificationStatusLPr()` 先读用户值；只有高位 UNDEFINED 才退到 main status，并把低位变成 0。公开 `getIntentVerificationStatus()` 则直接返回用户高位，不替调用者执行这次 fallback。
+
+这解释了“shell 显示 undefined、URL 却按 always 处理”：前者可能看到裸用户状态，后者可回退到网络验证写下的 main ALWAYS。也解释了同包所有匹配 Activity 共享策略：查询只拿 `PackageSetting` 的包级/用户级值，不用 `IntentFilterVerificationInfo.domains` 再按当前 host 查一次。
+
+generation 的存储有两个边角。设置 ALWAYS 时分配新的每用户序号；切到其他 status 时 `setDomainVerificationStatusForUser()` 不清旧 generation，清 status 的方法也只改高位。XML 仍可能保存陈旧低位，但 domain 分桶只在 status 为 ALWAYS 时把它写入 `ResolveInfo.preferredOrder`。重启读文件后，Settings 把 next 设为现有最大 generation + 1，下一次 ALWAYS 更新又先加 1，所以序号可以跳号；它只需保持相对新旧，不承诺连续或等于时间戳。
+
+### 练习 7：确认 main、per-user、fallback 与 generation 的所有权
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private int mMainStatus;' frameworks/base/core/java/android/content/pm/IntentFilterVerificationInfo.java
+grep -n -F 'public void setStatus(int s) {' frameworks/base/core/java/android/content/pm/IntentFilterVerificationInfo.java
+grep -n -F 's <= INTENT_FILTER_DOMAIN_VERIFICATION_STATUS_NEVER) {' frameworks/base/core/java/android/content/pm/IntentFilterVerificationInfo.java
+grep -n -F 'public void readFromXml(XmlPullParser parser)' frameworks/base/core/java/android/content/pm/IntentFilterVerificationInfo.java
+grep -n -F 'mMainStatus = status;' frameworks/base/core/java/android/content/pm/IntentFilterVerificationInfo.java
+grep -n -F 'mMainStatus = source.readInt();' frameworks/base/core/java/android/content/pm/IntentFilterVerificationInfo.java
+grep -n -F 'IntentFilterVerificationInfo verificationInfo;' frameworks/base/services/core/java/com/android/server/pm/PackageSettingBase.java
+grep -n -F 'long getDomainVerificationStatusForUser(int userId) {' frameworks/base/services/core/java/com/android/server/pm/PackageSettingBase.java
+grep -n -F 'state.domainVerificationStatus) << 32;' frameworks/base/services/core/java/com/android/server/pm/PackageSettingBase.java
+grep -n -F 'void setDomainVerificationStatusForUser(final int status, int generation, int userId) {' frameworks/base/services/core/java/com/android/server/pm/PackageSettingBase.java
+grep -n -F 'state.appLinkGeneration = generation;' frameworks/base/services/core/java/com/android/server/pm/PackageSettingBase.java
+grep -n -F 'private long getDomainVerificationStatusLPr(PackageSetting ps, int userId) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (result >> 32 == INTENT_FILTER_DOMAIN_VERIFICATION_STATUS_UNDEFINED) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'alwaysGeneration = mNextAppLinkGeneration.get(userId) + 1;' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+grep -n -F 'mNextAppLinkGeneration.put(userId, maxAppLinkGeneration + 1);' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+grep -n -F 'private static final String ATTR_DOMAIN_VERIFICATON_STATE = "domainVerificationStatus";' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+grep -n -F 'private static final String ATTR_APP_LINK_GENERATION = "app-link-generation";' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+grep -n -F 'writeDomainVerificationsLPr(serializer, pkg.verificationInfo);' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+grep -n -F 'XmlUtils.writeIntAttribute(serializer, ATTR_APP_LINK_GENERATION,' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+```
+
+## 11. 自动响应的状态矩阵：有 IVI 时先改 main，用户明确选择通常保留
+
+正确 verifier UID 的响应到达、且 packageName 对应的 IVI 仍存在时，main status 按本次结果改写：成功为 ALWAYS，失败为 ASK，并安排 Settings 主文件写入。若安装失败等原因使 IVI 不存在，token 已被删除，但这一响应不会创建新账。然后仅当安装 userId 不是 `USER_ALL` 时，PMS 才处理该用户策略：
+
+| 旧 per-user status | 验证成功 | 验证失败 |
+| --- | --- | --- |
+| UNDEFINED | 改 ALWAYS，分配 generation | 仍 UNDEFINED，但实现仍走一次 update |
+| ASK | 改 ALWAYS，分配 generation | 保持 ASK，不 update |
+| ALWAYS | 保持 ALWAYS | 普通包降 UNDEFINED；sysconfig linked app 保持 |
+| NEVER | 保持 NEVER | 保持 NEVER |
+| ALWAYS_ASK | 保持 ALWAYS_ASK | 保持 ALWAYS_ASK |
+
+因此自动成功不会覆盖用户明确的 NEVER/ALWAYS_ASK，自动失败也不会直接写 NEVER。NEVER 表示用户/策略拒绝，不是网络暂时失败。`USER_ALL` 安装只改 main，并记录忽略 per-user autoVerify；不能把它写成对每个现有用户循环更新。
+
+SystemConfig `<app-link>` 是另一条预置信任路径。`primeDomainVerificationsLPw()` 只接受已安装 system package，聚合 BROWSABLE + http/https Filter 的 hosts，把 main 留为 UNDEFINED，却把指定用户状态设成 ALWAYS。非 system 包、未知包或没有 host 的条目只在 prime 入口记录警告。自动验证失败时的“不降级旧 ALWAYS”豁免却只检查包名是否存在于 `SystemConfig.getLinkedApps()`，不再复核 system 身份；若配置误列非 system 包，而它又从其他路径取得 ALWAYS，失败后仍可能被保留。
+
+## 12. 更新与恢复：host 集合影响是否重验，却不在查询时逐 host 裁决
+
+新安装如果 Settings 已从备份恢复任何 `IntentFilterVerificationInfo`，入口因对象存在直接跳过网络；它不检查 main 是否 ALWAYS。备份 writer 虽接收 userId，却实际遍历所有 package、只写全局 IVI，不含该用户 policy/generation。现存包在恢复时立即替换 IVI；未知包先进入 `mRestoredIntentFilterVerifications`，以 `<restored-ivi>` 留在 packages.xml，等 `addPackageSettingLPw()` 再挂到包上。用户查询可在自己的 status 为 UNDEFINED 时回退恢复来的 main。这是一条迁移信任路径，不是本次安装现场完成 HTTPS 证明。
+
+替换安装若 main status 允许网络验证、且仍有合格 autoVerify 触发器：
+
+- 新 domains 是旧集合的子集，且当前用户为 ALWAYS：更新 domains 后早退；
+- 新增任一 host，或当前策略不是 ALWAYS：不能走保留状态早退，并在至少收进一个 Web Filter 时发起整批重验；
+- 重验请求发送时会更新 domains 集合，但旧 main/per-user status 不会先清零，直到响应才按矩阵变化。
+
+最后一点与查询的包级 fallback 组合成重要窗口：一个原来 ALWAYS 的包升级新增 host 后，在重验尚未响应时，新的 host 候选也可能暂时继承旧 ALWAYS，因为 URL 分桶没有用 `ivi.domains` 对当前 host 做二次限定。
+
+只要调用已经穿过“存在 verifier、非 instant、Activity 非空、package `hasDomainUrls` 为真”等前置门，包曾有 IVI 却不再形成合格 autoVerify 触发器时，代码就删除全局 IVI；只有旧 domains 覆盖新 domains 且用户本来 ALWAYS 才保留用户状态，否则一并重置。旧 main 为 NEVER（以及异常载入的其他非 UNDEFINED/ALWAYS/ASK 值）也会让网络门关闭并落入这条清账分支。反之，无 verifier、instant 安装、Activity 为空，或 `hasDomainUrls == false` 都会更早返回；“删除所有 Web Filters 必然清账”并不是 r48 实现事实。
+
+清账的作用域也不对称：即便只为一个 user 调用 `removeIntentFilterVerificationLPw()`，它也会把 `PackageSetting` 上的全局 IVI 置空，从而改变其他用户的 main fallback；`alsoResetStatus` 只决定是否清当前用户的高位 status，旧 generation 仍保留。PackageSetting 更新副本又浅共享旧 IVI 与每用户状态，显式比较/清理前天然继承旧账。若单用户卸载后 PackageSetting 仍因其他用户、system app 或 keep-uninstalled 策略而保留，`markPackageUninstalledForUserLPw()` 会保留该用户 domain status、只把 generation 归零，并保留全包 IVI；普通非 system 包已无安装用户且不保留时会转入完整删除。完整删除也只有在不带 `DELETE_KEEP_DATA` 时才清所有用户验证状态并移除 PackageSetting。
+
+### 练习 8：沿自动响应、sysconfig 与更新早退检查状态迁移
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'final boolean verified = ivs.isVerified();' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'ivi.setStatus(INTENT_FILTER_DOMAIN_VERIFICATION_STATUS_ALWAYS);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'ivi.setStatus(INTENT_FILTER_DOMAIN_VERIFICATION_STATUS_ASK);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'case INTENT_FILTER_DOMAIN_VERIFICATION_STATUS_ALWAYS:' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'case INTENT_FILTER_DOMAIN_VERIFICATION_STATUS_UNDEFINED:' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'case INTENT_FILTER_DOMAIN_VERIFICATION_STATUS_ASK:' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'Slog.i(TAG, "autoVerify ignored when installing for all users");' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'private void primeDomainVerificationsLPw(int userId) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (!pkg.isSystem()) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'ivi.setStatus(INTENT_FILTER_DOMAIN_VERIFICATION_STATUS_UNDEFINED);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'clearIntentFilterVerificationsLPw(packageName, userId, !keepCurState);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'ps.setIntentFilterVerificationInfo(null);' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+grep -n -F 'boolean removeIntentFilterVerificationLPw(String packageName, int userId,' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+grep -n -F 'verificationInfo = orig.verificationInfo;' frameworks/base/services/core/java/com/android/server/pm/PackageSettingBase.java
+grep -n -F 'IntentFilterVerificationInfo ivi = mRestoredIntentFilterVerifications.get(p.name);' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+grep -n -F 'void writeAllDomainVerificationsLPr(XmlSerializer serializer, int userId)' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+grep -n -F 'ps.readUserState(nextUserId).domainVerificationStatus,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F '0 /*linkGeneration*/,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'public abstract boolean updateIntentVerificationStatusAsUser(' frameworks/base/core/java/android/content/pm/PackageManager.java
+grep -n -F 'public boolean updateIntentVerificationStatus(String packageName, int status, int userId) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (!mUserManager.exists(nextUserId)) return;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'android:name="android.permission.SET_PREFERRED_APPLICATIONS"' frameworks/base/core/res/AndroidManifest.xml
+```
+
+## 13. 管理 API 与默认浏览器：一个改 App Link 策略，一个提供 browser role
+
+客户端准确方法名是 `PackageManager.updateIntentVerificationStatusAsUser()`，下沉到 `IPackageManager/PMS.updateIntentVerificationStatus()`，再写 `Settings.updateIntentFilterVerificationStatusLPw()`；不要把 per-user API 与 `IntentFilterVerificationInfo.setStatus()` 的 main setter 混名。服务端要求保护级别为 `signature|installer|verifier` 的 `SET_PREFERRED_APPLICATIONS`，但没有额外的 cross-user、user-exists、status-range、has-Web-filter 或 no-op 检查。未知包或按 calling user 被 AppsFilter 隐藏时返回 false；其余路径即使 status 非法、值未变、包无 Web Filter或 userId 不存在也可返回 true。重复写 ALWAYS 每次都会分配新 generation；不存在的 user 还会先生成内存 `PackageUserState`，随后因写调度发现用户不存在而不落盘。非法 status 会被 getter 原样读出，而 URL 分桶没有对应分支。
+
+`getIntentVerificationStatus()` 仅在跨用户读取时要求 `INTERACT_ACROSS_USERS_FULL`；instant caller、未知包和不可见包都统一得到 UNDEFINED，成功时也只返回裸 per-user 高位，不做 main fallback。可见性检查同样基于 calling user，不是目标 userId。另一个 `getIntentFilterVerifications()` 没有显式权限，只做 instant/AppsFilter 门；虽然公开注释称 packageName 为 null 应返回全部，r48 Settings 实现却直接返回空列表。
+
+`pm set-app-link` 把 `undefined|ask|always|always-ask|never` 映射成五个整数，先确认包存在且 `PRIVATE_FLAG_HAS_DOMAIN_URLS` 已置位，再调用更新 API。设成 ALWAYS 会分配新 generation；其他状态不获得新的相对次序。这个 shell 入口是有权限的管理操作，不是第三方 App 可以任意把自己升级成 ALWAYS 的证明。
+
+默认浏览器是另一套状态。Android 11 的 `RoleManagerService` 以 `ROLE_BROWSER` 持有者实现 `PermissionManagerServiceInternal.DefaultBrowserProvider`；PMS 查询 URL 时通过 PermissionManagerInternal 读取包名。旧 Settings 中的 default-browser 字段主要用于迁移/兼容，不应与 App Link status 或普通 PreferredActivity 合并。
+
+同样，用户 preferred activity 保存 IntentFilter、候选集合与目标 Component；domain status 保存于 PackageSetting/PackageUserState，并在 Web 候选分桶阶段生效。三类“默认”虽都会影响最后选择，所有者与失效条件完全不同。
+
+## 14. URL 候选分桶：ALWAYS 优先，ALWAYS_ASK 重新制造歧义
+
+第254章的普通 `IntentFilter.match()`、用户态与初始排序先产出 candidates；domain policy 不会召回 manifest 根本不匹配的 Activity。在 base Intent 未限定 component/package 的通用查询中，PMS 看到当前解析 Intent 的 `hasWebURI()` 后才考虑这条分支；仅 selector 带 package 时仍属于这一路。没有 parent 候选、当前结果不超过一个且不准备加入 instant 时，会直接返回；有 parent domain 候选、当前结果为空且不加入 instant 时，也直接返回 parent forwarding。两者都不做当前 profile 分桶，单个 NEVER 候选也可能因此留在结果中。只有还需合并/筛选的候选集才按命中 `ResolveInfo` 分组：
+
+- `handleAllWebDataURI == true` 进入 `matchAllList`，作为泛化浏览器；
+- 非浏览器按包的有效 status 进入 `alwaysList`、`undefinedList`（UNDEFINED 与 ASK）、`alwaysAskList`、`neverList`；
+- status 为 ALWAYS 时，把 packed low word 的 generation 写入 `preferredOrder`。
+
+初始规则是：有 ALWAYS 就只加入 alwaysList；没有才加入 ASK/UNDEFINED，并可加入 parent-profile forwarding，同时开启 `includeBrowser`。只要存在 ALWAYS_ASK，又会把当前 result 的 `preferredOrder` 全清零、加入 alwaysAskList，并开启浏览器。它的实现效果是让该 App 参与候选并抹平 generation 优势，增加进入询问的可能；`chooseBestActivity()` 仍可能按当前排序字段直接收敛，状态名本身不保证 ResolverActivity 一定出现。
+
+需要浏览器时，`MATCH_ALL` 直接加入全部 `matchAllList`。否则在 ROLE_BROWSER 包的匹配中选其最高 priority 条目；只有它存在、包名非空，且 priority 不低于 `max(0, 所有通用浏览器的最高 priority)`，才只加入这一条，否则加入全部浏览器。零下限意味着所有 browser priority 都为负时，即便默认浏览器并列最高也不能单独收敛。
+
+最后若 result 仍为空，代码退回全部原 candidates 再删除 neverList。domain 过滤完成后外层令 `sortResult = true`，通常以六键 comparator 重排；Web instant installer 若随后加入，也发生在这次排序之前。post-resolution 的删除或动态 split 原位替换仍可能改变最终列表形状。
+
+### 练习 9：手算五个桶、默认浏览器与 generation 排序
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'if (intent.hasWebURI()) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (result.size() == 0 && !addInstant) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F '} else if (result.size() <= 1 && !addInstant) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'final ArrayList<ResolveInfo> alwaysList = new ArrayList<>();' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'final ArrayList<ResolveInfo> alwaysAskList = new ArrayList<>();' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (info.handleAllWebDataURI) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'info.preferredOrder = linkGeneration;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (alwaysList.size() > 0) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (alwaysAskList.size() > 0) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'i.preferredOrder = 0;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if ((matchFlags & MATCH_ALL) != 0) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mPermissionManager.getDefaultBrowser(userId);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'int maxMatchPrio = 0;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F '&& defaultBrowserMatch.priority >= maxMatchPrio' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'result.addAll(candidates);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'result.removeAll(neverList);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F '& PackageManagerInternal.RESOLVE_NON_RESOLVER_ONLY) != 0) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'permissionManagerInternal.setDefaultBrowserProvider(new DefaultBrowserProvider());' frameworks/base/services/core/java/com/android/server/role/RoleManagerService.java
+grep -n -F 'RoleManager.ROLE_BROWSER));' frameworks/base/services/core/java/com/android/server/role/RoleManagerService.java
+```
+
+## 15. 跨 profile、instant 与最终选择发生在不同阶段
+
+当前 profile 查询后，PMS 在 domain 分桶之前就计算是否允许外部 instant resolution。Web Intent 需要非空 host，且 Web instant 功能未禁用。对非浏览器候选，只要某包有效状态为 ALWAYS 或 ALWAYS_ASK 就拒绝外部发现；是否已有匹配的 installed instant App 则在 browser 判断之外检查，所以任一这类候选都能阻断。ASK/UNDEFINED 与泛化浏览器的 status 本身不形成同样阻断。
+
+只有存在 parent，且 `UserManager.hasUserRestriction(ALLOW_PARENT_PROFILE_APP_LINKING, sourceUserId)` 为真时，跨 profile domain 查询才在 parent user 对同一 Intent 做普通组件匹配。它忽略 `handleAllWebDataURI` 浏览器，聚合非浏览器候选的最佳 status，并只返回一个 `IntentForwarderActivity` ResolveInfo。`bestDomainVerificationStatus()` 把 NEVER 特判为最差，再对其他状态取数值较大者；不能直接按 0—4 的整数认为 NEVER 优于 ALWAYS。
+
+若当前候选为空、parent domain 候选存在且不加入 instant，外层会在分桶前直接返回 forwarding。其余需要分桶的场景中，当前用户没有 ALWAYS 时，parent forwarding 可与 ASK/UNDEFINED 一起进入 result；当前已有 ALWAYS 时通常不加入。SKIP_CURRENT_PROFILE 是更早的 cross-profile 路径，也可能直接只返回 forwarding 结果，不能与 domain preferred 分支合并。
+
+domain 筛选与必要排序之后才进入 post-resolution AppsFilter/instant 可见性清理。`queryIntentActivities()` 在列表处完成；`resolveIntent()` 还会调用 `chooseBestActivity()`：单项直接返回，多项可能由前三个选择字段、persistent/user preferred、已安装 instant 特判决定；仍无法收敛时，`RESOLVE_NON_RESOLVER_ONLY` 请求返回 null，其余才构造 ResolverActivity。App Link ALWAYS、默认浏览器 role 与最终 Resolver 选择是连续阶段，不是同一个“默认应用”字段。
+
+## 16. 收束：按八个完成点定位 URL 为什么去了那里
+
+遇到 URL 去向异常，按以下顺序取证最可靠：
+
+1. 固定版本、userId、调用 UID、`resolveForStart`、Intent action/categories/data/flags，分开记录 base 与 selector 的 component/package；再判断 `hasWebURI()`、SKIP_CURRENT_PROFILE、单候选或仅 parent 早退是否真的让它走到旧 domain 分桶；
+2. 用普通 Filter 规则确认 action、BROWSABLE/DEFAULT、scheme、host、port、path 是否真的匹配，并记录获胜 Filter 的 `handleAllWebDataURI`；
+3. 安装侧区分 package `hasDomainUrls` 门、`needsVerification` 触发 Filter 与第二轮全包 Web Filter 集合；
+4. 对 pending 请求记录 verificationId、required UID、userId、归一化前后 hosts、广播发出时间；白名单到期不等于 token 完成；
+5. 网络侧逐 host 检查 HTTPS well-known URL、HTTP status、redirect、大小、timeout、JSON relation、packageName 与证书指纹，最后再看整批 AND；
+6. 同时读取全局 IVI main/domains 与目标用户 status/generation；裸用户 UNDEFINED 仍可能在内部查询回退 main；
+7. 更新场景记录旧/新 host 集、是否早退、重验是否在途，并警惕旧 ALWAYS 暂时覆盖新增 host 与 pending state 残留；
+8. 查询侧按 browser、ALWAYS、ASK/UNDEFINED、ALWAYS_ASK、NEVER、parent、instant 分桶，再检查默认浏览器零下限、重排、post-filter 与 chooseBest。
+
+对应的八个完成点也应分开：消息入队只说明“安装提出验证”；广播发送只说明“验证器获得请求”；每个 source 检查完成只说明“单站点有结果”；PMS 接受 required UID 回调才说明“批次关闭”；Settings 写入才说明“策略可恢复”；普通 Filter 匹配只说明“组件语法合格”；domain 分桶说明“本次解析允许保留哪些候选”；ATMS 后续授权通过才说明“Activity 启动可以继续”。
+
+下一章转入 256：`PackageInstallerSession` 如何从创建与参数校验，经过文件写入、sealed/committed 状态和父子会话门，最终把一次安装请求交给 PMS 多阶段安装链。

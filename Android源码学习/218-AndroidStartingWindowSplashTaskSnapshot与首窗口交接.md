@@ -1,135 +1,130 @@
-# 218 Android Starting Window、Splash、Task Snapshot与首窗口交接
+# 218 Android Starting Window、Splash、Task Snapshot 与首窗口交接
 
-> 源码：Android 11 `android-11.0.0_r48`。  
-> macOS只读学习，不编译、不连设备；本章不倒灌Android 12后新SplashScreen API的统一图标动画模型。
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`。
+>
+> 本章只做静态源码核对：可以证明系统何时选择、创建、登记、转移与移除 starting window，以及 WMS 的 drawn 账怎样参与 app transition；不能据此声称某台设备已经把对应像素交给 HWC。Android 12 以后公开 SplashScreen API 的统一图标与退出动画模型不在本章范围内。
 
-## 1. 本章目标
+第 217 章已经把 `StartingWindowDelay` 与真实窗口的 `WindowsDrawnDelay` 分开。本章继续追问：**同一个启动请求为什么有时看到主题 Splash、有时看到旧 Task 画面、有时什么过渡窗都没有；系统又怎样在真实窗口尚未物理显示时就开始清理这层代理画面？**
 
-第217章发现starting-window delay与windows-drawn delay是两条平行指标。本章继续回答：
+## 1. 先固定 Splash、Snapshot、转移三条路线，再定义交接点
 
-- 何时选theme splash、Task Snapshot或NONE；
-- 为什么冷启动常用splash，Task切换才可能用snapshot；
-- theme的translucent/floating/wallpaper/disablePreview如何影响创建；
-- starting window在哪个进程、哪个线程创建；
-- `StartingData`、`startingWindow`、`startingSurface`为什么是三个对象；
-- snapshot尺寸不匹配时如何crop/scale/补背景；
-- 真实App首window drawn后如何移除过渡窗口；
-- 跳板Activity如何转移starting window避免闪烁；
-- 白屏/黑屏怎样分层定位。
+不先固定现场，cold launch、Task 回前台、Home 解锁、跳板 Activity 与透明主题会被拼成一条不存在的总时序。本章并排使用三条路线。
 
-## 2. 一句话主线
+| 路线 | 固定前提 | 预期选择 |
+|---|---|---|
+| `L_splash` | 新 Task 的普通 cold launch；非 overlay、非 scene transition；display 可用；无已显示主窗；主题不透明、不浮动、未禁用 preview；无可转移前窗 | 新建传统主题 Splash |
+| `L_snapshot` | 已有 Task 被切回前台；进程有 thread，目标 Activity 服务端状态落在 STARTED—STOPPED；新 Intent 允许复用；running cache 有 rotation 兼容快照；非 Home | 新建 TaskSnapshotSurface |
+| `L_transfer` | 同一 Task 的跳板链；目标通过前置与主题门；前 Activity 已有完整 window/surface 对，或仍持有 StartingData | 转移现有窗口，或偷走模型后重排创建 |
+
+以下点是本章自己的诊断坐标，不是 AOSP 内置 trace 名。
+
+| 点 | 精确定义 | 仍不能推出 |
+|---|---|---|
+| `E_call` | 上层调用目标 `showStartingWindow()` | 一定会创建 preview |
+| `G_pass` | overlay、scene-transition、display、重复模型与已显示主窗等前置门已通过 | 类型一定是 Splash |
+| `K_read` | 已用 `restoreFromDisk=false` 查询 running snapshot cache | cache 一定命中 |
+| `T_pick` | `getStartingWindowType()` 返回 NONE/SNAPSHOT/SPLASH | 真实窗口已经加入 WMS |
+| `H_pass` | 非 Snapshot 路线已通过 theme/wallpaper 过滤 | transfer 一定成功 |
+| `X_move` | 目标已接管旧 window/surface 对或 StartingData | 旧像素已 present |
+| `M_data` | 目标 `mStartingData` 已写入模型 | WMS 已有 WindowState |
+| `Q_post` | `mAddStartingWindow` 已投到 AnimationThread 队首 | Runnable 已开始 |
+| `Q_take` | Runnable 第一段锁内已取得 StartingData 引用 | 创建不会再被取消 |
+| `C_open` | 已在 WMS global lock 外调用 `createStartingSurface()` | surface handle 已返回 |
+| `W_bind` | WMS `addWindow()` 已把 starting `WindowState`写给 ActivityRecord | 内容已 draw |
+| `B_queue` | Splash 或 Snapshot 的内容 Buffer 已进入 producer queue | SurfaceFlinger 已 latch |
+| `F_draw` | starting client 已调用 `finishDrawing()`，WMS draw state 可从 DRAW_PENDING 前进 | `isDrawnLw()`已经为 true |
+| `C_return` | `createStartingSurface()` 返回非空 StartingSurface 句柄 | ActivityRecord 已登记句柄 |
+| `S_store` | Add Runnable 第二段锁内已写 `startingSurface` | `startingDisplayed=true` |
+| `W_ready` | placement 已把 draw state 推到 READY_TO_SHOW | show transaction 已成功提交 |
+| `S_drawn` | `updateDrawnWindowStates()` 认出 starting window `isDrawnLw()`并置 `startingDisplayed` | 对应像素已 present |
+| `S_has` | `performShowLocked()` 的成功分支已把 draw state 置 HAS_DRAWN | HWC present fence 已 signal |
+| `T_go` | 该 Activity 的 preview/all-drawn 门及 transition 其他门均满足 | 真实 App 窗口已 drawn |
+| `P_start` | 可归因的 starting-window present fence 已 signal | App 内容已可用 |
+| `A_ready` | 非 starting 的真实窗口以 READY/HAS 进入 `performShowLocked()`并调用 `onFirstWindowDrawn()` | 真实 Buffer 已 present |
+| `R_clear` | ActivityRecord 已同步清掉 StartingData/surface/window/displayed 四项账 | WMS WindowState 已移除 |
+| `R_call` | 异步 `StartingSurface.remove()` 已调用 | exit animation 已结束 |
+| `R_gone` | starting WindowState 与底层 Surface 已真正退出层级 | 真实内容已物理显示 |
+| `P_real` | 可归因的真实窗口 present fence 已 signal | 用户已认为业务完成 |
+
+两类新建路线在 `C_open` 内部的顺序不同：
 
 ```text
-ActivityStack准备打开Activity
-→ ActivityRecord.showStartingWindow
-→ getStartingWindowType选SPLASH/SNAPSHOT/NONE
-→ 先写StartingData，再mAnimationHandler锁外创真窗口
-→ Splash用PhoneWindow+App theme，Snapshot用TaskSnapshotSurface+GraphicBuffer
-→ 两者都以TYPE_APPLICATION_STARTING加入WMS
-→ WindowStateAnimator完成draw state后startingDisplayed=true
-→ AppTransition可用starting surface作为就绪条件
-→ 真实App首window drawn
-→ ActivityRecord.onFirstWindowDrawn移除starting surface
+L_splash:
+E_call < G_pass < K_read < T_pick < H_pass < M_data < Q_post < Q_take
+Q_take < C_open < W_bind < C_return < S_store < B_queue < F_draw
+
+L_snapshot:
+E_call < G_pass < K_read < T_pick < M_data < Q_post < Q_take
+Q_take < C_open < W_bind < B_queue < F_draw < C_return < S_store
 ```
 
-## 3. 总时序图
+Snapshot 在 `create()` 返回前同步画旧 Buffer并报告 drawn；Splash 的 `addView()` 只先建 system_server 的 ViewRoot，首个 traversal 稍后才画。因此不能背一条统一的“surface 句柄登记先于 finishDrawing”。固定正常路线随后才有 `F_draw < W_ready < S_drawn`；`P_start`属于另一条 SF/HWC 链。
 
-```mermaid
-sequenceDiagram
-  participant AS as "ActivityStack/ActivityRecord"
-  participant AH as "WMS AnimationHandler"
-  participant P as "PhoneWindowManager or TaskSnapshotSurface"
-  participant WMS as "WMS addWindow"
-  participant SF as "SurfaceFlinger"
-  participant APP as "App real window"
+对仍有代理账的路线，真实窗口交接固定到 `A_ready < R_clear`。只有清账时已有非空句柄，或Runnable已越过`Q_take`且最终返回非空句柄，随后才存在`R_clear < R_call`；在`Q_take`前取消则根本没有`R_call`。`R_gone`还可因退出动画或 Snapshot 的延迟移除更晚；WMS 不读取 `P_real`，所以源码没有给出这些点与真实 present fence 的通用全序。
 
-  AS->>AS: getStartingWindowType()
-  alt Splash
-    AS->>AS: mStartingData=SplashScreenStartingData
-  else Snapshot
-    AS->>AS: mStartingData=SnapshotStartingData
-  else None
-    AS-->>AS: return false
-  end
-  AS->>AH: postAtFrontOfQueue(mAddStartingWindow)
-  AH->>AH: 锁内快照StartingData
-  AH->>P: 锁外createStartingSurface()
-  P->>WMS: add TYPE_APPLICATION_STARTING
-  WMS->>AS: startingWindow=WindowState
-  P->>P: draw theme Decor or snapshot buffer
-  P->>WMS: finishDrawing
-  WMS->>AS: startingDisplayed=true
-  WMS->>SF: show starting surface
-  APP->>WMS: real first window finishDrawing
-  WMS->>AS: onFirstWindowDrawn()
-  AS->>AH: post surface.remove()
-  AH->>WMS: remove starting window
-```
+## 2. Starting window 是系统代理窗；六本账分别回答六个问题
 
-## 4. Starting window是过渡窗口
-
-它由系统在App真实窗口尚未drawn时先显示，目的是给即时反馈、掩盖冷启动空档并保持Task视觉连续性。
-
-它不是Activity的DecorView，不运行App Activity业务代码，也不接收用户触摸。
-
-## 5. Android 11的三种类型
-
-`ActivityRecord` 定义：
+Android 11 定义三种选择结果：
 
 ```java
-STARTING_WINDOW_TYPE_NONE = 0;
-STARTING_WINDOW_TYPE_SNAPSHOT = 1;
-STARTING_WINDOW_TYPE_SPLASH_SCREEN = 2;
+static final int STARTING_WINDOW_TYPE_NONE = 0;
+static final int STARTING_WINDOW_TYPE_SNAPSHOT = 1;
+static final int STARTING_WINDOW_TYPE_SPLASH_SCREEN = 2;
 ```
 
-Splash是传统theme starting window；Snapshot是上次Task画面或theme代用snapshot；NONE则继续显示下层/旧画面或等App真实窗口。
+Splash 和 Snapshot 内容不同，但最终都以 `TYPE_APPLICATION_STARTING`、目标 Activity token 和 MATCH_PARENT 尺寸加入 WMS。它们由 system_server 侧代码创建，不是目标 Activity 的 Decor，也不会执行目标 App 的 `onCreate()`、点击逻辑或业务加载。
 
-## 6. showStartingWindow的上层入口
+ActivityRecord 周围至少有六本不能互换的账：
 
-ActivityStack准备App transition时，找到Task中可转移starting preview的前Activity，然后调：
+| 账 | 写入含义 | 最常见误读 |
+|---|---|---|
+| `mStartingWindowState` | `showStartingWindow()`返回“请求或转移被接受”后写 SHOWN；`cancelInitializing()`可写 REMOVED | 枚举名 SHOWN 就等于像素已显示 |
+| `mStartingData` | 尚可用于创建的 Splash/Snapshot 模型，也充当异步请求存在标记 | 它已经是 WindowState |
+| `startingWindow` | WMS 已登记的 `WindowState` | Window client 已拿到移除句柄 |
+| `startingSurface` | `StartingSurface.remove()`句柄 | 它就是 SurfaceControl 或已 present 的 Buffer |
+| `startingDisplayed` | WMS 本轮统计时看到 starting `WindowState.isDrawnLw()` | SurfaceFlinger/HWC 已完成 |
+| `startingMoved` | preview 所有权从该源 Activity 移走，可参与 transition 就绪判断 | 新目标已画好或旧画面已 present |
+
+`mStartingWindowState`尤其容易骗人：`addStartingWindow()`只要创建了 StartingData并排队，或成功转移，就返回 true；实际异步创建可以尚未开始甚至稍后失败。真正的 WMS drawn 指示是另一字段 `startingDisplayed`，物理显示则还要继续追 SF/HWC。
+
+WindowManagerPolicy 的 `StartingSurface`接口只承诺一个 `remove()`。Splash 实现包装 system_server 的 DecorView；Snapshot 实现持有 `IWindow`、`Surface`与 SurfaceControl。统一接口解决的是清理入口，不是证明两条创建链相同。
+
+## 3. 上层先判断“值得尝试吗”，类型选择并不是第一道门
+
+普通新 Activity 路线在 `ActivityStack.startActivityLocked()`准备 transition 后，才可能执行：
 
 ```java
+ActivityRecord prev = r.getTask().topActivityWithStartingWindow();
 r.showStartingWindow(prev, newTask,
         isTaskSwitch(r, focusedTopActivity));
 ```
 
-launch-task-behind和共享元素scene transition等路径会跳过普通starting window。
+这里的 `newTask` 是 `ActivityStarter.startActivityInner()` 查找可复用目标后得到的 `targetTask == null`，不能直接等同于 Intent 是否携带 `FLAG_ACTIVITY_NEW_TASK`。`taskSwitch` 则是目标 Activity 所属 Task 与当前 focused top Activity 所属 Task 不同；它描述 Task 身份变化，不描述进程冷热或窗口是否已经显示。
 
-## 7. Overlay Activity不显示starting window
+上层会排除 launch-task-behind、不可前移、scene transition 等不需要 preview 的情况；候选 `prev`来自同一 Task 中 `mStartingWindowState == SHOWN` 且可展示的 Activity，已经 `nowVisible`时又会被丢弃。另有 resume 失败、Task-to-front、用户切换等入口也会调用 `showStartingWindow()`，所以下面的布尔值不能反推唯一调用者。
 
-`mTaskOverlay` 直接return。Overlay是附着在Task上的特殊界面，为它覆盖一层全屏starting preview会破坏原有Task语义。
+`showStartingWindow()`自身还有两道早退：
 
-## 8. Shared-element transition不显示普通preview
+- `mTaskOverlay`为 true：覆盖在 Task 上的特殊 Activity 不盖一张全屏代理图；
+- pending animation 是 `ANIM_SCENE_TRANSITION`：共享元素要让真实 View 参与交接。
 
-pending options为 `ANIM_SCENE_TRANSITION`时return。共享元素需要用前后Activity的真实View/动画交接，一张theme splash盖在上面会与动画冲突。
+随后传给 `addStartingWindow()`的两个名字也要按实现解释：
 
-## 9. addStartingWindow的第一道门：display可用
+| 参数 | r48 实际来源 | 它不是 |
+|---|---|---|
+| `processRunning` | `isProcessRunning()`找到 WPC 且 `hasThread()` | Linux pid 只要存在就算 true |
+| `activityCreated` | 服务端 state ordinal 位于 STARTED 到 STOPPED，含两端 | 客户端对象一定仍健康、页面一定已画过 |
 
-`!okToDisplay()` 时return false。比如display frozen时，系统本来就不会立即展示该新窗口，无需多建一层preview。
+`addStartingWindow()`再依次拒绝 display 当前不能展示、目标已有 `mStartingData`、或主窗口已经 `getShown()`。只有这些门通过后才查询 snapshot cache并选择类型。防重因此有多层：ActivityRecord 的模型门防异步重复，WMS `addWindow()`还会拒绝同一 token 的第二个 starting WindowState。
 
-## 10. 同一Activity不重复建StartingData
+这些返回值都是“无需尝试/已接受”的控制结果。`showStartingWindow()`返回后没有同步等待 AnimationThread、View traversal、Buffer queue或 present。
 
-`mStartingData != null` 直接return false。这个字段既表示已选中的模型，也表示可能正在异步创建。
+## 4. 类型决策有严格优先级；有快照也不等于优先 Snapshot
 
-## 11. 已有可见主窗口不再建preview
-
-`findMainWindow()` 非空且Animator `getShown()`时return false。真实窗口已在显示，再盖starting window不仅无益，还会造成闪烁。
-
-## 12. 选类型前先查TaskSnapshot缓存
-
-```java
-snapshotController.getSnapshot(taskId, userId,
-        false /* restoreFromDisk */,
-        false /* isLowResolution */);
-```
-
-这里明确不从磁盘恢复，只看运行时cache；所以磁盘有历史snapshot不保证此次starting window会当场读它。
-
-## 13. getStartingWindowType的主决策
+r48 选择器可以压成：
 
 ```java
-if (newTask || !processRunning
-        || (taskSwitch && !activityCreated)) {
+if (newTask || !processRunning || (taskSwitch && !activityCreated)) {
     return SPLASH_SCREEN;
 } else if (taskSwitch && allowTaskSnapshot) {
     if (isSnapshotCompatible(snapshot)) return SNAPSHOT;
@@ -139,587 +134,460 @@ if (newTask || !processRunning
 return NONE;
 ```
 
-把源码里的条件按判断顺序画出来，会比只记三个返回值更容易理解：
+按源码判断顺序展开：
 
-```mermaid
-flowchart TD
-    A["开始选择starting window类型"] --> B{"新Task、进程未运行，或Task切换且Activity未创建？"}
-    B -->|是| S["SPLASH_SCREEN"]
-    B -->|否| C{"Task切换且允许使用TaskSnapshot？"}
-    C -->|否| N["NONE"]
-    C -->|是| D{"Snapshot存在且rotation兼容？"}
-    D -->|是| P["SNAPSHOT"]
-    D -->|否| E{"目标是Home Activity？"}
-    E -->|否| S
-    E -->|是| N
-```
+| 现场 | 结果 | 关键原因 |
+|---|---|---|
+| 新 Task | Splash | 没有一张可代表此次新页面的既有 Task 语义 |
+| 进程无 thread | Splash | cold 路线在第一层已结束判断，缓存命中也不改选 Snapshot |
+| Task switch 且 Activity 未落在 created 区间 | Splash | 目标需要重建，旧图不被优先采用 |
+| Task switch、允许快照、rotation 兼容 | Snapshot | 复用既有 Task 视觉状态 |
+| 同条件但快照为空/rotation 不兼容，目标非 Home | Splash | 普通 Activity 回退主题窗 |
+| 同条件但目标是 Home | None | Home 不走普通 Splash fallback |
+| 非 Task switch 且未命中第一层 | None | 没有选择新代理窗的理由 |
 
-注意这是一条有先后顺序的决策链：进程未运行已经在第一层选中Splash，不会因为缓存里碰巧存在旧snapshot就改走Snapshot。
+注意 cache 查询发生在选择器之前，所以 `K_read`存在不表示结果会消费该对象。`newTask`或`!processRunning`一旦命中，snapshot参数只是被忽略。
 
-## 14. 新Task为什么用Splash
+Home 还有选择器之后的第二道特殊门。若先选到 Snapshot，代码立即清掉该 Task 的 running-cache entry，然后检查 `TRANSIT_FLAG_KEYGUARD_GOING_AWAY_NO_ANIMATION`；不是直接解锁的无动画路线就返回 false。也就是说，Home 快照可能“未被使用但已从 running cache 清除”，且这个早退不会再回头创建 Splash或尝试 transfer。
 
-新Task没有一张可代表此次页面的旧Task内容，使用theme背景更符合启动语义。
+`isSnapshotCompatible()`只保证 snapshot rotation等于目标 Activity可能触发的 rotation，或 Task当前 rotation。它没有比较尺寸、Insets、资源限定符、业务数据、颜色模式或最终 present状态；后续 size-mismatch绘制正是为这些变化中的一部分兜底。
 
-## 15. 进程不运行为什么用Splash
+## 5. Snapshot 的“可用”横跨生产、缓存、Intent 与隐私四层
 
-这是cold launch的关键分支。旧snapshot可能表示Task上一次状态，但冷启动可经入口重建、路由变更；源码优先使用theme splash。
-
-## 16. Task switch但Activity未创建也用Splash
-
-这种情况虽有Task，但目标Activity需重建，旧内容不一定能准确预告将出现的页面。
-
-## 17. 什么时候才优先Snapshot
-
-同时满足：
-
-- 是Task switch；
-- 前面没命中newTask/process dead/activity not created；
-- `allowTaskSnapshot()`；
-- snapshot存在且rotation兼容。
-
-这更像将已存在Task快速拉回前台。
-
-## 18. allowTaskSnapshot还会审查新Intent
-
-Launcher MAIN intent、空intent、与上次等价且无extras的intent可放行。如果新Intent不同或带extras，这次可能要打开特定页面，展示旧Task图会误导用户，因此return false。
-
-## 19. Snapshot兼容性至少检查rotation
-
-`isSnapshotCompatible()` 先考虑Activity将导致的目标rotation，否则用Task当前rotation，要求snapshot rotation与目标一致。
-
-文档说“at least rotation”，不应将它夸大成对所有尺寸、Insets、资源与业务状态完美兼容。
-
-## 20. Home snapshot有特殊限制
-
-Home snapshot在屏幕亮时不持续更新，使用后会清cache；除非是keyguard going away no-animation的直接解锁路径，否则不用Home snapshot做starting window。
-
-## 21. Snapshot不兼容时的fallback
-
-普通Activity回退到Splash；Home回退到NONE。所以“有snapshot就一定显示snapshot”不对。
-
-## 22. Snapshot分支早于theme过滤
-
-`type == SNAPSHOT`时立即 `createSnapshot()` 并return。下面的theme translucency/floating/disable-preview检查只针对可能创建的Splash路径。
-
-## 23. theme资源解析失败不创建Splash
-
-`AttributeCache` 用package、theme、Window styleable和current user查属性。Entry为null直接return false，不用一个随机系统主题伪装App preview。
-
-## 24. Translucent theme不创建传统Splash
-
-传统starting window是全屏不透明遮罩，当真实Activity设计为透明、需透出后方内容时，这种过渡效果不正确，因此return false。
-
-## 25. Floating theme不创建Splash
-
-浮动Activity可能是Dialog尺寸。系统传统preview是全屏MATCH_PARENT窗口，用它代替浮动UI会产生尺寸和背景跳变。
-
-## 26. windowDisablePreview是App显式放弃
-
-theme `windowDisablePreview=true` 对应源码变量 `windowDisableStarting`，与floating一起直接return false。
-
-放弃preview会暴露更多启动空档/底层画面，应有明确视觉理由，不要把它当通用“消灭白屏”开关。
-
-## 27. Wallpaper theme的两种分支
-
-若theme要求show wallpaper且当前没有wallpaper target，starting window也加 `FLAG_SHOW_WALLPAPER`；若wallpaper已可见，则不创建全屏不透明preview，以免破坁应透出的壁纸效果。
-
-## 28. 创新Splash前先尝试转移
+starting-window 选择读取：
 
 ```java
-if (transferStartingWindow(transferFrom)) {
-    return true;
-}
+getSnapshot(taskId, userId,
+        false /* restoreFromDisk */,
+        false /* isLowResolution */);
 ```
 
-prev Activity已有同Task starting window时，转移旧窗口比移除再创建一个更连续。
+因此本次快路径只读 running cache。磁盘上即使有持久化文件，也不会在持 WMS lock 的选择现场临时恢复；cache 被清后，本轮常见非 Home task-switch会因 snapshot为空而回退 Splash。
 
-## 29. NONE分支仍可以转移已有preview
+`allowTaskSnapshot()`还逐个检查 `newIntents`：null和 MAIN/LAUNCHER类 Intent可跳过；其他 Intent必须与最后一次或原 Intent `filterEquals()`，并且不能带 extras。`filterEquals()`本身不比较 extras，所以源码另设这一门，避免“带参数打开详情页”却先展示旧首页。
 
-转移尝试发生在 `type != SPLASH` 的return之前。因此“决策类型是NONE”不必然表示最终屏幕上没有从prev继承的starting window。
+快照生产是另一条时间线：
 
-## 30. StartingData是模型，不是WindowState
-
-`SplashScreenStartingData` 保存package/theme/icon/logo/configuration；`SnapshotStartingData` 保存TaskSnapshot。
-
-它们的共同职责只是在合适线程调 `createStartingSurface(activity)`，并不是WMS已加入层级的窗口。
-
-## 31. startingWindow是WMS WindowState
-
-`TYPE_APPLICATION_STARTING` 通过 `addWindow()` 进WMS后，WMS建 `WindowState`，并写：
-
-```java
-tokenActivity.startingWindow = win;
+```text
+closing/hidden Task 或 screenTurningOff
+→ 选择 snapshot mode
+→ REAL: capture Task layers
+   APP_THEME: 画不透明 TaskDescription 背景与system bars
+→ running cache
+→ 非临时Home快照再交给persister并通知Task
 ```
 
-它用于层级、draw state、可见性、动画和移除判断。
+生产规则要注意四个边界：
 
-## 32. startingSurface是便于移除的句柄
+1. Wear、TV、IoT上的 `shouldDisableSnapshots()`会让普通closing-app与screen-off入口跳过抓取；它不在`snapshotTasks()`本体内，不能外推成所有直接调用路径都被封死。
+2. 普通生产只接受 standard/undefined 或 assistant Task；安全锁屏关屏时允许一条临时 Home REAL snapshot特例。
+3. Task顶层 Activity设置的`mDisablePreviewScreenshots`，或该 Activity窗口子树中任一窗口`isSecureLocked()`，会把生产切到APP_THEME；后者既覆盖`FLAG_SECURE`，也覆盖DevicePolicy截图禁令，因此不会捕获这棵窗口子树的敏感像素。
+4. APP_THEME画的是不透明 `TaskDescription` background color与系统栏，不是重新解析 Activity theme 的 `windowBackground`。
 
-`WindowManagerPolicy.StartingSurface` 只定义 `remove()`。Splash实现持有DecorView/token，Snapshot实现持有IWindow/Surface/SurfaceControl等。
+这里的 API 开关与主题属性 `windowDisablePreview`完全不同：前者控制快照是否可含真实像素，后者在消费时过滤传统 Splash/transfer 路线，不能合并成一个“禁用 preview”。
 
-因此三者必须分开：创建模型、WMS窗口账本、客户端移除句柄。
+REAL snapshot用 `captureLayersExcluding()`捕获 Task layer并显式排除 IME。选择可见 Activity时要求其 surface showing、至少一个窗口 shown且 alpha大于0，但代码不等待“最新帧”的 reliable present fence，也没有显式从整棵 Task capture中排除 starting layer。它是已有图层状态的快照，可能陈旧，不能升级成业务最新性的证明。
 
-```mermaid
-flowchart LR
-    D["StartingData<br/>尚未执行的创建模型"] --> R["AddStartingWindow Runnable<br/>锁外创建"]
-    R --> W["startingWindow<br/>WMS中的WindowState"]
-    R --> S["startingSurface<br/>可调用remove的句柄"]
-    W --> X["startingDisplayed<br/>是否已真正drawn"]
-    S --> M["remove()移除实际Surface或DecorView"]
+夜间模式切换还有一个外部防线：UiModeManagerService在更新 uiMode configuration前调用 `clearSnapshotCache()`，注释就是让下一次使用 Splash而不是 screenshot。它只清 running cache；因为本章消费固定 `restoreFromDisk=false`，这已足以改变下一次选型。
+
+## 6. Snapshot 早返；Theme 过滤、transfer 与新 Splash 的顺序不能交换
+
+类型为 Snapshot 时，`addStartingWindow()`先处理 Home 特例，再 `createSnapshot(snapshot)`并直接返回。下面的 theme 检查、transfer和新建 Splash都不会执行。
+
+非 Snapshot 路线才读取 Window styleable：
+
+| Theme 条件 | r48 行为 | 视觉理由或边界 |
+|---|---|---|
+| `AttributeCache.Entry == null` | 返回 false | 不猜一个替代 App 主题 |
+| `windowIsTranslucent=true` | 返回 false | 全屏不透明代理会遮错后方内容 |
+| `windowIsFloating=true` | 返回 false | MATCH_PARENT代理与浮动窗口尺寸冲突 |
+| `windowDisablePreview=true` | 返回 false | App theme明确拒绝传统 preview |
+| `windowShowWallpaper=true`且当前无 wallpaper target | 给候选窗加`FLAG_SHOW_WALLPAPER` | 让壁纸与代理一起出现 |
+| `windowShowWallpaper=true`且已有 wallpaper target | 返回 false | 避免不透明层破坏已有壁纸语义 |
+
+然后顺序严格是：
+
+```text
+theme/wallpaper门
+→ transferStartingWindow(transferFrom)
+→ 若type不是SPLASH则返回false
+→ 写SplashScreenStartingData并排队
 ```
 
-最容易混淆的一点是：`startingDisplayed=true` 不能由 `StartingData` 已存在推导出来，也不能由 `startingSurface` 已创建直接推导出来；它要等WMS观察到starting `WindowState` 进入drawn状态。
+由此得到三个不直观结论：
 
-## 33. 为什么要异步创建
+- NONE仍可能通过 transfer得到旧 preview，但前提是先通过 theme/wallpaper门；
+- `windowDisablePreview`不仅阻止新 Splash，也会在 transfer调用之前返回；
+- Snapshot已经在更早位置返回，所以该主题位挡不住选中的 Snapshot。
 
-`StartingData` 明确要求 `createStartingSurface()` 不能持WMS lock。因为create会加View、走WindowSession/WMS、读资源甚至draw Buffer，持全局锁回调这些路径容易死锁和扩大锁等待。
+`theme == 0`时整段属性过滤被跳过，随后仍可 transfer；失败且类型为 Splash时才新建模型。不要把“选型返回 Splash”与“最终一定建出 Splash”合并，theme、wallpaper、transfer和异步创建仍能改变结果。
 
-## 34. mAnimationHandler使用队列前端
+## 7. AddStartingWindow 是两段锁加一次锁外慢调用，不是事务提交
 
-`scheduleAddStartingWindow()` 先防重，再 `postAtFrontOfQueue()`。过渡窗口越早出现越能遮住启动空档。
+新建模型后，`scheduleAddStartingWindow()`先用 Runnable实例防止重复 callback，再把它 `postAtFrontOfQueue()`到 WMS `mAnimationHandler`。该 Handler绑定 system_server 的 `AnimationThread` Looper；队首只表示优先于当时普通消息，不表示在当前持锁调用返回前同步执行。
 
-但front-of-queue仍是异步Runnable，不保证在 `showStartingWindow()` 返回前已经drawn。
+Runnable 的骨架是：
 
-## 35. AddStartingWindow两次持锁、中间锁外调用
+```text
+第一段global lock
+  removeCallbacks(this)
+  若mStartingData==null则退出
+  捕获startingData引用
+解锁
+  surface = startingData.createStartingSurface(activity)
+  捕获Exception并保留surface=null
+若surface非空，第二段global lock
+  若当前mStartingData==null：清startingWindow，标abort
+  否则：startingSurface = surface
+解锁
+  abort时surface.remove()
+```
 
-1. 第一次锁内取 `mStartingData` 快照；
-2. 锁外 `createStartingSurface()`；
-3. 第二次锁内检查请求是否已取消，并登记surface。
+第一段与第二段之间的锁外调用会读资源、建 ViewRoot、进入 WMS、relayout甚至画 Buffer。`StartingData`类注释明确禁止调用者持 WMS lock，避免递归回调和长时间扩大临界区。
 
-这是典型的锁外慢调用+锁内代际校验。
+第二段只检查“当前 `mStartingData`是否为 null”，没有比较它与第一段捕获对象的身份，也没有 generation id。因此应称取消检查，而不是完整代际校验。r48依靠同一 Activity的模型防重与转移规则，让这个较弱检查足够覆盖常见竞态。
 
-## 36. 创建期间被取消怎么办
+三种结束必须分账：
 
-如果锁外create完成后 `mStartingData == null`，说明真实窗口已来、Activity已取消或其他路径已不需preview。代码不登记surface，而是锁外 `surface.remove()`。
+| 现场 | Runnable结果 | 残留状态 |
+|---|---|---|
+| 开始前已取消 | 第一锁区看到null直接退出 | 不创建真实窗；callback本次被消费 |
+| 锁外create期间取消 | create可先把WindowState加入WMS；第二锁区看到null，随后锁外remove返回句柄 | ActivityRecord引用可先清，WMS实体异步退出 |
+| create抛异常或返回null | 只记录日志，不进入第二锁区 | `mStartingData`不会由这里清除，可能继续阻挡add，直到别的remove/cleanup |
 
-## 37. create抛异常不会拖垮system_server
+这也说明 `mStartingWindowState=SHOWN`、`mStartingData!=null`、`startingWindow!=null`与`startingSurface!=null`可以短暂组合成多种中间态，不能用单字段判断创建完成。
 
-AddStartingWindow捕获Exception并记警告，将surface保持null。Starting preview是用户体验优化，创建失败时应继续等App真实窗口，不应让系统服务崩溃。
+## 8. Splash 在 system_server 创建 PhoneWindow；App Context 只提供资源
 
-## 38. Splash路径运行在system_server
+`SplashScreenStartingData.createStartingSurface()`调用 WMS policy；r48默认进入 `PhoneWindowManager.addSplashScreen()`，仍在 system_server 的 AnimationThread执行。
 
-`SplashScreenStartingData` 调WMS policy，r48默认实现是 `PhoneWindowManager.addSplashScreen()`。PhoneWindowManager在system_server，它使用system_server内的Context/WindowManagerGlobal建窗口。
+Context选择分三层：
 
-这不是SystemUI进程为每个App实例化一个Activity。
+1. 根据 displayId取正确 Display Context；非默认 Display不存在就返回null，不偷放到默认屏。
+2. theme或label需要时，用`createPackageContextAsUser(..., CONTEXT_RESTRICTED, user)`取得 App包资源并设主题。
+3. 有 merged override configuration时创建 configuration context；只有该配置下`windowBackground`资源和Drawable都可用才采用，避免换到一个无背景Context。
 
-## 39. 非默认Display的Context
-
-PhoneWindowManager先根据displayId取display context；找不到目标Display就return null，不把本应在外接屏的preview错放到主屏。
-
-## 40. 如何使用App资源
-
-需要时用 `createPackageContextAsUser(packageName, CONTEXT_RESTRICTED, user)` 创建限制package context，再set App theme。
-
-所以Splash能使用App theme的windowBackground/icon/logo，但代码执行者仍是system_server。
-
-## 41. OverrideConfiguration下的资源选择
-
-存在merged override config时，policy创建configuration context并查其 `windowBackground`。只有该drawable真实可用才切到override context，否则保留默认context，避免得到无背景starting window。
-
-## 42. Splash内部是PhoneWindow+DecorView
+随后创建的是系统代理 `PhoneWindow`：
 
 ```java
 PhoneWindow win = new PhoneWindow(context);
 win.setIsStartingWindow(true);
 win.setType(TYPE_APPLICATION_STARTING);
+win.setLayout(MATCH_PARENT, MATCH_PARENT);
 ```
 
-它是轻量的系统窗口客户端，不是目标Activity的PhoneWindow。
+policy强制 `FLAG_NOT_TOUCHABLE | FLAG_NOT_FOCUSABLE | FLAG_ALT_FOCUSABLE_IM`，设置目标 Activity token、package、window animation和标题，并加 `PRIVATE_FLAG_FAKE_HARDWARE_ACCELERATED`。这些字段让WMS正确分层与过渡；它们不证明目标App已创建自己的ViewRoot、Renderer或input connection。
 
-## 43. Splash为什么不可触、不聚焦
+Android 11已经会读取 `Window_windowSplashscreenContent`：有Drawable时包进一个View作为内容；没有时，PhoneWindow/Decor仍按 launch theme 的window背景形成传统占位。它只是r48的主题内容能力，不等于后续公开 SplashScreen API 的 icon animation或exit listener。
 
-policy强制加：
+`wm.addView(decor, params)`会在当前 AnimationThread创建 system_server 的 ViewRoot，并同步调用WMS `addWindow()`；WMS可在此写下`startingWindow`。但 addView返回时首次 traversal通常只是已调度，未完成draw。只有Decor已有parent才返回`SplashScreenSurface`，Add Runnable随后才登记`startingSurface`。
+
+固定成功 Splash因而是：
 
 ```text
-FLAG_NOT_TOUCHABLE
-FLAG_NOT_FOCUSABLE
-FLAG_ALT_FOCUSABLE_IM
+system_server addView
+→ WMS写startingWindow
+→ addView返回并包装SplashScreenSurface
+→ ActivityRecord写startingSurface
+→ AnimationThread后续traversal/draw
+→ IWindowSession.finishDrawing
 ```
 
-过渡画面不能窃取真实App的input focus，也不能让用户点击一个没有业务逻辑的假UI。
+BadToken、包资源异常或其他 RuntimeException会被policy捕获；未成功attach的View在finally里`removeViewImmediate()`，返回null。正常移除句柄则用View Context拿 WindowManager并`removeView()`，仍走普通ViewRoot/WMS移窗链。
 
-## 44. Splash是MATCH_PARENT
+## 9. Snapshot 在 create 返回前画 Buffer；尺寸不匹配又分两支
 
-width/height设MATCH_PARENT。这也解释了为什么floating/translucent Activity不适合传统preview。
-
-## 45. 标题、动画与token
-
-params使用App token、packageName、theme的windowAnimationStyle，标题是 `Splash Screen <package>`。Token让WMS把它挂到目标ActivityRecord，而不是挂成无主系统overlay。
-
-## 46. PRIVATE_FLAG_FAKE_HARDWARE_ACCELERATED
-
-Splash加这个private flag，表明它是系统生成的假硬件加速窗口语义，不等于目标App已创建自己的ThreadedRenderer。
-
-## 47. windowSplashscreenContent在Android 11已存在
-
-r48 policy会读 `Window_windowSplashscreenContent`，若有drawable，建一个View、把drawable设为background并 `win.setContentView(v)`。
-
-这证明Android 11有传统splash content能力；但它不等于Android 12公开SplashScreen API、统一icon animation和exit listener的整套机制。
-
-## 48. 没有windowSplashscreenContent时显示什么
-
-PhoneWindow仍会使用theme的windowBackground等装饰属性生成Decor。因此常见“白屏”其实是App launch theme的windowBackground为白色，不是系统随机插入一张白图。
-
-## 49. wm.addView后如何判定成功
-
-policy取DecorView并 `wm.addView(view, params)`，只有 `view.getParent() != null` 才返回 `SplashScreenSurface`。
-
-如BadToken、资源失败或其他RuntimeException，捕获后return null；finally会移除未成功附着的View。
-
-## 50. SplashScreenSurface.remove做什么
-
-它用View context取WindowManager并 `removeView(mView)`。因此ActivityRecord移除starting surface最终回到system_server这棵ViewRoot/Window的正常remove路径。
-
-## 51. Snapshot是怎样生产的
-
-Task关闭/隐藏或屏幕关闭等时机，TaskSnapshotController找可见Task和主窗口，记录rotation、orientation、task size、content Insets、system UI visibility和GraphicBuffer。
-
-它是上一次Task内容快照，不是目标Activity此次刚绘制的首帧。
-
-## 52. Secure window不生成真实像素snapshot
-
-`shouldUseAppThemeSnapshot()` 在Activity禁止preview screenshot或任一Window `isSecureLocked()` 时返回true。TaskSnapshotController此时draw一张不透明theme/task background+system bars的代用snapshot，不捕获敏感窗口像素。
-
-## 53. 不是所有设备都开Task snapshot
-
-Wear、TV和IoT特性设备上 `shouldDisableSnapshots()` 为true，TaskSnapshotController不走常见snapshot记录。
-
-## 54. Snapshot缓存与持久化
-
-正常snapshot放入running cache，并可由Persister持久化。但本章starting-window选择查询明确 `restoreFromDisk=false`，当次快速路径只使用cache中现成对象。
-
-## 55. Snapshot starting surface也是TYPE_APPLICATION_STARTING
-
-`TaskSnapshotSurface.create()` 组装LayoutParams：type仍是 `TYPE_APPLICATION_STARTING`，token仍是Activity token，width/height仍MATCH_PARENT。
-
-它与Splash的内容来源不同，但在WMS窗口类型和ActivityRecord交接账本上统一。
-
-## 56. Snapshot创建先复制真实窗口的部分属性
-
-它在WMS lock内找Activity主窗口与Task顶部不透明窗口，复制window animation、dim、system UI visibility、Insets behavior/appearance、cutout mode和部分flags。
-
-这让旧画面与系统栏、Task范围尽量连续。
-
-## 57. 为什么不继承所有flags
-
-`FLAG_INHERIT_EXCLUDES` 排除focus/touch、secure、scaled、hardware-accelerated等会产生副作用的flag，再强制NOT_FOCUSABLE/NOT_TOUCHABLE。
-
-Snapshot的目的是绘制一张可见图，不是把旧App窗口的input/安全/运行时行为整体克隆。
-
-## 58. Snapshot先addToDisplay再relayout
-
-`TaskSnapshotSurface.create()` 直接使用 `IWindowSession`：
+`TaskSnapshotSurface.create()`先短暂取得 WMS global lock，核对 Task、目标main window和Task顶部不透明window，并复制 window animation、dim、system UI、Insets、cutout与少量flags。它随后释放锁，再以本进程 `IWindowSession`完成：
 
 ```text
 addToDisplay(View.GONE)
-→ 创TaskSnapshotSurface并setOuter
+→ WMS写startingWindow
+→ 创建TaskSnapshotSurface并setOuter
 → relayout(View.VISIBLE)
 → setFrames
 → drawSnapshot
+→ finishDrawing
+→ 返回StartingSurface句柄
 ```
 
-这是system_server内本地Window client的完整加窗口/取Surface/绘制链。
+LayoutParams仍是 `TYPE_APPLICATION_STARTING`与目标 token。继承flags时先排除focus、touch、secure、scaled、hardware-accelerated等副作用位，再强制NOT_FOCUSABLE/NOT_TOUCHABLE；private flags只继承绘制系统栏所需的一小部分。这是一张图的代理窗，不是旧App运行行为的克隆。
 
-## 59. 尺寸完全匹配时零拷贝挂Buffer
+绘制按“窗口frame尺寸是否等于snapshot Buffer尺寸”分支：
 
-`drawSizeMatchSnapshot()` 调：
+| 分支 | Buffer路径 | 背景与system bars |
+|---|---|---|
+| size match | 父Surface直接`attachAndQueueBufferWithColorSpace()` | 不另画 |
+| size mismatch、宽高比差不超过0.01 | 建精确Buffer尺寸child Surface，matrix FILL到新frame | child覆盖目标，不另锁Canvas补洞 |
+| size mismatch且宽高比差超过0.01 | child Surface做crop、position、matrix；父Surface锁Canvas | 用TaskDescription背景填空洞并画system bars |
+
+crop把snapshot content Insets按原Task尺寸缩放到Buffer坐标；只有Task与window都顶到屏幕顶部时保留top方向，否则也裁掉top装饰。这里解决的是旧图适配新frame，不证明业务内容、Insets或系统栏一定与即将到来的真实页面相同。
+
+`drawSnapshot()`在queue后、`finishDrawing()`前用 uptime记录`mShownTime`并置`mHasDrawn=true`。这个名字不是物理显示时间。size-mismatch、非Home的`remove()`若离该点不足450 ms，会把真正的session remove推迟到阈值；所以450 ms只是“延迟调用remove”的门，不保证用户至少看到450 ms。
+
+`resized()`若发现orientation不同，会经system_server主Looper尽快remove；若收到`reportDraw`，也会在`mHasDrawn`后补一次`finishDrawing`。这不是重新捕获或重画一张新快照。
+
+## 10. WMS 把 starting 窗单独计账；drawn、show 与 present 仍是三层
+
+`WMS.addWindow()`对 `TYPE_APPLICATION_STARTING`保留服务端硬门：token必须解析成仍在层级中的 ActivityRecord，同一Activity不能已有startingWindow。通过后先attach WindowState并写入window map，再执行：
 
 ```java
-mSurface.attachAndQueueBufferWithColorSpace(
-        snapshot.getSnapshot(), snapshot.getColorSpace());
+tokenActivity.startingWindow = win;
+win.mToken.addWindow(win);
 ```
 
-它将已有GraphicBuffer挂给Surface并queue，不需要用Canvas把整张图重画一遍。
+ActivityRecord的z-order比较还把starting window排在同token其他应用窗之上。它能遮住尚未接管的真实窗，但“在层级上方”仍不是“已有Buffer被显示”。
 
-## 60. 尺寸不匹配时为什么需要child Surface
-
-快照Buffer尺寸与新window不同，直接attach到父Surface会失败。代码建一个精确Buffer尺寸的child SurfaceControl，再crop/position/matrix放缩到目标Task区域。
-
-## 61. aspect ratio mismatch的阈值
-
-快照与frame宽高比差大于0.01才当作明显比例不匹配；小差异可能是像素取整，直接scale fill用户不易察觉。
-
-## 62. 比例不匹配时的crop
-
-`calculateSnapshotCrop()` 按snapshot/task scale把内容Insets投影到snapshot坐标，并根据Task是否顶到屏幕顶部决定是否保留status-bar方向的top inset。
-
-这是减少旧导航栏/装饰被拉伸到新区域的视觉修复。
-
-## 63. 空白区域如何填充
-
-父Surface用Canvas画TaskDescription background color，并画status/navigation bar background。所以size-mismatch snapshot不是简单把一张图全屏拉伸，还会处理裁剪后的空洞与系统栏。
-
-## 64. Snapshot draw完成后何时report
-
-`drawSnapshot()` 设 `mShownTime`、`mHasDrawn=true`，然后 `mSession.finishDrawing(mWindow, null)`。
-
-这使WMS WindowStateAnimator将draw state从DRAW_PENDING推到COMMIT_DRAW_PENDING，不是反向等HWC present fence。
-
-## 65. resized(reportDraw)的补报
-
-Snapshot Window的 `resized()` 收到reportDraw时，主Looper Handler检查 `mHasDrawn`再次reportDrawn。这是WMS窗口resize/draw协议的容错，不是重新生成一张TaskSnapshot。
-
-## 66. Orientation变化时移除snapshot
-
-`resized()` 若看到merged configuration orientation与创建时不同，尽快post `remove()`。错方向的旧图比等真实新window更容易误导用户。
-
-## 67. Size mismatch snapshot最少显示450 ms
-
-`remove()` 在 `mSizeMismatch && shown < 450ms && activityType != HOME` 时延迟到450 ms再remove。
-
-目的是避免刚显示一张需复杂crop/scale的快照立即又被移除，造成明显闪烁；Home解锁要尽快显示最新内容，不受此保底。
-
-## 68. 450 ms不是所有starting window的最短时长
-
-它只在Snapshot且size mismatch分支中生效。Splash、size-match snapshot和Home不能用这个常量解释。
-
-## 69. WMS如何防止重复starting window
-
-`addWindow()` 看到type是APPLICATION_STARTING且ActivityRecord已有 `startingWindow` 时返回 `ADD_DUPLICATE_ADD`。
-
-它是服务端最后防线，与ActivityRecord `mStartingData` 防重一起应对异步竞态。
-
-## 70. starting window的token必须是ActivityRecord
-
-APPLICATION window type的token找不到ActivityRecord、Activity已退出层级，会返回BAD/EXITING错误。
-
-这保证preview不会在目标Activity已消失后变成孤立系统窗口。
-
-## 71. startingDisplayed何时置true
-
-ActivityRecord `updateDrawnWindowStates()` 遇到startingWindow且 `isDrawnLw()`时：
-
-```java
-metrics.notifyStartingWindowDrawn(this);
-startingDisplayed = true;
-```
-
-所以已schedule/add不等于displayed；要等它自己完成WMS draw state。
-
-## 72. startingWindowDelay不在create成功时停表
-
-第217章的metrics终点来臧3个条件：WindowState已建、内容已finishDrawing、WMS评估为drawn。只拿 `showStartingWindow()` 方法耗时不是starting-window delay。
-
-## 73. starting window可让AppTransition先开始
-
-AppTransitionController对opening Activity检查：
+draw-state路线是：
 
 ```text
-allDrawn || startingDisplayed || startingMoved
+client finishDrawing
+→ DRAW_PENDING → COMMIT_DRAW_PENDING
+→ placement commitFinishDrawingLocked
+→ READY_TO_SHOW
+→ performShowLocked尝试
+→ 成功时HAS_DRAWN并安排surface transaction
 ```
 
-三者都不满足才继续等。这是preview改善体感的核心：真实App还未all drawn，但过渡画面已可用于开始window transition。
+在placement同一窗口处理里，`commitFinishDrawingLocked()`先设READY并调用`performShowLocked()`；稍后`ActivityRecord.updateDrawnWindowStates()`才统计。starting window走专支：若`isDrawnLw()`为true，记StartingWindowDelay并设`startingDisplayed=true`，但不增加真实窗口的`mNumInterestingWindows/mNumDrawnWindows`。
 
-## 74. Transition reason区分Splash与Snapshot
+`performShowLocked()`对starting window调用`onStartingWindowDrawn()`，后者只把Task标成曾可见；对非starting窗才调用`onFirstWindowDrawn()`。若`isReadyForDisplay()`失败，window可仍停在READY，而`isDrawnLw()`已经接受READY；因此`startingDisplayed`连“成功走完show分支”都不应无条件替代，更不能替代present fence。
 
-若非allDrawn，controller根据 `mStartingData instanceof SplashScreenStartingData` 记 `APP_TRANSITION_SPLASH_SCREEN`，否则记SNAPSHOT。
-
-这是过渡metrics reason，不表示真实App窗口已drawn。
-
-## 75. 转移已经显示的starting window
-
-prev同Task Activity有 `startingWindow + startingSurface`时，新Activity直接接手：
-
-- 转StartingData/surface/displayed状态；
-- WindowState改token和ActivityRecord；
-- 从prev层级removeChild，加到new Activity；
-- 传allDrawn/firstWindowDrawn/visible/clientVisible；
-- 必要时转动画和fixed-rotation transform。
-
-## 76. 为什么转移时skip app transition animation
-
-已显示的starting icon/window被直接换token，再播一次新Activity普通opening animation可造成二次过渡，代码置 `mSkipAppTransitionAnimation=true`。
-
-## 77. 转移尚未创建的StartingData
-
-prev只有 `mStartingData`、尚未有surface时，新Activity“偷走”模型，prev清null并 `startingMoved=true`，new Activity重新schedule add。
-
-这避免两个异步AddStartingWindow都为同一次跳板创窗口。
-
-## 78. startingMoved不等于window已present
-
-它是AppTransition就绪判断的一个账本flag，表示preview所有权已在token之间移动。不是SurfaceFlinger/HWC完成事件。
-
-## 79. 真实首窗口drawn是主要交接点
-
-`ActivityRecord.onFirstWindowDrawn()` 置 `firstWindowDrawn=true`，清理dead placeholder；如有starting window，取消真实window自己的初始动画，再 `removeStartingWindow()` 并更新reported visibility。
-
-## 80. 为什么取消真实window的动画
-
-交接将使用starting window让位给真实content的transition；真实window如同时还播自己的初始动画，会叠加两层运动。
-
-## 81. removeStartingWindow能在“尚未add”时取消
-
-`startingWindow == null` 但 `mStartingData != null` 时，只清StartingData并return。稍后AddStartingWindow Runnable取锁看到null就不创建。
-
-这避免App首窗口来得很快时，preview反而在其后闪现。
-
-## 82. remove真实surface前先清账本
-
-锁内取 `startingSurface`，清StartingData/surface/window/displayed，然后在AnimationHandler post中调surface.remove。
-
-账本先清使后续决策不再认为Activity仍有preview；真实View/Window移除使用与add相同线程，避免View hierarchy跨线程访问。
-
-## 83. startingWindow存在但surface为null的容错
-
-源码记录警告并return，不在WMS lock内猜测一个不存在的移除对象。这是异步add/remove竞态下的防御分支。
-
-## 84. 隐藏Activity的孤儿preview清理
-
-INITIALIZING Activity被全屏Activity挡住且不会resume时，`cancelInitializing()` 将state置REMOVED并remove starting window，避免永远不会有真实window交接的孤儿preview留下。
-
-## 85. Surface被销毁会清startingDisplayed
-
-`WindowStateAnimator.destroySurfaceLocked()` 如果目标正是Activity startingWindow，将 `startingDisplayed=false`。显示状态不能在Surface已没有时仍粘住true。
-
-## 86. 白屏并不一定是“App什么都没画”
-
-常见情况是系统已成功显示Splash starting window，只是launch theme `windowBackground` 为纯白且没有splash content。
-
-这时starting-window delay可能很短，白色持续时间主要由真实App first-window drawn决定。
-
-## 87. 黑屏的第一层检查
-
-检查launch theme的windowBackground/windowSplashscreenContent、是否使用dark theme，以及theme是否translucent/floating/disablePreview导致starting window根本未创建。
-
-## 88. 黑/白屏的第二层检查
-
-看getStartingWindowType是Splash、Snapshot还是NONE，并检查snapshot是否兼容、Home特例、新Intent是否禁用snapshot。
-
-## 89. 黑/白屏的第三层检查
-
-区分：
+AppTransitionController在非timeout路径对每个opening Activity检查：
 
 ```text
-StartingData已写
-→ AddStartingWindow已运行
-→ WMS startingWindow已建
-→ finishDrawing已到
-→ startingDisplayed=true
-→ SF真正显示
+(allDrawn && !isRelaunching()) || startingDisplayed || startingMoved
 ```
 
-某一层失败都可能看到旧画面/底色，不要全部归因 `Activity.onCreate()`。
+这只是per-app门；rotation animation、remote animation specs、unknown-app visibility、wallpaper，以及opening/changing集合的其他对象也必须就绪。timeout会整体绕过这段reason-map填充。
 
-## 90. 黑/白屏的第四层检查
+非allDrawn时，reason按当前`mStartingData instanceof SplashScreenStartingData`记Splash，否则记Snapshot。它是模型分类而非像素证据：源Activity转走preview后`mStartingData`已清、`startingMoved=true`，即使被转走的是Splash，else分支也可能得到Snapshot reason。
 
-若starting window已正常drawn，主要查为什么真实window迟迟不交接：Provider/Application、Activity lifecycle、inflate、measure/layout多轮、PreDraw取消、RenderThread和finishDrawing。
+## 11. Transfer 有“完整对迁移”和“模型迁移”，都不复制像素
 
-## 91. Splash色彩与真实首帧不一致会发生什么
+ActivityStack寻找候选prev时用的是`mStartingWindowState==SHOWN`，并不要求`startingDisplayed`。目标进入`addStartingWindow()`后，还要先走theme/wallpaper门；Snapshot早返路线则根本不会尝试transfer。
 
-即使性能指标很好，两帧背景色、system bar颜色、cutout/insets处理不同也会在交接时产生闪烁。
+第一种 transfer条件是源 Activity同时有 `startingWindow`和`startingSurface`。它只说明window/handle完整登记，`startingDisplayed`仍可为false。WMS global lock内会：
 
-优化不只是缩短耗时，还要让launch theme与Activity真实初始状态视觉对齐。
+- 把 StartingData、surface handle、displayed值交给目标；
+- 清源 Activity三项对象引用，并把源`startingMoved=true`；
+- 改同一个 WindowState 的token与ActivityRecord，先从源容器removeChild，再add到目标；
+- 传播部分allDrawn、firstWindowDrawn、visible/clientVisible状态；
+- 必要时迁移animation与fixed-rotation transform；
+- 置DisplayContent的`mSkipAppTransitionAnimation=true`，避免再叠一轮普通opening动画。
 
-## 92. Snapshot可能显示过时内容
+这条路没有复制Buffer、重建Decor或重画Snapshot，只是把同一窗口实体换账本和容器。代码也没有在这里比较两个Activity的package/theme是否相同；上层仅把候选限定在同一Task并排除已nowVisible项。
 
-Snapshot本质是上一次Task像素。源码用Intent/extras限制、rotation检查和secure-theme fallback降低误导，但不能保证业务数据一定仍最新。
+第二种分支在完整window/surface对不成立、但源`mStartingData!=null`时触发。目标偷走模型，源清data并置`startingMoved=true`，目标重新`scheduleAddStartingWindow()`。它不只覆盖“尚未开始create”：锁外create可能已经让WMS写了source.startingWindow，却还没返回surface给Runnable登记，此时仍会落入这一分支。
 
-这是为什么它只是过渡画面，真实window drawn后必须尽快交接。
+若源旧Runnable随后返回，它在第二锁区看到源data已为null，会remove自己刚建出的句柄；目标Runnable则按转来的模型另建。这里可能短暂经历两次WMS add/remove尝试，但模型所有权只有一个。
 
-## 93. 常见误解一：Splash由目标App进程画
+`startingMoved`写在源 Activity上，作用是让其transition不再等一扇已经转走的窗；它不说明目标窗已drawn。r48没有后续平台那种Splash内容View复制/回调握手，本章的transfer只指 WindowState/StartingSurface所有权迁移或 StartingData重新执行。
 
-r48传统Splash由system_server中PhoneWindowManager使用App package resources创建PhoneWindow/Decor，不需等目标App fork、attach或Activity.onCreate。
+## 12. 真实窗口到 READY 就可触发清账；实际移除与物理交接更晚
 
-## 94. 常见误解二：所有启动都显Splash
+当非starting窗口以 READY_TO_SHOW或HAS_DRAWN进入`WindowState.performShowLocked()`时，它先调用`ActivityRecord.onFirstWindowDrawn()`，然后才检查`isReadyForDisplay()`并在成功分支把draw state改成HAS_DRAWN。方法名与日志里的“shown”不能覆盖这段源码顺序。
 
-Overlay、scene transition、translucent/floating/disablePreview、已显示主window、冻结display、Task snapshot可用或NONE决策都可让结果不是Splash。
+`onFirstWindowDrawn()`同步执行：
 
-## 95. 常见误解三：Snapshot就是实时屏幕截图
+```text
+firstWindowDrawn = true
+→ removeDeadWindows
+→ 若仍有startingWindow，取消本次真实window自己的animation
+→ removeStartingWindow
+→ updateReportedVisibilityLocked
+```
 
-它在Task关闭/隐藏等时机生产并cache/persist，starting window使用时取现有cache；不是每次点Task卡片都先对当前隐藏App实时截一张。
+`removeStartingWindow()`又分两种：
 
-## 96. 常见误解四：Secure Activity没有snapshot任何替代图
+| 当时账本 | 同步动作 | 异步动作 |
+|---|---|---|
+| `startingWindow==null && mStartingData!=null` | 只把data清null，取消请求 | `Q_take`前取消时Runnable醒来直接退出；`Q_take`后取消时creator仍可建出短命窗，若返回非空句柄则在第二锁区abort并remove |
+| window/data均存在，但`startingSurface==null` | 清data/surface/window/displayed后直接返回 | 若这是仍在锁外执行的creator且它返回非空句柄，第二锁区会发现data为null并自行remove；create失败或返回null则没有这次句柄调用 |
+| window/data/surface三者均存在 | 捕获surface handle，清data/surface/window/displayed | post到AnimationThread调用`surface.remove()` |
 
-secure/disable preview会让TaskSnapshotController选APP_THEME模式，画不透明背景与系统栏，既保留Task视觉占位，又不泄漏真实像素。
+所以`R_clear`发生时，真正的WMS WindowState可能仍在层级。Splash句柄会`removeView()`；WMS对 starting window的退出可使用`TRANSIT_PREVIEW_DONE`动画。Snapshot句柄直接`mSession.remove(mWindow)`，但size-mismatch且非Home时可能再把实际remove转投WMS主Handler，等到`mShownTime+450ms`。
 
-## 97. 常见误解五：startingDisplayed等于presented
+“用与add相同线程remove”的注释对ActivityRecord统一调度入口和Splash View hierarchy成立；不能扩写成所有底层remove最终都在AnimationThread，因为Snapshot的450 ms分支明确改用`mService.mH` Looper。
 
-它来自WMS WindowState `isDrawnLw()`的状态统计，不是SurfaceFlinger reliable present fence signal。
+即使真实window已触发`onFirstWindowDrawn()`，该方法也没有读取它的present fence；starting surface移除同样不等待`P_real`。WMS可以借同批Surface transaction与z-order实现视觉交接，但静态Java状态只能证明draw-ready、清账和移除请求，不能证明扫描线上完全无黑帧或色差。
 
-## 98. 常见误解六：450 ms是Splash强制最小时长
+其他清理入口也要保留：`cancelInitializing()`把独立的`mStartingWindowState`置STARTING_WINDOW_REMOVED并移除孤儿preview，它没有把Activity生命周期state改成REMOVED；WindowStateAnimator销毁仍被ActivityRecord引用的starting surface时会清`startingDisplayed`；窗口/Activity退出路径还会做last-window cleanup。
 
-这个保底仅属于size-mismatch TaskSnapshotSurface，Home还被明确排除。
+## 13. 失败与竞态要按“模型、WindowState、句柄、像素”分层恢复
 
-## 99. macOS只读练习一：手推选型表
+starting window是体验优化，许多失败选择继续等真实App而不让system_server崩溃；这不等于失败会把每本账自动回滚得像事务。
+
+| 失败或竞态 | 可见源码结果 | 后续应观察 |
+|---|---|---|
+| display frozen/无目标display | 选择前或policy层返回false/null | 是否直接等待真实窗 |
+| theme entry、包资源或Drawable失败 | Splash不建或create返回null | `mStartingData`是否仍残留、真实窗何时来 |
+| token不是Activity、Activity已退出层级 | WMS返回BAD/EXITING类错误 | policy finally或Snapshot outer catch怎样清理 |
+| 第二个starting WindowState | WMS返回`ADD_DUPLICATE_ADD` | ActivityRecord防重是否被异步窗口穿透 |
+| Snapshot无Task/main/top opaque window | `TaskSnapshotSurface.create()`返回null | 模型仍可能存在，但无可移除句柄 |
+| Snapshot add/relayout/draw异常 | 外层Add Runnable捕获Exception | 是否已有短命startingWindow、cleanup是否到达 |
+| create过程中目标先出真实窗 | data被清；返回句柄后走abort remove | WindowState从加入到移除的短窗口 |
+| orientation在Snapshot创建后改变 | `resized()`把remove投给主Looper | 真实新方向窗口与旧图的交接 |
+| transfer发生在源create途中 | 目标重排；源返回后自删句柄 | 两个Runnable与唯一模型所有权 |
+
+一个特别容易漏的状态是“create返回null”。Add Runnable不会因此清`mStartingData`，所以后续同Activity的`addStartingWindow()`仍可能被模型防重挡住；最终通常依靠真实窗口的remove、Activity清理或其他路径收口。诊断时只查WMS有没有WindowState，会错过这个模型残留。
+
+反过来，`startingWindow!=null && startingSurface==null`也可能只是正常in-flight：WMS add发生在create内部，Runnable还没返回登记句柄。若creator最终返回非空句柄，`removeStartingWindow()`先清ActivityRecord账后，creator会在第二锁区看到data为null，再用刚得到的句柄做真正remove；若create失败而没有句柄，则不能套用这个收口顺序。
+
+本章固定路线排除进程死亡、display移除、资源卸载和并发第二笔launch。现实故障若落在这些分支，应先标出四本对象账的现场值，再判断是等待、取消、清理还是重建，不能从一条白屏录像倒推唯一代码路径。
+
+## 14. 白屏、旧图与闪烁要找第一处分叉，而不是只盯 `onCreate()`
+
+| 现象 | 已知边界 | 第一轮证据重点 |
+|---|---|---|
+| 白色很快出现但停很久 | Splash可能已正常drawn，只是launch theme背景为白 | `T_pick/H_pass/S_drawn`与真实`A_ready`之间的Provider、Application、Activity、ViewRoot、RT |
+| 点击Recents先见旧业务数据 | 很可能选中REAL snapshot；旧图本就来自较早capture | cache对象的id/rotation/isReal、newIntents门、真实首窗交接时刻 |
+| 安全页只显示纯色+系统栏 | APP_THEME snapshot可能按设计隐藏真实像素 | `mDisablePreviewScreenshots`、secure window、TaskDescription颜色 |
+| 没有任何preview | 可能是NONE，也可能前置/theme/policy/create失败 | overlay/scene/display/mainWin、类型、theme、WindowState与句柄四层 |
+| 过渡图尺寸或bar闪变 | size-mismatch、crop、TaskDescription与真实Insets不一致 | frame/buffer/taskSize、aspectRatioMismatch、systemBar painter |
+| 跳板间闪两次 | pending transfer、旧create abort、新create重排可能交错 | 源/目标data/window/surface/moved与两个Runnable |
+| Snapshot似乎“不到450ms就没了” | 阈值从queue后的mShownTime算，不是present算 | sizeMismatch、Home特例、remove第一次调用与实际session remove |
+| `startingDisplayed=true`但肉眼未确认 | 这里只到READY/HAS的WMS统计 | show transaction、SF latch/compose、可靠present fence |
+| 真实首窗已ready仍短暂见preview | ActivityRecord先清账，真实remove可异步/动画/延迟 | `R_clear/R_call/R_gone`三点，不只看字段null |
+
+把证据按层排列更稳：
+
+```text
+决策层：showStartingWindow参数、cache、type、theme、transfer
+对象层：mStartingData / startingWindow / startingSurface
+WMS层：DRAW_PENDING / COMMIT / READY / HAS、startingDisplayed、startingMoved
+清理层：onFirstWindowDrawn / R_clear / StartingSurface.remove / R_gone
+显示层：starting与real各自的queue、latch、compose、present fence
+```
+
+Splash颜色与真实首帧背景不一致，即使所有duration都很小也会闪；Snapshot像素再漂亮，也可能业务过期。性能优化和视觉连续性是两项验收：前者缩短完成点间隔，后者让两侧内容、system bars与Insets在交接处一致。
+
+## 15. 九组 macOS 只读源码练习
+
+以下命令从 AOSP 根目录执行，只读文件，不要求编译或设备。每个`rg -e`备选都应独立命中；命中行号只负责定位，运行时顺序仍要按调用关系手画。
+
+### 练习 1：定位上层入口与五个前置门
 
 ```bash
-sed -n '1910,1940p' \
-  frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+test -f frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F -e 'void showStartingWindow' -e 'mTaskOverlay' -e 'ANIM_SCENE_TRANSITION' -e 'boolean addStartingWindow' -e '!okToDisplay()' -e 'mainWin.mWinAnimator.getShown()' frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F -e 'topActivityWithStartingWindow' -e 'showStartingWindow(prev' frameworks/base/services/core/java/com/android/server/wm/ActivityStack.java frameworks/base/services/core/java/com/android/server/wm/Task.java
 ```
 
-分别推导：新Task、进程死亡、Task switch+未创Activity、Task switch+可用snapshot、Home snapshot不兼容的结果。
+回答：哪些门在cache查询前？`mStartingWindowState=SHOWN`为何不证明AnimationThread已经运行？`activityCreated`的服务端state范围是什么？
 
-## 100. macOS只读练习二：追Splash跨层
+### 练习 2：手推类型表与Home第二道门
 
 ```bash
-rg -n "SplashScreenStartingData|addSplashScreen|addSplashscreenContent|SplashScreenSurface" \
-  frameworks/base/services/core/java/com/android/server/wm \
-  frameworks/base/services/core/java/com/android/server/policy
+test -f frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F -e 'false /* restoreFromDisk */' -e 'getStartingWindowType' -e 'newTask || !processRunning' -e 'taskSwitch && allowTaskSnapshot' -e 'isSnapshotCompatible' -e 'rotationForActivityInDifferentOrientation' frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F -e 'removeSnapshotCache' -e 'TRANSIT_FLAG_KEYGUARD_GOING_AWAY_NO_ANIMATION' -e 'return createSnapshot(snapshot)' frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
 ```
 
-标出每段的进程/线程，并解释为什么“使用App Context”不等于“在App进程运行”。
+回答：有cache时cold launch为何仍选Splash？普通Task rotation不兼容怎样回退？Home候选拒用时cache是否仍保留？
 
-## 101. macOS只读练习三：比较Snapshot尺寸分支
+### 练习 3：区分Intent许可、真实像素与APP_THEME生产
 
 ```bash
-sed -n '330,510p' \
-  frameworks/base/services/core/java/com/android/server/wm/TaskSnapshotSurface.java
+test -f frameworks/base/services/core/java/com/android/server/wm/TaskSnapshotController.java
+rg -n -F -e 'private boolean allowTaskSnapshot()' -e 'ActivityRecord.isMainIntent(intent)' -e 'filterEquals(intent)' -e 'intent.getExtras() != null' -e 'shouldUseAppThemeSnapshot' frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F -e 'SNAPSHOT_MODE_APP_THEME' -e 'drawAppThemeSnapshot' -e 'captureLayersExcluding' -e 'mCache.putSnapshot' -e 'persistSnapshot' -e 'false /* isRealSnapshot */' frameworks/base/services/core/java/com/android/server/wm/TaskSnapshotController.java
+rg -n -F -e 'setDisablePreviewScreenshots' -e 'mDisablePreviewScreenshots' -e 'WindowState::isSecureLocked' frameworks/base/core/java/android/app/Activity.java frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
 ```
 
-画出size-match与size-mismatch两条路径，标出child SurfaceControl、crop、matrix、背景/system bar与450 ms延迟属于哪一条。
+回答：`windowDisablePreview`与`setDisablePreviewScreenshots()`分别影响消费还是生产？APP_THEME画的是什么？REAL capture显式排除了哪一层？
 
-## 102. macOS只读练习四：追取消竞态
+### 练习 4：证明Theme、transfer与新Splash的真实顺序
 
 ```bash
-sed -n '1840,2005p' \
-  frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+test -f frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F -e 'Window_windowIsTranslucent' -e 'Window_windowIsFloating' -e 'Window_windowShowWallpaper' -e 'Window_windowDisablePreview' -e 'transferStartingWindow(transferFrom)' -e 'type != STARTING_WINDOW_TYPE_SPLASH_SCREEN' -e 'new SplashScreenStartingData' frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F -e 'if (type == STARTING_WINDOW_TYPE_SNAPSHOT)' -e 'return createSnapshot(snapshot)' frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
 ```
 
-回答：
+回答：Snapshot为何不受这些theme位过滤？NONE何时仍能得到旧preview？为什么`windowDisablePreview`也会挡住NONE transfer？
 
-1. 为什么createStartingSurface必须锁外；
-2. create完后怎样发现请求已取消；
-3. startingWindow还未建时remove如何生效；
-4. 为什么真实surface.remove要post回与add相同线程。
+### 练习 5：画出两段锁、锁外create与三对象中间态
 
-## 103. 源码导航
+```bash
+test -f frameworks/base/services/core/java/com/android/server/wm/StartingData.java
+rg -n -F -e 'DO NOT HOLD THE WINDOW MANAGER LOCK' -e 'abstract StartingSurface createStartingSurface' frameworks/base/services/core/java/com/android/server/wm/StartingData.java
+rg -n -F -e 'postAtFrontOfQueue(mAddStartingWindow)' -e 'startingData = mStartingData;' -e 'surface = startingData.createStartingSurface(ActivityRecord.this);' -e 'if (mStartingData == null) {' -e 'startingSurface = surface;' -e 'surface.remove();' frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F -e 'mStartingData' -e 'WindowState startingWindow' -e 'StartingSurface startingSurface' frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+```
 
-| 主题 | r48文件 |
-|---|---|
-| 选型、theme过滤、转移/移除 | `services/core/java/com/android/server/wm/ActivityRecord.java` |
-| 模型抽象 | `StartingData.java` |
-| Splash模型 | `SplashScreenStartingData.java` |
-| Snapshot模型 | `SnapshotStartingData.java` |
-| Splash真实窗口 | `services/core/java/com/android/server/policy/PhoneWindowManager.java` |
-| Splash移除句柄 | `services/core/java/com/android/server/policy/SplashScreenSurface.java` |
-| Snapshot生产/cache | `TaskSnapshotController.java` |
-| Snapshot starting surface | `TaskSnapshotSurface.java` |
-| starting WindowState登记 | `WindowManagerService.java` |
-| draw state | `WindowStateAnimator.java` |
-| transition就绪判断 | `AppTransitionController.java` |
+回答：第二锁区验证了null还是对象身份？create返回null会清data吗？取消发生在锁外create期间时谁负责移除已建实体？
 
-## 104. 复读修订
+### 练习 6：证明Splash属于system_server代理ViewRoot
 
-成文后重新核对r48，专门修正：
+```bash
+test -f frameworks/base/services/core/java/com/android/server/policy/PhoneWindowManager.java
+rg -n -F -e 'StartingSurface addSplashScreen' -e 'getDisplayContext' -e 'createPackageContextAsUser' -e 'createConfigurationContext' -e 'new PhoneWindow(context)' -e 'setIsStartingWindow(true)' -e 'TYPE_APPLICATION_STARTING' -e 'FLAG_NOT_TOUCHABLE' -e 'PRIVATE_FLAG_FAKE_HARDWARE_ACCELERATED' -e 'Window_windowSplashscreenContent' -e 'wm.addView(view, params)' -e 'view.getParent() != null' frameworks/base/services/core/java/com/android/server/policy/PhoneWindowManager.java
+rg -n -F -e 'class SplashScreenSurface' -e 'wm.removeView(mView)' frameworks/base/services/core/java/com/android/server/policy/SplashScreenSurface.java
+rg -n -F -e 'new Handler(AnimationThread.getHandler().getLooper())' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+```
 
-1. 传统Splash创建进程是system_server，不是SystemUI或目标App；
-2. App Context只是资源/主题上下文，不改变执行进程；
-3. 冷启动/process dead优先Splash，不是有旧Task就优先Snapshot；
-4. starting-window查snapshot明确不restore from disk；
-5. theme translucent/floating/disablePreview过滤发生在Snapshot早返回之后，主要约束Splash；
-6. `StartingData`/`startingWindow`/`startingSurface` 分别是模型、WMS WindowState和remove句柄；
-7. Android 11有 `windowSplashscreenContent`，但不等于Android 12后公开SplashScreen API全套实现；
-8. secure/disable-preview Task生产theme snapshot，不捕获真实像素；
-9. 450 ms延迟只属size-mismatch snapshot且排除Home；
-10. `startingDisplayed` 是WMS drawn状态，不是HWC present fence；
-11. NONE类型仍可先成功转移prev starting window；
-12. remove能通过清StartingData取消尚未执行的异步add，也能在锁外create后发现代际变化并移除新surface。
+回答：App包Context改变了资源来源还是执行进程？addView返回证明到哪一层？哪几个flag阻止代理窗接管输入？
 
-## 105. 本章结论与下一章
+### 练习 7：比较Snapshot的size match、同宽高比缩放与crop补洞
 
-Android 11 starting window是一套系统代理的过渡窗口协议：ActivityRecord根据Task/进程/Intent/snapshot/theme决策内容，异步在system_server创建 `TYPE_APPLICATION_STARTING`，用WMS draw state参与AppTransition，再在真实App首window drawn后交接并移除。
+```bash
+test -f frameworks/base/services/core/java/com/android/server/wm/TaskSnapshotSurface.java
+rg -n -F -e 'session.addToDisplay' -e 'session.relayout' -e 'drawSnapshot()' -e 'attachAndQueueBufferWithColorSpace' -e 'drawSizeMismatchSnapshot' -e 'aspectRatioMismatch' -e 'calculateSnapshotCrop' -e 'setWindowCrop' -e 'setMatrix' -e 'drawBackgroundAndBars' -e 'mSession.finishDrawing' frameworks/base/services/core/java/com/android/server/wm/TaskSnapshotSurface.java
+rg -n -F -e 'SIZE_MISMATCH_MINIMUM_TIME_MS' -e 'mShownTime = SystemClock.uptimeMillis()' -e 'mHandler.postAtTime(this::remove' -e 'mActivityType != ACTIVITY_TYPE_HOME' frameworks/base/services/core/java/com/android/server/wm/TaskSnapshotSurface.java
+```
 
-白屏/黑屏不是一个单一`onCreate()`问题；需分别检查选型、theme资源、异步创建、WMS drawn、SF显示与真实首窗口交接。
+回答：哪条分支才锁Canvas补背景？450 ms从什么点起算？为什么它不是“至少present 450 ms”？
 
-第219章将继续追ViewRootImpl首帧与WMS draw state的反向协议：`reportNextDraw`、`finishDrawing`、WindowStateAnimator的DRAW_PENDING→COMMIT_DRAW_PENDING→READY_TO_SHOW→HAS_DRAWN，以及这些状态与BLAST sync transaction、AppTransition交接的精确边界。
+### 练习 8：区分WMS登记、drawn、show与transition reason
+
+```bash
+test -f frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+rg -n -F -e 'activity.startingWindow != null' -e 'tokenActivity.startingWindow = win' -e 'ADD_DUPLICATE_ADD' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+rg -n -F -e 'finishDrawingLocked' -e 'COMMIT_DRAW_PENDING' -e 'commitFinishDrawingLocked' -e 'READY_TO_SHOW' frameworks/base/services/core/java/com/android/server/wm/WindowStateAnimator.java
+rg -n -F -e 'w != startingWindow' -e 'notifyStartingWindowDrawn' -e 'startingDisplayed = true' frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F -e 'startingDisplayed' -e 'startingMoved' -e 'APP_TRANSITION_SPLASH_SCREEN' -e 'APP_TRANSITION_SNAPSHOT' frameworks/base/services/core/java/com/android/server/wm/AppTransitionController.java
+```
+
+回答：starting窗为何不增加真实allDrawn计数？reason为何只是模型分类？`startingDisplayed`离可靠present还缺哪一层证据？
+
+### 练习 9：闭合transfer、真实首窗与异步remove
+
+```bash
+test -f frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F -e 'tStartingWindow != null && fromActivity.startingSurface != null' -e 'mSkipAppTransitionAnimation = true' -e 'startingDisplayed = fromActivity.startingDisplayed' -e 'fromActivity.startingMoved = true' -e 'fromActivity.mStartingData != null' -e 'scheduleAddStartingWindow()' frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F -e 'void onFirstWindowDrawn' -e 'win.cancelAnimation()' -e 'void removeStartingWindow' -e 'mWmService.mAnimationHandler.post' -e 'surface.remove()' -e 'mStartingWindowState = STARTING_WINDOW_REMOVED' frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F -e 'mHandler.postAtTime(this::remove' -e 'mSession.remove(mWindow)' frameworks/base/services/core/java/com/android/server/wm/TaskSnapshotSurface.java
+rg -n -F -e 'TRANSIT_PREVIEW_DONE' frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+```
+
+回答：完整pair为何仍不证明drawn？pending/in-flight transfer怎样区分？`R_clear`后哪两类机制还能延后`R_gone`？
+
+## 16. 把选择、创建与交接压成一张不会越界的检查表
+
+先记住六条不变量：
+
+1. cold、新Task，或Task-switch且服务端state不在STARTED—STOPPED闭区间时优先Splash；只有process有thread、state落在该闭区间、Task switch、Intent允许且running cache rotation兼容时才选Snapshot。
+2. Snapshot在theme过滤前早返；NONE transfer与新Splash都必须先过theme/wallpaper门。
+3. StartingData、startingWindow、startingSurface、startingDisplayed是模型、WMS实体、移除句柄与drawn统计四本账；`mStartingWindowState=SHOWN`只是接受结果。
+4. Splash先返回句柄再异步draw，Snapshot先queue/finishDrawing再返回句柄；不能统一强排。
+5. transfer迁移的是同一WindowState/句柄或未完成模型，`startingMoved`不等于drawn/present。
+6. 真实窗口进入`onFirstWindowDrawn()`便可同步清代理账，但真正remove、exit animation、Snapshot 450 ms门和两类present仍各有自己的完成点。
+
+遇到启动白屏或旧图，按下面顺序问：
+
+```text
+前置门是否允许preview？
+→ cache/Intent/rotation选了哪一类？
+→ theme是否挡住非Snapshot路线？
+→ 是transfer还是新建StartingData？
+→ AnimationThread是否建出WindowState与surface句柄？
+→ starting窗是否finish/READY/startingDisplayed？
+→ transition其他门是否满足？
+→ 真实窗何时进入onFirstWindowDrawn？
+→ ActivityRecord何时清账，底层何时真正remove？
+→ starting与real各自何时取得可靠present证据？
+```
+
+这条检查链把“系统给了即时反馈”“WMS认定代理窗drawn”“真实窗口开始接管”和“像素真正显示”分成四个问题。只有先找到第一处分叉，theme调整、启动性能优化与窗口状态诊断才不会互相代替。
+
+下一章继续追真实首窗的反向回报：Android ViewRootImpl `reportNextDraw`、`finishDrawing`与WMS draw-state状态机。

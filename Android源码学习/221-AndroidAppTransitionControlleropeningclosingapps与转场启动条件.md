@@ -1,856 +1,588 @@
 # 221 Android AppTransitionController opening/closing apps 与转场启动条件
 
-> 源码版本：Android 11 / `android-11.0.0_r48`  
-> 学习方式：macOS只读核源，不在当前Mac上编译或运行AOSP  
-> 前置章节：第 218、219、220 章
+> 源码基线：Android 11 / API 30 / `android-11.0.0_r48`。
+>
+> 本章只讨论旧版 `AppTransition` 管线：可以由源码证明某个 Display 何时从 pending 进入 READY、哪些门会阻止统一提交、动画容器怎样从 Activity 向上提升，以及 RUNNING 怎样回到 IDLE；不能据此证明 SurfaceFlinger 已 latch、HWC 已 present，也不能把 Android 12 以后 Shell Transitions 的协议倒灌进来。第 220 章留下的 `allDrawn` 在这里仅是 opening/changing readiness 的一个输入；第 222 章再进入 `AnimationAdapter`、`SurfaceAnimator` 与动画 leash。
 
-## 1. 本章要解决什么问题
+Activity 已 resumed、starting window 已显示，甚至真实窗口已 `allDrawn`，页面为什么仍可能不切换？核心不是再找一个“最终 ready”布尔值，而是分清四本账：**待执行 transit、AppTransition 状态、三组参与集合、动画是否仍存在**。它们在一次 surface placement 中汇合，却不是同一个状态机。
 
-Activity已经resume、Starting Window已经显示或真实窗口已经allDrawn，为什么新页面有时仍不立刻切换？
+## 1. 固定一条普通开页链，先命名九个观察点
 
-答案位于Android 11旧版AppTransition管线：系统需要把opening、closing和changing对象作为一组，等待多个门都满足，再统一选择transit、动画目标、可见性和Surface事务。
+先固定场景 `L_open`：默认 Display 上，旧 Activity A 关闭、新 Activity B 打开；二者位于可动画环境；没有 Keyguard、壁纸改写、relaunch、异步 spec、unknown visibility、旋转冲突或异常；B 的真实窗口最终绘制完成；经典本地动画能够创建并正常结束。后文再逐项放宽。
 
-## 2. 先给出全链路
+| 点 | 源码侧定义 | 仍不能推出 |
+|---|---|---|
+| `T_set` | `mNextAppTransition` 不再是 `TRANSIT_UNSET`，5 秒 runnable 已重新计时 | 状态已经 READY |
+| `S_join` | B 在 `mOpeningApps`、A 在 `mClosingApps` | 集合成员已经通过 ready 门 |
+| `E_ready` | `executeAppTransition()` 令状态成为 READY，并请求 traversal | 动画已绑定 |
+| `G_pass` | opening 与 changing 两次 `transitionGoodToGo()` 都返回 true | closing app 已 drawn |
+| `A_bind` | opening/closing target 已选出，`applyAnimation()` 已被调用 | Surface 动画已经获准真正起跑 |
+| `V_commit` | closing 先 `commitVisibility(false)`，opening 后 `commitVisibility(true)` 并 show windows | transaction 已 present |
+| `R_run` | `AppTransition.goodToGo()` 清 pending transit/flags，并写 RUNNING | 远端 runner 的 Binder `onAnimationStart` 已调用 |
+| `M_start` | Metrics 消费 `mTempTransitionReasons` | 每次转场都一定有非空 reason |
+| `R_idle` | Display 子树已找不到 `isAnimating(PARENTS \| TRANSITION)` 为 true 的 Activity，收尾把状态写回 IDLE | 用户已经看到目标像素 |
 
-```text
-prepareAppTransition(transit)
-  → 记录下一种transition并进入IDLE/pending
-setVisibility()
-  → ActivityRecord加入openingApps或closingApps
-executeAppTransition()
-  → AppTransition进入READY并请求WMS traversal
-SurfacePlacement
-  → transitionGoodToGo检查draw/preview/rotation/spec/unknown visibility/wallpaper
-handleAppTransitionReady
-  → 修正transit、选动画主题、提升动画target
-  → applyAnimations
-  → commit closing/opening visibility并show windows
-  → AppTransition.goodToGo进入RUNNING
-动画全部结束
-  → handleAnimatingStoppedAndTransition进入IDLE并收尾
-```
-
-## 3. 总时序图
-
-```mermaid
-sequenceDiagram
-    participant ATMS as "ATMS / ActivityRecord"
-    participant DC as "DisplayContent"
-    participant AT as "AppTransition"
-    participant C as "AppTransitionController"
-    participant WMS as "WMS SurfacePlacement"
-    ATMS->>DC: "prepareAppTransition(type)"
-    DC->>AT: "prepareAppTransitionLocked"
-    ATMS->>DC: "openingApps/closingApps.add"
-    ATMS->>DC: "executeAppTransition"
-    DC->>AT: "setReady"
-    DC->>WMS: "requestTraversal"
-    WMS->>C: "handleAppTransitionReady"
-    C->>C: "transitionGoodToGo"
-    alt "仍有门未满足"
-        C-->>WMS: "return，等待下一轮"
-    else "ready或5秒全局timeout"
-        C->>C: "选择transit/animLp/animation targets"
-        C->>ATMS: "commitVisibility + showAllWindows"
-        C->>AT: "goodToGo → RUNNING"
-    end
-    WMS->>AT: "全部动画结束 → IDLE"
-```
-
-## 4. 这是Android 11的旧版转场模型
-
-本章基于r48的 `AppTransition`、`AppTransitionController`和opening/closing集合。
-
-不要把Android 12以后Shell Transitions、TransitionInfo、TransitionPlayer等新架构倒灌进来；名字相似，控制中心和同步模型已不同。
-
-## 5. 主要类的职责
+固定场景的常见局部顺序是：
 
 ```text
-AppTransition：记录transit、状态、override动画信息、timeout和listener
-DisplayContent：每个Display持有AppTransition及三组参与集合
-AppTransitionController：检查ready、改写transit、选target并提交可见性
-ActivityRecord：把自己加入opening/closing，维护draw/starting/visible状态
-RootWindowContainer：在SurfacePlacement中逐Display触发ready检查
+T_set < S_join
+T_set < E_ready
+E_ready < G_pass
+G_pass < A_bind < V_commit < R_run < M_start
+R_run < R_idle
 ```
 
-## 6. 三个参与集合
+`S_join` 与 `E_ready` 没有值得依赖的通用先后：不同调用链可以先收集参与者，也可以先执行已准备的 transition 后再因 screen-freeze 特例加入 opening。更不能补写 `allDrawn < G_pass` 为全局定律，因为 starting window 与 5 秒 timeout 都能让门继续前进。
 
-每个 `DisplayContent`有：
+## 2. 四个状态、一个 transit 与三组集合是正交账本
+
+`AppTransition` 的整数状态只有四个：
+
+| 状态 | 写点 | 精确含义 |
+|---|---|---|
+| IDLE | 初值、`prepare()`、动画收尾 | 尚未获准执行，或上一轮已收尾 |
+| READY | `setReady()` | surface placement 可以开始检查 |
+| RUNNING | `goodToGo()` | 已完成本轮统一提交，等待 Display 的 `isAppTransitioning()` 谓词转 false |
+| TIMEOUT | 5 秒 runnable 的有条件分支 | `isReady()` 仍为 true，但普通门会被绕过 |
+
+状态之外，`mNextAppTransition` 单独回答“当前记录了哪种待执行 transit”。因此 `isTransitionSet()` 与 `isReady()` 不能互换：prepare 后通常是“transit 已 set、状态 IDLE”；`goodToGo()` 后则是“transit 已清、状态 RUNNING”。
+
+每个 `DisplayContent` 还维护：
+
+- `mOpeningApps`：元素是 `ActivityRecord`，表示参加 opening 侧；普通延迟路径稍后提交 visible，screen-freeze 特例却可能已经 commit；
+- `mClosingApps`：元素也是 `ActivityRecord`，表示参加 closing 侧；普通延迟路径稍后提交 invisible，移除路径却可以先 commit 再入组；
+- `mChangingContainers`：元素是 `WindowContainer`，r48 的实际入口可把 `Task` 放进来并冻结起始 surface。
+
+`ActivityRecord.setVisibility(false)` 在 `mVisibleRequested` 已为 false 时有提前返回；它至多补发此前 deferred 的 client-hide，不执行后面的移组与请求状态写入。其余完整路径才先把自己从 opening/closing 两组移除，再写请求状态。只有 `okToAnimate(true)` 且 transit 已 set 时，它才重新加入对应集合并延迟 `commitVisibility()`；否则当场 commit 与更新 reported visibility。可见请求还会先 `setClientVisible(true)`，避免一边等窗口绘制、一边禁止客户端生产窗口。
+
+另有三个容易漏掉的入口：
+
+- transit 未 set、状态却 READY 时，可见 Activity 会加入 opening，用于 screen freeze 解冻等待；
+- `TRANSIT_TASK_OPEN_BEHIND` 除 launching Activity 外，还会把当前 focused Activity 强制放入 opening，以便装载动画。
+- `onRemovedFromDisplay()` 会先 `commitVisibility(false)`；若随后发现 transit 仍 set，再把 Activity 放入 closing以延迟实体移除。
+
+这些集合是当前批次，不是历史。成功路径会全部清空；Activity 移除、跨 Display 等路径也会主动搬移或删除成员。
+
+## 3. prepare 与 execute 分工，5 秒计时也不是封闭状态图
+
+`prepareAppTransitionLocked()` 先选择或合并 transit，再调用 `prepare()`：
+
+- force override、传入 Keyguard transit、当前未 set、当前为 NONE，或允许 crash-close 覆盖时，直接写新 transit；
+- 否则在未要求 always-keep、当前也不是 Keyguard/crash-close 时，TASK_OPEN 可盖 TASK_CLOSE，ACTIVITY_OPEN 可盖 ACTIVITY_CLOSE，Task 级 transit 可盖当前 Activity 级 transit；
+- `setAppTransition()` 对 flags 使用按位或，不是每次覆盖清零。
+
+`prepare()` 只有在当前不为 RUNNING 时才把状态写 IDLE、通知 pending listeners 并重置 clip-reveal 统计；RUNNING 时返回 false。这里有一个比“RUNNING 时 prepare 无效”更精确的边界：**transit 选择发生在 `prepare()` 之前**，而且只要选择后仍 `isTransitionSet()`，方法无论 `prepared` 是 true 还是 false，都会移除旧 callback 并重新 post 5 秒 timeout。
+
+`DisplayContent.prepareAppTransition()` 只在 `prepared && okToAnimate()` 时清 `mSkipAppTransitionAnimation`。所以返回值既不代表“transit 一定没被碰”，也不代表“timeout 没被重置”。
+
+`executeAppTransition()` 则只在 transit 已 set 时做两件事：`setReady()` 与 `requestTraversal()`。前者还会启动已登记的异步 animation-spec Future；它不是在 ATMS 当前调用栈里直接选动画或提交可见性。
+
+5 秒 runnable 的行为也不是简单的 READY→TIMEOUT 箭头：
+
+1. 进入 global lock 后先无条件通知 AppTransition timeout listeners；
+2. 只有 transit 仍 set，或 opening/closing/changing 任一集合非空，才写 TIMEOUT 并同步 `performSurfacePlacement()`；
+3. 若已没有待处理内容，只发生 listener 通知，不改状态；
+4. 由于 RUNNING 期间的新 prepare 尝试仍可能重设 transit并重新计时，runnable 到点时并不以“当前必为 READY”为前提。
+
+TIMEOUT 是整批转场的逃生门，不是每个 Activity 各有五秒，也不会撤销仍在执行的 spec Future。
+
+spec Future 还没有批次 generation。worker 只捕获 Future Binder；完成时先把共享 pending bit写 false，再读取当时共享的 future-callback 与 scale-up 字段调用 `overridePendingAppTransitionMultiThumb()`。若此时没有 transit，或当前已是 remote override，结果会被拒绝；若一个更新的非 remote transit 已 set，旧结果却可能写进新批次。更新批次也在取 Future 时复用同一个 pending bit，因此旧 worker完成还可能过早打开新批次的 spec 门。最终无论 override是否接受，代码都会清共享 future-callback并请求 traversal。
+
+## 4. ready 检查位于 transaction 之后，并且短路调用两次
+
+`RootWindowContainer.performSurfacePlacement()` 进入 `performSurfacePlacementNoTrace()`；后者先在一笔 WMS Surface transaction 中执行 `applySurfaceChangesTransaction()`，关闭 transaction并运行 after-prepare-surfaces callbacks，随后才调用 `checkAppTransitionReady()`。它按 Display 的逆 Z 序遍历；当前 Display 的 `isReady()` 为 true时，才进入 controller。
+
+入口形状必须逐字读：
 
 ```java
-final ArraySet<ActivityRecord> mOpeningApps;
-final ArraySet<ActivityRecord> mClosingApps;
-final ArraySet<WindowContainer> mChangingContainers;
-```
-
-opening/closing以ActivityRecord为元素；changing可直接是Task等更高层WindowContainer。
-
-## 7. openingApps表达什么
-
-Activity已被请求变为可见，但在AppTransition存在时，最终 `commitVisibility(true)`被推迟。
-
-集合既是ready检查输入，也是动画source与最终可见性提交清单。
-
-## 8. closingApps表达什么
-
-Activity被请求隐藏，但退出可见性和动画需要与opening对象配对提交。
-
-旧Activity在这段时间仍可能保留Surface，避免新Activity尚未准备好时先露出背景空洞。
-
-## 9. changingContainers表达什么
-
-它处理窗口层级保持可见但边界或windowing mode变化的transition，例如Task改变窗口模式。
-
-changing对象不适合简单归类为opening或closing，所以有独立集合和动画路径。
-
-## 10. 集合不是历史日志
-
-三组集合只描述当前待执行transition，`handleAppTransitionReady()`成功后会统一clear。
-
-若看到空集合，可能是尚未加入、已经执行完成或被清理，不能仅凭空集合断言从未发生转场。
-
-## 11. prepare与execute是两个动作
-
-`prepareAppTransition()`选择/合并“下一种transit”，安装timeout并通知pending。
-
-`executeAppTransition()`才把状态设为READY、开始获取异步animation specs并请求Traversal。
-
-## 12. AppTransition四态
-
-```mermaid
-stateDiagram-v2
-    [*] --> IDLE
-    IDLE --> READY: "executeAppTransition / setReady"
-    READY --> RUNNING: "所有ready门满足后goodToGo"
-    READY --> TIMEOUT: "5秒AppTransition timeout"
-    TIMEOUT --> RUNNING: "下一次SurfacePlacement强制goodToGo"
-    RUNNING --> IDLE: "所有app transition动画停止"
-```
-
-`prepare()`在当前不RUNNING时将状态置IDLE；它不等于动画已经ready。
-
-## 13. prepareAppTransitionLocked如何选transit
-
-初次未设置时可直接写入；Keyguard和crashing transition有更高保护优先级。
-
-后续请求可能根据 `alwaysKeepCurrent`、Task级优先于Activity级、open优先覆盖对应close等规则更新当前transit。
-
-## 14. 为什么Task transition可覆盖Activity transition
-
-连续trampoline Activity可能先产生Activity级开关，最终实际跨Task。
-
-源码选择Task动画作为更能代表最终视觉层级的transition，减少重复或错误范围动画。
-
-## 15. prepare会安装5秒timeout
-
-只要transition仍set，`prepareAppTransitionLocked()`移除旧timeout并重新post `APP_TRANSITION_TIMEOUT_MS=5000`。
-
-这是整条AppTransition的总逃生门，不是每个Activity各有5秒。
-
-## 16. execute为何只请求Traversal
-
-`DisplayContent.executeAppTransition()`：
-
-```java
-mAppTransition.setReady();
-mWmService.mWindowPlacerLocked.requestTraversal();
-```
-
-它不直接在ATMS调用栈里执行动画，真正ready检查留给WMS统一SurfacePlacement。
-
-## 17. RootWindowContainer何时检查
-
-SurfacePlacement结束阶段逐Display处理；只有 `mAppTransition.isReady()`为true才调用：
-
-```java
-curDisplay.mAppTransitionController.handleAppTransitionReady();
-```
-
-TIMEOUT也被 `isReady()`视为ready。
-
-## 18. handleAppTransitionReady首先清理由映射
-
-`mTempTransitionReasons`每轮先clear，用于记录每个参与对象最终因真实windows drawn、Splash或Snapshot而ready。
-
-后面ActivityMetricsLogger使用它为transition start标注原因。
-
-## 19. opening和changing都要good-to-go
-
-入口先检查：
-
-```java
-transitionGoodToGo(mOpeningApps, reasons)
-transitionGoodToGo(mChangingContainers, reasons)
-```
-
-任意一组返回false，本轮整体return。
-
-## 20. 为什么不检查closingApps是否drawn
-
-closing Activity代表即将离开的旧内容，通常已有可展示Surface；即便自身未完成新一轮draw，也不能阻挡退出动画。
-
-源码在真正处理closing时还会强制 `app.allDrawn=true`，明确把关闭动画放行与绘制完成分开。
-
-## 21. 第一道门：旧旋转动画
-
-未timeout时，如果默认Display的ScreenRotationAnimation仍在运行，并且当前Display rotation需要更新，transition延迟。
-
-避免旧旋转动画中途启动App动画，随后又被新旋转打断。
-
-## 22. 多Display代码的一个版本边界
-
-r48这里取的是 `Display.DEFAULT_DISPLAY`的rotation animation，再结合当前Display `needsUpdate()`。
-
-不能无证据地把它描述成“每个Display完全独立检查自己的旋转动画”；应按当前源码和实际产品行为分别验证。
-
-## 23. 每个opening Activity的三选一ready条件
-
-```java
-final boolean allDrawn = activity.allDrawn
-        && !activity.isRelaunching();
-if (!allDrawn
-        && !activity.startingDisplayed
-        && !activity.startingMoved) {
-    return false;
+mTempTransitionReasons.clear();
+if (!transitionGoodToGo(mDisplayContent.mOpeningApps, mTempTransitionReasons)
+        || !transitionGoodToGo(mDisplayContent.mChangingContainers,
+                mTempTransitionReasons)) {
+    return;
 }
 ```
 
-真实窗口、已显示preview、或已转移preview任一成立即可继续。
+由短路语义可得到五个结论：
 
-## 24. allDrawn为何还要排除relaunching
+- opening 先检查；它失败时 changing 本轮根本不检查；
+- opening 通过、changing 失败时，reason map 可能已经含 opening 的条目；
+- 下一轮入口会先 clear，所以失败轮的部分 reason 不会累积；
+- closing 不在这两个调用里，因而 closing 是否 `allDrawn` 不阻止启动；
+- rotation、spec、unknown visibility 与 wallpaper 这些全局门写在 `transitionGoodToGo()` 内，所以 opening 通过后会在 changing 调用中再检查一次；即使集合为空，这些全局门也照样执行。
 
-配置重建时旧窗口状态可能暂时满足allDrawn，但新Activity实例仍在重建。
+这不是“所有三组成员逐个 ready 后一起开跑”，而是“opening 与 changing 的活动门，加上可能重复执行的 Display 级门”。日志若只写“Checking opening apps”，也不能替代实际传入的集合类型。
 
-转场若直接使用旧代际draw状态，会露出内容或尺寸不一致的窗口。
+## 5. 单个 opening/changing 对象有三条通路，reason 只是分类
 
-## 25. startingDisplayed的作用
+非 TIMEOUT 时，`transitionGoodToGo(apps, outReasons)` 对每个成员先调用 `getAppFromContainer()`：
 
-Splash或TaskSnapshot已达到WMS drawn状态时，用户已有过渡内容，AppTransition可以先启动，不必等真实窗口。
+- Activity 直接得到自身；
+- Task 映射为 `getTopNonFinishingActivity()`；
+- 得不到 Activity 的容器被跳过，不形成 reason，也不阻塞。
 
-这解释Starting Window不仅遮白屏，也参与启动transition的ready门。
+得到 Activity 后，真实窗口通路不是裸 `allDrawn`，而是：
 
-## 26. startingMoved的作用
-
-preview从一个ActivityRecord转移到另一个时，旧record会标记 `startingMoved=true`。
-
-它告诉ready检查：preview所有权已交接，不应让原Activity继续阻挡整组转场。
-
-## 27. startingMoved不代表当前Activity显示了一张preview
-
-字段描述“starting window已经被移走”，不是“startingDisplayed”的同义词。
-
-两者都可放行transition，但对应的窗口所有权和诊断意义相反。
-
-## 28. ready reason怎样选择
-
-真实allDrawn记录 `APP_TRANSITION_WINDOWS_DRAWN`。
-
-否则根据 `mStartingData instanceof SplashScreenStartingData`记录SPLASH_SCREEN；非Splash分支统一记SNAPSHOT。这个二选一也覆盖startingMoved但当前StartingData为空的情况，所以reason是粗粒度放行分类，不是对当前窗口对象的完整类型证明。
-
-## 29. reason映射不是draw完成证明
-
-它说明transition为什么获准开始，用于启动度量和诊断。
-
-Splash/Snapshot reason明确表示真实Activity窗口可能仍未完成。
-
-## 30. 第二道门：异步AnimationSpecs
-
-缩略图或多目标动画可通过future异步获取spec。
-
-只要 `isFetchingAppTransitionsSpecs()`为true，ready检查return false，避免动画已开跑才收到起止矩形或缩略图。
-
-## 31. setReady为何会触发fetch specs
-
-`AppTransition.setReady()`不仅改状态，还调用 `fetchAppTransitionSpecsFromFuture()`。
-
-异步结果回到WMS后清pending标志、安装spec并requestTraversal，再次尝试ready。
-
-## 32. specs等待也受全局5秒timeout保护
-
-若future永远不返回，AppTransition timeout把状态改为TIMEOUT并执行SurfacePlacement。
-
-TIMEOUT路径会跳过普通good-to-go门，优先避免界面永久卡住。
-
-## 33. 第三道门：unknown app visibility
-
-锁屏上启动Activity时，首次relayout前还不知道它是否会设置show-when-locked等flag。
-
-`UnknownAppVisibilityController`在状态未解析前阻止transition，避免先展示后又因Keyguard规则立刻隐藏产生闪烁。
-
-## 34. unknown visibility三态
-
-```text
-WAITING_RESUME
-  → WAITING_RELAYOUT
-  → WAITING_VISIBILITY_UPDATE
-  → 从unknown集合移除
+```java
+allDrawn = activity.allDrawn && !activity.isRelaunching();
+ready = allDrawn || activity.startingDisplayed || activity.startingMoved;
 ```
 
-resume、首次relayout和Keyguard flag可见性重算缺一不可。
+三者都为 false 才立即返回。reason 的写法则是：
 
-## 35. unknown状态如何重新触发检查
+| ready 通路 | 写入值 | 不能据此反推 |
+|---|---|---|
+| `allDrawn && !isRelaunching()` | `APP_TRANSITION_WINDOWS_DRAWN` | buffer 已 present |
+| 非 allDrawn，且 starting data 是 `SplashScreenStartingData` | `APP_TRANSITION_SPLASH_SCREEN` | 真实主窗口已完成 |
+| 其余 starting 通路 | `APP_TRANSITION_SNAPSHOT` | 当前一定存在可见 snapshot surface |
 
-最终visibility更新完成后，controller移除已解析Activity并直接 `performSurfacePlacement()`。
+最后一行尤其重要：代码在“不是 SplashScreenStartingData”时统一归为 SNAPSHOT；`startingMoved=true`、starting data 已变化等边界都可能得到这个标签。它是 Metrics 原因枚举，不是对当前 surface 类型的强证明。
 
-这让被挡住的AppTransition立即重新评估，而不是等一个无关窗口事件碰巧到来。
+closing 没有经过这张表。旧页面未完整绘制也可以参加退出动画；稍后的 closing 提交甚至会主动把其 `allDrawn` 写 true，这只是退出流程控制，不是补出绘制证据。
 
-## 36. 第四道门：Wallpaper ready
+## 6. Activity 门与四类全局门按固定顺序检查
 
-只有wallpaper当前可见时才检查 `wallpaperTransitionReady()`。
+每次非 TIMEOUT 调用的顺序是：
 
-若可见wallpaper尚未drawn，App transition先等wallpaper，避免目标App动画时背景突然补上。
+1. 取**默认 Display** 的 `ScreenRotationAnimation`；若它正在动画，且**当前 Display** 的 `DisplayRotation.needsUpdate()` 为 true，返回 false；
+2. 检查本次 apps 中的 Activity 三通路；
+3. 若 animation specs Future 仍 pending，返回 false；
+4. 若 unknown-app visibility map 非空，返回 false；
+5. 若 `isWallpaperVisible()` 为 false则通过；它为 true时要求 `wallpaperTransitionReady()`。
 
-## 37. Wallpaper有自己的500毫秒timeout
+这里混用了默认 Display 的 rotation animation 与当前 Display 的 needs-update，是 r48 的实现事实，多屏排障不能擅自改写成“同一 Display 的两个条件”。
 
-r48的 `WALLPAPER_DRAW_PENDING_TIMEOUT_DURATION`为500ms。
+这里的方法名也比事实强：r48 的 `isWallpaperVisible()` 只判断当前 `mWallpaperTarget` 或 `mPrevWallpaperTarget` 是否非 null，并不读取 wallpaper window 的实际 shown/present 状态。
 
-超时后wallpaper draw state变TIMEOUT，transition可继续；它与AppTransition的5秒总timeout是两层不同逃生门。
+unknown visibility 没有独立超时。锁屏后启动的 Activity 正常依次经过 WAITING_RESUME → WAITING_RELAYOUT → WAITING_VISIBILITY_UPDATE；只有 relayout 发生在正确前态才请求更新 Keyguard flags，最终 callback 删除处于第三态的项并主动做一次 surface placement。移除或隐藏 Activity 可直接删项。若全局 5 秒先到，ready 成功路径会把整个 controller 清空，未走完三态的项也不再挡本轮。
 
-## 38. 为什么Wallpaper timeout更短
+壁纸是另一套三态与 500ms 定时器。首次发现“应可见但未 drawn”的 wallpaper 时从 NORMAL 进 PENDING并发消息；到时只在仍为 PENDING 时改 TIMEOUT，并触发 surface placement。TIMEOUT 状态下，即使 wallpaper 仍未 drawn，`wallpaperTransitionReady()` 也允许转场继续；该状态没有 transition generation，可以跨到后续批次，直到某次检查发现 wallpaper 全部 ready，才恢复 NORMAL并移除消息。
 
-wallpaper是背景参与者，长时间阻挡前台App切换得不偿失。
+AppTransition 自身的 5 秒 TIMEOUT 更强：`transitionGoodToGo()` 直接返回 true，以上 rotation、Activity、spec、unknown、wallpaper 检查以及 reason 写入全部跳过。于是两次调用都会通过，入口刚清过的 `mTempTransitionReasons` 保持为空；后面的 Metrics 通知不会凭空制造 transition-start 条目。
 
-源码注释直接表达：对Recents动画而言，看不到wallpaper也好过动画完全不开始。
+## 7. 通过门后先消费一次性状态，这段不是可回滚预演
 
-## 39. 全局TIMEOUT怎样绕过所有普通门
+两次 good-to-go 都成功后，controller 才开始真正处理本批。顺序如下：
 
-`transitionGoodToGo()`外层结构是：未timeout才逐项检查；否则直接return true。
+1. 读取 pending transit 到局部变量；
+2. 若 `mSkipAppTransitionAnimation` 为 true且不是 Keyguard-going-away transit，先把局部 transit 置 UNSET；
+3. 无条件清 skip flag与 `mNoAnimationNotifyOnTransitionFinished`；
+4. 移除 AppTransition 的 5 秒 callback；
+5. 清 `mWallpaperMayChange`；
+6. 对 opening Activity 清 animating flags；对 changing 容器映射出的 Activity 也清；
+7. 调整本 Display 的 wallpaper windows，再计算 opening/closing 是否可作 wallpaper target；
+8. 依次做 translucent rewrite 与 wallpaper rewrite；
+9. 选择 activity types、anim-LP owner、三组 top app与可能的 remote override；
+10. defer SurfaceAnimationRunner 的动画启动，进入 apply/commit/goodToGo 主体。
 
-因此旋转、Activity draw、spec、unknown visibility与wallpaper门都会被5秒逃生路径绕过。
+几个写操作在动画真正绑定前就已发生，所以不能把这段叫作“纯检查”。源码的 `try/finally` 只包围 defer 之后的主体，并保证 `continueStartingAnimations()`；它没有建立一份可恢复快照，也没有在任意异常后自动还原已经清掉的 flag、timeout 或 animating flags。
 
-## 40. timeout表示继续，不表示条件已满足
+`mNoAnimationNotifyOnTransitionFinished` 在这里先清空，是为了开启新的 transition-finish 补偿区间。它稍后可由 opening 的“没有当前动画 source”分支填入，也可在 Activity 移除且自身/祖先有任意类型动画或 waiting-to-start 时填入；正常收尾统一消费。
 
-TIMEOUT只防止系统永久等待。
+## 8. transit 会连续改写，skip 也不保证最终没有动画
 
-被绕过的App可能仍未drawn，wallpaper仍为空或spec缺失；后续代码必须以降级方式继续，不能把timeout日志当成功证据。
+第一轮是 translucent rewrite。change transit 原样返回；其余只有 Task/Activity transit 才考虑：
 
-## 41. ready通过后先确定原始transit
+- closing 非空、每个 closing 都不 `fillsParent()`，并且所有 opening 已经 visible时，改成 `TRANSIT_TRANSLUCENT_ACTIVITY_CLOSE`；
+- opening 非空，所有“尚不可见的 opening”都不 `fillsParent()`，且 closing 为空时，改成 `TRANSIT_TRANSLUCENT_ACTIVITY_OPEN`。
 
-Controller读取 `appTransition.getAppTransition()`。
+第二轮才是 wallpaper rewrite。NONE、crash-close、dock-from-recents 与 change transit会直接保留；其余根据 wallpaper target、opening/closing target 属性、top app与原 transit，可能变成 GOING_AWAY_ON_WALLPAPER、WALLPAPER_INTRA_OPEN/CLOSE、WALLPAPER_OPEN 或 WALLPAPER_CLOSE。
 
-若Display设置 `mSkipAppTransitionAnimation`且不是Keyguard-going-away，transit改成UNSET，随后清skip flag。
+两处不符合直觉的边界值得单列：
 
-## 42. skip animation不等于跳过可见性提交
+- skip 分支写的是局部 `TRANSIT_UNSET`，但 wallpaper rewrite 的提前返回列表**没有 UNSET**；若 old/new wallpaper 条件成立，UNSET 仍可被改成 WALLPAPER_OPEN/CLOSE，因此“skip=true必然让 `applyAnimations()` 早退”不成立；
+- wallpaper 方法的总保护只针对 `isKeyguardGoingAwayTransit()` 两种 going-away 值；不能把它扩大成所有 Keyguard transit。OCCLUDE/UNOCCLUDE 没有同样的 blanket guard。
 
-transit为UNSET会让 `applyAnimations()`早退，但closing/opening的commitVisibility、show窗口、集合清理与layout仍继续。
+最后写入 `setLastAppTransition()`、传入动画与 listeners 的都是这个局部最终 transit；最初 prepare 的类型只是候选起点。
 
-“无动画”只去掉视觉插值，不取消状态转换。
+## 9. animLp owner、remote definition 与 voice flag 在 target 提升前决定
 
-## 43. ready后取消5秒timeout
+controller 先把 opening、closing、changing 三组的 activity type 放入 `ArraySet<Integer>`，再以 prefix-order index 选择 `animLpActivity`。三层筛选依次是：
 
-Controller调用 `removeAppTransitionTimeoutCallbacks()`。
+1. 具有与最终 transit/activity-types 匹配的 remote animation definition；
+2. `fillsParent()` 且能找到 main window；
+3. 能找到 main window。
 
-一旦开始执行，不应让旧timeout在RUNNING阶段突然把状态改成TIMEOUT或重复SurfacePlacement。
+每层都会在 closing、opening、changing 的合并候选中取 prefix-order 最高者。changing 项若是 Task，排名使用原 Task 的 prefix-order index，filter与最终返回身份才映射为 top non-finishing Activity。第一层不要求 main window，所以 remote 命中者可以令 `getAnimLp()` 返回 null；普通本地动画才应把 main-window LayoutParams 理解成 theme/style 输入。
 
-## 44. 为什么先clear opening app的animating flags
+接下来 `overrideWithRemoteAnimationIfSet()` 仍发生在 animation targets 计算之前。它查的是 **`animLpActivity` 自己的 definition**，未命中再查 controller 的 Display 级 definition；crash-close 明确不允许这次覆盖。稍后可能提升出的 Task 或 TaskDisplayArea 不是这一步的一级查找对象。
 
-旧exit animation标志会影响WindowState visibility和wallpaper target选择。
-
-源码在重算wallpaper与transit前清理opening/changing Activity的遗留动画状态，避免用旧可见性选错新动画。
-
-## 45. Wallpaper target为何在选transit前调整
-
-opening app可能带 `FLAG_SHOW_WALLPAPER`，清动画标志也可能改变旧target是否可见。
-
-必须先 `adjustWallpaperWindowsForAppTransitionIfNeeded()`，再判断opening/closing是否为wallpaper target。
-
-## 46. 原始transit还会被改写
-
-ready不代表最终使用最初prepare的枚举值。
-
-Controller会依次考虑translucent animation和wallpaper animation，把普通Activity/Task open-close转成更符合实际视觉关系的transit。
-
-## 47. translucent open怎样识别
-
-目标必须是Task或Activity transit；opening集合非空，并且尚未visible的opening Activity都不fillsParent；closing集合为空。
-
-此时可改成 `TRANSIT_TRANSLUCENT_ACTIVITY_OPEN`。
-
-## 48. translucent close怎样识别
-
-closing集合非空且都不fillsParent，同时opening Activity已经visible。
-
-系统使用translucent close动画，避免普通Task/Activity close对后方仍可见内容做不合适的整体动画。
-
-## 49. change transit为何不改成translucent
-
-源码直接排除change transition。
-
-边界/窗口模式变化没有对应的translucent专用动画语义，强行套用可能破坏changing container的几何动画。
-
-## 50. Wallpaper transit改写的主要情况
-
-系统区分：
-
-- opening/closing两边都有wallpaper：intra open/close；
-- 从有wallpaper切到无wallpaper：wallpaper close；
-- 从无wallpaper切入可见wallpaper target：wallpaper open；
-- Keyguard going away且目标可当wallpaper target：专用Keyguard-on-wallpaper。
-
-## 51. 哪些transit不做Wallpaper改写
-
-`TRANSIT_NONE`、crashing close、dock-from-recents和change transit直接保留。
-
-Keyguard transit也不会被随意降级为非Keyguard transit，避免破坏锁屏安全与策略假设。
-
-## 52. 动画主题由哪个Activity决定
-
-`findAnimLayoutParamsToken()`在opening、closing、changing三组里找一个Activity，其main window LayoutParams控制动画theme/style。
-
-它不是固定取top opening，也不是简单取集合第一个。
-
-## 53. animLp选择优先级
-
-1. 最高层且为当前transit注册RemoteAnimationDefinition的Activity；
-2. 最高层、fillsParent且有main window的Activity；
-3. 最高层、有main window的Activity。
-
-“最高”以WindowContainer `getPrefixOrderIndex()`比较真实层级顺序。
-
-## 54. 为什么fullscreen优先非fullscreen
-
-当多个Activity参与时，全屏窗口的theme通常更能代表整个转场背景和动画范围。
-
-但RemoteAnimationDefinition优先于普通theme选择，因为它明确声明要接管对应transit/activity types。
-
-## 55. activityTypes集合有什么用
-
-Controller收集三组参与者的WindowConfiguration activity type，例如standard、home、recents、assistant。
-
-RemoteAnimationDefinition用transit加activityTypes组合选择adapter，避免同一transit在Home与普通App间使用错误runner。
-
-## 56. Remote Animation两级查找
-
-先查动画目标container自己的definition；若无匹配，再查Display级 `mRemoteAnimationDefinition`。
-
-crashing activity close明确禁止Remote Animation覆盖，系统崩溃关闭动画拥有更高优先级。
-
-## 57. r48 voiceInteraction存在一处可疑重复
-
-源码实际写成：
+r48 还有一处必须忠实保留的重复判断：
 
 ```java
 containsVoiceInteraction(mOpeningApps)
         || containsVoiceInteraction(mOpeningApps)
 ```
 
-第二项仍是openingApps，按上下文很可能本意是closingApps；本章忠实记录r48行为，不擅自把源码讲成已经检查两边。
+两侧都是 opening，并没有检查 closing。于是“只有 closing app 属于 voice interaction”的批次会得到 false。文章应把它标为该版本实现，而不是按变量名脑补成 opening-or-closing。
 
-## 58. 这处可疑重复的影响边界
+远端 adapter 在这里仅被登记到 pending transition。`AppTransition.goodToGo()` 随后只是进入 `RemoteAnimationController.goodToGo()`；真正的 runner Binder `onAnimationStart()` 被安排到 after-prepare-surfaces runnable，且无 target、已取消等分支可以直接 finish，根本不调用 runner。两者不是同一个完成点。
 
-若只有closing Activity属于voice interaction而opening不属于，当前表达式不会得到true。
+## 10. 动画 target 从 Activity 向上提升，要同时通过三类阻断
 
-这是静态源码审计结论；没有真机实验时不进一步宣称具体设备一定出现某种动画错误。
-
-## 59. 动画target为何可能不是ActivityRecord
-
-开启层级动画时，多个Activity可提升到共同Task或更高WindowContainer动画。
-
-这样共享位移/缩放只需一条leash动画，也能让容器内相关窗口保持相对关系。
-
-## 60. target提升算法先建立candidates
-
-opening或closing集合中只有 `shouldApplyAnimation(visible)`为true的Activity进入候选队列。
-
-已经处于目标visibility且无退出/替换特殊情况的Activity无需重复应用动画。
-
-## 61. shouldApplyAnimation的三个条件
+opening 与 closing 分开计算 target。候选 Activity 先通过 `shouldApplyAnimation(visible)`：
 
 ```text
 当前isVisible与目标visible不同
-或Activity隐藏但处于mIsExiting
-或opening Activity存在waiting-for-replacement窗口
+或 当前不可见且mIsExiting
+或 这是opening且任一窗口waitingForReplacement
 ```
 
-最后一项允许窗口替换即使容器可见性未变仍获得正确转场。
+未开启 hierarchical animations 时，候选 Activity 直接成为 targets。开启后，每一侧还会构造“另一侧所有 Activity 及其全部祖先”集合，然后循环尝试把 current 提升为 parent。
 
-## 62. 何时不能提升到parent
+一次提升必须同时满足：
 
-parent为空或不能创建RemoteAnimationTarget时不能提升。
+- parent 存在且 `canCreateRemoteAnimationTarget()`；
+- parent 不在 other-side ancestors 中，否则 opening/closing 会被揉进同一 target；
+- parent 的每个**直接 child**要么就是 current，要么也在 candidates 中，要么不可见；任何可见但不参动的 sibling 都会阻止提升。
 
-更关键的是：parent子树若包含另一组opening/closing对象，就不能把一边动画提升到会同时包住另一边的共同parent。
+扫描直接 children 时，代码会把候选 sibling 从链表移出并放入临时 siblings。若能提升，只把 parent 重新入队；若不能，则把 current 与已收拢的 candidate siblings一起放入最终 targets。parent 还可继续向 Task、TaskDisplayArea 等更高层尝试，直到某一层失败。
 
-## 63. 为什么相反组ancestor会阻止提升
+因此“同 Task 内所有 opening Activity”仍不足以推出动画一定提升到 Task：另一侧后代、可见非候选 sibling、父容器能力任一项都能截断。反过来，不可见且非候选的 sibling 不会单独阻止提升。
 
-同一个Task内A关闭、B打开时，如果opening和closing都提升成整个Task，两条相反动画会争用同一容器。
+## 11. apply 先建立 source 归属，再统一放行动画启动
 
-系统保留Activity级target，分别处理进入和退出。
+若最终 transit 仍是 UNSET，或 opening 与 closing 同时为空，`applyAnimations(opening, closing, ...)` 直接返回。changing-only 批次仍会在后面的独立路径应用 change animation，但不会经过这段 opening/closing accessibility 通知。
 
-## 64. 可见sibling为何阻止提升
+正常路径先算 opening targets，再算 closing targets。对每个 target，controller 遍历本侧 apps，收集所有 `isDescendantOf(target)` 的 Activity 作为 `transitioningDescendants`，再调用：
 
-parent下若还有一个visible sibling不参与当前动画，提升到parent会把无关内容也一起移动或淡出。
-
-典型例子是同Task打开半透明Activity，下面原Activity仍应保持不动。
-
-## 65. 所有可见siblings都参与时可以提升
-
-算法把同parent的candidate siblings一并收集；若没有不参与的visible sibling，也没有相反组冲突，就把parent重新放回candidate队列。
-
-它会逐层重复，直到无法继续提升，再加入最终targets。
-
-## 66. target提升图
-
-```mermaid
-flowchart TD
-    A["Activity candidate"] --> B{"parent可创建动画target？"}
-    B -->|否| T["保留当前target"]
-    B -->|是| C{"parent子树含相反opening/closing组？"}
-    C -->|是| T
-    C -->|否| D{"存在可见但不参与的sibling？"}
-    D -->|是| T
-    D -->|否| P["提升为parent，再继续向上检查"]
+```java
+target.applyAnimation(
+        animLp, transit, visible, voiceInteraction, transitioningDescendants);
 ```
 
-## 67. 提升后如何通知每个Activity动画完成
+这份 sources 很关键：动画若提升到父容器，`SurfaceAnimator` 只会在父 target 上触发容器完成；sources 让各参与 Activity 仍能收到自己的 transition-finished 处理。它也被 opening 提交流程用来判断某个 token 是否确实由当前动画覆盖。
 
-动画实际挂在提升后的WindowContainer，SurfaceAnimator只会回调该target。
+外层在 apply 前调用 `SurfaceAnimationRunner.deferStartingAnimations()`，在 `finally` 中 `continueStartingAnimations()`。所以 `applyAnimation()` 已装好 adapter 不等于动画 runner 已在调用点同步起跑；controller 刻意先把两侧动画、可见性和回调整批装配完再放行。
 
-Controller额外收集所有作为其descendant的transitioning Activity，传给 `applyAnimation()`作为sources，保证每个Activity仍能收到对应收尾。
+## 12. 主体顺序固定为 apply、closing、opening、changing
 
-## 68. 为何先deferStartingAnimations
+defer 区间内的顺序不是 opening 优先：
 
-Controller在给opening、closing、changing逐个安装动画前调用 `SurfaceAnimationRunner.deferStartingAnimations()`。
+```text
+applyAnimations(opening, closing)
+handleClosingApps()
+handleOpeningApps()
+handleChangingApps()
+setLastAppTransition()
+goodToGo()
+handleNonAppWindowsInTransition()
+postAnimationCallback()
+clear()
+finally continueStartingAnimations()
+```
 
-所有动画都配置好后再continue，减少第一条已开跑、其他对象尚未装好造成的不同步。
-
-## 69. applyAnimations何时直接不做
-
-transit为UNSET，或opening与closing都为空时直接return。
-
-changing containers有自己的 `handleChangingApps()`，不依赖这条opening/closing动画函数。
-
-## 70. applyAnimations还通知Accessibility
-
-动画安装后，若存在AccessibilityController，会通知对应Display发生App window transition。
-
-无障碍放大、窗口事件等系统功能需要知道界面结构正在变化，但这也不代表动画已结束。
-
-## 71. closing可见性提交顺序
-
-`handleClosingApps()`对每个Activity：
+每个 closing Activity 依次执行：
 
 1. `commitVisibility(false, false)`；
-2. 更新reported visibility；
-3. 强制allDrawn=true；
-4. 安排移除尚未退出的starting window；
-5. 需要时附加thumbnail-down动画。
+2. `updateReportedVisibilityLocked()`；
+3. 强制 `allDrawn=true`；
+4. 若 starting window 存在且没有 animating-exit，移除它；
+5. 若配置 thumbnail-down，附加 thumbnail animation。
 
-## 72. closing为何先commit再更新reported
+每个 opening Activity 的顺序则是：
 
-reported visible计算必须看到容器已经目标隐藏，才能产生正确gone/visible历史。
+1. `commitVisibility(true, false)`；
+2. 用 `getAnimatingContainer(PARENTS, ANIMATION_TYPE_APP_TRANSITION)` 找动画容器；
+3. 容器为空，或其 animation sources 不含当前 Activity 时，把 token 放入 no-animation-finish 列表；
+4. `updateReportedVisibilityLocked()`；
+5. 清 `waitingToShow`；
+6. 为这个 Activity 单独 open Surface transaction，调用 `showAllWindowsLocked()`，再 close；
+7. 按 pending override 附加 thumbnail-up 或 cross-profile thumbnail。
 
-`performLayout=false`表示整组处理结束后再统一layout，不为每个Activity各跑一轮SurfacePlacement。
+这再次证明第 220 章的 `nowVisible` 不是 Surface show 回执：opening 先更新 reported visibility，后调用 `showAllWindowsLocked()`。changing 容器不走 visible commit，只执行 `applyAnimation(null, transit, true, false, null)`。
 
-## 73. opening可见性提交顺序
+## 13. goodToGo 是统一提交点，但后处理仍有严格先后
 
-`handleOpeningApps()`先 `commitVisibility(true, false)`，随后处理动画完成通知来源、更新reported visibility、清waitingToShow，并在Surface transaction里show all windows。
+三组主体处理完后，`setLastAppTransition()` 保存最终 transit 与各组 top app 的字符串。接着先抓取 flags，再调用 `AppTransition.goodToGo()`：
 
-这一步将之前“客户端可绘制但容器等待Transition”的状态正式提交。
+- 将 pending transit 写 UNSET、flags 清零；
+- 把状态写 RUNNING；
+- 从 top opening app 当前 animating container 取 animation adapter，用其 duration hint与 status-bar start time通知 AppTransition listeners；
+- 若有 `RemoteAnimationController`，调用它的 `goodToGo()`；
+- 返回 listeners 请求的 layout-redo 位。
 
-## 74. no-animation完成通知为何单独记录
+flags 必须在 `goodToGo()` 前保存，因为方法内部会清零；controller 随后才据旧 flags处理 Keyguard wallpaper与 non-app windows。之后 `postAnimationCallback()` 把 started callback投到 Handler并置 null，`clear()` 清 override type、package、spec、remote controller、尚未被 worker取走的 Future引用与 finished callback；它不清正在执行的 worker、共享 spec-pending bit、future-callback或scale-up字段，也**不把状态写回 IDLE**。
 
-有些opening Activity没有实际动画target或不是提升target的source，正常SurfaceAnimator结束回调不会覆盖它。
+finally 放行动画后，成功路径继续：
 
-系统把token放进 `mNoAnimationNotifyOnTransitionFinished`，待整个transition结束时补发finished。
+1. 通知 `TaskSnapshotController.onTransitionStarting()`；
+2. 清 opening、closing、changing 与 unknown-visibility map；
+3. 标记 layout needed并重算 IME target；
+4. 把 reason map交给 `ActivityMetricsLogger.notifyTransitionStarting()`；
+5. single-task-display 特例登记 after-prepare-surfaces callback；
+6. 合并 listener redo、LAYOUT与CONFIG位。
 
-## 75. waitingToShow何时清除
+TIMEOUT 路径的 reason map可以为空。Metrics 方法只遍历 map，空 map意味着这次调用不会把任何 `TransitionInfo.mLoggedTransitionStarting` 写 true；这与 AppTransition listeners 已收到 starting 是两套账，也解释了第 220 章的启动计时门为何不能用 RUNNING 状态替代。
 
-opening处理完成可见性与reported统计后，明确设置 `app.waitingToShow=false`。
+## 14. RUNNING 的终点看精确谓词；无命中时可同轮进入 IDLE
 
-WindowState `isReadyForDisplay()`不再因“token waiting且transition set”阻挡窗口show。
+`checkAppTransitionReady()` 在调用 ready handler 后，紧接着判断：
 
-## 76. showAllWindowsLocked做什么
+```java
+curDisplay.mAppTransition.isRunning()
+        && !curDisplay.isAppTransitioning()
+```
 
-它遍历Activity所有WindowState调用 `performShowLocked()`。
+`WindowContainer.isAppTransitioning()` 在子树中寻找 `app.isAnimating(PARENTS | TRANSITION)` 为 true 的 Activity。这个单参数重载检查 `ANIMATION_TYPE_ALL`，所以 Activity自身或祖先上的任意 SurfaceAnimator animation type 都可能命中，不限 APP_TRANSITION 类型；`TRANSITION` flag还把 `isWaitingForTransitionStart()` 计为 true。成功 handler已经清掉 pending transit与三组集合时，这个 waiting贡献通常消失，但 RUNNING 期间又准备的新批次仍可能重新引入它。
 
-只有已到READY_TO_SHOW且满足policy/parent等条件的窗口才真正进入HAS_DRAWN和后续SurfaceControl show。
+如果 skip 后 transit 保持 UNSET、候选全被 `shouldApplyAnimation()` 排除、动画装载失败，或本批只有没有令上述精确谓词为 true 的工作，并且没有其他类型动画/新 pending批次使它命中，`goodToGo()` 刚写 RUNNING后，第二个 if 就可能在**同一次 `checkAppTransitionReady()` 调用**里立即收尾。
 
-## 77. opening处理中的Surface transaction边界
+`DisplayContent.handleAnimatingStoppedAndTransition()` 的顺序是：
 
-每个Activity的showAllWindows被包在WMS open/closeSurfaceTransaction中。
+1. `mAppTransition.setIdle()`；
+2. 为补偿列表中的每个 token通知 transition finished，再清列表；
+3. 隐藏 deferred wallpapers；
+4. 调用 `onAppTransitionDone()`；
+5. 加 LAYOUT redo，重算 IME target；
+6. 令 `mWallpaperMayChange=true`、`mFocusMayChange=true`。
 
-它让同一Activity窗口show变化批量提交；更外层的animation defer则保证多目标动画启动协调。
+由当前 target覆盖的 Activity 依靠 animation sources与容器完成回调收尾。补偿列表有两个明确 producer：opening Activity不在当前动画 sources 中，以及 Activity被移除时 `isAnimating(TRANSITION | PARENTS)` 为 true；所以它既不是 opening-only，也不能仅按字段名理解为“绝无动画”。若精确谓词仍为 true，未来相关动画或 waiting状态消失后触发的 traversal/surface placement，才会再次判断并执行上述步骤。
 
-## 78. changing container怎样处理
+## 15. 九个只读练习把结论钉回 r48 源码
 
-`handleChangingApps()`直接对每个WindowContainer调用 `applyAnimation(null, transit, true, false, null)`。
+以下命令只读取本地源码；每个 `rg -e` 都应独立命中。建议先预测结果，再看上下文，而不是把命中行号当作完整时序。
 
-它不走opening/closing visibility切换，因为对象仍可见，只是几何/窗口模式发生change。
-
-## 79. setLastAppTransition记录什么
-
-Controller保存最终transit以及top opening、closing、changing Activity字符串，用于dump和诊断。
-
-这里的top以prefix order选择，不应由ArraySet迭代顺序推断。
-
-## 80. AppTransition.goodToGo是状态切换点
-
-它清 `mNextAppTransition`与flags，把状态设为RUNNING，并通知AppTransition listeners启动时间、duration hint和状态栏动画时机。
-
-若有RemoteAnimationController，也在这里 `goodToGo()`让远端runner正式开始。
-
-## 81. goodToGo返回值是什么
-
-返回所有listener要求的 `FINISH_LAYOUT_REDO_*` bit OR结果。
-
-Controller最后把这些bit与强制REDO_LAYOUT/REDO_CONFIG并入Display pendingLayoutChanges，驱动后续一致性布局。
-
-## 82. AppTransition callback何时触发
-
-`postAnimationCallback()`发送pending callback，随后 `clear()`清custom/thumbnail/remote spec等“下一次动画”配置。
-
-clear不把RUNNING改回IDLE；实际动画结束由另一条收尾路径处理。
-
-## 83. clear与状态清理不要混淆
-
-`AppTransition.clear()`清的是override资源、spec、remote controller和finished callback。
-
-状态仍由 `goodToGo()`设RUNNING，直到 `handleAnimatingStoppedAndTransition()`调用setIdle。
-
-## 84. Keyguard非App窗口动画
-
-Keyguard-going-away可能额外启动wallpaper exit和非App窗口（状态栏、导航栏等）退出动画。
-
-因此AppTransition不只影响Activity Surface；但非App窗口由policy和DisplayContent专门处理。
-
-## 85. TaskSnapshotController为何在transition start被通知
-
-opening/closing/animation状态都确定后，WMS调用 `onTransitionStarting(mDisplayContent)`。
-
-Snapshot controller可据此处理待关闭Task的snapshot缓存/持久化时机，而不是随意在Activity pause瞬间截图。
-
-## 86. 三组集合何时清空
-
-animation与visibility已经安装、AppTransition goodToGo后，Controller清opening、closing、changing以及unknown visibility controller。
-
-后续RUNNING阶段依赖已安装的SurfaceAnimator sources，不再把集合当实时动画目标表。
-
-## 87. 清集合后为何还要setLayoutNeeded
-
-Activity容器可见性、窗口show/hide、动画leash和wallpaper关系已改变。
-
-统一再做layout可刷新frame、layers、Insets、focus和Surface状态。
-
-## 88. IME target为何重新计算
-
-opening/closing切换改变可接受输入的顶层窗口。
-
-Controller在转场提交后以 `updateImeTarget=true`重算IME目标，避免软键盘仍跟随离开的Activity。
-
-## 89. Metrics为什么在最后收到notifyTransitionStarting
-
-此时mTempTransitionReasons已包含每个Activity以windows、Splash或Snapshot放行的原因，最终transit也已确定。
-
-ActivityMetricsLogger可将“动画开始”和“窗口drawn”两门正确闭合；它不是handle入口一来就记transition starting。
-
-## 90. 动画结束如何被检测
-
-RootWindowContainer发现AppTransition状态RUNNING，但Display已没有App transitioning对象时，调用 `handleAnimatingStoppedAndTransition()`。
-
-这不是固定delay计时器，而是根据SurfaceAnimator/transition sources实际是否仍在运行。
-
-## 91. 结束后首先setIdle
-
-DisplayContent把AppTransition状态从RUNNING改回IDLE。
-
-下一次prepare才可正常建立新的pending transition；若仍RUNNING，`prepare()`会返回false。
-
-## 92. no-animation token何时补finished
-
-收尾遍历 `mNoAnimationNotifyOnTransitionFinished`，逐token通知listener，然后clear。
-
-这与第74节的登记配套，保证没挂真实动画的Activity也获得统一完成语义。
-
-## 93. 结束还会做哪些系统收尾
-
-包括隐藏延迟wallpaper、递归 `onAppTransitionDone()`、重算IME target、请求layout，并让ActivityRecord处理动画finished、客户端visibility与停止/销毁调度。
-
-所以“动画视觉结束”后仍有一轮系统状态收束。
-
-## 94. Remote Animation失败会怎样
-
-RemoteAnimationController有独立finish与timeout/cancel机制；Controller在goodToGo才让它启动。r48基础timeout为2秒，并按控制App的animator scale缩放。
-
-runner启动RemoteException、Binder死亡、显式cancel或remote timeout都会进入animation-finished清理，释放被SurfaceAnimator捕获的finish callback；本章不把它展开成Shell Transition模型。
-
-## 95. 常见误解一：executeAppTransition立即开始动画
-
-不对。它只setReady并requestTraversal。
-
-真实开始仍等待draw/preview、rotation、spec、unknown visibility和wallpaper等门。
-
-## 96. 常见误解二：opening app必须等真实窗口
-
-不对。`startingDisplayed`或 `startingMoved`也能放行。
-
-Starting Window正是为了在真实首窗口较慢时让视觉转场先发生。
-
-## 97. 常见误解三：closing app也必须allDrawn
-
-不对。ready入口不检查closing集合，处理closing时还强制allDrawn=true。
-
-它是退出动画对象，不是这次新内容生产的完成门。
-
-## 98. 常见误解四：timeout表示动画条件全部成功
-
-不对。5秒timeout绕过所有普通ready条件。
-
-它只说明系统选择降级继续，现场仍需检查究竟是哪一门未完成。
-
-## 99. 常见误解五：动画一定挂在Activity上
-
-不对。层级动画可把所有参与siblings提升到Task或更高container。
-
-诊断Surface leash时要同时检查animation sources和promoted target。
-
-## 100. 常见误解六：transit在prepare后不会改变
-
-不对。prepare阶段可被后续请求覆盖，ready阶段还可改成translucent或wallpaper transit，skip flag也可改成UNSET。
-
-dump的last used transit比只看早期prepare日志更接近实际执行类型。
-
-## 101. 故障推理：AppTransition一直READY
-
-依次检查：
-
-1. rotation animation + needsUpdate；
-2. opening/changing Activity的allDrawn/startingDisplayed/startingMoved；
-3. specs future；
-4. unknown app visibility；
-5. wallpaper drawn；
-6. 5秒timeout是否被重置或尚未到。
-
-## 102. 故障推理：真实窗口已allDrawn仍不开始
-
-allDrawn只是Activity门之一。
-
-检查isRelaunching、同组其他opening Activity、changing container对应Activity、spec future、Keyguard unknown visibility、wallpaper及旋转门。
-
-## 103. 故障推理：动画带了不该动的页面
-
-检查target promotion：是否存在本应阻止提升的visible sibling，Activity的isVisible或参与集合是否错误，另一组ancestor是否正确建立。
-
-也要确认sHierarchicalAnimations设备配置与最终animation target层级。
-
-## 104. 故障推理：动画theme不对
-
-检查animLpActivity选择优先级、prefix order、fillsParent、main window是否存在，以及RemoteAnimationDefinition是否匹配transit+activityTypes。
-
-不要默认使用新Activity的windowAnimationStyle。
-
-## 105. 故障推理：锁屏启动闪一下又消失
-
-检查UnknownAppVisibilityController是否按resume→relayout→visibility update完整走完，Activity首次窗口flag是否及时提供，以及transition是否被timeout绕过。
-
-这类问题不是简单的allDrawn慢。
-
-## 106. 故障推理：Wallpaper背景晚到
-
-查看wallpaperTransitionReady、visible wallpaper drawn状态、500ms wallpaper timeout和5秒AppTransition timeout。
-
-若已走wallpaper timeout，转场继续而背景暂缺是显式降级结果。
-
-## 107. macOS只读练习一：手推ready门
+### 练习 1：分开状态、prepare、execute 与五秒计时
 
 ```bash
+set -eu
 cd /Users/ninebot/androidSource
-sed -n '640,735p' \
+rg -n -F \
+  -e 'private static final long APP_TRANSITION_TIMEOUT_MS = 5000;' \
+  -e 'private final static int APP_STATE_IDLE = 0;' \
+  -e 'private final static int APP_STATE_TIMEOUT = 3;' \
+  -e 'boolean prepared = prepare();' \
+  -e 'mHandler.postDelayed(mHandleAppTransitionTimeoutRunnable, APP_TRANSITION_TIMEOUT_MS);' \
+  -e 'fetchAppTransitionSpecsFromFuture();' \
+  frameworks/base/services/core/java/com/android/server/wm/AppTransition.java
+rg -n -F \
+  -e 'mAppTransition.setReady();' \
+  -e 'mWmService.mWindowPlacerLocked.requestTraversal();' \
+  frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+```
+
+解释 RUNNING 时 `prepare()` 返回 false，为什么仍不能推出 transit 与 timeout 保持原样。
+
+### 练习 2：追 opening、closing 与 changing 的入组条件
+
+```bash
+set -eu
+cd /Users/ninebot/androidSource
+rg -n -F \
+  -e 'if (!visible && !mVisibleRequested) {' \
+  -e 'displayContent.mOpeningApps.remove(this);' \
+  -e 'displayContent.mClosingApps.remove(this);' \
+  -e 'if (okToAnimate(true /* ignoreFrozen */) && appTransition.isTransitionSet()) {' \
+  -e 'displayContent.mOpeningApps.add(this);' \
+  -e 'displayContent.mClosingApps.add(this);' \
+  -e 'commitVisibility(false /* visible */, true /* performLayout */);' \
+  -e 'getDisplayContent().mClosingApps.add(this);' \
+  -e 'commitVisibility(visible, true /* performLayout */);' \
+  frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F \
+  -e 'mDisplayContent.mChangingContainers.add(this);' \
+  -e 'mSurfaceFreezer.freeze(getPendingTransaction(), startBounds);' \
+  frameworks/base/services/core/java/com/android/server/wm/Task.java
+```
+
+分别写出“延迟 commit”“立即 commit”和 change-transition freeze 的必要条件。
+
+### 练习 3：验证 placement 入口与两次短路检查
+
+```bash
+set -eu
+cd /Users/ninebot/androidSource
+rg -n -F \
+  -e 'mWmService.mAnimator.executeAfterPrepareSurfacesRunnables();' \
+  -e 'checkAppTransitionReady(surfacePlacer);' \
+  -e 'if (curDisplay.mAppTransition.isReady()) {' \
+  -e 'curDisplay.mAppTransitionController.handleAppTransitionReady();' \
+  frameworks/base/services/core/java/com/android/server/wm/RootWindowContainer.java
+rg -n -F \
+  -e 'mTempTransitionReasons.clear();' \
+  -e 'transitionGoodToGo(mDisplayContent.mOpeningApps, mTempTransitionReasons)' \
+  -e 'mDisplayContent.mChangingContainers,' \
   frameworks/base/services/core/java/com/android/server/wm/AppTransitionController.java
 ```
 
-为每个return false写出“谁能改变该条件、改变后怎样重新触发SurfacePlacement”。
+指出 opening 失败、changing 失败、两组都为空时，哪些全局门实际被执行几次。
 
-## 108. macOS只读练习二：追prepare到RUNNING
+### 练习 4：手算 Activity ready 与 reason
 
 ```bash
+set -eu
 cd /Users/ninebot/androidSource
-rg -n 'prepareAppTransitionLocked|executeAppTransition|setReady|handleAppTransitionReady|goodToGo' \
-  frameworks/base/services/core/java/com/android/server/wm/AppTransition.java \
-  frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java \
+rg -n -F \
+  -e 'wc.asTask().getTopNonFinishingActivity()' \
+  -e 'final boolean allDrawn = activity.allDrawn && !activity.isRelaunching();' \
+  -e '!activity.startingDisplayed && !activity.startingMoved' \
+  -e 'outReasons.put(activity, APP_TRANSITION_WINDOWS_DRAWN);' \
+  -e 'activity.mStartingData instanceof SplashScreenStartingData' \
+  -e '? APP_TRANSITION_SPLASH_SCREEN' \
+  -e ': APP_TRANSITION_SNAPSHOT' \
   frameworks/base/services/core/java/com/android/server/wm/AppTransitionController.java
 ```
 
-标注每一步AppTransition state、是否持WMS锁和是否立即执行动画。
+至少构造四例：relaunching+allDrawn、startingDisplayed、startingMoved、Task无top Activity，并分别预测 pass与reason。
 
-## 109. macOS只读练习三：模拟target提升
+### 练习 5：按源码顺序定位四类全局阻塞与两个重试器
 
 ```bash
+set -eu
 cd /Users/ninebot/androidSource
-sed -n '350,510p' \
+rg -n -F \
+  -e 'screenRotationAnimation.isAnimating()' \
+  -e 'mDisplayContent.getDisplayRotation().needsUpdate()' \
+  -e 'isFetchingAppTransitionsSpecs()' \
+  -e 'mUnknownAppVisibilityController.allResolved()' \
+  -e 'mWallpaperControllerLocked.wallpaperTransitionReady()' \
   frameworks/base/services/core/java/com/android/server/wm/AppTransitionController.java
-```
-
-分别画“同Task不透明A关、B开”和“同Task上打开半透明B”两棵树，判断动画应停在Activity还是提升到Task。
-
-## 110. macOS只读练习四：核对两个timeout
-
-```bash
-cd /Users/ninebot/androidSource
-rg -n 'APP_TRANSITION_TIMEOUT_MS|WALLPAPER_DRAW_PENDING_TIMEOUT_DURATION|setTimeout|wallpaperTransitionReady' \
-  frameworks/base/services/core/java/com/android/server/wm/AppTransition.java \
+rg -n -F \
+  -e 'UNKNOWN_STATE_WAITING_RESUME' \
+  -e 'UNKNOWN_STATE_WAITING_RELAYOUT' \
+  -e 'UNKNOWN_STATE_WAITING_VISIBILITY_UPDATE' \
+  -e 'mService.mWindowPlacerLocked.performSurfacePlacement();' \
+  frameworks/base/services/core/java/com/android/server/wm/UnknownAppVisibilityController.java
+rg -n -F \
+  -e 'WALLPAPER_DRAW_PENDING_TIMEOUT_DURATION = 500;' \
+  -e 'return wallpaperTarget != null || mPrevWallpaperTarget != null;' \
+  -e 'mWallpaperDrawState = WALLPAPER_DRAW_PENDING;' \
+  -e 'mWallpaperDrawState = WALLPAPER_DRAW_TIMEOUT;' \
   frameworks/base/services/core/java/com/android/server/wm/WallpaperController.java
 ```
 
-解释5秒总timeout与500ms wallpaper timeout分别绕过哪些条件。
+区分“状态变化会主动请求下一轮”与“只能依赖别的 traversal”的情况。
 
-## 111. 源码导航
+### 练习 6：核对 skip、两次 rewrite、remote owner 与 voice 实现
+
+```bash
+set -eu
+cd /Users/ninebot/androidSource
+rg -n -F \
+  -e 'transit = WindowManager.TRANSIT_UNSET;' \
+  -e 'transit = maybeUpdateTransitToTranslucentAnim(transit);' \
+  -e 'transit = maybeUpdateTransitToWallpaper(transit, openingAppHasWallpaper,' \
+  -e 'isKeyguardGoingAwayTransit(transit)' \
+  -e 'findAnimLayoutParamsToken(transit, activityTypes);' \
+  -e 'getRemoteAnimationOverride(animLpActivity, transit, activityTypes);' \
+  -e 'containsVoiceInteraction(mDisplayContent.mOpeningApps)' \
+  frameworks/base/services/core/java/com/android/server/wm/AppTransitionController.java
+```
+
+说明为何 UNSET 仍可能变成 wallpaper transit，并判断 closing-only voice interaction 得到什么值。
+
+### 练习 7：在一棵小树上手推 target 提升
+
+```bash
+set -eu
+cd /Users/ninebot/androidSource
+rg -n -F \
+  -e 'return isVisible() != visible || (!isVisible() && mIsExiting)' \
+  -e 'visible && forAllWindows(WindowState::waitingForReplacement, true)' \
+  frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+rg -n -F \
+  -e 'final LinkedList<WindowContainer> candidates = new LinkedList<>();' \
+  -e '!parent.canCreateRemoteAnimationTarget()' \
+  -e 'otherAncestors.contains(parent)' \
+  -e 'if (candidates.remove(sibling)) {' \
+  -e 'else if (sibling != current && sibling.isVisible()) {' \
+  -e 'candidates.add(parent);' \
+  -e 'targets.addAll(siblings);' \
+  frameworks/base/services/core/java/com/android/server/wm/AppTransitionController.java
+```
+
+给同一 parent 放入“另一侧 child”“可见非候选 child”“不可见非候选 child”，分别推导 target停在哪一层。
+
+### 练习 8：逐行确认 apply 后的三组处理顺序
+
+```bash
+set -eu
+cd /Users/ninebot/androidSource
+rg -n -F \
+  -e 'handleClosingApps();' \
+  -e 'handleOpeningApps();' \
+  -e 'handleChangingApps(transit);' \
+  -e 'app.commitVisibility(false /* visible */, false /* performLayout */);' \
+  -e 'app.allDrawn = true;' \
+  -e 'app.commitVisibility(true /* visible */, false /* performLayout */);' \
+  -e 'app.getAnimatingContainer(PARENTS,' \
+  -e 'mDisplayContent.mNoAnimationNotifyOnTransitionFinished.add(app.token);' \
+  -e 'app.showAllWindowsLocked();' \
+  -e 'wc.applyAnimation(null, transit, true, false, null /* sources */);' \
+  frameworks/base/services/core/java/com/android/server/wm/AppTransitionController.java
+rg -n -F \
+  -e 'if (isAnimating(TRANSITION | PARENTS)) {' \
+  -e 'getDisplayContent().mNoAnimationNotifyOnTransitionFinished.add(token);' \
+  frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+```
+
+给每行标注它改变的是 visible账、draw控制位、Surface show、动画归属还是 finish补偿，并区分补偿列表的两个 producer。
+
+### 练习 9：验证 RUNNING、Metrics 与同轮无动画收尾
+
+```bash
+set -eu
+cd /Users/ninebot/androidSource
+rg -n -F \
+  -e 'mNextAppTransition = TRANSIT_UNSET;' \
+  -e 'setAppTransitionState(APP_STATE_RUNNING);' \
+  -e 'mRemoteAnimationController.goodToGo();' \
+  frameworks/base/services/core/java/com/android/server/wm/AppTransition.java
+rg -n -F \
+  -e 'curDisplay.mAppTransition.isRunning() && !curDisplay.isAppTransitioning()' \
+  frameworks/base/services/core/java/com/android/server/wm/RootWindowContainer.java
+rg -n -F \
+  -e 'return isAnimating(flags, ANIMATION_TYPE_ALL);' \
+  -e 'return getActivity(app -> app.isAnimating(PARENTS | TRANSITION)) != null;' \
+  -e '&& isWaitingForTransitionStart()) {' \
+  frameworks/base/services/core/java/com/android/server/wm/WindowContainer.java
+rg -n -F \
+  -e 'mAppTransition.setIdle();' \
+  -e 'mAppTransition.notifyAppTransitionFinishedLocked(token);' \
+  -e 'mWallpaperController.hideDeferredWallpapersIfNeeded();' \
+  frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+rg -n -F \
+  -e 'for (int index = activityToReason.size() - 1; index >= 0; index--) {' \
+  -e 'info.mLoggedTransitionStarting = true;' \
+  frameworks/base/services/core/java/com/android/server/wm/ActivityMetricsLogger.java
+```
+
+分别模拟“有本地动画”“transit保持UNSET”“TIMEOUT且reason map为空”，不要把三种完成路径合成一个时间点。
+
+## 16. 排障矩阵、源码地图与下一章边界
+
+| 现象 | 第一证据点 | 常见误判 | 下一步 |
+|---|---|---|---|
+| 状态长期 READY | `transitionGoodToGo()` 首个 return false | closing没画完 | 按 rotation→本组Activity→spec→unknown→wallpaper 顺序定位 |
+| opening原因有记录却仍未启动 | changing 的第二次检查 | reason map代表整批已通过 | 查看 changing Activity或第二遍全局门 |
+| 五秒后转场启动、Displayed计时仍悬空 | TIMEOUT分支与空 reason map | RUNNING等于Metrics已starting | 回到 `TransitionInfo.mLoggedTransitionStarting` 与 pending-draw双门 |
+| 旧页面未allDrawn仍退出 | ready入口没有closing | 所有参与者都要drawn | 检查opening/changing即可 |
+| 设置skip仍看到壁纸动画 | UNSET后的wallpaper rewrite | skip是最终transit锁 | 重建old/new wallpaper条件 |
+| remote动画来源看似选错 | `animLpActivity` 与Display definition | promoted target先决定remote | 先还原三级owner筛选，再到第223章核对target注册 |
+| closing-only voice场景走普通参数 | opening OR opening | 变量名意味着两组都查 | 按r48实现记录，并评估版本修复 |
+| RUNNING几乎立刻变IDLE | 同一方法中的第二个if | 至少会维持一帧RUNNING | 按 `isAnimating(PARENTS \| TRANSITION)` 与全 animation-type 范围重建谓词 |
+| opening token收不到常规动画完成 | animation sources与no-animation列表 | target有动画就覆盖所有后代 | 核对该Activity是否在sources中 |
+| unknown visibility一直阻塞 | controller debug map中的三态 | relayout可从任意前态跳转 | 核对resume→relayout→visibility-update顺序 |
+| 壁纸约半秒后放行 | wallpaper PENDING/TIMEOUT | AppTransition五秒先到 | 区分500ms壁纸门与5000ms整批门 |
+
+源码导航：
 
 ```text
 frameworks/base/services/core/java/com/android/server/wm/AppTransition.java
 frameworks/base/services/core/java/com/android/server/wm/AppTransitionController.java
-frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
 frameworks/base/services/core/java/com/android/server/wm/RootWindowContainer.java
+frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
 frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+frameworks/base/services/core/java/com/android/server/wm/Task.java
 frameworks/base/services/core/java/com/android/server/wm/WindowContainer.java
 frameworks/base/services/core/java/com/android/server/wm/UnknownAppVisibilityController.java
 frameworks/base/services/core/java/com/android/server/wm/WallpaperController.java
-frameworks/base/services/core/java/com/android/server/wm/SurfaceAnimator.java
-frameworks/base/services/core/java/com/android/server/wm/SurfaceAnimationRunner.java
+frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
+frameworks/base/services/core/java/com/android/server/wm/ActivityMetricsLogger.java
+frameworks/base/services/core/java/com/android/server/wm/RemoteAnimationController.java
 ```
 
-## 112. 复读修订一：TIMEOUT状态本身也被isReady接受
+本章最小心智模型是：`mNextAppTransition` 选择候选类型；READY/TIMEOUT 决定是否进入门检查；opening与changing决定能否启动，closing参加动画、提交与移除延期；target提升决定动画挂在哪个容器，sources补回Activity完成归属；RUNNING最终由 Display 子树的精确 `isAppTransitioning()` 谓词结束。任何一个点都不是物理present证明。
 
-初稿若写“超时后直接调用动画函数”会遗漏真实调度。
-
-实际是timeout Handler设TIMEOUT并触发SurfacePlacement，RootWindowContainer因 `isReady()`接受TIMEOUT，才再次进入Controller并跳过普通门。
-
-## 113. 复读修订二：changing集合也做ready检查
-
-入口不只检查openingApps，还检查changingContainers，并用 `getAppFromContainer()`把Task映射到top non-finishing Activity。
-
-窗口模式变化的Task若找不到Activity会被跳过，但有Activity时同样受allDrawn/preview门约束。
-
-## 114. 复读修订三：closingApps不参与ready gate
-
-这不是文档简化，而是r48入口确实没有调用 `transitionGoodToGo(mClosingApps, ...)`。
-
-closing仍参与transit改写、animLp选择、target选择和实际退出动画，只是不作为新内容ready阻塞项。
-
-## 115. 复读修订四：忠实记录voiceInteraction重复opening检查
-
-源码的OR两侧均传 `mOpeningApps`。除非结合补丁历史或其他版本证据，不能在r48学习文档里悄悄改写为opening+closing。
-
-本章将其标为高度可疑的实现边界，而不是宣称已经在当前工程修复。
-
-## 116. 复读修订五：show与transition running仍非present
-
-Controller安装动画、提交visibility和调用showAllWindows后，SurfaceFlinger仍需应用Transaction、latch Buffer、compose并交HWC present。
-
-AppTransition从READY进RUNNING是窗口动画协议起点，不是第一帧物理显示完成点。
-
-## 117. 本章最终心智模型
-
-可以把旧版AppTransition看成一次“带逃生门的成组提交”：
-
-1. 三个集合定义参与对象；
-2. READY表示允许开始检查，不表示条件已齐；
-3. draw/preview、rotation、spec、Keyguard visibility和wallpaper组成门；
-4. transit与动画target在最后一刻根据实际层级重算；
-5. 可见性、动画和窗口show成组安装；
-6. RUNNING结束后再统一收尾。
-
-## 118. 本章结论与下一章
-
-Android 11的AppTransitionController不是一个“播放动画”的薄类，而是连接Activity绘制状态、Starting Window、锁屏可见性、Wallpaper、Remote Animation、层级target和最终visibility提交的协调器。诊断转场卡住时，先确定AppTransition四态，再沿good-to-go门逐层排除，远比只看Activity生命周期有效。
-
-下一章进入第222章“Android TransitionAnimation、AnimationAdapter、SurfaceAnimator与动画Leash”，继续追选中的动画如何变成SurfaceControl leash上的逐帧Transaction，以及动画结束回调怎样回到ActivityRecord。
+下一章进入第 222 章“Android AppTransition动画加载、AnimationAdapter、SurfaceAnimator 与动画 Leash”，继续追 `WindowContainer.applyAnimation()` 怎样选择 adapter、`SurfaceAnimator` 怎样创建 leash并把开始与完成回调接回容器；远端 runner 协议留到第 223 章。

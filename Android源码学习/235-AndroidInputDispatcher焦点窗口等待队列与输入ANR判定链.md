@@ -1,879 +1,555 @@
 # 235 Android InputDispatcher焦点窗口、等待队列与输入ANR判定链
 
-> 源码版本：Android 11 / `android-11.0.0_r48`  
-> 学习方式：macOS只读核源，不编译、不运行AOSP
+上一章沿着 `InputChannel` 追到了应用侧的 `finishInputEvent`：事件被应用取走，并不等于系统已经把这笔账结清。本章站回 system_server 与 inputflinger 一侧，回答更容易误诊的问题：`Input dispatching timed out` 到底是在等窗口出现，还是在等一个已经发布的事件回执？
 
-## 1. 本章要解决什么
+先给结论：**“输入分发超时”不是“应用主线程执行超过默认 5 秒”的同义词。** Android 11 的 InputDispatcher 至少存在两条入口不同的 ANR 路径：事件尚未找到 focused window 时，等的是窗口；事件已经成功写入某条 InputChannel 后，等的是该 Connection 的 finished signal（完成信号，后文简称回执）。只有先确定事件位于哪一侧，线程栈、队列和时间才有解释力。
 
-上一章看到ViewRoot可为IME过滤一个KeyEvent等待2500ms。本章回到更外层：InputDispatcher把事件交给目标窗口后，怎样知道App是否“真的不响应”。
+本文以 `android-11.0.0_r48` 为准。核心源码位于：
 
-需要回答：
+- `frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp`
+- `frameworks/native/services/inputflinger/dispatcher/Entry.h` 与 `Entry.cpp`
+- `frameworks/native/services/inputflinger/dispatcher/AnrTracker.h` 与 `AnrTracker.cpp`
+- `frameworks/base/services/core/java/com/android/server/wm/InputManagerCallback.java`
+- `frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java`
+- `frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java`
 
-```text
-focused application与focused window为什么是两套对象？
-没有焦点窗口为何也可能触发输入ANR？
-outboundQueue和waitQueue分别装什么？
-5秒从事件产生、入队还是发布到目标时开始？
-handled与finished/ack是什么关系？
-InputDispatcher怎样选择罪责窗口、通知WMS/AMS并允许延长等待？
-2500ms IME门和5秒输入分发门怎样相互影响但不等价？
-```
+本章聚焦按焦点寻址的 Key 与非 pointer Motion。pointer 命中、分流、手势监控和 pilfer 将留到下一章。
 
-## 2. 一句总纲
+## 1. 先按 publish 分界，不要先猜主线程
 
-输入ANR不是“主线程某方法执行超过5秒”的简单秒表，而是：
+一条输入事件可能停在以下三个位置：
 
 ```text
-InputDispatcher已经把事件发布给某个连接
-→ DispatchEntry进入waitQueue
-→ 到该窗口的dispatching timeout仍未收到finished signal
-→ native记录现场并异步问系统策略层
-→ WMS/ATMS/AMS识别责任进程、取证并决定延长还是终止等待
+mInboundQueue / mPendingEvent
+        │  尚未选出目标
+        ▼
+Connection.outboundQueue
+        │  publish 成功
+        ▼
+Connection.waitQueue ── finished(seq, handled) ──► 移除并结账
 ```
 
-另有一种兼容路径：focused application已经确定，但迟迟没有focused window。
+这里最重要的边界是 `publish`：
 
-## 3. 总体链路
+- 没有 focused window 时，事件仍是全局的 `mPendingEvent`。它没有对应的 `DispatchEntry`、Connection、Channel 或 `waitQueue` 记录。
+- 找到目标以后，InputDispatcher 为每个目标准备 `DispatchEntry`，先放进该 Connection 的 `outboundQueue`。
+- 只有 `publishKeyEvent`、`publishMotionEvent` 等调用成功，条目才从 `outboundQueue` 移到 `waitQueue`，并在 Connection 仍为 responsive 时登记进 `mAnrTracker`。
 
-```mermaid
-flowchart LR
-    WMS["WMS InputMonitor"] -->|"setInputWindows / focused app"| ID["InputDispatcher"]
-    IR["InputReader / 注入事件"] --> IN["inboundQueue / pendingEvent"]
-    IN --> TARGET["焦点或触摸目标选择"]
-    TARGET --> OUT["Connection outboundQueue"]
-    OUT -->|"publish成功"| WAIT["Connection waitQueue"]
-    WAIT --> APP["App InputChannel / ViewRoot"]
-    APP -->|"finished signal(seq, handled)"| WAIT
-    WAIT -->|"超时"| ANR["AnrTracker / onAnrLocked"]
-    ANR --> POLICY["InputManagerCallback"]
-    POLICY --> AMS["ATMS / AMS ANR处理"]
-    AMS -->|"延长timeout或abort"| ID
-```
+因此，日志里同样出现 `Input event dispatching timed out`，含义可能完全不同：
 
-## 4. 源码地图
+| 路径 | 超时前是否 publish | 等待对象 | native reason |
+|---|---:|---|---|
+| 无 focused window | 否 | 某个 focused application 出现可接收焦点的窗口 | `<app> does not have a focused window` |
+| Connection 超时 | 是 | 某个 seq 的完成回执 | `<channel> is not responding. Waited ... for ...` |
 
-native核心：
+这个分界也解释了为什么“看应用主线程栈”不是总能直接找到原因：第一条路径甚至还没有把事件交给应用。
+
+## 2. 正常路径先建立基准：发出、处理、回执
+
+正常链可以压缩成六步：
 
 ```text
-frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
-frameworks/native/services/inputflinger/dispatcher/InputDispatcher.h
-frameworks/native/services/inputflinger/dispatcher/Entry.cpp
-frameworks/native/libs/input/InputTransport.cpp
+InputReader / inject
+  → InputDispatcher 选目标
+  → outboundQueue
+  → publish 成功，进入 waitQueue 与 AnrTracker
+  → App InputEventReceiver 分发并 finishInputEvent
+  → native 收到 finished(seq, handled)，移除 waitQueue 账目
 ```
 
-Framework策略与取证：
+上一章已经说明应用侧 `ViewRootImpl`、`InputEventReceiver` 和 native consumer 如何发送回执。本章只守住两个协议事实。
 
-```text
-frameworks/base/services/core/java/com/android/server/wm/InputMonitor.java
-frameworks/base/services/core/java/com/android/server/wm/InputManagerCallback.java
-frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java
-frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
-frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
-frameworks/base/core/java/android/view/ViewRootImpl.java
-```
+第一，InputDispatcher 收到的 `seq` 用来查找 `Connection.waitQueue` 中的 `DispatchEntry.seq`。不要把它直接等同于 Java `InputEvent.getSequenceNumber()`；跨越传输边界时存在映射，InputDispatcher 最终关心的是能否定位自己的 dispatch 账目。
 
-## 5. InputDispatcher有独立线程
+第二，`handled` 与“有没有回执”正交：
 
-`start()`创建名为`InputDispatcher`的`InputThread`，循环调用`dispatchOnce()`。
+- `handled=true`：应用声明业务上已处理。
+- `handled=false`：应用声明业务上未处理，Key 还可能进入 policy fallback。
+- 两者都是有效的 finished signal，都能结束当前那次 waitQueue 等待。
 
-它不是system_server Java主线程，也不是App主线程。
+分析异常前，先用这条正常路径作对照。若连事件有没有 publish 都没有判断，后面的“5 秒”“窗口卡死”“IME 卡住”都只是猜测。
 
-## 6. dispatchOnce的基本节奏
+## 3. `dispatchOnce()`怎样把队列、命令和ANR检查串起来
 
-在native锁内：
+InputDispatcher 由自己的 `InputThread` 驱动。每轮 `dispatchOnce()` 大致执行：
 
-```text
-若无commands则dispatchOnceInnerLocked
-→ 执行需要解锁回调policy的commands
-→ processAnrsLocked算下一检查时刻
-→ 解锁
-→ Looper.pollOnce等待事件/回执/timeout
-```
+1. 持有 `mLock`；若没有待执行 command，则进入 `dispatchOnceInnerLocked()` 推进事件。
+2. 执行 command 队列；某些 command 会暂时释放 `mLock` 调 policy。
+3. 调用 `processAnrsLocked()`，得到下一次 ANR 检查时刻。
+4. 释放锁后进入 `Looper::pollOnce()`，等待 fd、显式 wake 或定时唤醒。
 
-不能持有InputDispatcher锁跨Java策略层做慢调用。
+`nextWakeupTime` 是这些原因的最早值，不是一个单独的“ANR 线程”。无窗口等待和 `mAnrTracker` 都通过它安排下一次检查。
 
-## 7. WMS怎样提供窗口事实
+有一个常被忽略的并发边界：`doNotifyAnrLockedInterruptible()` 在调用 Java policy 前会释放 native 的 `mLock`，所以其他线程可以更新窗口、注销 Channel；但这次 Java 回调仍由 InputDispatcher 线程同步执行。也就是说，native 数据锁没有跨 WMS/AMS 持有，不代表 InputDispatcher 线程可以同时继续分发。
 
-每个Display的`InputMonitor`收集InputWindowHandle，包含：
+`mLastAnrState` 则是在 native 判定超时时抓取的一份状态快照。之后看到的 traces、WMS dump 和进程状态可能已经变化，不能把不同时刻的证据拼成一个原子现场。
 
-```text
-InputChannel token
-窗口层级和visible/hasFocus
-touchable region与变换
-owner pid/uid
-paused、flags、displayId
-dispatching timeout
-```
+## 4. WMS提供两类焦点事实，InputDispatcher各自保存
 
-再通过input transaction/IMS把快照送InputDispatcher。
+需要严格区分：
 
-## 8. updateInputWindows为什么异步合并
+- `focused application` 是预期获得输入焦点的 `InputApplicationHandle`，它说明“当前应当由哪个应用承接焦点”。
+- `focused window` 是具体的 `InputWindowHandle`，它说明“现在可以把事件发往哪条窗口 Channel”。
 
-窗口布局、可见性、层级和焦点会在一轮Surface placement中多次变化。
+这两类事实进入 native 的路径也不同。普通窗口快照沿着 `InputMonitor → SurfaceControl.Transaction.setInputWindowInfo() → SurfaceFlinger::updateInputWindowInfo() → IInputFlinger/InputManager::setInputWindows() → InputDispatcher::setInputWindows()` 下沉。
 
-InputMonitor用pending标志和Handler合并更新；需要与Surface Transaction同帧一致时，也可立即生成并merge到传入Transaction。
+focused application 则由 Java InputManagerService 经 JNI 直接交给 `InputDispatcher::setFocusedApplication()`。
 
-## 9. focused application是什么
+对于同一 display，InputDispatcher 在按 top-to-bottom 顺序排列的窗口列表中选择首个同时满足 `hasFocus && visible` 的 handle；这里的“首个”是 z 序最靠上的匹配窗口，不是 Java 窗口层级里的所谓 top-level window。
 
-它表示系统当前认为哪个Activity/App应拥有焦点，即使该App的可接收输入窗口还未建好。
+focused application 已经确定、focused window 仍为空，是应用启动、切换或窗口事务过渡时可能出现的中间态。Android 11 保留一条兼容行为：只有当真正出现一条待按焦点分发的事件时，才开始“等待窗口”的计时。`setFocusedApplication()` 本身不启动这个计时器。
 
-WMS调用`setFocusedApplication(displayId, InputApplicationHandle)`单独下发。
+焦点变更还会形成 `FocusEntry/FocusEvent` 通知。旧焦点 Window 只有仍能找到已注册的 InputChannel 时，才合成 `CANCEL_NON_POINTER_EVENTS` 并入队 `focus=false`；新焦点则入队 `focus=true`。focused-window map 的旧值清理不依赖旧 Channel 是否仍存在。
 
-## 10. focused window是什么
+`FocusEvent` 与“按焦点寻址的 Key 或非 pointer Motion”不是同一个概念。本文把后者写全，避免把两者都简称为“焦点事件”。
 
-InputDispatcher在当前Display窗口列表中选择第一个同时：
+## 5. 无窗口路径有三种分支，计时只属于其中一种
 
-```text
-hasFocus == true
-visible == true
-```
+`findFocusedWindowTargetsLocked()` 取出目标 display 的两类焦点后，先分三种情况。
 
-的顶层InputWindowHandle。
+| focused window | focused application | 结果 |
+|---|---|---|
+| 空 | 空 | 直接丢弃，返回 injection failed；不启动 ANR 计时 |
+| 空 | 非空 | 首次发现时启动无窗口计时，事件保持 pending |
+| 非空 | 任意 | 重置无窗口计时，继续权限、paused、Key 排序等检查 |
 
-## 11. 为什么需要两套焦点
-
-启动新Activity时，任务焦点可以先切到新App，但它的Window尚未add、尚未visible或窗口快照尚未下发。
-
-若只有focused window概念，系统无法判断“现在暂时无窗口，但应该等某App创建”还是“本来就无人接收”。
-
-## 12. 焦点窗口变化时做什么
-
-旧焦点存在时：
-
-```text
-合成CANCEL_NON_POINTER_EVENTS
-→ enqueue focus=false
-→ 从focused map移除
-```
-
-新焦点存在时加入map并enqueue focus=true。
-
-## 13. 为什么焦点离开要取消非pointer事件
-
-旧窗口可能收到Key down但还没收到up。
-
-焦点切走时发送取消语义，避免旧View保留“按键仍按下”、tracking或long-press状态。
-
-## 14. 触摸窗口被移除时的取消不同
-
-若正在触摸的WindowHandle从列表消失，InputDispatcher合成`CANCEL_POINTER_EVENTS`。
-
-焦点键状态与触摸手势状态是两套连续性，取消类型不能混用。
-
-## 15. focused app变化可取消无窗口等待
-
-若当前正在等`mAwaitedFocusedApplication`创建焦点窗口，而focused app已切到另一个应用，InputDispatcher重置该计时器。
-
-不能让旧App的无窗口超时误伤新前台App。
-
-## 16. KeyEvent目标怎样找
-
-焦点型事件调用`findFocusedWindowTargetsLocked()`，按事件Display读取focused window和focused application。
-
-触摸事件则按坐标、touch region、层级、手势已有TouchState等选择窗口，不能简单套用焦点键目标。
-
-## 17. 无focused window也无focused app
-
-源码直接丢弃该焦点事件，并返回injection failed。
-
-系统没有可等待的责任主体，因此不会凭空启动5秒ANR。
-
-## 18. 有focused app但无window
-
-这是兼容等待路径：系统推测App可能仍在启动并即将添加窗口。
-
-只有真的出现一个待分发焦点事件时才开始计时，不是focused app一设置就立即倒计时。
-
-## 19. 无窗口timeout从何而来
-
-优先取`InputApplicationHandle`的dispatching timeout，缺省使用5秒。
-
-记录：
+第二种情况下，超时长度来自 focused application 的 dispatching timeout；未配置时回落到默认 5 秒。InputDispatcher 保存一对全局状态：
 
 ```text
 mNoFocusedWindowTimeoutTime = currentTime + timeout
-mAwaitedFocusedApplication = focusedApplication
+mAwaitedFocusedApplication  = focusedApplicationHandle
 ```
 
-事件保持PENDING。
+它不是“每个 display 一只计时器”，也不是每条事件各有一只。后续 retry 仍无窗口时复用这对状态。到期后，`processAnrsLocked()` 先走 `onAnrLocked(mAwaitedFocusedApplication)`，随后清空 awaited application；原 deadline 在这一步并未一并清成 `nullopt`。同一 pending 事件再次尝试选目标时，若仍无 focused window，就会因为超过旧 deadline 而被丢弃；若 policy 调用期间窗口已经出现，则转入有效窗口分支、重置计时并继续选目标。
 
-## 20. 无窗口ANR怎样取消
+事件推进中最常见的两类重置是：
 
-以下情形会重置：
+- pending 事件重试时看到了有效 focused window，调用 `resetNoFocusedWindowTimeoutLocked()`。
+- `setFocusedApplication()` 发现旧 application 正是正在等待的对象，而新 application 已换人。
 
-```text
-有效focused window出现
-focused application换人
-通过触摸开始与另一个应用交互的兼容路径
-```
+此外，dispatcher 从 frozen 恢复，以及 reset-and-drop 这类全局状态清理也会重置它；这些是控制面清场，不要误写成某个 pointer DOWN 直接清除了计时。
 
-所以它不是“一旦开始必然报错”的不可撤销秒表。
+若 policy 返回正的 extension，且此时找不到 Connection、但无窗口 deadline 与 command 携带的 application 仍有效，`extendAnrTimeoutsLocked()` 会用 `now() + extension` 重新设定 deadline 并恢复 awaited application。这里不再次校验当前 focused application 的身份；后续状态更新和目标选择仍要自行收敛。若 policy 返回 0，无窗口路径的 token 是空的，找不到 Connection，因此不会生成 Connection cancel；之后重试时若仍无 focused window，才按旧 deadline 的过期分支丢弃，窗口已经出现则继续正常选目标。
 
-## 21. 无窗口超时后的理由
+另外两个边界也要分开：
 
-`onAnrLocked(application)`构造：
+- 对本章的按焦点寻址路径，focused window 的 `paused` 为真时，目标已经存在，但事件仍保持 pending。这里不会创建 waitQueue 记录，也不启动一只“paused 专用 ANR 计时器”；后续是否被 stale 规则丢弃要按事件类型与重试时刻另算。pointer 新手势面对 paused window 走另一套目标选择，不能套用这条结论。
+- 新 pointer `DOWN` 可能触发 inbound pruning 或结束 Key 的 500ms 等待，但它不会直接调用 `resetNoFocusedWindowTimeoutLocked()`。是否解除无窗口等待，要看随后的焦点/application 状态变化。
 
-```text
-<application name> does not have a focused window
-```
+## 6. Key发送前还有两套不同的500ms机制
 
-此时没有具体InputChannel token，责任锚点是InputApplicationHandle。
+源码里至少有两套 500ms，目的和起点不同。
 
-## 22. window paused时怎么办
+`APP_SWITCH_TIMEOUT` 服务于应用切换键。只有未取消、带 `TRUSTED` 与 `PASS_TO_USER` policy flags 的 HOME、ENDCALL 或 APP_SWITCH 才被这段逻辑识别；先看到 DOWN，再在对应 Key Up 入队时用该事件的 `eventTime + 500ms` 设置 `mAppSwitchDueTime`。如果旧事件拖得太久，它用于丢弃先于切换键推进的其他 pending Key/Motion，不是 Connection ANR deadline。
 
-若焦点WindowHandle的`paused`为true，事件保持PENDING。
+`KEY_WAITING_FOR_EVENTS_TIMEOUT` 服务于 Key 的排序。Key 找到 focused window 后，若 `mAnrTracker` 仍非空，InputDispatcher 最多再等 500ms，让先前未完成的输入有机会引发焦点变化；超时后仍把 Key 发给当前 focused window。
 
-WMS在`setInputFocusLw()`把一个可接收键的新窗口设焦点时会自动清该WindowToken的paused，防止忘记resume导致永久停发。
+注释用“未处理 Motion 可能改变焦点”解释设计动机，但实现条件是 `mAnrTracker.empty()`，没有只筛 Motion、当前窗口或当前 display。因此准确说法是：设计主要防 Motion 导致焦点切换，实际门槛观察的是全局仍受追踪的 dispatch 条目。
 
-## 23. Key为何可能等前序Motion
+新 pointer `DOWN` 会把已经存在的 `mKeyIsWaitingForEventsTimeout` 改为 `now()`，让 pending Key 尽快结束这次等待。这仍不是 ANR；它只是发 Key 前的顺序协调。
 
-点击按钮可能弹出新窗口，紧接着按下“A”。
+## 7. EventEntry、DispatchEntry与三层队列不是同一笔账
 
-若旧Motion尚未完成，立刻按旧焦点发送Key可能送错窗口。因此Key会给前序可能改变焦点的事件一个完成机会。
+理解队列前先分对象：
 
-## 24. 这个额外等待是多少
+- `EventEntry` 表示一条逻辑输入事件，携带 `eventTime`、类型和原始事件信息。
+- `DispatchEntry` 表示这条事件面向某个目标的一次投递，带目标 flags、变换信息、`seq`、`deliveryTime` 与 `timeoutTime`。
+- 同一个 EventEntry 可以因为多个目标而对应多个 DispatchEntry；ANR 追踪针对具体 Connection 的投递账。
 
-r48：
+三个常见位置承担不同职责：
 
-```java
-KEY_WAITING_FOR_EVENTS_TIMEOUT = 500ms
-```
+| 位置 | 所属范围 | 语义 |
+|---|---|---|
+| `mInboundQueue` / `mPendingEvent` | InputDispatcher 全局 | 尚在选择与推进的逻辑事件 |
+| `Connection.outboundQueue` | 每条 Connection | 已准备给该目标、尚未成功写入 Channel |
+| `Connection.waitQueue` | 每条 Connection | 已成功 publish、正在等待回执 |
 
-超过500ms仍有旧事件，日志告警后仍把Key发给当前焦点窗口；这不是输入ANR的5秒门。
+`DispatchEntry::nextSeq()` 生成的是 InputDispatcher 这端的投递序号。它随 publish 送入 transport，回执携带能映射回这笔账的 seq。排查“回执找不到事件”时，应沿 transport 映射逐层看，而不是拿任意一层显示的 sequence number 直接比较。
 
-## 25. inbound、outbound、wait三层队列
+`InputState` 还会在准备投递时记录按键、触点等状态，以便需要时合成取消。这个状态更新发生在应用真正看到事件之前；因此“能合成 CANCEL”不等于“原事件已被应用消费”。
 
-```text
-inboundQueue：尚未完成全局目标选择的事件
-Connection.outboundQueue：已为某连接准备、尚未成功发布的DispatchEntry
-Connection.waitQueue：已发布给连接、等待finished signal的DispatchEntry
-```
+## 8. deadline在发布尝试前写入，成功发布后才受追踪
 
-“队列里有事件”必须写出是哪一层。
+`startDispatchCycleLocked(currentTime, connection)` 从 `outboundQueue.front()` 开始，每次发布尝试前都会写：
 
-## 26. EventEntry与DispatchEntry区别
-
-一个EventEntry表示原始逻辑事件。
-
-它可针对多个目标生成不同DispatchEntry，每个带自己的seq、target flags、坐标变换、deliveryTime和timeoutTime。
-
-## 27. DispatchEntry seq怎样生成
-
-用全局原子递增序列，0被保留并跳过。
-
-目标进程finished signal带seq返回，InputDispatcher据此从该Connection waitQueue找到精确条目。
-
-## 28. timeout何时开始
-
-`startDispatchCycleLocked(currentTime, connection)`取当前窗口timeout，并设置：
-
-```java
+```cpp
 dispatchEntry->deliveryTime = currentTime;
 dispatchEntry->timeoutTime = currentTime + timeout;
 ```
 
-也就是准备向该Connection发布的时刻，不是硬件事件最初eventTime。
+timeout 通过目标 token 查 Window 的配置；找不到 Window 时才使用默认值。因此“输入 ANR 固定 5 秒”也不严谨：默认是 5 秒，具体 Window/Application 可以提供不同值，instrumentation 或包装环境也可能改变它。
 
-## 29. publish失败不会进入waitQueue
+随后才调用 publisher。三种结果不能混为一谈：
 
-若Channel pipe满：
+1. **publish 成功**：从 outbound 移除、压入 waitQueue；若 Connection 当前 responsive，再把 `(timeoutTime, token)` 加入 `mAnrTracker`。
+2. **`WOULD_BLOCK` 且 waitQueue 非空**：说明 pipe 满且应用还有未完成事件，当前条目留在 outbound，等待后续回执腾出空间。
+3. **`WOULD_BLOCK` 但 waitQueue 为空**：按协议 Channel 本应可写，这被视为异常，进入 broken dispatch cycle；其他意外错误也走 broken 路径。
 
-```text
-waitQueue空却满 → 异常，abort broken cycle
-waitQueue非空 → App落后，保留outbound等其完成旧事件
-```
+由此得到一个略细但很实用的时间边界：deadline 字段在发布尝试前被写入，但只有成功 publish 后才进入 waitQueue/AnrTracker，成为可触发 Connection ANR 的账。若先前因 pipe 满而保留在 outbound，下一次 `startDispatchCycleLocked()` 会用新的 `currentTime` 覆盖它的 delivery/deadline。一次 start cycle 连续发布多条时则共享该次传入的 `currentTime`。
 
-其他不可恢复错误也会走broken channel清理。
+所以有效追踪时间从成功发布的那次尝试开始，而不是从硬件产生事件的 `eventTime` 开始。
 
-## 30. publish成功后的队列迁移
+## 9. AnrTracker只保存索引，真正的账在waitQueue
 
-从outboundQueue移除，push到waitQueue。
+`AnrTracker` 可以理解为按 deadline 排序的 `(timeoutTime, connectionToken)` 多重集合。它不保存 `DispatchEntry.seq`，也不是完整队列；真实条目仍在各 Connection 的 `waitQueue`。
 
-若Connection仍responsive，把`timeoutTime + connection token`插入`mAnrTracker`。
+`processAnrsLocked()` 每轮先检查无 focused window deadline，再把下一检查点与 `mAnrTracker.firstTimeout()` 取最小值。Connection deadline 到期时，它：
 
-## 31. AnrTracker解决什么
+1. 用 tracker 的首个 token 找 Connection。
+2. 把 `connection->responsive` 设为 `false`。
+3. `eraseToken(token)`，移除该 token 在 tracker 中的全部索引，停止反复按旧 deadline 唤醒。
+4. 调 `onAnrLocked(connection)`。
 
-多个连接、多个wait entry有不同到期时刻。
+`onAnrLocked(connection)` 若看到空 waitQueue，会把它当作已经恢复而不再上报。这是针对延长历史和队列状态的防御性检查；`processAnrsLocked()` 标记 Connection 与紧接着调用 `onAnrLocked()` 之间没有一次 policy 解锁，不能把这个分支解释成“finished 恰好在两行之间插入”。
 
-Tracker维护最早timeout，使dispatch loop只需在最早检查点唤醒，而不必固定频率扫描全部队列。
+生成 reason 时选择 `waitQueue.begin()` 的 oldest entry。它未必就是 tracker 中最早 deadline 对应的条目：窗口 timeout 可能中途变化，让较新的条目更早到期。源码仍选择 oldest，是因为应用通常线性处理输入，它更能描述阻塞链的前端。
 
-## 32. 默认dispatch timeout是多少
+这也意味着诊断时必须同时看：tracker 说明哪个 token 何时触发检查，waitQueue oldest 说明 reason 展示哪条等待，二者不是按 seq 一一配对的同一个容器。
 
-```cpp
-DEFAULT_INPUT_DISPATCHING_TIMEOUT = 5s;
-```
+## 10. native先留快照，再解锁同步进入Java policy
 
-但`getDispatchingTimeoutLocked(token)`优先取窗口自己的timeout，因此5秒是默认值，不是所有窗口绝对固定值。
+两条 ANR 路径最终都创建 `doNotifyAnrLockedInterruptible` command，但携带的信息不同：
 
-## 33. instrumentation/debugger为何可能不同
-
-应用/Activity的InputApplicationHandle可携带调整后的timeout；AMS在真正ANR决策时也会对debugger、instrumentation作特殊处理。
-
-排查时应看dump里的实际dispatchingTimeout，而不是只背5秒。
-
-## 34. processAnrsLocked先查什么
-
-先查“focused app但无focused window”的独立计时器，再查AnrTracker最早Connection timeout。
-
-两类ANR一个没有Channel，一个有具体waitQueue和Connection，理由及归责不同。
-
-## 35. Connection到期时怎样标记
-
-设置：
-
-```text
-connection.responsive = false
-从AnrTracker移除该token
-onAnrLocked(connection)
-```
-
-先停止为同一不响应Connection反复唤醒，再交策略层判断是否延长。
-
-## 36. 为什么onAnr前再看waitQueue
-
-策略回调、锁切换或完成信号可能让Connection恢复。
-
-如果waitQueue已空，源码打印recovered并不再报ANR，避免用陈旧计时点误报。
-
-## 37. ANR理由为什么引用oldest entry
-
-理由包含Channel名、已等待毫秒和oldest event description。
-
-源码注释承认：若窗口timeout动态变化，真正最先到期的可能是较新entry；但多数App线性处理，展示最早发送事件对诊断最有用。
-
-## 38. 2秒慢事件日志不是ANR
-
-r48另有：
-
-```cpp
-SLOW_EVENT_PROCESSING_WARNING_TIMEOUT = 2s;
-```
-
-事件最终finish时若处理超过2秒只写slow日志和统计；未达到实际窗口timeout就不等于ANR。
-
-## 39. 10秒stale event也不是ANR
-
-`STALE_EVENT_TIMEOUT = 10s`从事件自身eventTime衡量未及时分发的陈旧事件，可能直接丢弃。
-
-Connection ANR从deliveryTime衡量“已经交给目标后多久没ack”，两者起点不同。
-
-## 40. 500ms app-switch门也不同
-
-HOME/ENDCALL等应用切换键到来时，InputDispatcher用500ms优化抢占旧事件。
-
-这是切换延迟策略，不是目标窗口正常完成回执的dispatch timeout。
-
-## 41. finished signal怎样返回native
-
-App `ViewRootImpl.finishInputEvent()`调用Window InputEventReceiver。
-
-JNI通过`InputConsumer.sendFinishedSignal(seq, handled)`写回Channel，InputDispatcher收到后创建完成command。
-
-## 42. handled会影响是否移出waitQueue吗
-
-无论handled true或false，只要finished signal有效，当前DispatchEntry都已完成，应从waitQueue移除。
-
-handled用于后续策略/统计/回退语义，不是“只有处理了才ack”。
-
-## 43. doDispatchCycleFinished的顺序
-
-```text
-按seq查wait entry
-→ 算delivery到finish耗时并打慢日志/统计
-→ afterKey/afterMotion策略
-→ 再次确认entry仍存在
-→ 从waitQueue移除并从AnrTracker删timeout
-→ 必要时恢复responsive
-→ release或重新入outbound
-→ 启动下一dispatch cycle
-```
-
-## 44. 为什么要二次查waitQueue
-
-afterKey/afterMotion可能解锁并触发其他清理，队列内容已变化。
-
-持有旧iterator继续erase会产生use-after-free或删错事件，因此重新按seq查找。
-
-## 45. Connection何时恢复responsive
-
-若之前标为false，完成一个entry后扫描剩余waitQueue；没有任何`timeoutTime < now`的entry才恢复responsive。
-
-仅收到一个晚回执不一定代表积压已全部健康。
-
-## 46. native ANR不会直接弹框
-
-`onAnrLocked()`先保存native InputDispatcher现场，再post一个command。
-
-command执行时释放mLock，调用`mPolicy->notifyAnr()`进入Java策略层。
-
-## 47. 为什么策略回调必须解锁
-
-WMS/AMS可能取Java大锁、收集堆栈并做跨服务调用。
-
-持有InputDispatcher锁等待它们会阻塞所有输入与finished signal，反而放大甚至制造系统级卡死。
-
-## 48. native现场保存什么
-
-`mLastAnrState`记录时间、reason、Window label，并dump当前dispatcher状态：
-
-```text
-焦点、窗口列表
-inbound/pending事件
-各Connection状态
-outbound/wait队列与age
-触摸状态等
-```
-
-这是`dumpsys input`诊断的重要快照。
-
-## 49. Java policy入口
-
-`InputManagerCallback.notifyANR(applicationHandle, token, reason)`运行在InputDispatcher相关回调线程上。
-
-返回值单位是纳秒：大于0表示继续等这么久，0表示停止当前等待策略。
-
-## 50. 为什么先做pre-dump
-
-debuggable构建上，若WMS或AMS锁在限定时间内拿不到，后台线程先抓system_server及必要时SurfaceFlinger堆栈。
-
-这样真正ANR路径稍后拿到锁时，早先的阻塞现场不会完全消失。
-
-## 51. token怎样映射责任窗口
-
-在WMS全局锁内用`mInputToWindowMap`查WindowState，再取得：
-
-```text
-ActivityRecord
-window process pid
-是否高于系统窗口层
-窗口标题
-```
-
-## 52. embedded window怎样归责
-
-若普通WindowState映射不到，继续查EmbeddedWindowController，取ownerPid和host window层级。
-
-没有host时难以判断z序，源码选择尽量把ANR对话框放高。
-
-## 53. 无窗口ANR怎样找到Activity
-
-没有token时，使用InputApplicationHandle.token通过`ActivityRecord.forTokenLocked()`定位focused activity。
-
-这与第21节的“focused app但无window”路径对应。
-
-## 54. WMS保存哪些ANR状态
-
-在窗口状态仍稳定时调用`saveANRStateLocked(activity, windowState, reason)`。
-
-随后锁外让ATMS保存Activity/Task现场；`dumpsys window lastanr`可查看，r48默认保留两小时后清理。
-
-## 55. 为什么调用AMS前释放WMS锁
-
-ActivityManager ANR流程会获取AMS锁、查询进程并抓取堆栈。
-
-若反向再需要WMS，持锁跨调用容易形成锁序死锁；源码明确把后续调用放在WMS锁外。
-
-## 56. Activity窗口怎样交给AMS
-
-`ActivityRecord.keyDispatchingTimedOut(reason, windowPid)`先判断窗口进程是否就是Activity进程。
-
-若同进程走带Activity上下文的AM internal接口；若是另一个进程借Activity token加窗，则按真实windowPid走通用路径，避免错怪Activity宿主。
-
-## 57. AMS正常进程怎样处理
-
-构造`Input dispatching timed out (...)`注解并交`mAnrHelper.appNotResponding()`异步处理ANR取证/对话框/杀进程策略。
-
-函数返回true表示应中止当前输入等待。
-
-## 58. 正在debug为什么可继续等
-
-若`ProcessRecord.isDebugging()`，AMS返回false，不立即按普通ANR中止。
-
-InputManagerCallback把Activity的`mInputDispatchingTimeoutNanos`返回native，延长等待，方便断点调试。
-
-## 59. instrumentation异常路径
-
-有active instrumentation时，AMS结束instrumentation并返回true中止，而不是走普通用户ANR对话流程。
-
-测试运行环境不能完全套用普通前台App表现。
-
-## 60. 无Activity的Window进程
-
-WMS调用`mAmInternal.inputDispatchingTimedOut(pid, aboveSystem, reason)`。
-
-返回负数代表abort；非负毫秒数代表继续等待，policy转换成纳秒返回native。
-
-## 61. 策略允许延长时native做什么
-
-`extendAnrTimeoutsLocked()`：
-
-```text
-connection.responsive = true
-newTimeout = now + extension
-更新需要延长的wait entries timeoutTime
-重新插入AnrTracker
-```
-
-这不是清空旧事件，而是给现有未完成事件新的截止点。
-
-## 62. 无窗口ANR也能延长
-
-若没有Connection但仍在等同一个focused application，重新设置：
-
-```text
-mNoFocusedWindowTimeoutTime = now + extension
-```
-
-因此policy返回值同时服务两类ANR路径。
-
-## 63. 策略选择abort时native做什么
-
-对具体Connection调用`cancelEventsForAnrLocked()`，合成`CANCEL_ALL_EVENTS`。
-
-源码强调不会在这里直接break Channel；若策略最终关闭App，后续unregister InputChannel再做连接清理。
-
-## 64. 为什么focused事件还可能堆积
-
-不响应Connection上不再正常发送新pointer，但焦点事件可能继续排队。
-
-输入ANR不是“所有队列瞬间冻结为空”，dump时要同时看outbound和wait积压。
-
-## 65. App为什么会不回finished signal
-
-常见根因：
-
-```text
-主线程长计算、死循环或Binder同步等待
-主线程等待被其他线程持有的锁
-View事件处理里执行慢I/O
-system_server/WMS/AMS锁或Binder对端形成等待链
-App在ImeInputStage等待卡住的IME
-native InputQueue/自定义InputEventReceiver漏finish
-```
-
-ANR表象是输入ack没回来，根因不必在InputDispatcher。
-
-## 66. IME 2500ms怎样嵌入5秒
-
-原Window事件发布给App后已经进入InputDispatcher waitQueue。
-
-ViewRoot到ImeInputStage时又在App内部等待IME专用Channel；这段2500ms发生在原窗口事件尚未finish期间，因此计入App Connection的总等待时间。
-
-## 67. 两个计时器为什么不等价
-
-```text
-IMM 2500ms：App侧局部等待当前IME过滤，超时后按false继续App流水线
-InputDispatcher通常5s：系统等待目标Window Connection完成整个事件
-```
-
-InputDispatcher看不到App内部是在等IME、执行View回调还是卡锁，只看到原finished signal未回来。
-
-## 68. 超时不是简单2.5+5
-
-5秒从事件发布给App开始；2.5秒是其内部的一段重叠时间。
-
-若IME正好耗尽2.5秒，App常只剩大约余下窗口timeout处理post-IME逻辑，而不是再获得完整5秒。调度延迟和自定义timeout还会改变实际时间。
-
-## 69. 2500ms后为何可能仍触发App输入ANR
-
-IMM虽把事件按not handled继续，但App主线程若本身卡住，callback也无法及时恢复ViewRoot；或者恢复后View处理又很慢。
-
-最终原Window finished signal仍可能越过InputDispatcher deadline。
-
-## 70. IME卡顿应怪谁
-
-InputDispatcher这条原Window Connection的token通常指向目标App窗口，因此外层reason可能表现为目标App未完成输入。
-
-IMM另有“Timeout waiting for IME”日志能揭示内部原因；诊断必须结合两侧日志和线程栈，不能只看ANR进程名下结论。
-
-## 71. 完整正常完成时序
-
-```mermaid
-sequenceDiagram
-    participant ID as "InputDispatcher"
-    participant CH as "App Window Channel"
-    participant VR as "App ViewRoot"
-    participant IME as "可选IME过滤"
-    ID->>CH: publish DispatchEntry(seq)
-    ID->>ID: outbound→wait, deadline=delivery+timeout
-    CH->>VR: onInputEvent
-    VR->>IME: 可选专用Channel过滤
-    IME-->>VR: handled / 2500ms局部回退
-    VR->>VR: finish或post-IME View处理
-    VR->>CH: finishInputEvent(seq, handled)
-    CH->>ID: finished signal
-    ID->>ID: waitQueue erase + AnrTracker erase
-    ID->>ID: start next dispatch cycle
-```
-
-## 72. Connection ANR与无焦点窗口ANR对比
-
-| 条件 | 下一步 | 到期结果 |
+| 来源 | `inputApplicationHandle` | `inputChannel` / token |
 |---|---|---|
-| 有focused window | publish到Connection并进入waitQueue | deadline前无finished → Connection ANR |
-| 无window、有focused application | 启动no-focused-window timer | 窗口出现/应用切换则reset；否则Application无焦点窗口ANR |
-| window和application都没有 | 直接drop | 没有可归责主体，不启动这两类ANR |
+| 无 focused window | 等待中的 application | 空 |
+| Connection timeout | 空 | 超时 Connection 的 Channel |
 
-## 73. ANR策略回调时序
-
-```mermaid
-sequenceDiagram
-    participant ID as "native InputDispatcher"
-    participant WMS as "InputManagerCallback/WMS"
-    participant ATMS as "ATMS"
-    participant AMS as "AMS/AnrHelper"
-    ID->>ID: 保存mLastAnrState
-    ID->>ID: post command并释放mLock
-    ID->>WMS: notifyANR(appHandle/token/reason)
-    WMS->>WMS: 解析Window/Activity/PID并保存lastanr
-    WMS->>ATMS: 保存Activity/Task现场
-    WMS->>AMS: inputDispatchingTimedOut
-    alt debugger/策略继续等
-        AMS-->>WMS: abort=false / extension
-        WMS-->>ID: extension > 0
-        ID->>ID: 重设wait entry deadline
-    else 正常ANR中止
-        AMS-->>WMS: abort=true
-        WMS-->>ID: 0
-        ID->>ID: synthesize CANCEL_ALL_EVENTS
-    end
-```
-
-## 74. 四类时间必须分账
-
-| 时间 | 起点 | 用途 |
-|---|---|---|
-| 500ms key-wait | Key发现前序事件可能改焦点 | 给前序Motion改变焦点的机会 |
-| 2s slow warning | deliveryTime | 完成后记录慢处理，不必ANR |
-| 默认5s dispatch timeout | deliveryTime | 等目标Connection finished signal |
-| 10s stale timeout | 原eventTime | 未及时分发的陈旧事件可丢弃 |
-
-上一章2500ms IME门是第五套、位于App内部的计时。
-
-## 75. handled=false也能证明响应
-
-App可以迅速返回“我没处理”。
-
-只要finish及时，Connection就是responsive；ANR关心是否按期完成协议，不要求业务必须消费事件。
-
-## 76. handled=true也可能太晚
-
-业务最终返回true，但超过deadline才finished，仍可能先触发ANR。
-
-“处理结果正确”和“系统响应及时”是两项独立指标。
-
-## 77. ANR reason为何写等待具体事件
-
-reason示例语义：
+在 command 入队前，native 先通过 `updateLastAnrStateLocked()` 保存时间、reason、窗口标签和 dispatcher dump。随后 command 执行：
 
 ```text
-<channel> is not responding. Waited N ms for <event description>
+取 token
+  → mLock.unlock()
+  → mPolicy->notifyAnr(application, token, reason)
+  → mLock.lock()
+  → extension > 0 ? 进入延长分支 : 进入 abort 分支
 ```
 
-在debuggable构建，KeyEvent description会包含更多keyCode/source等字段；非debug构建为隐私/日志量减少细节。
+释放锁是跨 native/Java 与跨锁域调用的必要并发边界。WMS 和 AMS 处理期间，窗口、Connection 乃至原条目都可能变化，所以返回后必须重新按 token 查询，不能继续相信旧裸指针。
 
-## 78. dumpsys应看什么
+调用链是 `InputDispatcher → NativeInputManager::notifyAnr() → InputManagerService.notifyANR() → InputManagerCallback.notifyANRInner()`。它仍是 InputDispatcher 线程上的同步调用。若 Java policy 自身长时间阻塞，native 锁虽然可被其他线程取得，这条 dispatcher loop 仍要等回调返回；`InputManagerCallback.notifyANR()` 也专门记录该调用耗时。JNI callback 若抛出异常，native 会清除异常并把返回值收敛为 0，也就是 abort。
 
-只读排查常用：
+## 11. Java按token把Channel责任映射到Window、Activity或进程
 
-```text
-dumpsys input
-dumpsys window lastanr
-dumpsys activity lastanr（具体版本命令以help为准）
-traces中的main/Binder/RenderThread/锁等待
-logcat的InputDispatcher、WindowManager、ActivityManager、InputMethodManager
-```
+`InputManagerCallback.notifyANRInner()` 在 WMS 锁内完成责任定位与状态保存，顺序如下：
 
-本机macOS源码学习只核对生成路径，不实际运行设备命令。
+1. token 非空时，先查 `mInputToWindowMap` 得到 `WindowState`，再取得它的 `ActivityRecord`、窗口进程 PID 与 `aboveSystem`。
+2. 普通 Window 未命中时，再查 embedded window，至少找 owner PID，并尽量由 host window 判断层级。
+3. 若仍没有 Activity、但 native 传来了 `InputApplicationHandle`，用其中的 token 查 `ActivityRecord`。这正是无 focused window 路径。
+4. 在 WMS 锁内保存 WMS ANR state；释放 WMS 锁后，再保存 ATMS state 并调用 AM，避免持 WMS 锁进入 AM。
 
-## 79. waitQueue age怎样读
+之后有两条 Java 入口：
 
-最老entry长时间未完成通常最关键，但要同时检查：
+- 有 Activity 时调用 `ActivityRecord.keyDispatchingTimedOut(reason, windowPid)`。如果窗口 PID 与 Activity 进程不一致，会改走通用 PID 归责，避免把外挂在 Activity token 上的其他进程窗口错怪给 Activity。
+- 没有 Activity、但有 Window 或有效 PID 时，调用 `mAmInternal.inputDispatchingTimedOut(windowPid, aboveSystem, reason)`。
 
-```text
-它的deadline是否被自定义/延长
-后续entry是否因timeout变化更早到期
-Connection responsive标志
-outbound是否因pipe满继续积压
-```
+AMS 的决策也不是“上报就立刻杀进程”：
 
-不能只数waitQueue长度。
+- 正在调试的进程返回 keep waiting。
+- 有 active instrumentation 的进程会结束 instrumentation，并选择 abort。
+- 普通进程把 `appNotResponding` 交给 `mAnrHelper`，随后返回 abort；ANR 处理本身由 helper 推进。
+- 找不到可归责主体时直接返回 abort。
 
-## 80. 焦点窗口为何必须visible
+Java 最终给 native 的不是布尔值，而是纳秒：正值表示继续等待多久，0 表示中止分发。通用 PID 路径中，AMS 的毫秒返回值会在 `InputManagerCallback` 中乘 `1000000L`。
 
-WMS可能短暂保留hasFocus状态，但窗口已不可见。
+## 12. extension、abort与broken channel是三种不同动作
 
-InputDispatcher只取首个hasFocus且visible窗口，避免把新Key交给已经退出视觉交互的旧Surface/Window。
+policy 返回正数时，`extendAnrTimeoutsLocked()` 会先按 token 重新查 Connection。若它已消失，且这也不是带有效 deadline/application 的无窗口路径，函数直接返回；不会恢复 responsive 或重建 tracker。Connection 仍存在时，代码才把它恢复为 responsive，并计算统一的 `newTimeout = now() + extension`。它只更新满足 `newTimeout >= entry->timeoutTime` 的 waitQueue 条目，并把这些条目重新插入 tracker。
 
-## 81. FocusEvent本身也走Connection
+这个条件有一个容易漏掉的 r48 边界：Connection 被判超时时，`eraseToken()` 已移除该 token 的全部 tracker 索引；如果某个 waitQueue 条目的原 deadline 比 `newTimeout` 还晚，它既不会被覆盖，也不会在这个循环里重新插入 tracker。也就是说，waitQueue 与 tracker 并非任何时刻都严格一一对应。
 
-焦点变化会enqueue FocusEntry，由InputChannel传给ViewRoot的`onFocusEvent()`。
+policy 返回 0 时也会重新按 token 查 Connection；若它已经消失，直接返回。Connection 仍存在时才调用 `cancelEventsForAnrLocked()`：
 
-WMS/InputDispatcher内部map更新与App真正收到focus event之间存在异步距离，阅读竞态时要区分“服务端已选焦点”和“客户端已处理通知”。
+- 不直接断开 Channel。
+- 不直接清空既有 waitQueue 或 outboundQueue。
+- 不等于杀掉应用进程。
+- 在 Connection 仍为 normal 时，构造 `CancelationOptions(CANCEL_ALL_EVENTS, ...)`，再由 `InputState` 生成具体带取消语义的 Key/Motion 事件并加入同一分发体系。
 
-## 82. Channel broken与ANR不同
+因为 cancel 也要走 Channel，“已生成取消语义”不证明卡住的 client 已经收到它。真正的 Channel 错误走 `abortBrokenDispatchCycleLocked()`，它会清空两条 dispatch 队列、把状态改为 broken，并按 `notify` 参数决定是否通知 policy；publish 异常路径传入的是 `true`。这是与 ANR abort 不同的故障路径。
 
-publish出现不可恢复错误或Channel对端死亡会通知`notifyInputChannelBroken()`，WMS按token移除Window。
+Connection 变成 unresponsive 后，新 pointer gesture 不再选它作为目标；但源码明确允许按焦点寻址的事件（源码注释称 `focused events`）继续堆积，已经属于它的 touch stream 也有自己的连续性语义。不要把 `responsive=false` 解读成“此进程的所有输入从此全部丢弃”。
 
-ANR是Channel仍存在但事件长期未ack；broken是通信端点已不可用。
+## 13. 迟到回执能结账，但不保证重建全部追踪索引
 
-## 83. pause dispatch与ANR不同
+native consumer 读到 `(seq, handled)` 后，经 command 进入 `doDispatchCycleFinishedLockedInterruptible()`：
 
-paused Window会使目标选择保持PENDING，是系统明确暂停交付。
+1. 在 waitQueue 中按 seq 查条目。
+2. 计算 `finishTime - deliveryTime`，上报统计；超过 2 秒才打印 slow processing warning。
+3. 对 Key/Motion 执行完成后的 policy 动作。
+4. 因 policy 可能临时解锁，回来后再次按 seq 查找。
+5. 若仍存在，则从 waitQueue 移除，并从 tracker 删除对应 `(timeoutTime, token)`。
+6. 若 Connection 先前 unresponsive，扫描剩余 waitQueue；只有不存在 `timeoutTime < now()` 的条目，才恢复 responsive。
+7. 再次启动该 Connection 的 dispatch cycle。
 
-已publish后进入waitQueue才进入Connection ack超时语义；不能把pause等待直接说成App已收事件不处理。
+所以迟到回执仍有价值：它可以关闭对应账目，并在剩余条目都未过期时恢复 Connection。但恢复代码不会把其他仍在 waitQueue、却已因 `eraseToken()` 消失的旧索引重新加入 tracker；它与 policy extension 的“条件式重建”也不相同。
 
-## 84. 常见误解一：5秒从用户按下按键开始
+`handled=false` 同样先表示这次投递已经完成。对于未处理的前台 Key，policy 可能生成 fallback key，并让 `restartEvent` 把同一个 DispatchEntry 推回 outbound 前端。它的 seq 不变，所指 KeyEntry 内容被改成 fallback；旧 wait 实例先结清，随后重新发布会形成新的 delivery/deadline。若恢复判定仍为 unresponsive，发布成功也不会重新插 tracker；fallback 再次未处理时只上报，不会无限递归生成下一层。不能把 `handled=false` 说成“不回 ACK”，也不能说“该逻辑按键永远只投递一次”。
 
-不准确。Connection timeout在startDispatchCycle设置deliveryTime时开始。
+最后，2 秒 slow warning 只在收到完成回执后计算。它说明“已完成但很慢”；ANR 则说明 deadline 到时仍在等。二者可能描述同一条事件的不同阶段，但不是同一个判定器。
 
-事件此前可能在inbound、策略拦截、无焦点等待或Key等待中花费时间，另由stale等机制约束。
+## 14. 七套计时机制要按起点和动作分别记账
 
-## 85. 常见误解二：waitQueue是尚未发给App的队列
+把常见常量排在一起，最容易看出它们不能相加：
 
-相反，waitQueue表示已经publish、正等待finished signal。
+| 时间尺度 | 起点 | 观察对象 | 到期动作 |
+|---|---|---|---|
+| app switch 500ms | app-switch Key Up 的 `eventTime` | 旧事件是否阻碍应用切换 | 到期后丢弃先于切换键处理的其他 pending Key/Motion |
+| Key waiting 500ms | Key 选目标时的 `currentTime` | 全局 tracker 是否仍有条目 | 不再等前序，发给当前焦点窗口 |
+| slow warning 2s | `deliveryTime` | 已完成投递耗时 | 回执后打印慢处理日志 |
+| IME 2500ms | IMM main looper 成功向当前 IME Channel 发送事件并登记 PendingEvent 后 | IME Session Channel finished / `ImeInputEventSender` 回调 | 以 `handled=false` 恢复应用侧回调并继续 post-IME；原输入仍须最终 finish |
+| no-focused-window timeout（默认 5s） | 首次有待发事件发现 application 有、window 无 | focused application 是否获得窗口 | application 路径进入 ANR policy 链 |
+| Connection dispatch timeout（默认 5s） | 成功 publish 的那次尝试 | 该 Connection 的完成回执 | Connection 路径进入 ANR policy 链 |
+| stale 10s | Key/Motion 的 `eventTime` | 当前分发循环中的事件年龄 | 在发布前丢弃陈旧 Key/Motion |
 
-尚未成功publish的是outboundQueue。
+这里还要补三条限制：
 
-## 86. 常见误解三：主线程不处理事件一定是唯一根因
+- 5 秒只是默认值，不是所有 Window/Application 的保证值。
+- stale drop 在这一版的当前分发循环中针对 Key/Motion；不要推广到 Focus、Configuration、DeviceReset 等所有 EventEntry。
+- 两套 500ms 恰好数值相同，但状态变量、起点和作用都不同。
 
-ViewRoot最终通常依赖主线程，但InputQueue/native receiver、Binder/锁等待、IME过滤和系统服务锁也可能阻断完成链。
+上一章的 IME 2500ms 正好说明“时间重叠而非串联”。Window 事件成功 publish 后，外层 Connection deadline 已经开始走；应用处理这条事件时若进入 IMM 的 2500ms 等待，这段时间消耗的就是同一段外层预算，而不是先等 2.5 秒、再额外获得完整 5 秒。Handler 回调还可能受应用 Looper 排队影响，而 InputDispatcher 的时钟独立推进，因此两边可能竞争到期。
 
-应从waitQueue回执链向上找真正等待对象。
+外层 reason 仍按 Window Channel 归责。即使根因在应用内部等待 IME session，InputDispatcher 看到的也只是“这个窗口尚未返回 seq”。诊断必须把 InputDispatcher 的 delivery/deadline、应用主线程栈和 IMM 日志放在同一时间轴上。
 
-## 87. 常见误解四：报ANR后InputDispatcher立刻杀进程
+## 15. 九组只读练习：从源码重建状态迁移
 
-InputDispatcher只通知policy并依据返回值延长或取消事件。
+下面命令只读，默认源码根目录为 `/Users/ninebot/androidSource`，也可把其他 AOSP 根目录作为第一个参数传入。每条 `grep` 都应独立命中；任何一条失败都应视为基线或源码形态不同，而不是忽略后继续推理。
 
-进程ANR取证、对话框和终止由AMS等上层策略决定。
-
-## 88. 常见误解五：ANR之后Channel立即断开
-
-abort路径先合成CANCEL_ALL_EVENTS，不直接break Connection。
-
-若上层杀死/移除App，随后unregister channel才完成端点清理。
-
-## 89. 常见误解六：2500ms IME timeout能保证不会输入ANR
-
-它只避免ImeInputStage无限等IME。
-
-callback回App主Looper、post-IME View处理和原Window finish仍可能超出整体dispatch deadline。
-
-## 90. 实用诊断问答树
-
-```text
-reason是“does not have a focused window”吗？
-  是 → 查Activity启动、Window add/visible/focus下发
-  否 → 查具体Connection waitQueue
-
-wait entry已经publish吗？
-  是 → 查目标进程为何没finish
-  否 → 查outbound pipe满/Channel broken
-
-日志有“Timeout waiting for IME”吗？
-  是 → 把IME 2500ms等待纳入App原事件总时长
-
-AMS是否返回extension？
-  是 → 查debugger、自定义timeout或策略为何继续等
-```
-
-## 91. macOS只读练习一：对比两类焦点ANR
+### 练习 1：按焦点寻址事件何时启动无窗口等待
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '1440,1510p' \
-  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
-sed -n '3685,3820p' \
-  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'int32_t InputDispatcher::findFocusedWindowTargetsLocked(nsecs_t currentTime,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (focusedWindowHandle == nullptr && focusedApplicationHandle == nullptr) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'ALOGI("Dropping %s event because there is no focused window or focused application in "' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (focusedWindowHandle == nullptr && focusedApplicationHandle != nullptr) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'DEFAULT_INPUT_DISPATCHING_TIMEOUT.count());' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mNoFocusedWindowTimeoutTime = currentTime + timeout;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mAwaitedFocusedApplication = focusedApplicationHandle;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F '*nextWakeupTime = *mNoFocusedWindowTimeoutTime;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'return INPUT_EVENT_INJECTION_PENDING;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
 ```
 
-要求：推演“focused app先到、2秒后窗口出现”和“5秒内一直无窗口”两种时序，指出timer何时启动/重置。
+要求：比较 window/application 都为空和只有 focused application 两条路径，并解释为何计时从待分发事件到来时才启动。
 
-## 92. macOS只读练习二：跟踪outbound到wait
+### 练习 2：等待怎样被解除或升级为无窗口ANR
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '2425,2620p' \
-  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
-sed -n '4735,4810p' \
-  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'if (!newFocusedWindowHandle && windowHandle->getInfo()->hasFocus &&' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'windowHandle->getInfo()->visible) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'void InputDispatcher::resetNoFocusedWindowTimeoutLocked() {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mNoFocusedWindowTimeoutTime = std::nullopt;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (oldFocusedApplicationHandle == mAwaitedFocusedApplication &&' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'inputApplicationHandle != oldFocusedApplicationHandle) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (currentTime >= *mNoFocusedWindowTimeoutTime) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'onAnrLocked(mAwaitedFocusedApplication);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mAwaitedFocusedApplication.clear();' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'android::base::StringPrintf("%s does not have a focused window",' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
 ```
 
-要求：列出publish成功、WOULD_BLOCK、finished signal三种情况下DispatchEntry所在队列、AnrTracker和responsive变化。
+要求：推演窗口及时出现、focused application 换人、等待到期三种结局，并写出没有具体 Channel 时的 reason。
 
-## 93. macOS只读练习三：闭合Java ANR决策
+### 练习 3：区分dispatching timeout与其他时间尺度
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '175,275p' \
-  frameworks/base/services/core/java/com/android/server/wm/InputManagerCallback.java
-sed -n '19810,19890p' \
-  frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'constexpr std::chrono::nanoseconds DEFAULT_INPUT_DISPATCHING_TIMEOUT = 5s;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'void InputDispatcher::startDispatchCycleLocked(nsecs_t currentTime,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'dispatchEntry->deliveryTime = currentTime;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'getDispatchingTimeoutLocked(connection->inputChannel->getConnectionToken());' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'dispatchEntry->timeoutTime = currentTime + timeout;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'constexpr nsecs_t SLOW_EVENT_PROCESSING_WARNING_TIMEOUT = 2000 * 1000000LL;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'constexpr nsecs_t STALE_EVENT_TIMEOUT = 10000 * 1000000LL;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'constexpr std::chrono::nanoseconds KEY_WAITING_FOR_EVENTS_TIMEOUT = 500ms;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'constexpr nsecs_t APP_SWITCH_TIMEOUT = 500 * 1000000LL; // 0.5sec' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mAppSwitchDueTime = keyEntry.eventTime + APP_SWITCH_TIMEOUT;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'static final long INPUT_METHOD_NOT_RESPONDING_TIMEOUT = 2500;' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'if (mCurSender.sendInputEvent(seq, event)) {' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'mPendingEvents.put(seq, p);' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+grep -n -F 'mH.sendMessageDelayed(msg, INPUT_METHOD_NOT_RESPONDING_TIMEOUT);' frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
 ```
 
-要求：分别写出普通App、debugging App、instrumentation进程和无Activity Window进程返回给native的abort/extension语义。
+要求：分别标注两套 500ms、2s、2500ms、两类默认 5s、10s 的起点和用途，证明 Connection timeout 从成功 publish 的那次 delivery 尝试开始，而非原始 `eventTime`。
 
-## 94. macOS只读练习四：比较五个计时器
+### 练习 4：观察outbound到waitQueue的迁移边界
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '75,110p' \
-  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
-sed -n '485,540p' \
-  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
-rg -n "INPUT_METHOD_NOT_RESPONDING_TIMEOUT" \
-  frameworks/base/core/java/android/view/inputmethod/InputMethodManager.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'while (connection->status == Connection::STATUS_NORMAL && !connection->outboundQueue.empty()) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'DispatchEntry* dispatchEntry = connection->outboundQueue.front();' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F '.publishKeyEvent(dispatchEntry->seq, dispatchEntry->resolvedEventId,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (status == WOULD_BLOCK) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (connection->waitQueue.empty()) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'connection->outboundQueue.erase(std::remove(connection->outboundQueue.begin(),' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'connection->waitQueue.push_back(dispatchEntry);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (connection->responsive) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mAnrTracker.insert(dispatchEntry->timeoutTime,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
 ```
 
-要求：给500ms、2s、2.5s、5s、10s分别写出起点、观察者、超时动作，禁止把它们相加成一个固定ANR公式。
+要求：画出 publish 成功、pipe 满且 waitQueue 为空、pipe 满且已有未完成事件三种队列状态，标清哪一种才进入 waitQueue。
 
-## 95. 自测题
+### 练习 5：finished signal如何按seq关闭waitQueue账
 
-1. focused application和focused window分别表达什么？
-2. 为什么无focused app/window时直接drop，有focused app无window时却等待？
-3. outboundQueue与waitQueue的分界点是什么？
-4. 默认5秒从何时开始？
-5. handled=false为何仍能让Connection保持responsive？
-6. native为何解锁后才调用Java policy？
-7. policy返回extension和0时native分别做什么？
-8. IMM 2500ms为什么会占用而不是叠加在InputDispatcher 5秒之后？
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'status = connection->inputPublisher.receiveFinishedSignal(&seq, &handled);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'd->finishDispatchCycleLocked(currentTime, connection, seq, handled);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'const bool handled = commandEntry->handled;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'connection->findWaitQueueEntry(seq);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'reportDispatchStatistics(std::chrono::nanoseconds(eventDuration), *connection, handled);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'connection->waitQueue.erase(dispatchEntryIt);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mAnrTracker.erase(dispatchEntry->timeoutTime,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'startDispatchCycleLocked(now(), connection);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'q.mReceiver.finishInputEvent(q.mEvent, handled);' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'mSeqMap.put(event.getSequenceNumber(), seq);' frameworks/base/core/java/android/view/InputEventReceiver.java
+grep -n -F 'int seq = mSeqMap.valueAt(index);' frameworks/base/core/java/android/view/InputEventReceiver.java
+grep -n -F 'nativeFinishInputEvent(mReceiverPtr, seq, handled);' frameworks/base/core/java/android/view/InputEventReceiver.java
+grep -n -F 'status_t status = mInputConsumer.sendFinishedSignal(seq, handled);' frameworks/base/core/jni/android_view_InputEventReceiver.cpp
+```
 
-## 96. 自测题答案
+要求：分别代入 `handled=true/false`，证明两者都会关闭当前 waitQueue 账；再说明 Java sequence 与 native DispatchEntry seq 为什么要沿映射核对。
 
-1. 前者是期望获得输入的App/Activity，后者是当前已存在、visible且真正可接收输入的具体Window。
-2. 前者没有责任主体；后者代表启动中的App可能即将建窗，需要兼容等待并可归责。
-3. 事件成功publish到Connection后，从outbound移入wait并开始等finished signal。
-4. `startDispatchCycleLocked()`给DispatchEntry设置deliveryTime和`timeoutTime=delivery+window timeout`时。
-5. responsive要求按期完成协议，不要求业务消费；false也是及时有效的finished结果。
-6. WMS/AMS回调可能很慢并拿其他大锁，持native锁调用会阻塞全部输入和回执甚至死锁。
-7. extension重设现有deadline并重新追踪；0对具体Connection合成CANCEL_ALL_EVENTS，后续由上层决定进程/Channel清理。
-8. 原Window事件进入App时5秒已开始，ViewRoot等待IME发生在事件尚未finish的内部阶段，两者时间重叠。
+### 练习 6：Connection到期与ANR reason怎样形成
 
-## 97. 复读后的易混状态表
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'nsecs_t InputDispatcher::processAnrsLocked() {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'nextAnrCheck = std::min(nextAnrCheck, mAnrTracker.firstTimeout());' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (currentTime < nextAnrCheck) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'connection->responsive = false;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mAnrTracker.eraseToken(connection->inputChannel->getConnectionToken());' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'onAnrLocked(connection);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'ALOGI("Not raising ANR because the connection %s has recovered",' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'DispatchEntry* oldestEntry = *connection->waitQueue.begin();' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'android::base::StringPrintf("%s is not responding. Waited %" PRId64 "ms for %s",' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'oldestEntry->eventEntry->getDescription().c_str());' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mLastAnrState += StringPrintf(INDENT2 "Reason: %s\n", reason.c_str());' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
 
-| 状态 | 准确含义 | 不代表什么 |
-|---|---|---|
-| focused application | 预期拥有焦点的App | 已有可输入窗口 |
-| focused window | 当前visible焦点InputWindowHandle | App主线程已处理focus通知 |
-| outboundQueue | 等待publish到Connection | App已经收到 |
-| waitQueue | 已publish，等待finished | App业务一定handled |
-| responsive=false | 至少一个追踪deadline已到期 | Channel已经broken/进程已杀 |
-| ANR policy extension | 系统决定继续等待 | 旧事件已完成或队列已清空 |
+要求：说明为何先标记 unresponsive 并停止追踪该 token，为什么回调 policy 前还检查 waitQueue，以及 reason 为什么展示 oldest entry。
 
-## 98. 本章结论
+### 练习 7：native怎样解锁调用policy并处理返回值
 
-输入ANR的核心不是“5秒”这个数字，而是Connection级完成协议：
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'std::make_unique<CommandEntry>(&InputDispatcher::doNotifyAnrLockedInterruptible);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'void InputDispatcher::doNotifyAnrLockedInterruptible(CommandEntry* commandEntry) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mLock.unlock();' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mPolicy->notifyAnr(commandEntry->inputApplicationHandle, token, commandEntry->reason);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mLock.lock();' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (timeoutExtension > 0) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'extendAnrTimeoutsLocked(commandEntry->inputApplicationHandle, token, timeoutExtension);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'cancelEventsForAnrLocked(connection);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F '// We will not be breaking any connections here, even if the policy wants us to abort dispatch.' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'CancelationOptions options(CancelationOptions::CANCEL_ALL_EVENTS,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'abortBrokenDispatchCycleLocked(currentTime, connection, true /*notify*/);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'void InputDispatcher::abortBrokenDispatchCycleLocked(nsecs_t currentTime,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'drainDispatchQueue(connection->outboundQueue);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'drainDispatchQueue(connection->waitQueue);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'connection->status = Connection::STATUS_BROKEN;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
+
+要求：解释为什么不能持 dispatcher 锁进入 WMS/AMS，以及 extension 大于 0、返回 0、broken dispatch cycle 令 Connection 进入 `STATUS_BROKEN` 三者有何差异。
+
+### 练习 8：Java policy怎样定位责任主体并决定延长或中止
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'public long notifyANR(InputApplicationHandle inputApplicationHandle, IBinder token,' frameworks/base/services/core/java/com/android/server/wm/InputManagerCallback.java
+grep -n -F 'windowState = mService.mInputToWindowMap.get(token);' frameworks/base/services/core/java/com/android/server/wm/InputManagerCallback.java
+grep -n -F 'activity = ActivityRecord.forTokenLocked(inputApplicationHandle.token);' frameworks/base/services/core/java/com/android/server/wm/InputManagerCallback.java
+grep -n -F 'mService.saveANRStateLocked(activity, windowState, reason);' frameworks/base/services/core/java/com/android/server/wm/InputManagerCallback.java
+grep -n -F 'mService.mAtmInternal.saveANRState(reason);' frameworks/base/services/core/java/com/android/server/wm/InputManagerCallback.java
+grep -n -F 'final boolean abort = activity.keyDispatchingTimedOut(reason, windowPid);' frameworks/base/services/core/java/com/android/server/wm/InputManagerCallback.java
+grep -n -F 'return activity.mInputDispatchingTimeoutNanos;' frameworks/base/services/core/java/com/android/server/wm/InputManagerCallback.java
+grep -n -F 'long timeout = mService.mAmInternal.inputDispatchingTimedOut(windowPid, aboveSystem,' frameworks/base/services/core/java/com/android/server/wm/InputManagerCallback.java
+grep -n -F 'return timeout * 1000000L; // nanoseconds' frameworks/base/services/core/java/com/android/server/wm/InputManagerCallback.java
+grep -n -F 'return 0; // abort dispatching' frameworks/base/services/core/java/com/android/server/wm/InputManagerCallback.java
+grep -n -F 'if (proc.isDebugging()) {' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'if (proc.getActiveInstrumentation() != null) {' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'mAnrHelper.appNotResponding(proc, activityShortComponentName, aInfo,' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+```
+
+要求：推演普通 Activity、debugging 进程、instrumentation 进程、无 Activity Window 进程的 abort/extension 语义。
+
+### 练习 9：responsive如何通过延长或完成回执恢复
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'void InputDispatcher::extendAnrTimeoutsLocked(const sp<InputApplicationHandle>& application,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mNoFocusedWindowTimeoutTime = now() + timeoutExtension;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mAwaitedFocusedApplication = application;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'connection->responsive = true;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'const nsecs_t newTimeout = now() + timeoutExtension;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'for (DispatchEntry* entry : connection->waitQueue) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (newTimeout >= entry->timeoutTime) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'entry->timeoutTime = newTimeout;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mAnrTracker.insert(entry->timeoutTime, connectionToken);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'static bool isConnectionResponsive(const Connection& connection) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (entry->timeoutTime < currentTime) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (!connection->responsive) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'connection->responsive = isConnectionResponsive(*connection);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
+
+要求：比较 policy extension 与迟到 finished 两种恢复方式，重点解释 surviving wait entry 的 tracker 索引是否必然恢复。
+
+## 16. 用两条时间线落地诊断，并给下一章留出边界
+
+遇到输入 ANR，先按 reason 把现场放入两条时间线之一。
+
+无 focused window：
 
 ```text
-WMS提供可见窗口、焦点App/窗口和timeout
-→ InputDispatcher选目标并publish
-→ DispatchEntry进入waitQueue
-→ ViewRoot完成全输入流水线后回finished signal
-→ 按seq移除wait并启动下一轮
+按焦点寻址的事件成为 mPendingEvent
+  → 只有 focused application，没有 focused window
+  → 首次发现时设全局 deadline
+  → 窗口出现 / application 换人：重置
+  → deadline 到期：保存快照并通知 policy
+  → extension：重新等待
+     或返回 0：重试时仍无窗口才丢弃；窗口已出现则继续选目标
 ```
 
-deadline到期时，native只负责识别未ack连接、保存现场并向上询问；真正的责任进程判断、取证、延长和终止由WMS/ATMS/AMS共同完成。上一章IME 2500ms只是App输入流水线内部的一段等待，它能解释某些耗时，却不能替代外层Connection ANR模型。
+Connection timeout：
 
-## 99. 下一章预告
+```text
+选择 Window/Connection
+  → DispatchEntry 进入 outbound
+  → publish 成功，进入 waitQueue + AnrTracker
+  → finished：按 seq 结账
+  → deadline 到期：responsive=false、eraseToken、保存快照
+  → 若 Connection 仍存在：policy extension 条件式改 deadline 并重建索引
+     或 abort 生成取消语义，但不直接断 Channel/杀进程
+  → 若 Connection 已消失：不再延长，也不生成取消语义
+```
 
-下一章继续研究InputDispatcher的触摸目标选择、TouchState、split touch、outside/wallpaper/spy窗口、pilfer与取消事件，解释一次多指手势怎样稳定绑定窗口并在窗口变化时保持一致性。
+实战时按下面顺序收证据：
+
+1. 读 native reason。`does not have a focused window` 与 `is not responding. Waited` 已经把两条路径分开。
+2. 对 Connection 路径，看 dump 中 outbound/waitQueue、oldest entry、deliveryTime/timeoutTime 与 responsive；不要只看 inbound age。
+3. 对无窗口路径，对齐 focused display、focused application、可见且 `hasFocus` 的 Window 快照，以及 application 是否在等待期间换人。
+4. 查看 `mLastAnrState` 对应的原始时刻，再与 WMS/ATMS 保存状态、ANR trace 的采样时刻区分。
+5. 看到应用主线程阻塞在 IME 时，把上一章的 2500ms 内层等待叠到本章外层 delivery deadline 上，而不是相加。
+6. 看到 cancel、broken、unresponsive 或 handled=false 时，分别按本章定义核对，避免把协议状态直接翻译成“进程已死”。
+
+可以用四问自测本章是否真正读通：事件有没有成功 publish？等的是 focused application 还是 Connection？当前 deadline 从哪个时间点起算？policy 返回后改变的是 tracker、队列、responsive，还是进程处置？
+
+下一章将转向 pointer 分发：同一个 Motion 如何经过窗口命中、touch state、split、spy/monitor 与 pilfer，形成比“当前 focused window”更复杂的目标集合。

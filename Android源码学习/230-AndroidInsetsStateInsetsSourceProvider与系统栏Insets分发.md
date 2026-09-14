@@ -1,878 +1,548 @@
 # 230 Android InsetsState、InsetsSourceProvider与系统栏Insets分发
 
-> 源码版本：Android 11 / `android-11.0.0_r48`  
-> 学习方式：macOS只读核源，不编译、不运行AOSP
+本文基于 `android-11.0.0_r48`，追踪状态栏、导航栏、手势区、刘海与 IME 如何从 system_server 中的窗口几何，变成某个应用窗口收到的 `InsetsState`，再由客户端折算为 `WindowInsets` 并进入 View 树。
 
-## 1. 本章要解决什么
+这一章最重要的不变量是：**提供窗口已经布局、原始 Source 已更新、服务端决定广播、面向某个窗口的 State 已过滤、`IWindow` 调用已经返回、ViewRoot Handler 已处理、客户端 State 已接纳、一次 traversal 已安排、根 View 与子树收到 `WindowInsets`，是不同的完成点。**
 
-Android窗口为什么知道状态栏占顶部多少、导航栏在左/右/底部哪一侧、IME出现后底部要避让多少？
+版本锚点：
 
-本章从WMS生产Insets来源开始，追到App View树收到`WindowInsets`，重点回答：
+- `frameworks/base/core/java/android/view/InsetsSource.java`
+- `frameworks/base/core/java/android/view/InsetsState.java`
+- `frameworks/base/core/java/android/view/InsetsController.java`
+- `frameworks/base/core/java/android/view/InsetsSourceConsumer.java`
+- `frameworks/base/core/java/android/view/ViewRootImpl.java`
+- `frameworks/base/core/java/android/view/ViewRootInsetsControllerHost.java`
+- `frameworks/base/core/java/android/view/IWindow.aidl`
+- `frameworks/base/core/java/android/view/IWindowSession.aidl`
+- `frameworks/base/services/core/java/com/android/server/wm/DisplayPolicy.java`
+- `frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java`
+- `frameworks/base/services/core/java/com/android/server/wm/InsetsSourceProvider.java`
+- `frameworks/base/services/core/java/com/android/server/wm/ImeInsetsSourceProvider.java`
+- `frameworks/base/services/core/java/com/android/server/wm/InsetsStateController.java`
+- `frameworks/base/services/core/java/com/android/server/wm/InsetsPolicy.java`
+- `frameworks/base/services/core/java/com/android/server/wm/WindowState.java`
+- `frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java`
 
-```text
-InsetsSource怎样表示一块来源区域？
-Provider怎样从真实Window算出source frame？
-为什么同一Display上的不同Window收到不同InsetsState？
-InsetsState怎样变成相对某个Window的四边Insets？
-```
+## 1. 先把一次Insets分发的完成点拆开
 
-## 2. Insets不是简单的padding
-
-Insets首先是一组系统来源的几何与可见性状态，再相对具体Window frame计算。
-
-同一个状态栏Source，对全屏Window可能产生top inset；对完全不相交的浮动Window可能产生`Insets.NONE`。
-
-## 3. 总体结构图
-
-```mermaid
-flowchart LR
-    A["StatusBar/NavBar/IME WindowState"] --> B["InsetsSourceProvider"]
-    B --> C["InsetsStateController raw InsetsState"]
-    C --> D["InsetsPolicy与per-window过滤"]
-    D -->|"IWindow.insetsChanged"| E["ViewRootImpl"]
-    E --> F["客户端InsetsController"]
-    F --> G["InsetsState.calculateInsets(windowFrame)"]
-    G --> H["WindowInsets"]
-    H --> I["View.dispatchApplyWindowInsets"]
-    J["Insets control target"] --> B
-    B -->|"Surface leash/control"| F
-```
-
-本章主讲状态与分发；control leash和逐帧动画放在第231章。
-
-## 4. 四层对象先分清
+设想已注册的状态栏高度在布局中改变。下面是几何 post-layout 变化的一条代表路径，不是所有可见性请求与 transient 更新都必须经过的唯一路线：
 
 ```text
-InsetsSource：一种内部类型的frame、visibleFrame与visible
-InsetsState：Display frame + 最多20种内部Source
-InsetsSourceProvider：服务端把WindowState变成Source并管理控制权
-WindowInsets：客户端相对当前Window计算后的公开类型四边值
+DisplayPolicy 早已为 Window 注册一个或多个 internal source
+  → 本轮窗口布局
+  → InsetsSourceProvider.onPostLayout()
+  → 更新 serverVisible、frame、visibleFrame 与最终 visible
+  → InsetsStateController.onPostLayout() 比较 raw InsetsState
+  → DisplayContent 遍历可见 WindowState
+  → InsetsPolicy.getInsetsForDispatch(target) 生成逐窗口视图
+  → IWindow.insetsChanged(state)
+  → ViewRootImpl 把消息切到客户端 Handler
+  → InsetsController.onStateChanged(state)
+  → requestLayout / scheduleTraversals
+  → calculateInsets() 生成 WindowInsets
+  → View.dispatchApplyWindowInsets()
 ```
 
-`WindowInsets`是计算结果，不是WMS原始账本。
+同一条链上的完成点必须分开描述：
 
-## 5. internal type与public type不同
+| 完成点 | 此时可以证明 | 此时仍不能证明 |
+| --- | --- | --- |
+| Provider 完成 post-layout | 本轮 frame、visibleFrame、serverVisible 已计算 | raw State 一定与上一轮不同 |
+| 服务端决定广播 | 本轮 raw 比较变化，或另一入口直接要求通知 | 每个窗口最终收到的副本都相同 |
+| 逐窗口 State 构造完 | 目标适用的 fixed-rotation early-return，或普通 provider/windowing/above-IME 分支已完成 | Binder 回调已经执行 |
+| 服务端 `IWindow` 调用返回 | 远端 proxy 已提交 oneway；本地 W 回调已把 Handler 消息入队 | 客户端 Handler 已处理 |
+| ViewRoot Handler 分支返回 | `InsetsController.onStateChanged()` 已执行 | View 已经重新布局 |
+| traversal 已安排 | 将在合适时机重新计算 | 本帧已经提交或显示 |
+| `dispatchApplyWindowInsets()` 执行 | 根 View 已开始向子树派发这份值 | 各子 View 一定采用而未消费它 |
+| ViewGroup 派发返回 | 本轮兼容规则下的子树传播已结束 | 随后的 layout、draw 或物理 present 已完成 |
 
-服务端r48有20个`ITYPE_*`槽位，而公开`WindowInsets.Type`使用bit mask聚合。
+Insets 不是“一组系统 padding”。它是一组有类型、有矩形、有可见性、有目标窗口过滤规则的 source；`WindowInsets` 只是这些 source 相对某个窗口 frame 的一次派生结果。
 
-一个公开类型可能来自多个内部Source。
+上面的主链以默认 FULL 模式为准。NONE 模式下 `ViewRootImpl.notifyInsetsChanged()` 会直接返回，新 State 回调不会靠这条入口安排 apply-insets traversal；旧布局字段仍承担兼容职责。因此模式本身是第一份现场证据。
 
-## 6. 状态栏的多来源映射
+## 2. 四层对象与三种矩形先分清
+
+完整链路至少有四层对象：
+
+| 层级 | 代表对象 | 负责什么 |
+| --- | --- | --- |
+| 提供窗口 | 状态栏、导航栏、IME 的 `WindowState` | 拥有真实窗口 frame、policy 可见性与 surface |
+| 单源状态 | `InsetsSource` | 保存 internal type、屏幕坐标 frame、visibleFrame、visible |
+| display 聚合 | `InsetsState` | 用固定槽位保存多个 Source，并记录 display frame |
+| 客户端派生 | `WindowInsets` | 把多个 internal source 聚合为 public type 的当前值、最大值和可见性 |
+
+`InsetsSource.mFrame` 明确处于 screen coordinate space。传给 `calculateInsets(relativeFrame, ...)` 的 `relativeFrame` 也必须在同一坐标系；算法先求交集，再把交集贴在哪一条边折成 `Insets(left, top, right, bottom)`。结果是相对窗口内容使用的厚度，不再是一块屏幕矩形。
+
+还要区分三个看起来相似的矩形：
+
+- `WindowState.getFrameLw()` 是提供窗口布局后的外框。
+- `InsetsSource.frame` 是 Provider 从窗口外框经过 `frameProvider` 或 given content insets 修饰后的占用区。
+- `visibleFrame` 是给 legacy visible insets 使用的可见区域；为空引用表示退回 `frame`，空矩形则会让该 Source 被判为不可供用户动画控制。
+
+setter 会复制传入 `Rect`，但 `getFrame()`、`getVisibleFrame()` 和 `InsetsState.getDisplayFrame()` 都直接暴露内部可变对象。这里不是不可变值对象体系；共享引用、浅拷贝和原地修改必须结合调用点审计。
+
+## 3. internal type不是public type的同义词
+
+r48 的 `InsetsState` 有 20 个 internal 槽位，编号从 0 到 19。public `WindowInsets.Type` 则是位掩码 API；一个 public type 可以由多个窗口或多个方向的 Source 合并。
+
+关键映射如下：
+
+| public type 方法 | r48 中对应的 internal source |
+| --- | --- |
+| `Type.statusBars()` | status bar、climate bar |
+| `Type.navigationBars()` | navigation bar、extra navigation bar |
+| `Type.captionBar()` | caption bar |
+| `Type.ime()` | IME |
+| `Type.mandatorySystemGestures()` | top/bottom gestures，加四个 mandatory gesture source |
+| `Type.systemGestures()` | left/right gestures；mandatory 结果还会再次并入这里 |
+| `Type.tappableElement()` | top/bottom tappable element |
+| `Type.displayCutout()` | left/top/right/bottom 四个 cutout source |
+
+最容易读错的是 gesture：在这份源码中，`ITYPE_TOP_GESTURES` 与 `ITYPE_BOTTOM_GESTURES` 直接映射到 `MANDATORY_SYSTEM_GESTURES`，不是普通 `SYSTEM_GESTURES`。`processSource()` 随后又把 mandatory 的几何并入 system gestures，因此 public system gesture 区域是两阶段合并结果。
+
+表里的大写名字是 framework 内部 bit 常量，应用公开入口是这些 `Type.xxx()` 方法。反向映射也不是上表的完全逆函数。`toInternalType(publicMask)` 只展开 status、navigation、caption、cutout 和 IME；它不展开 gesture、tappable，也不处理 package-private 的 `WINDOW_DECOR` bit。该函数主要服务 show/hide/control 请求，不能当作任意 public 类型到全部 internal source 的通用查询器。
+
+默认可见性同样简单但影响很大：只有 IME 默认隐藏，其余 internal type 默认可见。因此 `getSource(type)` 的“读操作”会在缺失时创建一个空 frame 的 Source，并立即把它置为该类型的默认可见性；真正无副作用的查询是 `peekSource(type)`。
+
+## 4. InsetsSource怎样把矩形折成单边厚度
+
+普通 Source 的几何算法可以压缩为五步：
+
+1. `ignoreVisibility` 为 false 且 Source 不可见，直接返回 `Insets.NONE`。
+2. caption bar 不先求交，直接把 source frame 高度作为 top inset。
+3. 其余类型先计算 source frame 与目标 frame 的交集；没有交集则返回 0。
+4. IME 只要有交集，固定把交集高度报告为 bottom inset。
+5. 普通类型只有在交集横跨目标全宽时才尝试 top/bottom，或在交集纵跨目标全高时才尝试 left/right；不贴边的内部悬浮矩形返回 0。
+
+例如目标窗口为 `[0,0]-[1080,2400]`：
+
+| Source frame | 类型 | 结果 | 原因 |
+| --- | --- | --- | --- |
+| `[0,0]-[1080,96]` | status | top=96 | 横跨全宽且贴上边 |
+| `[0,2300]-[1080,2400]` | navigation | bottom=100 | 横跨全宽且贴下边 |
+| `[0,1700]-[1080,2400]` | IME | bottom=700 | IME 固定走下边规则 |
+| `[200,200]-[800,500]` | 普通类型 | 0 | 只在窗口内部相交，不占完整边 |
+| `[0,0]-[30,2400]` | left gesture | left=30 | 纵跨全高且贴左边 |
+
+四个边界值得单独记住：
+
+- caption 规则发生在相交判断之前。即使 caption frame 与目标窗口不相交，也可能按其高度给出 top inset；这是拖动与缩放期间的布局补偿。
+- `getIntersection()` 使用 `<=`，共边也算相交；交集可以是零宽或零高，最后仍通常折成 `Insets.NONE`。
+- 普通 top/bottom 分支还有 `intersection.top == 0` 的兼容分支，用于把某些未贴目标上边、但位于屏幕顶部的 Source 仍解释为 top inset。
+- 方法契约要求单个 Source 最终只占一边。若几何既不能唯一落到横向边，也不能落到纵向边，就返回 0，而不是生成四边包围盒。
+
+“共边通常为 0”仍有退化 frame 例外：目标自身宽为 0 时，零宽交集仍可能满足“交集宽等于目标宽”，从而返回非零 top；目标高为 0 时同理可能返回非零 left。这里比较的是宽高相等，不是先要求目标面积为正。
+
+`calculateVisibleInsets()` 只是优先用 `visibleFrame` 替代 `frame`，仍然尊重 `visible`。它也不会在 Source 内强制把 visibleFrame 裁进 frame；Provider 的常规构造会从同一窗口几何得到二者，但对象 API 本身允许 visibleFrame 超出 frame。所以“visibleFrame 非空”不等于“Source 可见”，“visibleFrame 为 null”也不等于“没有 visible insets”。
+
+## 5. InsetsState聚合时几何取max，可见性却是覆盖
+
+`calculateInsets()` 为 public type 建立 current、max 和 visibility 三组结果，然后按 internal type 从 0 到 19 遍历。单个 Source 先经上一节折成一边厚度，再映射到 public type。
+
+同一 public type 有多个 Source 时，几何通过 `Insets.max(existing, insets)` 逐边取最大值，不做相加。例如顶部 80 的 status bar 与左侧 40 的 climate bar 都映射到 status bars，public 结果可以是 `(40,80,0,0)`；两个顶部来源分别为 80 与 30 时仍是 top=80，而不是 110。
+
+可见性没有做 OR/AND 聚合。`typeVisibilityMap[index] = source.isVisible()` 是顺序覆盖，最后处理到的同 public type Source 获胜。由槽位顺序可得：climate bar 可以覆盖 status-bar public visibility，extra navigation bar 可以覆盖 navigation-bar public visibility。gesture 的三级顺序更微妙：top/bottom gestures（槽 3/4）先同时写 mandatory 与 system visibility，left/right gestures（槽 5/6）随后只覆盖 system，四个显式 mandatory source（槽 7—10）最后又同时覆盖 mandatory 与 system。几何与 visibility 因而可能来自不同的 internal source，排查时必须同时打印类型、槽位与遍历顺序。
+
+`WindowInsets.isVisible(typeMask)` 对调用者给出的多个 public type 采用“全部为 true”语义；任意一个为 false，整体就是 false。visibility 只读聚合表，不检查 Source 是否与目标 frame 相交，所以 Source 可见而本窗口计算几何为 0 是合法组合。反过来，缺失的 internal Source 不参与 visibility 写入；只有没有任何映射到该 public type 的现存 Source 写过值时，槽才保持默认 false。`getSourceOrDefaultVisibility()` 的默认逻辑主要服务请求状态。
+
+实现还有两个容易被数组名字遮住的事实：
+
+- current 与 max 数组长度是 `WindowInsets.Type.SIZE`，这份源码为 9；visibility 数组却按 internal `InsetsState.SIZE` 分配，长度为 20。实际写入仍使用 public `indexOf()`。
+- 缺失 Source 的分支只为 current map 补 `Insets.NONE`，不为 max map 补值；`WindowInsets` 构造端负责解释这些槽位。
+
+max insets 对每个“未被模式跳过且非 IME”的 Source 以 `ignoreVisibility=true` 计算。IME 被明确排除，因为它的高度依赖当前 editor/target，不能承诺稳定最大值；调用 `WindowInsets.getInsetsIgnoringVisibility(mask)` 时，只要 mask 含 `Type.ime()`，API 会直接抛出 `IllegalArgumentException`，而不是返回 0 或一个猜测值。
+
+`ignoreVisibility=true` 只绕过 visible 位，不保留历史几何。Provider 因 server 不可见而已把 frame 清空时，同一 State 的 max 仍是 0；只有传入另一个保留几何的 `ignoringVisibilityState` 才可能得到非零值。此时代码调用辅助 State 的 `getSource(type)`；缺少槽位会现场创建默认 Source，后面的 null 判断实际上不可达。这既是读结果，也是一次可观察的对象修改。
+
+## 6. 三种新Insets模式与legacy兼容不是一把总开关
+
+`persist.debug.new_insets` 在 `ViewRootImpl` 中对应三种模式：0 为 NONE，1 为只启用 IME 新链，2 为 FULL，默认值是 FULL。它同时影响计算、控制资格与 ViewRoot 是否因新 State 触发布局。
+
+`InsetsState.calculateInsets()` 的跳过规则不是简单的“旧模式全跳过”：
+
+| 当前模式 | 本轮最终跳过的 Source |
+| --- | --- |
+| FULL | 不因这组三态条件跳过 Source |
+| IME | 所有非 IME source，只保留 IME |
+| NONE | canonical status bar、canonical navigation bar、IME |
+
+被跳过的 Source 仍会写 public visibility，但不写 current/max 几何。注意 `skipSystemBars` 只点名 canonical status/navigation；climate 与 extra-navigation 并未被该条件覆盖。因而不能把旧模式概括为“所有状态栏/导航栏同族 Source 都忽略”。
+
+返回 `WindowInsets` 前还会构造 compat types：初始包含 `Type.systemBars()` 与 display cutout，其中 system bars 在 r48 是 status、navigation、caption 三者，不含 IME；soft-input adjust 为 `ADJUST_RESIZE` 时加入 IME；窗口带 `FLAG_FULLSCREEN` 时移除 status bars。这只决定已废弃的 `getSystemWindowInsets()` 等兼容结果，不会删除新 API `getInsets(Type.ime())`、`getInsets(Type.statusBars())` 的数据或 visibility。
+
+FULL 模式且 legacy system-ui flags 含 `LAYOUT_STABLE` 时，`compatIgnoreVisibility` 为 true：legacy system insets 对非 IME 类型使用 ignoring-visibility/max 值，对 IME 仍使用当前值。它也不会改变新类型 API。因而“布局稳定”“当前栏隐藏”和“public visibility”为不同输入，不能由一个旧式 Rect 反推出全部状态。
+
+`calculateVisibleInsets()` 另走一条 legacy 路径：非 FULL 模式只处理 IME；FULL 模式下只接受 system bars，以及 soft-input adjust 不是 `ADJUST_NOTHING` 时的 IME。gesture、tappable 与 cutout 不参与。它逐边取 max，并对每个 Source 尊重 visible、优先使用 visibleFrame。这里 IME 在 PAN/UNSPECIFIED 下可以进入 visibleInsets，而 deprecated system-window insets 只有 `ADJUST_RESIZE` 才把 IME 纳入 compat types。current insets、visible insets 与 ignoring-visibility max insets不是同一个概念，现场日志不能混为一列。
+
+## 7. DisplayPolicy把一个系统窗口注册成多个Source
+
+window-backed Source 的 Provider 创建入口是 `DisplayContent.setInsetProvider()`，最终由 `InsetsStateController.getSourceProvider(type)` 按 internal type 懒创建。IME 会得到专门的 `ImeInsetsSourceProvider`，其他经此入口的类型使用普通 `InsetsSourceProvider`。不能反推“每个 Source 都有 Provider”：cutout 由 Policy 直接写 raw State，caption 又主要由客户端组装。
+
+状态栏 Window 加入时，一次注册三个 Source：
 
 ```text
-ITYPE_STATUS_BAR
-ITYPE_CLIMATE_BAR
-    → WindowInsets.Type.STATUS_BARS
+TYPE_STATUS_BAR Window
+├─ ITYPE_STATUS_BAR
+├─ ITYPE_TOP_GESTURES
+└─ ITYPE_TOP_TAPPABLE_ELEMENT
 ```
 
-汽车等产品可以用额外climate bar贡献同一公开statusBars语义。
+三者可以共享同一个 frame-provider：把 `rect.top` 固定为 0，把 `rect.bottom` 改为 policy 计算的状态栏高度。它们共享提供窗口，却拥有独立的 Source、可见性与 public 映射。
 
-## 7. 导航栏的多来源映射
+导航栏 Window 注册的 Source 更多：canonical navigation、bottom gestures、left gestures、right gestures、bottom tappable element。各自的 frame-provider 可以重写同一个窗口 frame：
+
+- 手势导航且栏位于底部时，canonical navigation source 会缩到真正参与 layout 的高度。
+- bottom gesture source 在窗口 frame 基础上再向上扩展额外手势区。
+- left/right gesture source 直接构造贯穿显示高度的侧边条带。
+- navigation window 不可触摸或允许触摸穿透时，bottom tappable source 被清为空矩形。
+
+canonical navigation Provider 还保存一个仅向 IME 分发的 override frame。原因是手势导航下，普通应用用于布局的 nav frame 可以较小，而 IME 看到的 nav frame 需要保持常规窗口大小，避免键盘出现时客户端内容与导航栏重叠。
+
+带 `providesInsetsTypes` 的替代系统栏必须通过 `STATUS_BAR_SERVICE` 权限检查；同类 singleton 也会被拒绝重复添加。权限只约束谁能声明提供者，不替代后续的布局、可见性与逐窗口过滤。
+
+Display cutout 不依赖一个可见 Window。`DisplayPolicy.updateInsetsStateForDisplayCutout()` 以 unrestricted frame 与 safe frame 的差值构造四个方向 Source；cutout 为空时则移除四个槽位。
+
+系统栏 Window 移除时也不是把其全部辅助 Provider 同步摘除。`removeWindowLw()` 显式清的是 canonical status/navigation 绑定；gesture/tappable Provider 可暂时仍指向旧 Window，随后因旧窗口不再具备显示条件而产出不可见、空 frame，新的系统栏加入时再重新绑定。不要把“一窗多源”的建立与销毁想象成一个原子数组替换。
+
+## 8. Provider把frame、serverVisible与clientVisible合成事实
+
+`InsetsSourceProvider.setWindow()` 负责把 Source 归属切到某个 `WindowState`。替换旧 Window 时，它会解除 controllable-provider 关系并取消旧动画；传入 null 时把 server visibility 设为 false、frame 清空、visibleFrame 设为 null。若 Source 可控制且新 Window 已存在，Provider 还会处理此前因“尚无 Window”而暂存的 control target。
+
+`WindowState.computeFrame(displayFrames)` 先调用 `computeFrameLw()` 得到 `mWindowFrames.mFrame`，随后只会立即刷新它关联的单个 controllable Provider；一个系统栏的 gesture/tappable 辅助 Source 仍要等 `InsetsStateController.onPostLayout()` 遍历全部 Provider 才形成权威批次。因此“主 Source 已刷新”不代表同窗辅助 Source 已全部刷新。
+
+每轮 `onPostLayout()` 先计算：
 
 ```text
-ITYPE_NAVIGATION_BAR
-ITYPE_EXTRA_NAVIGATION_BAR
-    → WindowInsets.Type.NAVIGATION_BARS
+serverVisible = wouldBeVisibleIfPolicyIgnored()
+             && isVisibleByPolicy()
+             && !mGivenInsetsPending
 ```
 
-公开API不要求应用理解每块系统装饰Window的内部名字。
+只有 `serverVisible` 为 true 才从 `WindowState.getFrameLw()` 产生有效 source frame；否则 frame 被清空。若有自定义 `frameProvider`，它原地改写临时 Rect；没有时则用 `mGivenContentInsets` 内缩。非零 `mGivenVisibleInsets` 会生成 visibleFrame，全零则回退为 null。
 
-## 8. Display cutout被拆成四个Source
-
-left/top/right/bottom四个`ITYPE_*_DISPLAY_CUTOUT`都映射到公开`DISPLAY_CUTOUT`。
-
-这样State计算时仍可按边处理，公开层再得到聚合结果。
-
-## 9. Gesture来源更细
-
-top/bottom/left/right gesture与mandatory gesture分别建Source。
-
-mandatory结果还会额外合并进公开`SYSTEM_GESTURES`，体现“强制手势区域也是系统手势区域”。
-
-## 10. 默认可见性
-
-```java
-return type != ITYPE_IME;
-```
-
-r48所有内部类型默认visible，只有IME默认隐藏。Provider和客户端请求后续再覆盖。
-
-## 11. InsetsSource的三个核心字段
+最终 Source 可见性通常是：
 
 ```text
-mType：固定internal type
-mFrame：来源在屏幕坐标中的Rect
-mVisibleFrame：可选的实际可见区域
-mVisible：当前是否参与普通Insets计算
+source.visible = serverVisible && clientVisible
 ```
 
-type构造后不可改，frame和visible会随布局变化。
+`serverVisible` 回答“WMS 是否认为提供窗口具备显示条件”，`clientVisible` 回答“当前控制方希望该 Source 是否可见”。二者任何一个为 false，普通 Source 都不可见。声明 `providesInsetsTypes` 且其中包含 IME 的 mirrored source 是例外：只要 server 可见，就绕过 clientVisible。这是源码中的定向兼容逻辑，不应泛化到所有多源窗口。
 
-## 12. frame为什么是屏幕坐标
+clientVisible 初值来自默认可见性，所以 IME 初始 false，其他类型初始 true。clientVisible 变化会请求 `LAYOUT_AND_ASSIGN_WINDOW_LAYERS_IF_NEEDED`，因为 Source visibility 不只是 surface alpha，还会改变别的窗口布局输入。
 
-Source要服务Display上多个Window，必须先有共同坐标系。
+IME 的“请求显示”还要过一个 post-layout 门：`mIsImeLayoutDrawn` 已锁存时可直接继续；否则要求 IME 请求目标与 DisplayContent 认定的目标匹配、IME Window 已 drawn，且 `mGivenInsetsPending` 为 false。穿过门后 `ImeInsetsSourceProvider` 才调用 control target 的 `showInsets(Type.ime(), true)`。这个调用仍只是发起客户端显示链，不是键盘动画或呈现完成。
 
-客户端计算时再拿目标Window frame与Source frame相交，得到相对该Window的一边厚度。
+“可控制”也由模式和类型共同决定：FULL 模式下 status/navigation/climate/extra-navigation 可控制；IME 在 IME 或 FULL 模式下可控制；手势区、tappable、cutout 等普通 Provider 不可控制。是否有 Provider、Source 是否可见、是否可控制、当前是否已有 control target，是四个独立状态。
 
-## 13. visibleFrame是什么
+## 9. control target、请求可见性与真实State要分开
 
-若提供Window用`mGivenVisibleInsets`声明只有内部一部分可见，Provider据此生成visibleFrame。
+`InsetsStateController` 同时维护 raw State、Provider 表、real control target 映射、fake target 映射和待通知 control-target 集合。它不是简单的 `InsetsState` 容器。
 
-它主要服务`calculateVisibleInsets()`；为空引用时等同使用普通frame。
+当控制权交给目标时，Provider 会启动一次 `ANIMATION_TYPE_INSETS_CONTROL` 动画以取得 leash。新 leash 创建后并不会立即下发：对应 Surface transaction 尚未应用时，客户端更早操作 leash 可能被服务端事务覆盖。此时 `getControl()` 返回同类型与位置、但 leash 为 null 的 control。
 
-## 14. visibleFrame为空Rect的控制含义
+目标也不总是当前焦点 Window。Provider 会把带 Window 的候选目标经 `getImeControlTarget()` 归一化到 IME host 或 fallback；没有 IME target 时，StateController 使用 empty IME target 持有隐藏 leash，并安排移除遗留 IME surface。这里的“empty”是系统兜底 control target，不是没有控制链。
 
-`InsetsSource.isUserControllable()`返回：
+`notifyPendingInsetsControlChanged()` 把通知放到 `addAfterPrepareSurfacesRunnable()`。该回调先对所有 Provider 调用 `onSurfaceTransactionApplied()`，再执行目标的 `notifyInsetsControlChanged()`。这个屏障证明“准备 leash 的事务已进入正确顺序”，不证明动画完成或画面已经 present。
+
+客户端 show/hide 改的是本地 SourceConsumer 的 requested visibility。`InsetsController.updateRequestedState()` 只把当前拥有 control 的 Source 写入 `mRequestedState`，跳过客户端自行组装的 caption，再通过 `IWindowSession.insetsModified()` 回到 system_server：
 
 ```text
-visibleFrame == null，或visibleFrame非空 → 可控制
-visibleFrame显式为空 → 不可做用户动画控制
+InsetsController.mRequestedState
+  → ViewRootInsetsControllerHost.onInsetsModified()
+  → IWindowSession.insetsModified()
+  → Session.insetsModified()
+  → WindowState.updateRequestedInsetsState()
+  → InsetsPolicy.onInsetsModified()
+  → InsetsStateController.onInsetsModified()
+  → 对匹配 Provider 更新 clientVisible
 ```
 
-“没有visibleFrame”与“有一个空visibleFrame”语义不同。
+服务端 Provider 只接受当前 real control target 的修改；非控制方提交的 Source 不会改变它的 clientVisible。即使调用者是真实控制方，`onInsetsModified()` 也只读取对应 Source 的 `isVisible()`，不会接受客户端提交的 frame 或 visibleFrame。`WindowState.updateRequestedInsetsState()` 只 add/replace 请求 State 中实际存在的 Source，既不会凭空补齐本次缺少的类型，也不会删除此前留下的槽位；最终仍由 Provider 的当前 real-target 检查挡住失效项。
 
-## 15. Source怎样计算Insets
+详细的 leash 生命周期、show/hide 动画与 `InsetsSourceControl` 协议留到第 231 章；本章只需建立边界：State 是“看到什么”，requested State 是“希望什么”，control 是“能否驱动对应 surface”。三者可以暂时不一致。
 
-```java
-source.calculateInsets(relativeFrame, ignoreVisibility)
-```
+## 10. raw State只在post-layout后比较，没变也可能通知
 
-先处理visible，再求source frame与目标frame交集，然后判断交集贴住目标的哪一边。
+`InsetsStateController.onPostLayout()` 先把 display bounds 写入 raw State，再逐个调用 Provider 的 `onPostLayout()`。完成后用 `mLastState.equals(mState)` 判断全局事实是否改变；变化时深拷贝到 `mLastState` 并广播。
 
-## 16. 隐藏Source通常贡献0
+但 raw compare 不是每次 dispatch 的必经门。客户端请求经 `onInsetsModified()` 改变 Provider clientVisible 后，StateController 会直接 `notifyInsetsChanged()`；transient 收尾也可直接通知。`mLastState` 要到下一次 `onPostLayout()` 才追上 raw State，因此随后还可能由比较路径再广播一次。排查重复回调时，应同时找直接通知入口与 post-layout 比较入口。
 
-`ignoreVisibility=false`且Source invisible时立即返回`Insets.NONE`。
+Controller 与 Provider 本身没有另建互斥锁；这些布局更新、Session 回传与 Animator 帧通常由 WMS global lock 串行。在 `onPostLayout()` 的 global-difference 分支中，`mLastState` 会在逐窗口 oneway 回调前更新；某个 client 抛 `RemoteException` 不会回滚全局状态，也没有为该次广播建立自动重试或客户端确认。因此准确说法是“服务端已更新并尝试投递”，不是“所有客户端已接纳”。
 
-`getInsetsIgnoringVisibility()`所需的max Insets则以true计算，不受当前显示/隐藏影响。
+深拷贝很关键。`new InsetsState(other)` 与 `set(other)` 默认只复制 Source 引用；若拿浅副本后原地修改某个 `InsetsSource`，原对象也会被改。`set(other, true)` 或 `new InsetsState(other, true)` 才逐个调用 Source 拷贝构造。
 
-## 17. Caption bar是特殊规则
+源码在逐窗口修饰中遵守一条 copy-on-write 纪律：
 
-Caption Source不做普通相交归边，直接返回：
+- 只 `removeSource()` 时，复制槽位数组即可，因为没有修改共享 Source 对象。
+- 要改 IME frame、IME visibility 或 transient visibility 时，先复制具体 `InsetsSource`，再用 `addSource()` 替换当前 State 的槽位。
+- `mLastState` 必须深拷贝，否则下一轮 Provider 原地更新 raw Source 后，last 与 current 会一起变化，差异检测失效。
+
+全局 State 相等也不代表无需任何通知。`DisplayContent.mWinInsetsChanged` 保存那些自身条件改变、从而可能得到不同 dispatch State 的窗口，例如 z-order 影响“是否位于 IME 上方”。raw State 没变时，controller 仍单独通知这批窗口，之后清空列表。
+
+`InsetsState.equals()` 还提供两个客户端专用忽略项：可以忽略 caption，因为 caption Source 在客户端组装；也可以在 IME 不可见时忽略其 frame，避免不可见键盘几何抖动触发无意义布局。普通 raw State 比较不启用这两个忽略项。
+
+## 11. 发给每个Window前要经过一套过滤函数
+
+`InsetsStateController.getInsetsForDispatch(target)` 不是返回 raw State 的 getter。它先检查目标 token 是否有 fixed-rotation InsetsState；有则优先使用旋转后的副本。否则根据目标是不是 Source 提供者、windowing mode、always-on-top 与 IME 层级构造个性化视图。
+
+过滤规则按源码顺序发生：
+
+1. 目标若关联一个 controllable Provider，只移除这个可控主 Source；同一 Window 生产的 gesture/tappable 辅助 Source 不会因此全部移除。
+2. navigation/extra-navigation 提供者还移除 IME、status、climate、caption。
+3. status/climate 提供者移除 caption。
+4. 目标是 IME 时，具有 `imeFrameProvider` 的其他 Source 被复制并替换为 IME 专用 frame。
+5. floating window，或 multi-window 且 always-on-top，移除 canonical status 与 navigation。
+6. 位于 IME 上方的目标若看到可见 IME，则复制该 Source，把 visible 设为 false 并把 frame 清零。
+
+这里再次出现“canonical 与同族替代 Source 不完全对称”：浮动窗口分支只移除 `ITYPE_STATUS_BAR` 与 `ITYPE_NAVIGATION_BAR`，没有顺手移除 climate/extra-navigation。现场若只看 public `statusBars()` 或 `navigationBars()`，很容易把残留贡献误判为过滤失败。
+
+`isAboveIme()` 对 `WindowState` 使用 `needsRelativeLayeringToIme() || !mBehindIme`；它不是拿两个 frame 做几何比较。IME Source 的隐藏因此是层级语义，而非“矩形没有相交”的副产品。
+
+fixed-rotation State 被优先选中以后，`DisplayContent.notifyInsetsChanged()` 还会把 raw State 中现存 Source 的最新 visibility 同步进旋转副本；这里只同步可见性，不重算旋转几何。它解决的是启动固定旋转期间可见性不能冻结在旧值的问题。
+
+## 12. InsetsPolicy为transient bar构造“看不见但可动画”的视图
+
+`WindowState.getInsetsState()` 最终还要经过 `InsetsPolicy.getInsetsForDispatch()`。当某个 bar 正以 transient 方式显示时，Policy 检查逐窗口 State 中对应 Source；若它真实可见，就复制 State 与具体 Source，再把分发给应用的 visibility 改为 false。
+
+这看似矛盾，却是在区分两种事实：系统 surface 可以临时出现在屏幕上，但应用布局仍应把 bar 当作隐藏，避免一次边缘滑动让内容区突然收缩。于是 raw Source、屏幕上的 transient surface、应用收到的 Source visibility 可以同时是“真、显示、假”。
+
+真实 control target 可能被切到 `mDummyControlTarget` 来执行 transient 动画；原 focused window 同时成为 fake control target。fake control 没有 leash，但保留应用 show/hide 意图的观测通道：若 fake target 在 transient 期间请求把 bar 显示，Policy 会中止 transient 状态，而不是把这次请求丢掉。
+
+因此四种身份不能混写：
+
+| 身份 | 主要用途 |
+| --- | --- |
+| State recipient | 接收逐窗口几何与可见性 |
+| real control target | 获得可操作 leash，可修改 Provider clientVisible |
+| fake control target | 没有真实 leash，但让 Policy 观察原应用意图 |
+| dummy target | 系统临时接管 leash，驱动 transient 动画或复位 |
+
+控制权变化会单独走 `insetsControlChanged(state, controls)`；普通几何/可见性变化走 `insetsChanged(state)`。两类回调都带 State，但后者没有 control 数组，不能仅凭收到新 State 推断应用获得了控制权。
+
+## 13. 服务端有同步返回和异步回调两条交付通道
+
+窗口首次 `addToDisplay` 与以后 `relayout` 都通过 out 参数同步返回 `InsetsState` 和 active controls。WMS 调用 `outInsetsState.set(win.getInsetsState(), win.isClientLocal())`：同进程 client 需要深拷贝，跨进程则由 Parcel 提供对象隔离。controls 在离开 WM 锁前也会另建 `InsetsSourceControl`，避免原 leash 引用随后被释放。
+
+运行中的变化通过 oneway `IWindow` 回调：
+
+- `insetsChanged(InsetsState)` 只交付 State。
+- `insetsControlChanged(InsetsState, InsetsSourceControl[])` 同时交付 State 与控制数组。
+- `showInsets(types, fromIme)`、`hideInsets(types, fromIme)` 是 Policy/IME 发给客户端控制器的动作请求。
+
+`DisplayContent.notifyInsetsChanged()` 从顶到下遍历所有窗口，但 `mDispatchInsetsChanged` 只对 `w.isVisible()` 的窗口调用 `notifyInsetsChanged()`。不可见 Window 不会因这次广播立即收到异步 State；它以后可在 add/relayout 或其他状态转换中重新同步。
+
+异步 `insetsChanged` 与 `resized` 也不是一个原子状态包。在同一次 WMS surface-placement 中，Provider post-layout 与 Insets 回调先发生，surface transaction 关闭后才可能遍历 resizing windows 发送 resize；客户端分别排入 `MSG_INSETS_CHANGED` 与 `MSG_RESIZED`。因此新 State 可以暂时配着旧 window frame。非 NONE 模式下，`InsetsController.onFrameChanged()` 会再次请求 apply，最终依靠客户端主线程消息与 traversal 收敛；NONE 模式则由 resize 消息自身的 requestLayout 与 legacy 路径推进。同步 add/relayout 的返回路径先 `setFrame()`，再处理 out State 和 controls。
+
+同进程 Binder 调用不会自动得到 Parcel 深拷贝，所以 `ViewRootImpl.dispatchInsetsChanged()` 与 `dispatchInsetsControlChanged()` 检查 calling pid；若服务端和客户端在同一进程，就显式深拷贝 State，control 回调还逐个复制 control。之后无论来自哪个进程，都只把消息投递到 ViewRoot Handler。
+
+`MSG_INSETS_CONTROL_CHANGED` 的 Handler 处理顺序固定为先 `onStateChanged()`，再 `onControlsChanged()`。理由是获得控制时需要拿最新 server State 判断是否启动动画；失去控制时则要先把最近下发的 server State 恢复为当前依据。只有这个客户端 Handler 分支返回，才能证明 controller 已处理两个输入；服务端 oneway 调用返回并不能证明这一点，前者也仍不说明 surface 动画已经结束。
+
+逐窗口过滤是布局语义隔离，不是内容保密机制。`InsetsState` 携带类型、矩形与可见性等元数据，不含窗口像素或输入文本；真正的画面保护仍属于 secure layer 等机制。反向请求还受三道边界约束：Session 用所属 `IWindow` 解析调用方自己的 `WindowState`，Provider 只接纳当前 real control target，并且只采用 visibility；能用 `providesInsetsTypes` 声明系统栏提供者的调用方另受 `STATUS_BAR_SERVICE` 权限保护。
+
+## 14. 客户端三份State最终在traversal里变成WindowInsets
+
+`InsetsController` 的三份 State 各有职责：
+
+| 字段 | 含义 |
+| --- | --- |
+| `mLastDispatchedState` | 服务端最近一次原样下发的 State 深副本 |
+| `mState` | 服务端 State 经各 SourceConsumer 与本地 visibility override 后的当前有效状态 |
+| `mRequestedState` | 由受控 Source 增量填充、可能保留失控类型旧条目的请求账本 |
+
+`onStateChanged()` 先计算“忽略 caption、不忽略 invisible IME frame”的有效状态差异，并单独检查本地 caption 是否未变。只有这些都无变化且 `mLastDispatchedState` 也与新输入相等，才直接返回；即使有效状态不变，只要 server 原始输入不同，仍会深拷到 last-dispatched。随后 `updateState()` 逐个更新/创建 SourceConsumer，并移除服务端已不存在的 Source；若客户端 DecorView 有 caption 高度，它还会在 `mState` 中组装 caption Source。
+
+应用正在控制某类 Insets 时，本地 requested visibility 可以覆盖刚收到的服务端 visibility；所以 `mState` 与 `mLastDispatchedState` 暂时不同并不必然是错误。若最终有效 State 变化，Controller 会调用 Host；在非 NONE 模式中，`ViewRootImpl.notifyInsetsChanged()` 才会标记 `mApplyInsetsRequested`、requestLayout，并在不处于 traversal 时安排新的 traversal。NONE 模式在 Host 入口直接返回。
+
+真正构造 public 对象发生在 `ViewRootImpl.getWindowInsets(true)`：它把当前 window frame、round/cutout、softInputMode、window flags 与 system-ui flags 一起交给 `InsetsController.calculateInsets()`。同一处还计算 legacy visibleInsets，并把 public system/stable insets 回填到 `AttachInfo`。
+
+`dispatchApplyInsets()` 可根据窗口 cutout 策略先 consume `DisplayCutout` 对象，再调用根 View 的 `dispatchApplyWindowInsets()`。这不会清掉 current/max/visibility map，所以 `getDisplayCutout()` 可以变为 null，而 `getInsets(Type.displayCutout())` 仍保留四个 cutout Source 的聚合值。
+
+View 树传播还有 target-SDK 兼容分叉。`mode != FULL` 或应用 `targetSdk < R` 时，前一个 child 返回的 consumed 结果会串给下一个 child，已全部消费时可以提前停止；FULL 且 targetSdk 至少为 R 时，各 child 独立收到同一份输入，一个兄弟消费不会截断其他兄弟。因此调试“内容为什么下移”至少要保留四份证据：服务端 raw State、目标窗口 dispatch State、客户端 `mState`、根 View 实收 `WindowInsets`；只截其中一层会把过滤、本地覆盖或子树消费误认为上游计算错误。
+
+对一次普通 State 更新，较准确的终点表述是：
 
 ```text
-top = sourceFrame.height
+IWindow 回调已发出
+  ≠ ViewRoot Handler 已处理
+  ≠ InsetsController 已接纳为有效变化
+  ≠ traversal 已执行
+  ≠ 根 View 已收到
+  ≠ 子 View 最终采用
+  ≠ 对应 surface 已显示在物理屏幕
 ```
 
-这是为了拖动/resize时App frame和caption位置更新不同步仍能稳定布局。
+## 15. 九个只读练习：从类型映射追到View派发
 
-## 18. IME也有特殊规则
+下面命令只读取源码。默认源码根目录为 `/Users/ninebot/androidSource`，也可以把另一个源码根目录作为第一个参数传入。每段都兼容 macOS 自带 Bash 3.2 与 Zsh 5.9。
 
-IME与目标frame相交后，无论几何边判断如何，都按交集高度贡献bottom inset。
-
-源码TODO承认这是r48为非浮动IME/cutout问题保留的策略性假设。
-
-## 19. 普通上下边判断
-
-交集宽度等于目标Window宽度时：
-
-```text
-交集top == target.top       → top inset
-交集bottom == target.bottom → bottom inset
-```
-
-若交集在中间悬浮，不产生四边Insets。
-
-## 20. top==0的兼容hack
-
-完整宽度交集既不贴目标top也不贴bottom，但其屏幕坐标top为0时，r48仍把它算作top inset。
-
-注释说这是split primary被IME调整时的临时兼容规则。
-
-## 21. 普通左右边判断
-
-交集高度等于目标frame高度时，贴left产生left inset，贴right产生right inset。
-
-来源只覆盖目标高度一部分时不会自动推断为左右Inset。
-
-## 22. 一种Source只应占一边
-
-`calculateInsets()`契约要求结果四个分量最多一边非0。
-
-后续`getInsetSide()`和控制能力判断依赖这个假设。
-
-## 23. 相交计算包含共边
-
-`getIntersection()`用`<=`，共享边也算有intersection。
-
-但得到的交集可能宽或高为0，最终贡献通常仍是0；布尔“相交”不等于有非零Inset。
-
-## 24. InsetsState的固定槽位
-
-`mSources`是长度`InsetsState.SIZE=20`的数组，以internal type直接当下标。
-
-同一种internal type在一个State中最多一个Source。
-
-## 25. getSource会创建
-
-`getSource(type)`若不存在会创建默认Source并放入数组；`peekSource(type)`只查询，不产生副作用。
-
-读条件分支时应优先注意调用的是哪一个。
-
-## 26. InsetsState还保存Display frame
-
-`mDisplayFrame`是Source共同参照的Display范围，也用于判断某Window能否控制某一侧Insets。
-
-它不是当前App Window frame。
-
-## 27. 浅拷贝与深拷贝
-
-```java
-new InsetsState(other)                // set(other)，默认共享Source引用
-new InsetsState(other, true)          // 每个Source深拷贝
-```
-
-r48许多过滤路径先浅拷State，再只复制即将修改的Source，避免全量对象分配。
-
-## 28. 修改浅拷贝的风险
-
-如果直接修改浅拷贝中共享的Source，会连原State一起变。
-
-源码需要改visibility时通常先`new InsetsSource(originalSource)`，再add回浅拷State。
-
-## 29. calculateInsets的输出Map
-
-State为每个公开type维护：
-
-```text
-typeInsetsMap：按当前可见性计算
-typeMaxInsetsMap：忽略可见性计算
-typeVisibilityMap：当前可见状态
-```
-
-最终共同构造`WindowInsets`。
-
-## 30. 多Source怎样合并
-
-映射到同一公开type的多个Source使用`Insets.max(existing, insets)`逐边取最大。
-
-它不是求和。例如顶部status bar与climate bar重叠时不会简单把高度相加。
-
-r48的`typeVisibilityMap`却不是同样取max或做OR：每处理一个Source都会直接给对应public type槽位赋当前`source.isVisible()`。因此多个internal Source映射到同一public type时，internal type遍历顺序靠后的Source会覆盖先前布尔值；数值聚合与可见性聚合并不对称。
-
-## 31. IME没有max Insets
-
-源码明确不把IME写入`typeMaxInsetsMap`，因为IME尺寸依赖当前EditorInfo/键盘形态。
-
-因此不能把`getInsetsIgnoringVisibility(Type.ime())`当成稳定的“键盘最大高度”。
-
-## 32. ignoringVisibilityState的用途
-
-调用者可传另一份State计算max Insets，例如保留系统栏未受临时可见性改变影响的稳定几何。
-
-传null则复用当前State，只在计算时忽略Source visible。
-
-## 33. legacy soft input兼容
-
-公开compat Insets默认包含system bars和display cutout；`SOFT_INPUT_ADJUST_RESIZE`时再包含IME。
-
-旧Window flags含FULLSCREEN则从compat集合移除statusBars。
-
-## 34. r48有三种新Insets模式
-
-```text
-NEW_INSETS_MODE_NONE：系统栏/IME仍走更多legacy路径
-NEW_INSETS_MODE_IME：只对IME采用新模型
-NEW_INSETS_MODE_FULL：系统栏与IME完整采用新模型
-```
-
-源码中大量条件必须结合`sNewInsetsMode`阅读，不能把后续Android版本行为倒灌进r48。
-
-## 35. InsetsSourceProvider是什么
-
-每个internal type在服务端对应一个Provider，它持有：
-
-```text
-共享InsetsSource
-背后的WindowState
-可选frameProvider/imeFrameProvider
-serverVisible与clientVisible
-控制目标、Surface leash与control信息
-```
-
-Provider是Window与State之间的活桥。
-
-## 36. Provider何时创建
-
-`InsetsStateController.getSourceProvider(type)`按需`computeIfAbsent`。
-
-IME创建专用`ImeInsetsSourceProvider`，其他类型用普通Provider。
-
-## 37. setWindow建立来源归属
-
-DisplayPolicy识别状态栏/导航栏等Window后调用`DisplayContent.setInsetProvider()`，最终执行Provider.setWindow。
-
-IME Window设置时也专门绑定ITYPE_IME Provider。
-
-## 38. 旧提供Window被替换
-
-Provider先解除旧Window的controllable provider，并取消其动画以回收可能已发出的control leash。
-
-然后保存新Window与frame计算函数。
-
-## 39. setWindow(null)怎样清空
-
-```text
-serverVisible=false
-source.frame=empty
-source.visibleFrame=null
-```
-
-Source槽位本身可以继续存在，但不再贡献有效几何与可见状态。
-
-## 40. 哪些Source可控制
-
-r48中：
-
-```text
-status/navigation/climate/extra-nav：仅FULL模式可控制
-IME：IME或FULL模式可控制
-gesture/cutout/caption等：普通Provider标为不可控制
-```
-
-“有Source”不等于App能拿Surface leash控制它。
-
-## 41. Status bar怎样注册三个来源
-
-同一个TYPE_STATUS_BAR Window同时提供：
-
-```text
-ITYPE_STATUS_BAR
-ITYPE_TOP_GESTURES
-ITYPE_TOP_TAPPABLE_ELEMENT
-```
-
-frameProvider把top设为0、bottom设为策略计算的状态栏高度。
-
-## 42. 一个Window可支持多个Provider
-
-每个internal type仍有独立Provider/Source，但它们的`mWin`可以指向同一个WindowState。
-
-这就是“一个系统栏Window，多种Insets语义”。
-
-## 43. Navigation bar提供更多来源
-
-除NAVIGATION_BAR外，还可提供bottom/left/right gestures与bottom tappable element。
-
-各自frameProvider根据导航模式、Display尺寸和触摸策略修正同一个Window frame。
-
-## 44. Gesture Nav下导航栏frame为何重算
-
-导航栏Window视觉/触摸frame可能比实际需要避让内容的navigation inset更大。
-
-Provider把inOutFrame.top改到安全Display底部减导航栏高度，向App报告较小的布局Insets。
-
-## 45. IME看到的导航栏frame可以不同
-
-Navigation Provider保存单独`imeFrameProvider`，对IME分发时可使用regular Window frame。
-
-这防止手势导航下IME与导航栏内容发生错误重叠。
-
-## 46. Alternative bar的权限门
-
-Window自定义`providesInsetsTypes`需要`STATUS_BAR_SERVICE`权限，并限制与Window type对应的主栏类型不能一次声明多个。
-
-普通三方App不能把任意Window注册成系统状态栏Source。
-
-## 47. updateSourceFrame何时计算
-
-Provider注释要求在来源Window完成布局后调用。
-
-`onPostLayout()`先更新serverVisible，再调用updateSourceFrame。
-
-## 48. serverVisible条件
-
-```java
-wouldBeVisibleIfPolicyIgnored()
-&& isVisibleByPolicy()
-&& !mGivenInsetsPending
-```
-
-有Window对象但尚无可显示Surface、被Policy隐藏或given Insets仍pending时，不应向App报告有效frame。
-
-## 49. server不可见时frame为空
-
-Provider不会保留旧Window frame继续占位，而是把Source frame清空。
-
-这防止一块尚未准备好的系统栏让其他Window提前错误布局。
-
-## 50. 无自定义frameProvider时
-
-先复制`mWin.getFrameLw()`，再按`mGivenContentInsets`向内收缩。
-
-来源Window可用given content Insets声明真正产生Insets的内部区域。
-
-## 51. 有frameProvider时
-
-函数收到`DisplayFrames、WindowState、inOut Rect`并原地修改。
-
-状态栏高度、手势区域和导航栏位置等Policy逻辑因此不必硬编码进通用Provider。
-
-## 52. visibleFrame怎样生成
-
-只要Window任一`mGivenVisibleInsets`非0，就以Window frame向内inset得到visibleFrame；全0则设null。
-
-显式空Rect可能让客户端判断该Source当前不可用户控制。
-
-## 53. 最终visible是两个维度相与
-
-```java
-source.visible = serverVisible
-        && (isMirroredSource() || clientVisible);
-```
-
-服务端几何/Policy准备好与控制客户端请求显示是两本账。
-
-## 54. clientVisible初始值
-
-Provider构造时用type默认可见性：系统栏true、IME false。
-
-控制目标通过requested InsetsState修改后，Provider更新clientVisible。
-
-## 55. mirrored source例外
-
-若背后Window的`providesInsetsTypes`数组包含ITYPE_IME，Provider忽略clientVisible，只要serverVisible就显示。
-
-这是r48特殊镜像来源逻辑，不应泛化到所有普通系统栏。
-
-## 56. 可见性变化为什么触发布局
-
-`setClientVisible()`给WMS H发送`LAYOUT_AND_ASSIGN_WINDOW_LAYERS_IF_NEEDED`。
-
-Insets变化不仅是通知字段，还可能要求重新布局Window并调整Surface层级。
-
-## 57. InsetsStateController维护什么
-
-```text
-mState：当前Display原始InsetsState
-mLastState：上次post-layout深拷贝
-mProviders：type到Provider
-control target双向映射
-pending control changed集合
-```
-
-它是每个DisplayContent一份，不是全系统唯一实例。
-
-## 58. onPostLayout更新Display frame
-
-Controller先把`mDisplayContent.getBounds()`写入mState displayFrame，再让所有Provider post-layout。
-
-所以Source几何与Display bounds在同一布局批次更新。
-
-## 59. 怎样判断全局State变化
-
-`mLastState.equals(mState)`比较Display frame和每个Source的type/frame/visibleFrame/visible。
-
-变化时深拷当前State作为下一轮基线，并通知Insets changed。
-
-## 60. State没变也可能要通知特定Window
-
-Window Z序、是否位于IME上方等条件变化，会改变per-window过滤结果，却不改变raw State。
-
-`mWinInsetsChanged`保存这类Window，post-layout时单独分发。
-
-## 61. raw State不能直接广播给所有Window
-
-`getInsetsForDispatch(target)`会根据目标身份和布局环境裁剪/改写。
-
-同一Display上的状态栏Window、普通App、浮窗与IME拿到的State可能不同。
-
-```mermaid
-flowchart TD
-    A["Display raw InsetsState"] --> B{"fixed rotation副本存在"}
-    B -->|"是"| R["使用rotated State"]
-    B -->|"否"| C{"目标自身提供Insets"}
-    C -->|"是"| D["移除自身Source及角色相关Source"]
-    C -->|"否"| E["保留普通来源"]
-    D --> F{"floating或multi-window always-on-top"}
-    E --> F
-    F -->|"是"| G["移除status/navigation"]
-    F -->|"否"| H["保持"]
-    G --> I{"目标位于IME上方"}
-    H --> I
-    I -->|"是"| J["复制IME Source并置invisible/empty"]
-    I -->|"否"| K["保持IME"]
-    J --> P["InsetsPolicy transient修饰"]
-    K --> P
-    R --> P
-    P --> Q["分发给该Window"]
-```
-
-## 62. fixed rotation优先
-
-若目标Window token有fixed-rotation transform InsetsState，直接返回旋转后的副本。
-
-DisplayContent在raw visibility变化时还会同步更新这份rotated State的Source visible。
-
-## 63. 提供者不接收自己的Source
-
-目标Window自身是可控制Insets Provider时，分发State会remove该type。
-
-状态栏不需要再因为自己的状态栏Source给自己产生top inset。
-
-## 64. Navigation bar提供者还排除什么
-
-Nav/extra-nav Window收到的State还移除：
-
-```text
-IME
-status/climate bar
-caption bar
-```
-
-源码注释称导航栏不受其他来源影响。
-
-## 65. Status bar提供者排除caption
-
-状态栏或climate bar自身不接收caption bar Source。
-
-这是服务端按Window角色定制，而非客户端自行consume。
-
-## 66. IME可得到override frame
-
-当目标type为IME时，Controller遍历带`imeFrameProvider`的其他Provider，用其override frame替换相应Source副本。
-
-同一个导航栏Source对普通App与IME可以报告不同几何。
-
-## 67. 浮动Window的系统栏过滤
-
-`WindowConfiguration.isFloating(windowingMode)`时移除status和navigation Source。
-
-multi-window且always-on-top也做相同处理；浮窗不应按全屏系统栏方式被压缩。
-
-## 68. 位于IME上方的Window
-
-若目标Z序高于IME且IME Source当前visible，Controller复制IME Source后：
-
-```text
-visible=false
-frame=empty
-```
-
-上层Window不会因自己下面的IME产生bottom inset。
-
-## 69. InsetsPolicy再做一层修饰
-
-`WindowState.getInsetsState()`实际先进入`InsetsPolicy.getInsetsForDispatch()`，它包裹StateController结果。
-
-Transient system bars是其中最重要的额外状态。
-
-## 70. transient bar为何对App报告invisible
-
-系统栏可在不改变App稳定布局意图的情况下临时滑入。Policy对正在transient展示的Source复制后设visible=false再分发。
-
-物理栏暂时可见，与App布局State把它当作隐藏可以同时成立。
-
-## 71. fake control target的作用
-
-Transient期间App可能不再拥有真实leash，但服务端仍给它fake control以观察show/hide意图。
-
-若App明确请求show，Policy可中止transient状态并恢复正常控制关系。
-
-## 72. Control target与State recipient不同
-
-每个可见Window都可能收到InsetsState；只有被Policy选中的焦点/IME目标等才拿某类SourceControl。
-
-“知道栏在哪里”与“能移动/隐藏栏Surface”是两种权限。
-
-## 73. 为什么leash不能创建后立刻发
-
-Provider创建SurfaceAnimator leash后把`mIsLeashReadyForDispatching=false`。
-
-在准备leash的Surface Transaction真正apply前，若客户端先操作可能被服务端后提交状态覆盖。
-
-## 74. afterPrepareSurfaces屏障
-
-StateController把control-changed通知放到Animator `addAfterPrepareSurfacesRunnable`：
-
-```text
-先标所有Provider leash可分发
-再notify各ControlTarget
-```
-
-这是Surface状态与Binder控制权交付的顺序屏障。
-
-## 75. 屏障前会发什么
-
-若目标查询到mControl但leash尚未ready，Provider返回同type/position、但`leash=null`的新Control。
-
-客户端可以知道类型，却不能过早操作服务端尚未生效的Surface层。
-
-## 76. Global State变化怎样广播
-
-`InsetsStateController.notifyInsetsChanged()`调用DisplayContent，后者top-to-bottom遍历所有Window。
-
-回调Consumer只对`w.isVisible()`的Window执行`w.notifyInsetsChanged()`。
-
-## 77. fixed rotation State同步
-
-广播前若有fixed-rotation launching App，DisplayContent逐type把raw State最新visible复制进rotated State。
-
-几何仍保持旋转副本，visibility跟随当前系统栏/IME状态。
-
-## 78. 服务端到客户端的Binder接口
-
-WindowState执行：
-
-```java
-mClient.insetsChanged(getInsetsState());
-```
-
-`IWindow.insetsChanged(InsetsState)`是oneway式窗口回调链的一部分，参数是该Window定制后的Parcelable副本。
-
-## 79. control变化使用另一回调
-
-拿到或失去控制权时使用`insetsControlChanged(InsetsState, InsetsSourceControl[])`。
-
-状态变化与control变化可分别发生，客户端必须支持两条入口。
-
-## 80. Window首次add也带Insets
-
-`IWindowSession.addToDisplayAsUser()`的输出参数包含`InsetsState`与`InsetsSourceControl[]`。
-
-ViewRootImpl在setView初次add成功后立刻调用客户端InsetsController的`onStateChanged()`和`onControlsChanged()`，不用等下一次异步广播。
-
-## 81. ViewRoot的IWindow回调线程
-
-`ViewRootImpl.W`收到insetsChanged后调用`dispatchInsetsChanged()`，把处理切回ViewRoot主线程消息队列。
-
-Binder回调到达不等于View树已经同步执行apply Insets。
-
-## 82. 客户端有三份State
-
-InsetsController维护：
-
-```text
-mLastDispatchedState：服务端最近下发
-mState：应用本地消费/动画后的当前状态
-mRequestedState：准备回报服务端的可见性请求
-```
-
-它们在动画或本地visibility override期间可以不同。
-
-## 83. Caption Source为何客户端组装
-
-客户端DecorView知道caption Insets高度，InsetsController可在本地给ITYPE_CAPTION_BAR设置frame。
-
-因此State equals有“忽略caption Insets”选项，避免把客户端合成字段误判成服务端变化。
-
-## 84. invisible IME frame也可忽略比较
-
-状态通知判断可选择在IME隐藏时忽略其frame变化。
-
-隐藏键盘几何变化不应总是触发App重新布局，但服务端最新State仍需妥善记录。
-
-## 85. onStateChanged并非直接调View
-
-它更新本地State、应用visibility override，若有效State变化则调用Host.notifyInsetsChanged。
-
-ViewRootImpl把`mApplyInsetsRequested=true`并schedule traversal。
-
-## 86. WindowInsets在何时计算
-
-Traversal需要分发时，ViewRoot调用：
-
-```java
-mInsetsController.calculateInsets(
-    isScreenRound, alwaysConsumeSystemBars, displayCutout,
-    softInputMode, windowFlags, systemUiFlags)
-```
-
-计算使用当前Window frame，不是服务端预先给出的固定四边数字。
-
-## 87. ViewRoot还计算legacy visibleInsets
-
-`calculateVisibleInsets()`结果写入AttachInfo.mVisibleInsets；公开WindowInsets的system/stable值也回填旧AttachInfo字段。
-
-r48仍需同时支持新Insets API与旧View布局兼容字段。
-
-## 88. 最终怎样进入View树
-
-```java
-host.dispatchApplyWindowInsets(insets);
-```
-
-随后每个View按自己的listener、fitsSystemWindows或override继续消费/传递。
-
-## 89. DisplayCutout可能先被consume
-
-若Window布局模式不需要单独分发cutout，或status bar inset已经负责避让，ViewRoot会先`consumeDisplayCutout()`。
-
-所以服务端State有cutout Source不保证每个子View都看到未消费的DisplayCutout。
-
-## 90. 从Source到View的完整时序
-
-```mermaid
-sequenceDiagram
-    participant BW as Bar/IME Window
-    participant P as InsetsSourceProvider
-    participant SC as InsetsStateController
-    participant W as Target WindowState
-    participant VR as ViewRootImpl
-    participant IC as Client InsetsController
-    participant V as View hierarchy
-    BW->>P: layout完成/onPostLayout
-    P->>P: serverVisible + frame + clientVisible
-    P->>SC: 更新raw InsetsSource
-    SC->>SC: 与mLastState比较
-    SC->>W: notifyInsetsChanged
-    W->>W: per-window过滤/InsetsPolicy
-    W-->>VR: IWindow.insetsChanged(state)
-    VR->>IC: onStateChanged
-    IC->>VR: notifyInsetsChanged/schedule traversal
-    VR->>IC: calculateInsets(windowFrame)
-    IC-->>VR: WindowInsets
-    VR->>V: dispatchApplyWindowInsets
-```
-
-## 91. 几何例题一：顶部状态栏
-
-```text
-target frame = [0,0,1080,2400]
-status source = [0,0,1080,100], visible=true
-```
-
-交集满目标宽并贴top，结果`Insets.of(0,100,0,0)`。
-
-## 92. 几何例题二：不相交浮窗
-
-```text
-target frame = [100,300,900,1600]
-status source = [0,0,1080,100]
-```
-
-没有交集，结果NONE；此外服务端对floating window通常已先移除status/nav Source。
-
-## 93. 几何例题三：底部IME
-
-```text
-target frame = [0,0,1080,2400]
-IME source = [0,1500,1080,2400], visible=true
-```
-
-IME特殊规则返回bottom=900。
-
-## 94. 几何例题四：中间悬浮Source
-
-```text
-target = [0,0,1080,2400]
-source = [200,500,880,700]
-```
-
-虽有交集，但不覆盖完整宽或高、也不贴四边，普通Source返回NONE。
-
-## 95. 常见误解纠正
-
-1. “状态栏高度就是全局top padding”——错，要相对Window frame计算。  
-2. “Source visible完全由系统Window是否有Surface决定”——错，是server/client两本账相与。  
-3. “所有Window收到同一State”——错，有角色、窗口模式、Z序、旋转和transient过滤。  
-4. “收到State就能控制系统栏”——错，还需Control与leash。  
-5. “Binder回调后View立刻拿到新Insets”——错，通常在主线程Traversal中分发。
-
-## 96. 为什么排查Insets先看Raw再看Dispatch
-
-如果App拿到错误Insets，要分别检查：
-
-```text
-raw Source frame/visible是否正确
-Provider server/client visible是否正确
-getInsetsForDispatch是否移除/override
-InsetsPolicy是否做transient改写
-客户端Window frame和本地override是否正确
-```
-
-只dump App最终WindowInsets会丢失中间证据。
-
-## 97. 进程与线程边界
-
-```text
-system_server的WMS布局/调用路径（通常持global lock）：Provider、StateController、per-window State
-Binder IWindow回调：跨进程传Parcelable State
-App主线程：ViewRoot/InsetsController更新与Traversal
-Surface动画：Control leash由SF transaction和客户端逐帧参数协作
-```
-
-最后一项将在下一章展开。
-
-## 98. macOS只读练习一：手算Source
+### 练习 1：确认20个internal槽位与public映射
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '65,175p' frameworks/base/core/java/android/view/InsetsSource.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+FILE="$ROOT/frameworks/base/core/java/android/view/InsetsState.java"
+grep -n 'ITYPE_EXTRA_NAVIGATION_BAR = 19' "$FILE"
+grep -n 'public static final int SIZE = LAST_TYPE + 1' "$FILE"
+grep -n 'case ITYPE_TOP_GESTURES:' "$FILE"
+grep -n 'return Type.MANDATORY_SYSTEM_GESTURES' "$FILE"
+grep -n 'return Type.SYSTEM_GESTURES' "$FILE"
 ```
 
-用本章91—94节四组Rect逐行走`calculateInsets()`，写出命中的return分支。
+先验证 top gestures 的直接映射，再看 mandatory 如何额外并入 system gestures。不要从名字猜 public type。
 
-## 99. macOS只读练习二：追系统栏Provider
+### 练习 2：核对矩形折边的特殊次序
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '1095,1175p' frameworks/base/services/core/java/com/android/server/wm/DisplayPolicy.java
-rg -n "setInsetProvider|updateSourceFrame|setServerVisible" \
-  frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java \
-  frameworks/base/services/core/java/com/android/server/wm/InsetsSourceProvider.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+FILE="$ROOT/frameworks/base/core/java/android/view/InsetsSource.java"
+grep -n 'getType() == ITYPE_CAPTION_BAR' "$FILE"
+grep -n 'getIntersection(frame, relativeFrame' "$FILE"
+grep -n 'getType() == ITYPE_IME' "$FILE"
+grep -n 'mTmpFrame.width() == relativeFrame.width()' "$FILE"
+grep -n 'mTmpFrame.top == 0' "$FILE"
 ```
 
-目标：列出status Window与navigation Window各自提供的internal types。
+输出行号应显示 caption 在相交之前、IME 在相交之后、普通边判断最后发生。
 
-## 100. macOS只读练习三：比较四类目标Window
+### 练习 3：验证聚合是max而visibility是覆盖
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '115,245p' frameworks/base/services/core/java/com/android/server/wm/InsetsStateController.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+FILE="$ROOT/frameworks/base/core/java/android/view/InsetsState.java"
+grep -n 'Insets.max(existing, insets)' "$FILE"
+grep -n 'typeVisibilityMap\[index\] = source.isVisible()' "$FILE"
+grep -n 'new boolean\[SIZE\]' "$FILE"
+grep -n 'source.getType() != ITYPE_IME' "$FILE"
+grep -n 'ignoringVisibilityState.getSource(type)' "$FILE"
 ```
 
-分别推演导航栏自身、状态栏自身、floating App和位于IME上方Window会被移除哪些Source。
+把五行放在一起读：几何、visibility、数组尺寸、IME max 例外和辅助 State 的潜在补槽都能一次定位。
 
-## 101. macOS只读练习四：追到View
+### 练习 4：枚举状态栏与导航栏提供的Source
 
 ```bash
-cd /Users/ninebot/androidSource
-rg -n "notifyInsetsChanged|insetsChanged\\(|onStateChanged|dispatchApplyInsets|dispatchApplyWindowInsets" \
-  frameworks/base/services/core/java/com/android/server/wm/WindowState.java \
-  frameworks/base/core/java/android/view/ViewRootImpl.java \
-  frameworks/base/core/java/android/view/InsetsController.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+FILE="$ROOT/frameworks/base/services/core/java/com/android/server/wm/DisplayPolicy.java"
+grep -n 'setInsetProvider(ITYPE_STATUS_BAR' "$FILE"
+grep -n 'setInsetProvider(ITYPE_TOP_GESTURES' "$FILE"
+grep -n 'setInsetProvider(ITYPE_TOP_TAPPABLE_ELEMENT' "$FILE"
+grep -n 'setInsetProvider(ITYPE_NAVIGATION_BAR' "$FILE"
+grep -n 'setInsetProvider(ITYPE_BOTTOM_GESTURES' "$FILE"
+grep -n 'setInsetProvider(ITYPE_LEFT_GESTURES' "$FILE"
+grep -n 'setInsetProvider(ITYPE_RIGHT_GESTURES' "$FILE"
 ```
 
-目标：标出system_server、Binder回调和App主线程Traversal三个边界。
+同一个 `WindowState` 出现在多次注册里，正是“一窗多 Source”的直接证据。
 
-## 102. 源码阅读导航
+### 练习 5：追Provider的frame与可见性合成
 
-```text
-frameworks/base/core/java/android/view/InsetsSource.java
-frameworks/base/core/java/android/view/InsetsState.java
-frameworks/base/core/java/android/view/InsetsSourceControl.java
-frameworks/base/core/java/android/view/InsetsController.java
-frameworks/base/core/java/android/view/ViewRootImpl.java
-frameworks/base/core/java/android/view/IWindow.aidl
-frameworks/base/services/core/java/com/android/server/wm/InsetsSourceProvider.java
-frameworks/base/services/core/java/com/android/server/wm/ImeInsetsSourceProvider.java
-frameworks/base/services/core/java/com/android/server/wm/InsetsStateController.java
-frameworks/base/services/core/java/com/android/server/wm/InsetsPolicy.java
-frameworks/base/services/core/java/com/android/server/wm/DisplayPolicy.java
-frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
-frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+FILE="$ROOT/frameworks/base/services/core/java/com/android/server/wm/InsetsSourceProvider.java"
+grep -n 'wouldBeVisibleIfPolicyIgnored()' "$FILE"
+grep -n '!mWin.mGivenInsetsPending' "$FILE"
+grep -n 'mFrameProvider.accept' "$FILE"
+grep -n 'mTmpRect.inset(mWin.mGivenContentInsets)' "$FILE"
+grep -n 'mServerVisible && (isMirroredSource() || mClientVisible)' "$FILE"
 ```
 
-## 103. 本章复读后的精确结论
+前两行决定 serverVisible，接着两行展示 frame 的二选一计算，最后一行才是 Source 的最终 visible。
 
-1. InsetsSource保存屏幕坐标来源区域；四边Insets必须相对目标Window frame计算。  
-2. 一个系统栏Window可通过多个Provider贡献布局、gesture和tappable等不同内部类型。  
-3. Provider最终visible通常是serverVisible与clientVisible相与，frame只在来源Window服务端可见且given Insets不pending时有效。  
-4. StateController为提供者、浮窗、IME上下层、fixed rotation等目标生成不同State，InsetsPolicy还会改写transient bar可见性。  
-5. 服务端通过IWindow回调State，客户端在ViewRoot主线程Traversal中计算WindowInsets并分发View树。  
-6. State可见性与Surface控制权分离；Control leash必须等准备Transaction apply后才能交给客户端。
+### 练习 6：定位逐窗口过滤的六类分支
 
-## 104. 检查题
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+FILE="$ROOT/frameworks/base/services/core/java/com/android/server/wm/InsetsStateController.java"
+grep -n 'getFixedRotationTransformInsetsState' "$FILE"
+grep -n 'state.removeSource(type)' "$FILE"
+grep -n 'otherProvider.overridesImeFrame()' "$FILE"
+grep -n 'WindowConfiguration.isFloating(windowingMode)' "$FILE"
+grep -n 'if (aboveIme)' "$FILE"
+grep -n 'imeSource.setFrame(0, 0, 0, 0)' "$FILE"
+```
 
-1. internal type为什么比public type多？  
-2. visibleFrame为null与显式empty有什么区别？  
-3. 多个Source映射到同一公开type时为何取max而非求和？  
-4. 为什么IME不提供稳定max Insets？  
-5. serverVisible与clientVisible各由什么决定？  
-6. 为什么导航栏Window不接收自己的导航栏Source？  
-7. transient bar物理可见时为何可能向App报告invisible？  
-8. IWindow.insetsChanged到View.onApplyWindowInsets之间还有哪些步骤？
+这些位置共同说明 dispatch State 是按目标生成的视图，不是 raw State 的无条件广播。
 
-## 105. 下一章预告
+### 练习 7：验证transient与fake target的分工
 
-下一章深入Insets控制与动画：焦点Window怎样得到`InsetsSourceControl`和Surface leash，App调用show/hide或`controlWindowInsetsAnimation()`后，客户端怎样同步布局Insets、逐帧移动栏/IME，并把最终可见性回报WMS。
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+POLICY="$ROOT/frameworks/base/services/core/java/com/android/server/wm/InsetsPolicy.java"
+STATE="$ROOT/frameworks/base/services/core/java/com/android/server/wm/InsetsStateController.java"
+grep -n 'source.setVisible(false)' "$POLICY"
+grep -n 'getFakeControlTarget' "$POLICY"
+grep -n 'mDummyControlTarget' "$POLICY"
+grep -n 'onControlFakeTargetChanged' "$STATE"
+grep -n 'new InsetsSourceControl(source.getType(), null' "$ROOT/frameworks/base/services/core/java/com/android/server/wm/InsetsSourceProvider.java"
+```
+
+最后一行确认 fake control 没有 leash；它传递的是意图通道，不是 surface 操作能力。
+
+### 练习 8：串起服务端到ViewRoot的异步回调
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+WINDOW="$ROOT/frameworks/base/services/core/java/com/android/server/wm/WindowState.java"
+VIEWROOT="$ROOT/frameworks/base/core/java/android/view/ViewRootImpl.java"
+AIDL="$ROOT/frameworks/base/core/java/android/view/IWindow.aidl"
+grep -n 'void insetsChanged' "$AIDL"
+grep -n 'mClient.insetsChanged(getInsetsState())' "$WINDOW"
+grep -n 'MSG_INSETS_CHANGED' "$VIEWROOT"
+grep -n 'mInsetsController.onStateChanged' "$VIEWROOT"
+grep -n 'dispatchApplyWindowInsets(insets)' "$VIEWROOT"
+```
+
+这条练习刻意保留 Binder callback、Handler message、controller 接纳和 View 派发四个节点。
+
+### 练习 9：确认客户端三份State与反向请求链
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+CONTROLLER="$ROOT/frameworks/base/core/java/android/view/InsetsController.java"
+HOST="$ROOT/frameworks/base/core/java/android/view/ViewRootInsetsControllerHost.java"
+SESSION="$ROOT/frameworks/base/services/core/java/com/android/server/wm/Session.java"
+grep -n 'mState = new InsetsState()' "$CONTROLLER"
+grep -n 'mLastDispatchedState = new InsetsState()' "$CONTROLLER"
+grep -n 'mRequestedState = new InsetsState()' "$CONTROLLER"
+grep -n 'mHost.onInsetsModified(mRequestedState)' "$CONTROLLER"
+grep -n 'mWindowSession.insetsModified' "$HOST"
+grep -n 'windowState.updateRequestedInsetsState(state)' "$SESSION"
+```
+
+若只看 `mState`，就会漏掉“服务端最后说了什么”和“客户端准备请求什么”这两个比较基准。
+
+## 16. 用四份State和分层完成点收束排查
+
+读这条链时，可以先画四列：
+
+| 证据列 | 首选观察点 | 典型问题 |
+| --- | --- | --- |
+| raw | `InsetsStateController.getRawInsetsState()` / dump | 提供窗口 frame、server/client visible 是否正确 |
+| dispatch | `WindowState.getInsetsState()` | fixed rotation、provider 自排除、floating、above-IME、transient 是否改变目标视图 |
+| client | `InsetsController.mLastDispatchedState` 与 `mState` | consumer、本地 requested visibility、caption 是否造成差异 |
+| View | `dispatchApplyInsets()` 的最终 `WindowInsets` | cutout consume、View 传播与消费是否改变结果 |
+
+最后保留十条精确结论：
+
+1. Source frame 是屏幕坐标矩形，WindowInsets 是它相对目标 frame 折出的单边厚度。
+2. 20 个 internal type 会多对一映射到 public type；top/bottom gestures 在 r48 直接属于 mandatory gestures。
+3. 同 public type 的几何逐边取 max，不相加；visibility 按遍历顺序覆盖，不做集合逻辑。
+4. caption 在求交前报告顶部高度，IME 在求交后固定报告底部高度，普通悬浮交集通常为 0。
+5. `getSource()` 会补建槽位；`peekSource()` 才是无副作用查询；默认只有 IME 不可见。
+6. Provider 最终 visibility 通常由 serverVisible 与 clientVisible 相与；只要 backing Window 的 `providesInsetsTypes` 含 IME，它背后的 Source 都会走 mirrored 例外。
+7. 逐窗口结果不保证内容相同；无需修饰的普通窗口在 system_server 内甚至可沿用同一个 raw State，命中过滤时才 copy-on-write，之后再由 Parcel 或同进程显式深拷贝隔离。
+8. State recipient、real control target、fake target 与 dummy target 是四个角色；收到 State 不等于拿到 leash。
+9. `IWindow` 调用与 ViewRoot Handler 处理是两个完成点；非 NONE 模式还要安排 traversal、计算 WindowInsets 并向 View 树派发。
+10. “Insets 已更新”必须带层级和完成点，否则无法区分上游生产错误、逐窗口过滤、本地覆盖或 View 消费。
+
+建议的现场顺序是：先确认源码模式与 internal 槽位，再看 Provider 的窗口、frame、server/client visibility；随后对比 raw 与目标 dispatch State；最后进入客户端同时检查 last-dispatched、current、requested 和根 View 实收值。这样可以在第一次出现分叉的层级停下，而不是在应用 padding 处反推整个 WMS。
+
+下一章进入 `InsetsSourceControl`、show/hide 与 `WindowInsetsAnimation` 控制链，重点拆开 control 获取、leash 可用、请求可见性回传、每帧 surface 参数、动画 finish/cancel 和服务端最终 State 收敛这些完成点。

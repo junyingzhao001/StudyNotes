@@ -1,57 +1,66 @@
-# 239 Android系统拖放、DragState、DragEvent跨窗口分发与URI权限链
+# 239 Android 系统拖放：DragState、DragEvent 跨窗口分发与 URI 权限链
 
 > 源码版本：Android 11 / `android-11.0.0_r48`  
-> 学习方式：macOS只读核源，不编译、不运行AOSP
+> 学习方式：macOS 只读核源，不编译、不运行 AOSP
 
-## 1. 本章要解决什么
+## 1. 主问题：一次拖放究竟迁移了什么
 
-上一章看到WMS怎样把当前MotionEvent流迁给Drag专用InputChannel。本章补全业务层：App怎样创建拖影，WMS怎样把原始MOVE转换成跨窗口DragEvent，目标View怎样表达接收意愿，DROP结果和URI权限又怎样安全闭环。
+上一章只回答了 pointer 流怎样从发起窗口转交给 drag InputChannel。本章继续追同一次操作：App 画出的拖影怎样交给 WMS，哪些窗口先得到数据描述，最终命中的 View 怎样拿到 `ClipData`，URI 访问能力又怎样独立建立和释放。
 
-```text
-MotionEvent与DragEvent为什么同时存在？
-local drag与global drag怎样限制接收窗口？
-STARTED返回true为何决定后续资格？
-ENTERED是谁生成的，为什么WMS代码里主要发LOCATION？
-ClipDescription、ClipData和localState分别在何时、发给谁？
-DROP后5秒等什么，是否等输入ANR？
-URI权限何时创建、何时真正grant、怎样release？
-拖影Surface失败时为何返回起点，成功时为何直接消失？
-```
+先把“拖放”拆成四本账：
 
-## 2. 一句总纲
+| 账本 | 记录什么 | 关键完成点 |
+|---|---|---|
+| 输入控制账 | 当前 pointer 流由哪个 `InputChannel` 接收 | `transferTouchFocus()` 改写路由并为新连接补事件 |
+| 窗口通知账 | 哪些 `WindowState` 已由 WMS 发出 `ACTION_DRAG_STARTED` | 加入 `mNotifiedWindows` |
+| View 兴趣账 | 一个窗口内哪些 View 对 STARTED 返回 `true` | `mChildrenInterestedInDrag` 与 `PFLAG2_DRAG_CAN_ACCEPT` |
+| 数据能力账 | DROP 数据、URI grant、结果回报与资源回收 | `take*()`、`reportDropResult()`、`closeLocked()` 各自收敛 |
 
-Android拖放是两条链协作：
+这四本账不会自动等价。WMS 向一个窗口发过 STARTED，不代表该窗口内已有 View 接受；View 对 DROP 返回 `true`，也不代表数据已经复制或 URI 权限已经持久化；`finishInputEvent()` 更不代表拖放业务结束。
+
+全章的主问题是：
 
 ```text
-控制链：当前MotionEvent经transferTouchFocus进入system_server DragInputEventReceiver
-→ MOVE更新拖影与命中窗口，UP/手写笔按钮释放触发DROP
-
-业务链：WMS向合格窗口广播STARTED
-→ 当前窗口收LOCATION/EXITED，View层合成ENTERED
-→ 目标收DROP并回报consumed
-→ 所有已通知窗口收ENDED(result)
+一条正在进行的 pointer 流，怎样被转换为跨窗口 DragEvent 协议，
+并在窗口资格、View 兴趣、DROP 回报和 URI 授权彼此独立的条件下结束？
 ```
 
-ClipData只在最终DROP交给目标，跨应用URI访问还要目标显式take权限。
+## 2. 两种事件、三道门与全链路
 
-## 3. 总体链路
+拖放同时存在两种事件：
 
-```mermaid
-flowchart LR
-    V["View.startDragAndDrop"] --> SH["App绘制drag shadow Surface"]
-    SH --> WMS["IWindowSession.performDrag"]
-    WMS --> DS["DragState + 专用InputChannel"]
-    DS --> X["transferTouchFocus"]
-    X --> START["向合格窗口发DRAG_STARTED"]
-    X --> RX["DragInputEventReceiver"]
-    RX -->|"MOVE"| LOC["移动Surface / 命中窗口 / LOCATION"]
-    RX -->|"UP或stylus button release"| DROP["发送DROP"]
-    DROP --> RESULT["目标reportDropResult"]
-    RESULT --> END["成功关闭或失败返回动画"]
-    END --> ALL["向已通知窗口发DRAG_ENDED"]
+- 发起窗口在当前 `TouchState` 中拥有的 pointer 份额转入 system_server 的 drag 专用连接，用来移动拖影、做窗口命中并决定何时尝试 DROP；同一 split 流的其他窗口份额以及 monitor 路径不因这次 transfer 自动消失。
+- `DragEvent` 由 WMS 发给候选 `IWindow`，再由 `ViewRootImpl`、`ViewGroup` 分给 App 的 View 树。
+
+主链如下：
+
+```text
+View.startDragAndDrop()
+  ├─ App 创建并绘制 drag Surface
+  ├─ IWindowSession.performDrag()
+  └─ WMS 创建 DragState
+       ├─ 注册 drag InputChannel / InputWindowHandle
+       ├─ 同步 input window 后 transferTouchFocus()
+       ├─ 向合格窗口发 STARTED，并排队拖影 show/reparent
+       ├─ MOVE：移动 Surface + 窗口级 LOCATION/EXITED
+       └─ UP / CANCEL / stylus-release MOVE：最终重新命中并发 DROP
+                            ├─ View 树返回 consumed
+                            ├─ 可选 take URI permission
+                            └─ reportDropResult()
+                                  ├─ success：直接 close
+                                  └─ failure：动画后 close
+                                             └─ 向已通知窗口逐个发 ENDED
 ```
 
-## 4. 源码地图
+最终目标要连续通过三道门：
+
+1. STARTED 时，`WindowState` 通过 WMS 的 local/global、版本与 profile 筛选。
+2. App 收到 STARTED 后，View 或其子树返回 `true`，建立窗口内部的兴趣集合。
+3. DROP 时，WMS 重新命中一个已通知窗口；该窗口的 View 树再按坐标选择曾接受 STARTED 的目标，并决定 consumed。
+
+第 1 道门不等待第 2 道门的结果，因为 `IWindow` 是 oneway 接口。WMS 后续仍可能向一个“已通知但客户端兴趣集合保持为空”的窗口发 LOCATION 和 DROP；典型的 `ViewGroup` 根不会把 DROP 交给未入选的 child，最后报告 `false`。这项客户端行为不是 WMS 的窗口资格校验结果。
+
+核心源码地图：
 
 ```text
 frameworks/base/core/java/android/view/View.java
@@ -59,8 +68,6 @@ frameworks/base/core/java/android/view/ViewRootImpl.java
 frameworks/base/core/java/android/view/ViewGroup.java
 frameworks/base/core/java/android/view/DragEvent.java
 frameworks/base/core/java/android/view/DragAndDropPermissions.java
-frameworks/base/core/java/android/app/Activity.java
-frameworks/base/core/java/android/view/IWindowSession.aidl
 frameworks/base/services/core/java/com/android/server/wm/Session.java
 frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
 frameworks/base/services/core/java/com/android/server/wm/DragState.java
@@ -68,744 +75,625 @@ frameworks/base/services/core/java/com/android/server/wm/DragInputEventReceiver.
 frameworks/base/services/core/java/com/android/server/wm/DragAndDropPermissionsHandler.java
 ```
 
-## 5. App入口
+## 3. App 入口：数据、阴影与 localState 分三路
 
-`View.startDragAndDrop(ClipData, DragShadowBuilder, localState, flags)`要求View已attach且ViewRoot Surface有效，否则返回false。
-
-旧`startDrag()`只是deprecated包装。
-
-## 6. 四个参数各管什么
+`View.startDragAndDrop(data, shadowBuilder, myLocalState, flags)` 先要求 View 已 attach，且所属 `ViewRootImpl` 的 `Surface` 有效。`data` 非空时，它在出进程前调用：
 
 ```text
-ClipData：最终可交给drop目标的数据
-DragShadowBuilder：提供拖影尺寸、触点和绘制内容
-localState：仅发起进程本地共享的任意对象，不跨Binder
-flags：global、URI read/write/persistable/prefix、opaque等策略
-```
-
-## 7. ClipData出进程前准备
-
-若data非null，调用：
-
-```java
 data.prepareToLeaveProcess((flags & DRAG_FLAG_GLOBAL) != 0)
 ```
 
-它按是否global检查/准备URI等跨进程内容。
+这一步检查和准备 `ClipData` 内的 URI/Intent；它不是 URI grant。`myLocalState` 根本不进入 `performDrag()` 的 Binder 参数，只在成功后写进发起方那个 `ViewRootImpl.mLocalDragState`。因此 r48 的实现边界比“同进程共享”更窄：同一进程的另一个顶层窗口有另一份 ViewRoot，默认仍得到 `null`。
 
-## 8. 拖影尺寸校验
+`DragShadowBuilder` 返回 buffer 尺寸和触点在阴影中的偏移。任一尺寸或偏移为负会抛 `IllegalStateException`，但代码不检查偏移是否落在阴影矩形内。若任一尺寸为零：targetSdk P 之前的兼容模式把宽和高都改成 `1`，P 及以后抛异常。
 
-`onProvideShadowMetrics()`提供shadow size和手指在拖影内的touch point。
+随后 App 创建以当前 ViewRoot Surface 为 parent 的透明 `SurfaceControl`，清空 Canvas，调用 `onDrawShadow()`，再提交 buffer。阴影是 App 主动画出的独立 Surface，不是 WMS 截图。WMS 后面持有 `SurfaceControl`，并通过 transaction 改 position、alpha、scale、visibility 与 parent。
 
-负数直接抛IllegalStateException；零尺寸在兼容开关允许时改为1×1，因为SurfaceControl.Builder不接受零buffer尺寸。
+起点取自 `ViewRootImpl` 保存的最后触点与 source，而不是从调用该 API 的 View 几何中心推导。代码甚至复用了原先装阴影尺寸的 `Point` 来承载最后触点；是否仍是当前活跃触摸，要留给 WMS 和 InputDispatcher 的后续路径判断。
 
-## 9. 拖影在哪里绘制
-
-App进程创建名为`drag surface`的SurfaceControl，初始parent是当前ViewRoot的SurfaceControl。
-
-App lockCanvas、清透明背景、调用`DragShadowBuilder.onDrawShadow()`，再unlockCanvasAndPost提交buffer。
-
-## 10. 拖影不是系统截图
-
-内容由App回调自己画入独立Surface；WMS之后只移动、缩放、改alpha和重挂层级。
-
-这与TaskSnapshot或ViewRoot主窗口buffer是不同Surface。
-
-## 11. 起始坐标来自最后触点
-
-ViewRoot保存最近触摸点与source。发起时调用：
+`performDrag()` 返回非空 token 后，App 才缓存三项：
 
 ```text
-getLastTouchPoint
-getLastTouchSource
+AttachInfo.mDragSurface = Surface 包装
+AttachInfo.mDragToken   = 源端取消 token
+ViewRoot.mLocalDragState = 仅本 ViewRoot 可见的对象
 ```
 
-连同shadow touch point传给WMS。
+返回 `true` 只说明同步的启动调用走到 WMS 成功出口。它不等待其他进程处理 STARTED，不等待目标 View 表态，也不等待拖影像素 present。返回空 token 时，App 销毁本地 `Surface`；WMS 的失败路径则释放自己收到的 `SurfaceControl` 引用，两端引用不能混成一次释放。
 
-## 12. 跨Binder入口
+### 练习 1：划出 App 启动的失败线与所有权线
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'public final boolean startDragAndDrop(ClipData data, DragShadowBuilder shadowBuilder,' frameworks/base/core/java/android/view/View.java
+grep -n -F 'startDragAndDrop called on a detached view.' frameworks/base/core/java/android/view/View.java
+grep -n -F 'startDragAndDrop called with an invalid surface.' frameworks/base/core/java/android/view/View.java
+grep -n -F 'data.prepareToLeaveProcess((flags & View.DRAG_FLAG_GLOBAL) != 0);' frameworks/base/core/java/android/view/View.java
+grep -n -F 'shadowBuilder.onProvideShadowMetrics(shadowSize, shadowTouchPoint);' frameworks/base/core/java/android/view/View.java
+grep -n -F 'if (!sAcceptZeroSizeDragShadow) {' frameworks/base/core/java/android/view/View.java
+grep -n -F '.setName("drag surface")' frameworks/base/core/java/android/view/View.java
+grep -n -F 'shadowBuilder.onDrawShadow(canvas);' frameworks/base/core/java/android/view/View.java
+grep -n -F 'root.getLastTouchPoint(shadowSize);' frameworks/base/core/java/android/view/View.java
+grep -n -F 'token = mAttachInfo.mSession.performDrag(' frameworks/base/core/java/android/view/View.java
+grep -n -F 'mAttachInfo.mDragToken = token;' frameworks/base/core/java/android/view/View.java
+grep -n -F 'root.setLocalDragState(myLocalState);' frameworks/base/core/java/android/view/View.java
+grep -n -F 'surface.destroy();' frameworks/base/core/java/android/view/View.java
+```
+
+按“抛异常、返回 false、token 非空”三类出口整理表格，再说明 App 的 `Surface` 包装、WMS 的 `SurfaceControl` 与 `localState` 分别由谁持有。
+
+## 4. performDrag：身份快照与启动事务
+
+`IWindowSession.performDrag()` 是同步 Binder 调用。`Session` 先清除当前 Binder identity，却把创建 Session 时保存的 `mPid/mUid` 显式传给 `DragDropController`；后续 URI grant 使用的源 UID 不是目标 App 可改写的临时 Binder 身份。
+
+默认 AOSP 流程先在 WMS 锁外调用厂商扩展的 `prePerformDrag()`，再在全局锁内依次拒绝：
 
 ```text
-View
-→ IWindowSession.performDrag
-→ Session.performDrag
-→ DragDropController.performDrag
+扩展回调拒绝
+已有未 closing 的 DragState
+发起 IWindow 找不到对应 WindowState
+发起窗口 cantReceiveTouchInput()
+发起窗口没有 DisplayContent
 ```
 
-Session先保存自身mPid/mUid参数并clearCallingIdentity，WMS仍显式知道来源进程和UID。
+这里没有重新验证“当前 pointer 的 touched window 仍是发起窗口”，源码只留下未完成事项注释。真正的常见校验来自稍后的 `transferTouchFocus()`；而上一章已经证明它的 `true` 也只是弱成功，不能反推两端补事件已经交付。
 
-## 13. App怎样知道启动成功
+控制器创建一个本次 drag token。`DragState` 构造器收到的临时 Binder 立刻被 `mDragState.mToken = dragToken` 覆盖；r48 只有一个 `mToken` 字段，后面还会再次换角色。创建状态后，局部变量 `surface` 被置空，表示后续失败由 `DragState.closeLocked()` 回收，而不是外层 finally 再释放。
 
-WMS成功返回新dragToken；View缓存：
+输入接管成功以后，未设置 `DRAG_FLAG_OPAQUE` 的阴影 alpha 为 `0.7071`，设置后为 `1`。接下来的启动顺序是：
 
 ```text
-mDragSurface
-mDragToken
-ViewRoot.mLocalDragState
+mData = data
+广播 STARTED
+必要时把鼠标图标改为 grabbing
+记录 shadow touch offset
+排队 alpha / position / show / reparentToOverlay（此处未 apply）
+scheduleAnimation
+主动执行一次 notifyLocationLocked(startX, startY)
+返回 dragToken
 ```
 
-token为null则销毁Surface并返回false。
+所以第一条 LOCATION 不需要等待 MOVE；STARTED 还早于拖影属性排队和这次初始命中。跨进程 `dispatchDragEvent()` 是 oneway，别的进程可能在源 App 尚未从 `startDragAndDrop()` 返回时就开始处理 STARTED。
 
-## 14. localState为何不进WMS
+这里还藏着一个 r48 的 transaction 断点。`DragState` 用 `mTransactionFactory.get()` 保存一只独立 transaction；`showInputSurface()` 较早的 `apply(true)` 已提交 input Surface。控制器随后只向同一对象追加拖影的 alpha、position、show 与 reparent，没有调用 `apply()`，也没有把它 merge 到 `callingWin.scheduleAnimation()` 使用的 transaction。`notifyLocationLocked()` 同样不提交。第一条常规 MOVE 在 `notifyMoveLocked()` 追加位置并 `.apply()` 时，才把这些启动属性一起送出；若没有 MOVE，不能从 `performDrag()` 成功返回推导拖影 show 已提交。
 
-`myLocalState`没有作为performDrag参数跨Binder。
+## 5. 专用输入接管：先让 handle 可见，再迁 pointer 流
 
-ViewRoot只在本进程收到DragEvent消息时写入`event.mLocalState = mLocalDragState`；其他进程的ViewRoot没有这份对象，得到null。
-
-## 15. WMS的第一组拒绝条件
+AOSP 默认 `IDragDropCallback.registerInputChannel()` 先执行 `state.register(display)`：
 
 ```text
-扩展回调prePerformDrag拒绝
-已有drag进行中
-发起IWindow无对应WindowState
-窗口不能接收touch input
-没有DisplayContent
+创建名为 drag 的 InputChannel pair
+注册 server channel
+在 WMS Handler Looper 上创建 DragInputEventReceiver
+创建 TYPE_DRAG InputApplicationHandle / InputWindowHandle
+暂停该 Display 的 rotation
+创建全屏 input Surface 并挂 InputWindowInfo
+syncInputWindows().apply(true)
+调用 InputManagerService.transferTouchFocus(source, drag channel)
 ```
 
-任一条件使performDrag返回null并清理尚未接管的Surface。
+同步提交的目的，是让 InputDispatcher 在迁移前先认识目标 channel token；它不是等待硬件合成或客户端处理。drag handle 的 frame 覆盖显示屏、`hasFocus=true`、`canReceiveKeys=false`。注释说空 `touchableRegion` 用来拒绝新触摸，但 `layoutParamsFlags=0` 形成 touch-modal 语义；如第 238 章所见，不能把空 Region 单独当成绝对隔离条件。本章只依赖现有流的显式迁移。
 
-## 16. r48仍有启动竞态TODO
+若 transfer 返回 `false`，`performDrag()` 返回空 token。由于 STARTED 尚未广播，finally 看到 `!isInProgress()`，会逻辑关闭状态、移除 input/drag Surface，并把 channel teardown 投递到正确 Looper。rotation 的恢复因此可能晚于同步返回。
 
-源码明确留下：应验证input是否仍聚焦在发起窗口。
+transfer 返回 `true` 也不证明 drag 客户端已经看到补 `DOWN`。它只允许 WMS 继续建立 STARTED 与视觉状态；Connection 缺失、broken 或 publish 失败等弱成功边界仍沿用上一章结论。
 
-例如请求刚到时闹钟窗口抢到触摸，当前实现依赖后面transfer失败等路径，而不是在这一层完整预判。
+### 练习 2：证明注册、同步、迁移与首个 LOCATION 的顺序
 
-## 17. DragState.mToken按阶段复用
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'return mDragDropController.performDrag(mSurfaceSession, mPid, mUid, window,' frameworks/base/services/core/java/com/android/server/wm/Session.java
+grep -n -F 'final boolean callbackResult = mCallback.get().prePerformDrag(window, dragToken,' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'if (dragDropActiveLocked()) {' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'if (callingWin == null || callingWin.cantReceiveTouchInput()) {' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'final DisplayContent displayContent = callingWin.getDisplayContent();' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'mDragState = new DragState(mService, this, token, surface, flags, winBinder);' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'mDragState.mToken = dragToken;' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'if (!mCallback.get().registerInputChannel(' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'mTransaction = service.mTransactionFactory.get();' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'state.register(display);' frameworks/base/services/core/java/com/android/server/wm/WindowManagerInternal.java
+grep -n -F 'return service.transferTouchFocus(source, state.getInputChannel());' frameworks/base/services/core/java/com/android/server/wm/WindowManagerInternal.java
+grep -n -F 'InputChannel.openInputChannelPair("drag");' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'new DragInputEventReceiver(mClientChannel,' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mDragWindowHandle.layoutParamsFlags = 0;' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mDragWindowHandle.touchableRegion.setEmpty();' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mDisplayContent.getDisplayRotation().pause();' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mTransaction.syncInputWindows();' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mTransaction.apply(true);' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mDragState.broadcastDragStartedLocked(touchX, touchY);' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'transaction.show(surfaceControl);' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'callingWin.scheduleAnimation();' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'mDragState.notifyLocationLocked(touchX, touchY);' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'mTransaction.setPosition(mSurfaceControl, x - mThumbOffsetX, y - mThumbOffsetY).apply();' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+```
 
-`DragDropController`创建并返回源App的`dragToken`，开始阶段把它写入`mToken`，供`cancelDragAndDrop(dragToken)`校验。
+画出两个失败切面：register 前失败和 transfer 返回 `false`。分别写出此时 STARTED、`mDragInProgress`、rotation、两个 channel 与两个 Surface 的状态。
 
-发送DROP后，同一个`mToken`被覆盖为目标`IWindow` token，供`reportDropResult()`校验唯一回报窗口。构造DragState时另传入的临时Binder随即又被dragToken覆盖，在本版没有形成长期独立状态；阅读时应按阶段而不是想象成两个并存字段。
+## 6. STARTED：窗口通知资格不是 View 兴趣
 
-## 18. alpha策略
+`broadcastDragStartedLocked()` 固定起点、缓存 `ClipDescription`、清空通知列表、置 `mDragInProgress=true`，并缓存源 user 的 cross-profile 限制。它遍历发起 `DisplayContent` 的全部窗口，而非只看手指下方窗口。
 
-`DRAG_FLAG_OPAQUE`存在时原始alpha为1；否则使用半透明拖影常量。
+一个窗口先要满足 `isPotentialDragTarget()`：当前可见、未 removed，并且同时有 `InputChannel` 与 `InputWindowHandle`。这里不检查 `FLAG_NOT_TOUCHABLE`，所以某窗口可以收到 STARTED；若该 flag 到最终命中时仍保留，它就不能通过 DROP 的 touchable hit-test。
 
-WMS在overlay层显示拖影时应用alpha。
+然后进入 local/global 分支：
 
-## 19. 建立专用输入接管者
+| flags 与目标 | 是否可继续 |
+|---|---|
+| 非 GLOBAL，目标就是源 `IWindow` | 是 |
+| 非 GLOBAL，同进程另一顶层 `IWindow` | 否 |
+| GLOBAL，目标有 `ActivityRecord` 且 targetSdk ≥ N | 是 |
+| GLOBAL，目标的 `mActivityRecord == null` | 是 |
+| GLOBAL，pre-N App 的其他窗口 | 否 |
+| GLOBAL，pre-N App 恰好就是源 `IWindow` | 是，退回 local binder 相等分支 |
 
-DragState创建InputChannel pair、注册server端、在WMS Handler Looper上建立DragInputEventReceiver，并创建TYPE_DRAG InputWindowHandle。
+最后还要过 profile 门：若源 user 在开始时受 `DISALLOW_CROSS_PROFILE_COPY_PASTE` 限制，只允许相同 userId。这个布尔值只在广播开始时取一次快照，拖动中途的限制变化不会重新计算。
 
-随后按第238章调用transferTouchFocus，从发起窗口接管当前pointer流。
+`IWindow.dispatchDragEvent()` 属于 oneway。调用未立即抛 `RemoteException` 后，WMS 就把窗口加入 `mNotifiedWindows`；这表示 Binder 事务已发出，不表示 App 主线程已经处理，更不表示某个 View 返回 `true`。
 
-## 20. 为什么先同步InputWindow
+拖动期间新出现或变为可见的窗口也可补收 STARTED：InputMonitor 更新窗口时调用 `sendDragStartedIfNeededLocked()`。r48 这条迟到通知路径还额外限制在 default display；整个 `DragState` 的命中也固定在发起 `DisplayContent`，不要把它解释成成熟的跨显示屏拖放。
 
-显示全屏drag input surface后使用`syncInputWindows()`并同步apply，保证InputDispatcher先看到to window，再transfer。
+### 练习 3：手算 STARTED 的窗口资格矩阵
 
-否则目标handle不存在会失败。
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'oneway interface IWindow {' frameworks/base/core/java/android/view/IWindow.aidl
+grep -n -F 'void dispatchDragEvent(in DragEvent event);' frameworks/base/core/java/android/view/IWindow.aidl
+grep -n -F 'mCrossProfileCopyAllowed = !userManager.getUserRestriction(' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mDisplayContent.forAllWindows(w -> {' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'if (mDragInProgress && isValidDropTarget(newWin)) {' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mNotifiedWindows.add(newWin);' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'if (!targetWin.isPotentialDragTarget()) {' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'if ((mFlags & View.DRAG_FLAG_GLOBAL) == 0 || !targetWindowSupportsGlobalDrag(targetWin)) {' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'if (mLocalWin != targetWin.mClient.asBinder()) {' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'return mCrossProfileCopyAllowed ||' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'return targetWin.mActivityRecord == null' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F '|| targetWin.mActivityRecord.mTargetSdk >= Build.VERSION_CODES.N;' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'return isVisibleNow() && !mRemoved' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F '&& mInputChannel != null && mInputWindowHandle != null;' frameworks/base/services/core/java/com/android/server/wm/WindowState.java
+grep -n -F 'if (mInDrag && isVisible && w.getDisplayContent().isDefaultDisplay) {' frameworks/base/services/core/java/com/android/server/wm/InputMonitor.java
+grep -n -F 'mService.mDragDropController.sendDragStartedIfNeededLocked(w);' frameworks/base/services/core/java/com/android/server/wm/InputMonitor.java
+```
 
-## 21. transfer失败必须终止
+沿源码分支列出 local/global、源窗口/其他窗口、M/N target、`mActivityRecord==null`、同 user/跨 user 的有效组合，不把四个二元维度机械压成八组。特别解释为什么“GLOBAL 排除全部 pre-N 窗口”比源码更强。
 
-无法迁移时WMS记录错误并返回null，finally关闭未进入progress的DragState。
+## 7. Motion 控制链：DOWN 被忽略，CANCEL 却会尝试 DROP
 
-它不会让拖影开始移动而Motion仍送给App。
+`DragInputEventReceiver` 在 WMS Handler Looper 上处理迁移后的输入。非 `MotionEvent`、非 pointer source 或已 `mMuteInput` 的事件直接返回，但 finally 仍调用 `finishInputEvent(event, handled)`。
 
-## 22. STARTED广播何时发生
+动作矩阵如下：
 
-接管成功、保存ClipData后，DragState调用`broadcastDragStartedLocked(touchX,touchY)`遍历Display全部窗口。
+| Motion action | receiver 行为 | WMS 行为 |
+|---|---|---|
+| `DOWN` | 记日志后返回 | 不移动、不 DROP |
+| `MOVE` | 通常继续；若检测到 stylus 主按钮释放则 mute | `notifyMoveLocked()` 或最终 `notifyDropLocked()` |
+| `UP` | mute | 最终重新命中并尝试 DROP |
+| `CANCEL` | mute | 同样尝试 DROP，不直接走 cancel animation |
+| `POINTER_DOWN/POINTER_UP` 等 | default 返回 | 只 finish，本次不移动也不结束 |
 
-不是只通知当前手指下的窗口。
+这里的 `CANCEL` 语义反直觉：`handleMotionEvent(false, x, y)` 与 UP 共用 `notifyDropLocked()`。如果最终位置命中合格窗口，仍会尝试发 `ACTION_DROP`；命中失败、DROP 派发立即抛错、目标返回 false 或 5 秒未回报都会进入失败结束。
 
-## 23. 哪些窗口有资格收STARTED
+stylus 分支还有一个跨章边界。receiver 在 switch 前用“第一条收到的事件”记录主按钮是否按下；正常 transfer 给全新的 drag Connection 合成的第一条通常是 `DOWN`，而 r48 的补 DOWN 把 `buttonState` 写成中性值 `0`。因此典型路径会把 `mStylusButtonDownAtStart` 记为 false，不能仅凭 receiver 中的按钮释放分支断言该功能在每次 transfer 后都会触发。这是结合第 238 章合成字段得出的实现推论。
 
-必须：
+`getRawX()/getRawY()` 提供 WMS 命中的显示坐标。多指的 POINTER 动作没有选择某个拖拽 pointer 的逻辑；后续 MOVE 使用事件的 raw 坐标，不能把这段实现描述成按显式 pointerId 跟踪。
+
+### 练习 4：构造 receiver 动作表并验证 stylus 起始快照
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'if (!(event instanceof MotionEvent)' frameworks/base/services/core/java/com/android/server/wm/DragInputEventReceiver.java
+grep -n -F '|| (event.getSource() & SOURCE_CLASS_POINTER) == 0' frameworks/base/services/core/java/com/android/server/wm/DragInputEventReceiver.java
+grep -n -F 'if (mIsStartEvent) {' frameworks/base/services/core/java/com/android/server/wm/DragInputEventReceiver.java
+grep -n -F 'mStylusButtonDownAtStart = isStylusButtonDown;' frameworks/base/services/core/java/com/android/server/wm/DragInputEventReceiver.java
+grep -n -F 'case ACTION_DOWN:' frameworks/base/services/core/java/com/android/server/wm/DragInputEventReceiver.java
+grep -n -F 'case ACTION_MOVE:' frameworks/base/services/core/java/com/android/server/wm/DragInputEventReceiver.java
+grep -n -F 'if (mStylusButtonDownAtStart && !isStylusButtonDown) {' frameworks/base/services/core/java/com/android/server/wm/DragInputEventReceiver.java
+grep -n -F 'case ACTION_UP:' frameworks/base/services/core/java/com/android/server/wm/DragInputEventReceiver.java
+grep -n -F 'case ACTION_CANCEL:' frameworks/base/services/core/java/com/android/server/wm/DragInputEventReceiver.java
+grep -n -F 'mDragDropController.handleMotionEvent(!mMuteInput /* keepHandling */, newX, newY);' frameworks/base/services/core/java/com/android/server/wm/DragInputEventReceiver.java
+grep -n -F 'finishInputEvent(event, handled);' frameworks/base/services/core/java/com/android/server/wm/DragInputEventReceiver.java
+grep -n -F 'synthesizePointerDownEventsForConnectionLocked(toConnection);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F '0 /*buttonState*/, MotionClassification::NONE,' frameworks/native/services/inputflinger/dispatcher/InputState.cpp
+```
+
+分别推导 synthetic DOWN→MOVE、DOWN→CANCEL、POINTER_DOWN→MOVE 三条路径。说明每条 Motion 的 `handled`、`mMuteInput`、是否移动 Surface、是否进入 DROP。
+
+## 8. WMS 窗口命中：LOCATION 与 DROP 使用两次选择
+
+`notifyMoveLocked()` 先更新 `mCurrentX/Y`，用一次 Surface transaction 移动拖影，再调用 `notifyLocationLocked()`。拖影视觉移动不依赖 App 是否处理 LOCATION。
+
+LOCATION 的窗口级算法是：
 
 ```text
-WindowState是potential drag target
-满足local/global范围
-满足跨profile策略
+DisplayContent.getTouchableWinAtPointLocked(x, y)
+→ 若该窗口不在 mNotifiedWindows，把命中视为空
+→ 与旧 mTargetWindow 不同：向旧窗口发 EXITED
+→ 新目标非空：向新窗口发 LOCATION
+→ 无论 Binder 分发是否抛错，最后更新 mTargetWindow
 ```
 
-只有实际发送成功的窗口加入`mNotifiedWindows`。
+WMS 的 touchable hit-test 要求窗口可见、没有 `FLAG_NOT_TOUCHABLE`、点在 visible bounds 内；点在 `touchableRegion` 内，或者窗口同时没有 `FLAG_NOT_FOCUSABLE/FLAG_NOT_TOUCH_MODAL` 时也可命中。后一个 touch-modal 分支解释了为什么 Region 不是唯一边界。
 
-## 24. local drag范围
+旧目标的 EXITED 以 `(0,0)` 作为传给 `obtainDragEvent()` 的占位输入，但 helper 仍调用 `translateToWindowX/Y()`；最终数值未必是零，而且 `DragEvent` 契约本就规定 EXITED 坐标无效。正确说法是“不可读取”，而不是“固定为零”。
 
-没有`DRAG_FLAG_GLOBAL`时，只允许`mLocalWin == target.mClient.asBinder()`。
+EXITED 与 LOCATION 包在同一个 `try` 中：若给旧窗口发 EXITED 立即抛 `RemoteException`，本次不会继续给新窗口发 LOCATION，但 `mTargetWindow` 仍改成新窗口。WMS 没有为这类 oneway 投递缺口回滚目标账。
 
-也就是拖放限定发起顶层窗口；同进程其他顶层窗口也不会仅因同PID自动获得资格。
+UP/CANCEL 到来时，`notifyDropLocked()` 不信任上一帧 `mTargetWindow`，而是按最终坐标重新调用同一个窗口 hit-test，再检查 `mNotifiedWindows`。它不会先调用 `notifyLocationLocked()`，也不会依据旧 `mTargetWindow` 补窗口 EXITED：UP 若跨到另一窗口，新窗口可以直接收到 DROP，旧窗口随后只等 ENDED。无有效窗口时不发 DROP，也不设置 5 秒回报消息，只把结果置 false 并开始失败结束。
 
-## 25. global drag版本门
+### 练习 5：画出跨两个窗口的命中与投递
 
-global drag目标限定：
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'void notifyMoveLocked(float x, float y) {' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mTransaction.setPosition(mSurfaceControl, x - mThumbOffsetX, y - mThumbOffsetY).apply();' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'WindowState touchedWin = mDisplayContent.getTouchableWinAtPointLocked(x, y);' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'if (touchedWin != null && !isWindowNotified(touchedWin)) {' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'DragEvent.ACTION_DRAG_EXITED,' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'DragEvent.ACTION_DRAG_LOCATION,' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mTargetWindow = touchedWin;' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'final WindowState touchedWin = mDisplayContent.getTouchableWinAtPointLocked(x, y);' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'if (!isWindowNotified(touchedWin)) {' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'final DragEvent evt = obtainDragEvent(touchedWin, DragEvent.ACTION_DROP, x, y,' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'final float winX = win.translateToWindowX(x);' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'if ((flags & FLAG_NOT_TOUCHABLE) != 0) {' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+grep -n -F 'return mTmpRegion.contains(x, y) || touchFlags == 0;' frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java
+```
+
+设 A、B 已通知，C 是覆盖其上的未通知窗口。推导 A→B、B→C、最终在 A DROP 三步的 `mTargetWindow`、EXITED/LOCATION/DROP；再加入“给旧窗口发 EXITED 立即失败”的分支。
+
+## 9. View 树：STARTED 返回值只建立客户端兴趣
+
+`ViewRootImpl.W` 收到 oneway `DragEvent` 后把它投递到 UI Handler。LOCATION 使用独立消息号，并在入队前移除尚未处理的旧 LOCATION，因此高频 MOVE 可以逐帧移动服务端 Surface，而 App 只观察到合并后的较新位置。
+
+LOCATION/DROP 的有效坐标会连续变换：receiver 的 raw display 坐标先由 `WindowState.translateToWindowX/Y()` 转成窗口坐标，ViewRoot 再应用 compatibility translator 与 `mCurScrollY`，每层 ViewGroup 最后变换到目标 child 的局部坐标。STARTED 也有有效 x/y，但 ViewRoot 不走 compatibility/scroll 分支；ViewGroup 仍会在 `notifyChildOfDragStart()` 中用 `transformPointToViewLocal()` 逐层换成 child 局部坐标。因此 STARTED 与后续 LOCATION/DROP 不能笼统写成同一条变换链。
+
+Handler 在进入 `handleDragEvent()` 前，把本 ViewRoot 的 `mLocalDragState` 写入事件。STARTED 缓存 `ClipDescription`；后续 LOCATION、ENTERED、EXITED、DROP 由客户端补回这份 description，ENDED 则清空。
+
+STARTED 在 `ViewGroup` 内递归发给当时可见的 children 和容器自身。返回 `true` 的 child 进入 `mChildrenInterestedInDrag` 并带上 `PFLAG2_DRAG_CAN_ACCEPT`。拖动中新增或刚变为 visible 的 child，可利用缓存的 STARTED 补做一次兴趣判断。
+
+LOCATION/DROP 到来时，每层 `ViewGroup` 按 children 数组从末项向首项寻找：
 
 ```text
-系统窗口（无ActivityRecord）
-或targetSdk >= Android N的应用窗口
+曾接受 STARTED
++ 变换后的坐标落在 child 内
+→ 数组逆序遇到的第一个 droppable child
 ```
 
-旧target应用不会被强行纳入新全局拖放协议。
+这个 helper 没有采用 touch 分发的 Z/custom drawing order 预排序，也不重新检查 visibility；已接受 STARTED 后才变为 invisible 的 child 仍可能命中。因此方法名里的 frontmost 不能扩大成严格的视觉最上层。找不到 child 而容器自身接受过 STARTED 时，容器可成为目标。移除的 View 不再位于树中，即使它早先收过 STARTED，也不保证能收到 ENDED。
 
-## 26. 跨profile限制
+N 及以后，最终 `View.dispatchDragEvent(LOCATION/DROP)` 在调用业务 handler 前执行 `ViewRootImpl.setDragFocus()`：旧 View 收 EXITED、新 View 收 ENTERED，二者坐标设为无效占位且 `ClipData=null`。pre-N 进程使用 `sCascadedDragDrop`，由 `ViewGroup` 维持整条父子包含链的 enter/exit 兼容状态。
 
-源User若被`DISALLOW_CROSS_PROFILE_COPY_PASTE`限制，只能向相同userId窗口拖放。
+`OnDragListener` 在 View enabled 时先执行；若返回 `true`，不再调用 `onDragEvent()`，否则继续调用后者。STARTED 的 `true` 建立兴趣，DROP 的实际目标返回值成为最终 consumed，其他 action 的返回值不承担最终业务结果。N 及以后，命中 child 只要调用过 handler，父 ViewGroup 就不再 fallback，即使 child 返回 false；pre-N 兼容分支才用 child 的 boolean 决定是否继续交给父级，不能把结果描述成父子返回值简单 OR。
 
-判断发生在STARTED资格阶段，未授权profile窗口不会进入notified集合。
+在非直接窗口 EXITED 的普通分发分支中，dispatch 前后的 `mCurrentDragView` 若改变，ViewRoot 会调用 `dragRecipientExited/Entered(IWindow)`；r48 AOSP 服务端方法只做可选日志，不用它重算 WMS 的窗口级目标。WMS 直接发来的 `ACTION_DRAG_EXITED` 走另一分支，只执行 `setDragFocus(null, event)`，不会调用这两个 Session 方法。窗口目标与 View focus 是两层独立状态。
 
-## 27. STARTED带什么
+### 练习 6：证明窗口资格与 View 兴趣不回传
 
-WMS发送：
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'if (event.getAction() == DragEvent.ACTION_DRAG_LOCATION) {' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'mHandler.removeMessages(what);' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'event.mLocalState = mLocalDragState;' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'mDragDescription = event.mClipDescription;' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'event.mClipDescription = mDragDescription;' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'if ((what == DragEvent.ACTION_DRAG_LOCATION) || (what == DragEvent.ACTION_DROP)) {' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'event.mClipData.prepareToEnterProcess();' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'boolean result = mView.dispatchDragEvent(event);' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'mWindowSession.reportDropResult(mWindow, result);' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'public void setDragFocus(View newDragTarget, DragEvent event) {' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'event.mAction = DragEvent.ACTION_DRAG_EXITED;' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'event.mAction = DragEvent.ACTION_DRAG_ENTERED;' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'transformPointToViewLocal(point, child);' frameworks/base/core/java/android/view/ViewGroup.java
+grep -n -F 'mChildrenInterestedInDrag = new HashSet<View>();' frameworks/base/core/java/android/view/ViewGroup.java
+grep -n -F 'if (notifyChildOfDragStart(children[i])) {' frameworks/base/core/java/android/view/ViewGroup.java
+grep -n -F 'View target = findFrontmostDroppableChildAt(event.mX, event.mY, localPoint);' frameworks/base/core/java/android/view/ViewGroup.java
+grep -n -F 'if (!child.canAcceptDrag()) {' frameworks/base/core/java/android/view/ViewGroup.java
+grep -n -F 'li.mOnDragListener.onDrag(this, event)) {' frameworks/base/core/java/android/view/View.java
+grep -n -F 'result = onDragEvent(event);' frameworks/base/core/java/android/view/View.java
+```
+
+以兴趣集合在 DROP 前保持为空的典型 `ViewGroup` 根为例，证明 WMS 为什么仍可能继续向该 `IWindow` 发 LOCATION/DROP，以及最后的 `reportDropResult(false)` 从哪里产生；再说明普通叶子 View 作为根时为何不能仅凭 WMS 代码推导同一结果。
+
+## 10. DROP：数据只给最终窗口，description 由客户端补回
+
+WMS 的跨进程事件内容并不相同：
+
+| action | WMS 携带的内容 | ViewRoot 补充/处理 |
+|---|---|---|
+| STARTED | 窗口局部 x/y、`ClipDescription` | 缓存 description，注入本 root 的 localState |
+| LOCATION | 窗口局部 x/y | 补 description，可能被消息合并 |
+| 窗口级 EXITED | 坐标无效，其他内容空 | 清 View focus，并由客户端补 description |
+| DROP | 窗口局部 x/y、完整 `ClipData`、可选 permission Binder | `prepareToEnterProcess()`，补 description，再分发 View 树 |
+| ENDED | 最终 result；失败时源 PID 窗口另带当前显示坐标 | 清客户端状态；description 为空 |
+
+`notifyDropLocked()` 在 dispatch 前取得最终窗口的 owning user/package。若 source user 与 target user 不同，它对 `mData.fixUris(mSourceUserId)`，把数据里的 URI 标出来源 user；这发生在 DROP，不发生在 STARTED。
+
+DROP 发给的是进程边界上的最终窗口，而不是“最终返回 true 的 View”才取得数据。目标 View 可以读取数据、请求 URI grant，然后仍返回 false；WMS 的 `mDragResult` 与权限生命周期没有自动绑定。
+
+`ViewRootImpl` 在 UI 线程同步分发整个 View 树，拿到根返回值后通过同步的 `IWindowSession.reportDropResult(mWindow, result)` 回到 WMS。`true` 只表示这次 View 处理声明消费，不证明文件落盘、数据库提交、远端上传或 URI 权限持久化。
+
+## 11. URI 能力：permission Binder 不是已经授权
+
+WMS 创建 `DragAndDropPermissionsHandler` 必须同时满足：
 
 ```text
-ACTION_DRAG_STARTED
-窗口局部坐标
-ClipDescription
-不带ClipData
-不带URI permission handler
-result=false
+DRAG_FLAG_GLOBAL
++ READ 或 WRITE 至少一位
++ ClipData 非空
 ```
 
-目标可以看MIME描述决定是否感兴趣，却还拿不到实际数据。
+`PERSISTABLE` 与 `PREFIX` 只加入 mode，本身不能触发 handler。构造器递归收集 item URI、Intent data 与嵌套 ClipData URI，但不检查列表是否为空；因此 permission Binder 非空甚至不能证明 `ClipData` 真含 URI。
 
-## 28. 为什么STARTED不带ClipData
-
-Display上可能有许多候选窗口；过早广播完整数据会扩大敏感内容暴露面。
-
-真正ClipData只在最终DROP发给命中且有资格的窗口。
-
-## 29. 新出现窗口也可能收STARTED
-
-拖拽期间某Window后来变为可见，WMS调用`sendDragStartedIfNeededLocked()`。
-
-只有未在`mNotifiedWindows`且仍满足资格才补发，结束后绝不再发STARTED。
-
-## 30. DragInputEventReceiver只处理pointer Motion
-
-非Motion、非SOURCE_CLASS_POINTER或已经mute的事件不处理，但finally仍`finishInputEvent()`。
-
-这条专用Channel不处理KeyEvent业务。
-
-## 31. transfer补来的DOWN为何“unexpected”
-
-第238章transfer会给新Connection补ACTION_DOWN，以维持协议。
-
-DragInputEventReceiver看到DOWN只写debug warning并返回；拖拽已经由performDrag的起始坐标初始化，不需把这个补DOWN再当MOVE。
-
-## 32. MOVE怎样驱动拖拽
-
-Receiver读取rawX/rawY，调用：
-
-```text
-handleMotionEvent(true,x,y)
-→ DragState.notifyMoveLocked
-```
-
-后者移动拖影Surface到`x-thumbOffsetX,y-thumbOffsetY`并执行窗口命中。
-
-## 33. UP怎样结束输入阶段
-
-ACTION_UP把`mMuteInput=true`，调用`handleMotionEvent(false,x,y)`，进而`notifyDropLocked()`。
-
-之后即使清理消息尚未执行，Receiver也不再重复驱动drag。
-
-## 34. stylus按钮释放也可DROP
-
-若首个观察事件中stylus primary button按下，之后MOVE发现按钮释放，也把mMuteInput设true并以当前坐标触发DROP。
-
-不必等待触笔离开屏幕的UP。
-
-## 35. CANCEL的r48行为
-
-ACTION_CANCEL也mute并调用`handleMotionEvent(false,x,y)`。
-
-从代码结果看它进入`notifyDropLocked()`，不是独立`cancelDragLocked()`；是否找到合格窗口决定后续DROP/失败结束。这一点应按源码而非凭“CANCEL必然无DROP”的直觉理解。
-
-## 36. 两层事件的关系
-
-```mermaid
-flowchart TD
-    M["MotionEvent: DOWN/MOVE/UP/CANCEL"] --> R["DragInputEventReceiver"]
-    R -->|"MOVE"| S["移动drag Surface"]
-    R -->|"raw坐标"| HIT["WMS窗口级命中"]
-    HIT --> DE["IWindow.dispatchDragEvent"]
-    DE --> ROOT["ViewRootImpl.handleDragEvent"]
-    ROOT --> VG["ViewGroup按子View命中"]
-    VG --> VIEW["OnDragListener / View.onDragEvent"]
-```
-
-MotionEvent只在system_server控制拖拽；App候选窗口收到的是DragEvent，不会同时拿原始接管后的MOVE。
-
-## 37. WMS窗口级命中
-
-`notifyLocationLocked(x,y)`调用：
-
-```text
-DisplayContent.getTouchableWinAtPointLocked
-```
-
-如果命中窗口没收过STARTED，就当作空区域，不发送LOCATION。
-
-## 38. 离开旧窗口
-
-新命中窗口与`mTargetWindow`不同且旧目标非null时，WMS向旧窗口直接发送ACTION_DRAG_EXITED，坐标为0。
-
-这是窗口边界退出，不是每个子View的完整enter/exit算法。
-
-## 39. 进入新窗口WMS发什么
-
-WMS直接向新窗口发ACTION_DRAG_LOCATION，并在末尾把它记为mTargetWindow。
-
-它没有在这段代码先发窗口级ACTION_DRAG_ENTERED；View级ENTERED由客户端层根据drag focus变化形成。
-
-## 40. 坐标转换两次
-
-WMS `obtainDragEvent()`先把Display坐标经WindowState翻译为窗口坐标。
-
-ViewRoot还考虑Compatibility Translator、scrollY，ViewGroup继续转换为目标子View局部坐标。
-
-## 41. ViewRoot收到哪些根事件
-
-注释概括：root主要接收start/end/location；window boundary exited也可由WMS直接到达。
-
-entered/exited的View层级细节由ViewGroup与`setDragFocus()`决定。
-
-## 42. STARTED返回true为何关键
-
-ViewGroup向可见children分发STARTED，并把返回true的View放入`mChildrenInterestedInDrag`。
-
-未表示兴趣的分支不会成为LOCATION/DROP目标，但已感兴趣者最终都会得到ENDED。
-
-## 43. Listener与onDragEvent优先级
-
-View先调用启用状态下的OnDragListener；若listener返回true，就不再调用`onDragEvent()`。
-
-listener不存在、View disabled或listener返回false时，再调用View.onDragEvent。
-
-## 44. View怎样标记可接受
-
-STARTED处理结果影响`PFLAG2_DRAG_CAN_ACCEPT`等私有状态，drawable state也随ENTERED/EXITED/ENDED刷新。
-
-这既控制路由也允许控件呈现可放置高亮。
-
-## 45. ViewGroup怎样找当前目标
-
-LOCATION/DROP时调用`findFrontmostDroppableChildAt()`，从前到后寻找坐标下且曾接受STARTED的子View。
-
-找不到child但ViewGroup自身感兴趣时，可由ViewGroup接收。
-
-## 46. ENTERED/EXITED怎样生成
-
-目标View变化时，`setDragFocus()`及兼容分发逻辑向旧View发EXITED、向新View发ENTERED。
-
-ENTERED/EXITED不带有效位置，代码暂时把x/y设0、ClipData设null，再恢复原LOCATION/DROP内容。
-
-## 47. Android N前后的层级兼容
-
-pre-N应用采用cascaded enter/exit，保持整个包含层级的hover状态。
-
-N及以后主要让最内层实际目标处于entered状态，父子传播规则不同；源码保留兼容分支。
-
-## 48. App进程向WMS报告View焦点变化
-
-ViewRoot发现`mCurrentDragView`变化时，通过WindowSession调用：
-
-```text
-dragRecipientExited(window)
-dragRecipientEntered(window)
-```
-
-r48 WMS对应方法主要debug记录，并不据此重新决定DROP目标；DROP仍由WMS窗口命中。
-
-## 49. DROP目标重新命中
-
-UP时`notifyDropLocked()`再次用最终x/y寻找touchable WindowState，而不是无条件使用上一帧mTargetWindow。
-
-它还要求目标在mNotifiedWindows中。
-
-## 50. 无有效DROP目标
-
-若目标没收过STARTED：
-
-```text
-mDragResult=false
-立即endDragLocked
-```
-
-没有接收窗口，所以也不建立5秒DROP结果timeout。
-
-## 51. DROP带什么
-
-```text
-ACTION_DROP
-目标窗口局部坐标
-完整ClipData
-必要时IDragAndDropPermissions
-ClipDescription由ViewRoot缓存补回
-```
-
-目标进程先`ClipData.prepareToEnterProcess()`再分发View树。
-
-## 52. 跨User URI修正
-
-sourceUserId与targetUserId不同时，WMS调用`mData.fixUris(sourceUserId)`，为URI加入正确user语义。
-
-这发生在DROP前，不是STARTED广播时。
-
-## 53. 何时创建permission handler
-
-必须同时满足：
-
-```text
-GLOBAL drag
-flags含URI read/write/persistable/prefix访问位
-ClipData非null
-```
-
-否则DROP的permissions对象为null。
-
-## 54. 创建handler不等于已经grant
-
-构造器只收集ClipData中的URI并记录sourceUid、targetPackage、mode、source/target user。
-
-真正授权要目标App显式调用take或takeTransient。
-
-## 55. Activity绑定权限
-
-目标Activity调用：
-
-```java
-requestDragAndDropPermissions(dropEvent)
-```
-
-包装IDragAndDropPermissions并`take(activityToken)`，系统查Activity对应permission owner后逐URI授权。
-
-## 56. Activity权限生命周期
-
-授权绑定Activity permission owner；Activity销毁时相应grant可随owner撤销。
-
-应用也可显式调用`DragAndDropPermissions.release()`提前释放。
-
-## 57. transient权限
-
-`takeTransient()`新建名为`drop`的URI permission owner，并把本地transient Binder linkToDeath。
-
-调用者必须release；进程死亡时binderDied也会release，避免永久泄漏。
-
-## 58. grant怎样保持来源身份
-
-Handler清除当前Binder identity后调用UriGrantsManager：
+handler 在跨 user 的 `fixUris()` 之前收集原始 URI，同时保存独立的 `sourceUserId/targetUserId`。真正 grant 时，服务端显式传入：
 
 ```text
 permissionOwner
 sourceUid
 targetPackage
-URI、mode
-sourceUserId、targetUserId
+Uri + mode
+sourceUserId + targetUserId
 ```
 
-不能由目标App自行把任意URI声明成来自源UID。
+目标不能借当前 Binder identity 把任意 URI 伪装成源 App 数据。handler 在调用 `UriGrantsManager` 前清 identity，但授权来源仍由 performDrag 时保存的 `sourceUid` 限定。
 
-## 59. URI权限链
+获得 permission Binder 后还要显式 take：
 
-```mermaid
-sequenceDiagram
-    participant S as "源App"
-    participant W as "WMS DragState"
-    participant T as "目标App"
-    participant U as "UriGrantsManager"
-    S->>W: "GLOBAL ClipData + URI flags"
-    W->>T: "DROP(ClipData, permission Binder)"
-    T->>W: "take(activityToken) / takeTransient(token)"
-    W->>U: "grant from sourceUid to targetPackage"
-    U-->>T: "URI read/write能力生效"
-    T->>W: "release 或 token死亡"
-    W->>U: "revoke from permission owner"
-```
+- `Activity.requestDragAndDropPermissions(event)` 取得包装并调用 `take(activityToken)`；ATMS 找到 Activity 对应的 permission owner，Activity 销毁或显式 `release()` 时撤销。
+- 隐藏的 transient 路径创建名为 `drop` 的 owner，并对客户端提供的 token `linkToDeath()`；显式 release 或该 token 死亡时逐 URI revoke。
 
-## 60. DROP返回值怎样上报
+两种 take 共用一次性 guard；已有 Activity token 或 permission owner 时，后续 take 直接返回。AIDL 方法返回 `void`，客户端包装只以是否抛 `RemoteException` 判断 boolean，因此重复 take 的 `true` 不代表新建了第二组 grant。
 
-目标View的OnDragListener/onDragEvent返回boolean，经ViewGroup汇总到ViewRoot。
+逐 URI grant 是循环调用，没有批量事务或显式回滚。更重要的是，`closeLocked()` 不持有这个 handler，也不自动 revoke：目标在 DROP 内 take 后即使返回 false、超时或收到 ENDED，grant 仍按 Activity owner、transient token 或显式 release 的生命周期处理。
 
-ViewRoot收到ACTION_DROP后调用`mWindowSession.reportDropResult(mWindow,result)`。
-
-## 61. 只有DROP窗口能认领结果
-
-WMS发送DROP后把`mToken`改为目标`IWindow.asBinder()`。
-
-reportDropResult若token不匹配，抛IllegalStateException，防止其他已收STARTED窗口冒充成功目标。
-
-## 62. DROP的5秒timeout
-
-发送DROP后WMS以目标window token安排`MSG_DRAG_END_TIMEOUT`，延迟固定5000ms。
-
-它等的是目标窗口通过reportDropResult回报，不是InputDispatcher finished signal。
-
-## 63. 5秒不是普通输入ANR计时器
-
-超时Handler设置`mDragResult=false`并结束drag，源码还留TODO“ANR the drag-receiving app”。
-
-所以r48这里主要保证拖放状态不永久悬挂，并未直接复用第235章完整输入ANR责任链。
-
-## 64. 正确结果会取消timeout
-
-只要正确目标回报，WMS先remove对应timeout，即使随后WindowState查找失败也不让旧timeout误结束其他状态。
-
-## 65. result=false的结果
-
-目标拒绝DROP或timeout，无消费结果；DragState创建return animation，让拖影从当前点回到原始点，同时alpha减半。
-
-动画结束后才close。
-
-## 66. result=true的结果
-
-`endDragLocked()`直接`closeLocked()`，不播放return动画。
-
-拖影Surface解除parent并清理，表示内容被目标接受。
-
-## 67. cancelDragAndDrop安全token
-
-取消调用必须携带本次performDrag返回的dragToken。
-
-无活动drag或token不匹配会抛IllegalStateException，防止旧token取消新drag。
-
-一旦已发送DROP，`mToken`进入“目标窗口回报”阶段并被window token覆盖，此时再用最初dragToken取消也不会匹配；正常流程应等待DROP结果或5秒timeout。
-
-## 68. skipAnimation语义
-
-显式取消可要求跳过cancel animation；未进入progress或skip时直接close，否则播放cancel动画。
-
-已有动画时重复end/cancel直接返回，避免双重结束。
-
-## 69. ENDED发给谁
-
-close时遍历`mNotifiedWindows`，也就是成功收到STARTED的WindowState，向每个发送ACTION_DRAG_ENDED。
-
-并非只发给DROP窗口。
-
-## 70. ENDED的result
-
-`DragEvent.getResult()`在ENDED上表示最终DROP是否被目标消费。
-
-没有发送DROP、目标返回false或timeout均为false。
-
-## 71. 失败坐标只给源进程
-
-若drag失败且被通知窗口与发起者PID相同，ENDED携带最终mCurrentX/Y；其他窗口坐标为0。
-
-这减少向其他进程泄露未消费位置，并允许源App理解返回位置。
-
-## 72. ViewRoot结束清理
-
-收到ENDED后：
-
-```text
-mCurrentDragView=null
-localState=null
-dragToken=null
-release mDragSurface
-```
-
-View/ViewGroup也清除drag hover和interest状态。
-
-## 73. system_server结束清理
-
-```text
-异步在正确Looper销毁DragInputEventReceiver/channel
-恢复鼠标pointer icon
-移除drag input surface
-把拖影SurfaceControl reparent到null
-清空ClipData、token和内部字段
-DragDropController.mDragState=null
-```
-
-## 74. 为什么InputChannel teardown异步
-
-InputEventReceiver要求在创建/处理它的线程dispose，以避免Looper/fd竞态。
-
-close只发`MSG_TEAR_DOWN_DRAG_AND_DROP_INPUT`，Handler再执行interceptor.tearDown。
-
-## 75. Surface release的两端
-
-App持有Surface包装并在ENDED释放；WMS持有SurfaceControl引用并在close解除层级。
-
-两端引用生命周期不同，不能把一次release理解为底层对象立即从所有进程消失。
-
-## 76. 常见误解一：DragEvent就是MotionEvent
-
-错误。
-
-Motion控制system_server拖影和命中；DragEvent是WMS发给候选窗口/View树的业务协议。
-
-## 77. 常见误解二：所有窗口一开始拿到ClipData
-
-错误。
-
-STARTED只带ClipDescription；完整data只给最终DROP目标。
-
-## 78. 常见误解三：STARTED返回值无所谓
-
-错误。
-
-返回true建立View兴趣资格，决定后续LOCATION/DROP和最终ENDED分发。
-
-## 79. 常见误解四：WMS直接发每个View的ENTERED
-
-错误。
-
-WMS负责窗口级LOCATION/EXITED；客户端ViewRoot/ViewGroup按子View目标变化生成ENTERED/EXITED。
-
-## 80. 常见误解五：拿到permission Binder就已能读URI
-
-错误。
-
-构造handler只是能力提议；目标必须take，系统才逐URI grant。
-
-## 81. 常见误解六：DROP true等于文件已持久保存
-
-错误。
-
-它只是目标View声明消费；真实数据复制、数据库提交等是目标业务责任，WMS不验证。
-
-## 82. 常见误解七：5秒DROP timeout就是输入ANR
-
-错误。
-
-它是DragDropController自己的结果等待门，r48超时只结束失败drag并留有ANR TODO。
-
-## 83. 常见误解八：CANCEL一定走取消不DROP
-
-按r48 Receiver代码，CANCEL也以`keepHandling=false`进入notifyDropLocked。
-
-需记录实现事实，不能用一般Gesture语义替代这里的特殊状态机。
-
-## 84. 调试检查清单
-
-```text
-1. View是否attached、Surface是否valid
-2. shadow metrics/Canvas绘制是否成功
-3. 是否已有drag、calling Window是否有效
-4. drag InputWindow是否同步、transfer是否成功
-5. 哪些Window进入mNotifiedWindows
-6. global/targetSdk/profile门是否过滤目标
-7. Motion是否被mute、最终动作是UP/CANCEL/stylus release
-8. 最终Window是否收过STARTED
-9. DROP token与report token是否相同
-10. permission是否真正take/release
-11. 5秒timeout是否被取消
-12. ENDED和InputChannel/Surface是否清理
-```
-
-## 85. macOS只读练习一：追App创建拖影
+### 练习 7：闭合 Activity 与 transient 两条 URI 生命周期
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '26326,26415p' frameworks/base/core/java/android/view/View.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'if ((mFlags & View.DRAG_FLAG_GLOBAL) != 0 && (mFlags & DRAG_FLAGS_URI_ACCESS) != 0' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'dragAndDropPermissions = new DragAndDropPermissionsHandler(' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mData.fixUris(mSourceUserId);' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'clipData.collectUris(mUris);' frameworks/base/services/core/java/com/android/server/wm/DragAndDropPermissionsHandler.java
+grep -n -F 'if (mActivityToken != null || mPermissionOwnerToken != null) {' frameworks/base/services/core/java/com/android/server/wm/DragAndDropPermissionsHandler.java
+grep -n -F 'getUriPermissionOwnerForActivity(mActivityToken);' frameworks/base/services/core/java/com/android/server/wm/DragAndDropPermissionsHandler.java
+grep -n -F 'long origId = Binder.clearCallingIdentity();' frameworks/base/services/core/java/com/android/server/wm/DragAndDropPermissionsHandler.java
+grep -n -F 'UriGrantsManager.getService().grantUriPermissionFromOwner(' frameworks/base/services/core/java/com/android/server/wm/DragAndDropPermissionsHandler.java
+grep -n -F 'mPermissionOwnerToken = LocalServices.getService(UriGrantsManagerInternal.class)' frameworks/base/services/core/java/com/android/server/wm/DragAndDropPermissionsHandler.java
+grep -n -F '.newUriPermissionOwner("drop");' frameworks/base/services/core/java/com/android/server/wm/DragAndDropPermissionsHandler.java
+grep -n -F 'mTransientToken.linkToDeath(this, 0);' frameworks/base/services/core/java/com/android/server/wm/DragAndDropPermissionsHandler.java
+grep -n -F 'mTransientToken.unlinkToDeath(this, 0);' frameworks/base/services/core/java/com/android/server/wm/DragAndDropPermissionsHandler.java
+grep -n -F 'ugm.revokeUriPermissionFromOwner(permissionOwner, mUris.get(i), mMode, mSourceUserId);' frameworks/base/services/core/java/com/android/server/wm/DragAndDropPermissionsHandler.java
+grep -n -F 'public void binderDied() {' frameworks/base/services/core/java/com/android/server/wm/DragAndDropPermissionsHandler.java
+grep -n -F 'DragAndDropPermissions dragAndDropPermissions = DragAndDropPermissions.obtain(event);' frameworks/base/core/java/android/app/Activity.java
+grep -n -F 'dragAndDropPermissions.take(getActivityToken())' frameworks/base/core/java/android/app/Activity.java
+grep -n -F 'mDragAndDropPermissions.takeTransient(mTransientToken);' frameworks/base/core/java/android/view/DragAndDropPermissions.java
 ```
 
-标出失败返回、Canvas提交、最后触点、performDrag、token成功缓存和Surface失败销毁。
+分别画出 owner 创建、逐 URI grant、显式 release、Activity 销毁和 transient token 死亡。再回答：目标 take 后返回 `false`，哪段源码会自动 revoke？
 
-## 86. macOS只读练习二：列STARTED资格表
+## 12. DROP 回报：一个 token 字段的两段协议
+
+`DragState.mToken` 在 r48 分两阶段使用：
+
+```text
+DROP 之前：performDrag 返回给源 App 的 dragToken
+            → 只允许源窗口 cancelDragAndDrop(dragToken)
+
+DROP 发出后：最终目标 IWindow.asBinder()
+             → 只允许该窗口 reportDropResult(window, consumed)
+```
+
+成功调用 `dispatchDragEvent(DROP)` 后，WMS 为目标 token 安排 5000 ms 的 `MSG_DRAG_END_TIMEOUT`，然后把 `mToken` 改为目标窗口 token。计时从服务端发出 oneway DROP 后开始，包括目标 Binder 排队和 UI Handler 等待；它不等同于 InputDispatcher 的 publish/finish ANR。
+
+正确目标回报时，控制器先比较参数 `IWindow.asBinder()` 与当前目标 token，再移除 timeout，然后重新用 `windowForClientLocked()` 查当前 `WindowState`。这里有一个明确的 r48 断点：若 token 正确但窗口已经移除，代码在取消 timeout 后直接 return，没有调用 `endDragLocked()`。默认路径会留下仍 active 的 `DragState`、已 mute 的 receiver、Surface 与 rotation pause，也失去 5 秒兜底。
+
+若窗口仍在，`consumed=true` 直接 close；`false` 启动返回动画。错误窗口回报抛 `IllegalStateException`。已无 DragState 的迟到回报只记录并返回。
+
+timeout 处理本身把结果置 false 并调用 `endDragLocked()`，并未走普通输入 ANR 责任链；源码注释仍把对目标 App 做 ANR 归责列为未完成事项。5 秒到达只是开始失败动画，逻辑关闭还要等动画结束。
+
+还有一个窄竞态：timeout 已启动返回动画但 `closeLocked()` 尚未执行时，正确目标的迟到回报仍可把 `mDragResult` 改为 true；`endDragLocked()` 因 `mAnimator != null` 返回，最终 ENDED 可能携带 true，却已经播放了失败返回动画。迟到时点落在 close 之后则因 `mDragState==null` 被忽略。
+
+源 App 的公开 `View.cancelDragAndDrop()` 总是传 `skipAnimation=false`，并在调用后清自己的 token。DROP 已发出时 WMS 的 `mToken` 已换成目标窗口 token，原 dragToken 会校验失败，服务端继续等待 DROP 回报或 timeout。
+
+### 练习 8：推演 token、timeout 与窗口消失竞态
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '350,455p' \
-  frameworks/base/services/core/java/com/android/server/wm/DragState.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'mDragDropController.sendTimeoutMessage(MSG_DRAG_END_TIMEOUT, token);' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mToken = token;' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'private static final long DRAG_TIMEOUT_MS = 5000;' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'if (mDragState.mToken != token) {' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'mHandler.removeMessages(MSG_DRAG_END_TIMEOUT, window.asBinder());' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'WindowState callingWin = mService.windowForClientLocked(null, window, false);' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'if (callingWin == null) {' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'mDragState.mDragResult = consumed;' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'mDragState.endDragLocked();' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'mHandler.sendMessageDelayed(msg, DRAG_TIMEOUT_MS);' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'case MSG_DRAG_END_TIMEOUT: {' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'mDragState.mDragResult = false;' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'if (mDragState.mToken != dragToken) {' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'mDragState.cancelDragLocked(skipAnimation);' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'mAttachInfo.mSession.cancelDragAndDrop(mAttachInfo.mDragToken, false);' frameworks/base/core/java/android/view/View.java
+grep -n -F 'mAttachInfo.mDragToken = null;' frameworks/base/core/java/android/view/View.java
 ```
 
-手算local/global、targetSdk M/N、同/跨profile限制的八种组合。
+画出四条时间线：正常 true、正常 false、正确 token 但 WindowState 已消失、timeout 后动画结束前迟到 true。标出每条线的 `mToken`、timeout 是否存在、`mDragResult` 与 `mDragState`。
 
-## 87. macOS只读练习三：画MOVE到DROP
+## 13. 结束：返回动画、取消动画、ENDED 与异步 teardown
+
+业务结果与动画分三路：
+
+| 入口 | 动画 | 终点 |
+|---|---|---|
+| DROP consumed=true | 无 | 直接 `closeLocked()` |
+| 无目标、DROP false、5 秒 timeout、发送 DROP 立即失败 | return animation | 从当前位置回原点，alpha 降到一半，再 close |
+| 仍 in-progress 且 `skipAnimation=false` 的显式 cancel | cancel animation | 在当前位置缩放到 0、alpha 到 0，再 close |
+| `skipAnimation=true` 或 cancel 时尚未 in-progress | 无 | 直接 close |
+
+公开 View API 不暴露 `skipAnimation=true`。两类动画在 AnimationThread 更新 Surface，结束后发 `MSG_ANIMATION_END` 回 WMS Handler，再在全局锁内 close。
+
+`closeLocked()` 的逻辑顺序是：
+
+```text
+mIsClosing = true
+投递 drag InputChannel teardown，立即清 mInputInterceptor 字段
+向 mNotifiedWindows 中每个窗口发 ENDED(result)
+恢复 mouse pointer icon
+移除 input Surface
+把 drag Surface reparent 到 null
+清 ClipData/token/flags/list
+DragDropController.mDragState = null
+```
+
+ENDED 面向 WMS 已通知窗口，不只面向 DROP 窗口；死亡 Binder 仍可能让某次发送失败。窗口内部则由 ViewGroup 转发给仍在兴趣集合、仍在树中的 View。结果失败时，WMS 为 `ws.mSession.mPid == 源 pid` 的已通知窗口填入 `mCurrentX/Y`，为其他进程窗口填零；这不是只按源 `IWindow` 判断。WMS 对 ENDED 直接 `DragEvent.obtain()`，没有做窗口坐标翻译，因此这组失败坐标是实现私有信息，不应当作普通 ENDED 的有效局部坐标。
+
+InputChannel 并未在 `closeLocked()` 内立即 dispose。Handler 稍后 unregister server channel、dispose receiver 和两端 channel，并恢复 rotation；这是 InputEventReceiver 必须在所属 Looper 线程销毁的约束。逻辑 `mDragState=null`、channel fd 销毁、Surface transaction apply、硬件 present 是不同完成点。
+
+仍满足 `mView != null && mAdded` 的 ViewRoot 正常处理 ENDED 时，会清 `mDragDescription`、`mCurrentDragView`、localState、dragToken，并 release 本地 `Surface` 包装。若根已 detach，`handleDragEvent()` 只 recycle 事件，不走这段客户端清理；服务端仍会解除自己的 `SurfaceControl` parent 并拆 input 资源。两边动作次序与底层对象何时真正消失不能从单次 release 推导。
+
+### 练习 9：给结束链的每个资源标完成点
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '50,120p' \
-  frameworks/base/services/core/java/com/android/server/wm/DragInputEventReceiver.java
-sed -n '480,610p' \
-  frameworks/base/services/core/java/com/android/server/wm/DragState.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'if (!mDragResult) {' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mAnimator = createReturnAnimationLocked();' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mAnimator = createCancelAnimationLocked();' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'void closeLocked() {' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'MSG_TEAR_DOWN_DRAG_AND_DROP_INPUT, mInputInterceptor);' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'for (WindowState ws : mNotifiedWindows) {' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'if (!mDragResult && (ws.mSession.mPid == mPid)) {' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'DragEvent.ACTION_DRAG_ENDED,' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mTransaction.remove(mInputSurface).apply();' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mTransaction.reparent(mSurfaceControl, null).apply();' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mDragDropController.onDragStateClosedLocked(this);' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mService.mInputManager.unregisterInputChannel(mServerChannel);' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mInputEventReceiver.dispose();' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'mDisplayContent.getDisplayRotation().resume();' frameworks/base/services/core/java/com/android/server/wm/DragState.java
+grep -n -F 'case MSG_ANIMATION_END: {' frameworks/base/services/core/java/com/android/server/wm/DragDropController.java
+grep -n -F 'setLocalDragState(null);' frameworks/base/core/java/android/view/ViewRootImpl.java
+grep -n -F 'mAttachInfo.mDragSurface.release();' frameworks/base/core/java/android/view/ViewRootImpl.java
 ```
 
-解释UP、CANCEL和stylus button release怎样到`notifyDropLocked()`，以及何时没有5秒timeout。
+把“ENDED 已发出、WMS 状态已清、channel 已 dispose、App Surface 已 release、transaction 已 apply、画面已 present”排成偏序，而不是强行写成一条全局同步时间线。
 
-## 88. macOS只读练习四：追URI grant/revoke
+## 14. 三条完整时间线：成功、空目标与丢失窗口
 
-```bash
-cd /Users/ninebot/androidSource
-sed -n '1,145p' \
-  frameworks/base/services/core/java/com/android/server/wm/DragAndDropPermissionsHandler.java
-```
-
-分别写出Activity owner和transient owner的建立、grant、显式release与进程死亡回收路径。
-
-## 89. 复读后最容易不理解的地方
+第一条：跨窗口成功，目标在 UI 线程返回 true。
 
 ```text
-STARTED窗口资格、View返回兴趣和最终DROP命中是三道门
-WMS窗口目标与ViewGroup子View目标是两层命中
-permission handler存在与URI grant生效是两个时刻
-InputDispatcher finished与DragDropController reportDropResult是两种回执
+源 App：画 Surface → performDrag 阻塞 → 收到 dragToken
+WMS：register/sync/transfer → STARTED → queue shadow show/reparent → 初始 LOCATION
+输入：synthetic DOWN(忽略) → 首个 MOVE 提交 shadow transaction → MOVE* → UP
+目标：DROP(data, permission Binder) → 可选 take → handler 返回 true
+WMS：report token 匹配 → 移除 5 秒消息 → close → ENDED(true)
+异步：App release Surface；WMS teardown channel / resume rotation
 ```
 
-## 90. 复读修订一：ENTERED不在单一层生成
-
-“WMS发送完整六种DragEvent”会误导。
-
-r48 WMS跨窗口直接发STARTED/LOCATION/EXITED/DROP/ENDED；View级ENTERED以及细粒度EXITED由客户端drag focus逻辑补齐。
-
-## 91. 复读修订二：localState不是跨进程数据
-
-它只缓存在发起ViewRoot，收到任意DragEvent时本地填入。
-
-跨进程交换必须用可Parcel的ClipData，不能把localState当共享对象通道。
-
-## 92. 复读修订三：完成点分层
+第二条：最终点没有已通知窗口。
 
 ```text
-finishInputEvent：Drag专用Motion已处理
-reportDropResult：目标View已决定是否消费DROP
-DRAG_ENDED：所有参与窗口得知业务结果
-Surface transaction apply：发出视觉清理
-硬件present：屏幕真正显示下一帧
+UP/CANCEL
+→ 最终 hit 为空或命中未通知窗口
+→ 不发 DROP，不创建 5 秒消息
+→ mDragResult=false
+→ return animation
+→ close
+→ ENDED(false)
 ```
 
-五者不是同一完成点。
-
-## 93. 复读修订四：Drag空Region边界沿用上一章
-
-DragState注释称空touchableRegion阻止新触摸，但r48 flags=0形成touch-modal，普通命中可绕过Region。
-
-本章只确认当前手势通过transfer进入；不要把注释扩大成单独由空Region提供的绝对安全保证。
-
-## 94. r48版本边界
+第三条：DROP 已发出，目标在回报前被 WMS 移除。
 
 ```text
-同时只允许一个DragState
-performDrag保留输入仍在发起窗口的TODO和multi-display TODO
-DragState.mToken先存dragToken、DROP后复用为目标window token
-global目标App要求targetSdk >= N
-DROP结果timeout固定5秒，超时ANR仍是TODO
-CANCEL走notifyDropLocked而非直接cancel
-Drag URI权限由目标显式take，不自动grant
+DROP oneway 已排队 + 5 秒消息已挂起 + mToken=目标 IWindow
+→ 目标以正确 token report
+→ WMS 先 remove timeout
+→ windowForClientLocked() 返回 null
+→ 直接返回，未 end/close
+→ receiver 已 mute，DragState 仍 active
 ```
 
-## 95. 本章检查清单
+第三条不是正常契约，而是 r48 的恢复缺口。诊断时如果看到“新 drag 一直报已有 drag、旧影或 rotation 状态不收敛”，不能只检查 5 秒消息是否触发，还要检查正确回报之后的 WindowState 查找。
+
+此外，四条顺序不能拼成全局完成序：
+
+- STARTED/LOCATION/DROP/ENDED 是 `IWindow` oneway，服务端调用返回不等于 UI 线程处理。
+- 同一 ViewRoot 会合并尚未处理的 LOCATION。
+- `reportDropResult()` 是目标 UI 分发后的同步反向调用。
+- Surface transaction apply 与 display present 不是同一步。
+
+## 15. 调试时按账本找断点
+
+遇到“拖影出现但不能放”“目标没收到数据”或“结束后仍卡住”，按下面顺序收窄：
+
+| 观察 | 查哪本账 | r48 的关键问题 |
+|---|---|---|
+| `startDragAndDrop()` 返回 false | App/WMS 启动 | attach、Surface、metrics、已有 drag、callingWin、display、transfer |
+| 有 dragToken 但无移动 | 输入控制 | drag handle 是否同步、transfer 是否弱成功、receiver 是否只收到被忽略动作 |
+| 窗口没有 STARTED | 窗口通知 | potential target、local/global、pre-N fallback、profile、display |
+| 窗口有 STARTED 但 View 无 LOCATION | View 兴趣 | STARTED 是否返回 true、View 是否仍在树中、坐标变换与 LOCATION 合并 |
+| DROP 没发 | 最终窗口门 | 最终 hit 是否 touchable、是否在 `mNotifiedWindows` |
+| DROP 有 data 但 URI 仍拒绝 | 数据能力 | 是否 GLOBAL+READ/WRITE、是否 take、source/target user 与 package |
+| 目标返回后仍不结束 | 结果账 | token、timeout、WindowState 消失分支、是否已处于 animation |
+| ENDED 后 channel/rotation 稍晚恢复 | 资源账 | teardown Handler 是否执行，而非只看 `mDragState` |
+
+建议把日志和断点对齐到这些对象，而不是只搜 action 名：
 
 ```text
-[ ] 能区分Motion控制链与DragEvent业务链
-[ ] 能解释drag shadow Surface如何创建/移交/清理
-[ ] 能列出STARTED窗口资格
-[ ] 能说明View STARTED返回true的作用
-[ ] 能解释窗口级与View级enter/exit
-[ ] 能从UP追到DROP和reportDropResult
-[ ] 能说明5秒timeout不是普通输入ANR
-[ ] 能闭合Activity/transient URI权限生命周期
-[ ] 能解释成功/失败动画和ENDED result
-[ ] 能指出r48 CANCEL、multi-display、空Region边界
+DragState.mNotifiedWindows / mTargetWindow / mToken / mDragResult / mAnimator
+ViewRootImpl.mLocalDragState / mCurrentDragView / mDragDescription
+ViewGroup.mChildrenInterestedInDrag / mCurrentDragChild
+DragAndDropPermissionsHandler 的 owner/token/URI 列表
+DragDropController 的 timeout 与 teardown 消息
 ```
 
-## 96. 本章小结
+还要区分五个经常被混写的完成点：
 
-Android 11拖放不是单一View API，而是App绘制Surface、WMS接管输入、窗口级筛选、View树兴趣路由、DROP回执与URI授权共同组成的跨进程协议：
+1. `startDragAndDrop()==true`：WMS 启动路径返回。
+2. `finishInputEvent()`：一条 drag Motion 已由 receiver 结束处理。
+3. `reportDropResult()`：目标 View 的 consumed 决定到达 WMS。
+4. `closeLocked()`：WMS 逻辑状态清理并发出结束 transaction/通知。
+5. teardown、App release 与硬件 present：各在线程或进程中继续完成。
+
+## 16. r48 边界与本章结论
+
+把本章压成一句话：
 
 ```text
-startDragAndDrop绘制拖影
-→ performDrag建立DragState并transfer当前触摸
-→ STARTED只广播描述和资格
-→ MOVE移动Surface并向已通知窗口发LOCATION
-→ View树生成细粒度ENTERED/EXITED
-→ 最终DROP独占获得ClipData与可take权限
-→ 目标5秒内回报结果
-→ 成功关闭或失败返回动画
-→ 全体参与窗口收到ENDED并清理
+系统拖放 = 迁移当前 pointer 控制权
+         + 向合格窗口建立 DragEvent 会话
+         + 在客户端 View 树维护兴趣与 enter/exit
+         + 只向最终窗口交付数据和可请求的 URI 能力
+         + 用目标窗口 token、结果消息、动画与异步资源清理收敛
 ```
 
-## 97. 下一章预告
+阅读 Android 11 r48 时，必须保留这些版本边界：
 
-下一章回到窗口输入同步：WMS怎样把WindowState的frame、touchableRegion、transform、Surface layer和InputChannel token打包为InputWindowInfo，并通过SurfaceControl Transaction与InputDispatcher保持同一帧视图。
+- 同时只有一个 `DragState`；默认流程固定在发起 `DisplayContent`，迟到窗口通知还限定 default display。
+- 启动层没有再次证明 pointer 仍属于发起窗口；input transfer 本身又存在弱成功。
+- GLOBAL 对其他 pre-N App 窗口受限，但源 `IWindow` 仍可经 local fallback 收到事件。
+- WMS 的通知窗口与客户端的感兴趣 View 是两本账，STARTED 的 boolean 不回传 WMS。
+- 初始 LOCATION 由 `performDrag()` 主动触发；后续 LOCATION 可在 ViewRoot 合并。
+- `performDrag()` 只排队拖影 show/reparent，首个常规 MOVE 的 `.apply()` 才提交该独立 transaction。
+- receiver 忽略 DOWN 与 POINTER 动作，却把 CANCEL 当作最终 DROP 尝试；stylus 起始按钮还受 synthetic DOWN 中性字段影响。
+- permission Binder 只提供 take 能力，grant 与 drag result/ENDED 生命周期分离。
+- 5 秒等的是 DROP result，不是输入 ANR；正确 token 后窗口消失会出现取消 timeout 却未结束状态的缺口。
+- `mToken` 在 DROP 前后换角色；源 token 不能在 DROP 后继续取消。
+- ENDED、逻辑 close、channel teardown、Surface apply 与画面 present 没有单一全局完成点。
+
+下一章进入第 240 章：追 `WindowState` 怎样生成 `InputWindowInfo`，并经 `SurfaceControl.Transaction`、input window 同帧同步与 InputDispatcher 窗口快照把几何、层级、Region、transform 和 channel token 交到 native 输入路由。

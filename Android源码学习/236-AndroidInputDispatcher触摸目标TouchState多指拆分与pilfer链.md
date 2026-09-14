@@ -1,1315 +1,482 @@
 # 236 Android InputDispatcher触摸目标、TouchState、多指拆分与pilfer链
 
-> 源码版本：Android 11 / `android-11.0.0_r48`  
-> 学习方式：macOS只读核源，不编译、不运行AOSP
+上一章从 focused window 讲到 Connection 回执与输入 ANR。本章回到 publish 之前，回答 pointer Motion 最核心的问题：一个 `ACTION_DOWN` 怎样选出窗口，为什么后续 `MOVE` 通常不再跟着坐标换窗口，多指怎样拆成各自合法的局部事件流，gesture monitor 又怎样在手势中途 pilfer（截获）窗口的后续接收权。
 
-## 1. 本章要解决什么
+先给结论：**普通触摸路由不是“每一帧重新命中”，而是“首个 DOWN 建立所有权，后续事件沿 TouchState 延续”。** outside、split、slippery、wallpaper、monitor 与 pilfer 看似例外很多，核心仍是让通道正常的主路径保持完整事件流；通道注销、目标失联等生命周期断点则必须单独识别，不能伪装成正常所有权转移。
 
-上一章解释了InputDispatcher怎样把事件送进窗口连接并等待完成回执。本章向前补上最关键的一步：一个触摸屏事件究竟应该送给谁。
+本文以 `android-11.0.0_r48` 为准，核心源码位于：
 
-需要回答：
+- `frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp`
+- `frameworks/native/services/inputflinger/dispatcher/InputDispatcher.h`
+- `frameworks/native/services/inputflinger/dispatcher/TouchState.h` 与 `TouchState.cpp`
+- `frameworks/native/services/inputflinger/dispatcher/TouchedWindow.h`
+- `frameworks/native/services/inputflinger/dispatcher/InputTarget.h`
+- `frameworks/native/include/input/InputWindow.h`
+- `frameworks/base/core/java/android/view/InputMonitor.java`
+- `frameworks/base/core/java/android/view/IInputMonitorHost.aidl`
+- `frameworks/base/services/core/java/com/android/server/input/InputManagerService.java`
 
-```text
-为什么ACTION_DOWN之后，手指移出窗口仍通常发给原窗口？
-NOT_TOUCHABLE、NOT_TOUCH_MODAL和touchableRegion怎样影响命中？
-WATCH_OUTSIDE_TOUCH为什么只收到一次ACTION_OUTSIDE？
-两个手指落在两个窗口时，原始MotionEvent怎样拆成两条自洽事件流？
-TouchState为什么必须按Display持久保存？
-FLAG_SLIPPERY为什么能在MOVE途中换目标？
-壁纸和gesture monitor为什么也能收到同一手势？
-pilferPointers“偷走手势”时，原窗口、监控者和TouchState分别发生什么？
-```
+## 1. 一条主线：DOWN建账，UP或CANCEL结账
 
-## 2. 一句总纲
-
-InputDispatcher不是对每个`MOVE`重新做一次窗口命中，而是：
+先把普通单指手势压缩成一条时间线：
 
 ```text
-首个DOWN按当前窗口Z序和touchable region选定目标
-→ 把目标、pointerId集合、设备/来源/Display和监控者记入TouchState
-→ 后续事件沿这份状态继续投递
-→ split touch按pointerId为不同窗口裁剪MotionEvent
-→ UP/CANCEL、窗口移除或pilfer再显式结束/改写这份状态
+MotionEntry(DOWN)
+  → 按当前 display 的窗口列表做 hit-test
+  → 生成本次 InputTarget
+  → 把窗口、角色与流身份写入 TouchState
+  → publish 到目标 Connection
+
+MotionEntry(MOVE / POINTER_UP ... UP/CANCEL)
+  → 读取同一 display 的 TouchState
+  → 沿既有窗口继续生成 InputTarget
+  → UP/CANCEL 发给当前目标后 reset TouchState
 ```
 
-这叫“手势流所有权”，不是“每一帧谁在手指下面谁就收”。
+手指从 A 的区域移到 B 上方，默认仍是 `A: DOWN → MOVE → UP`，B 什么也收不到。若每个 MOVE 都重新命中，A 会缺少结束事件，B 会从无来源的 MOVE 开始，点击、拖拽、长按和速度计算都无法维持状态。
 
-## 3. 总体链路
+需要重新选目标的情形都由源码显式列出：首个 DOWN、SCROLL、Hover，以及已进入 split 模式后的 `POINTER_DOWN`；单指 slippery MOVE 是另一条受限的转移分支。把“普通延续”和这些显式入口分开，是读懂本章的第一把钥匙。
 
-```mermaid
-flowchart LR
-    IR["InputReader MotionEntry"] --> ID["InputDispatcher"]
-    ID --> ACT{"ACTION"}
-    ACT -->|"首个 DOWN"| HIT["按Z序命中窗口"]
-    HIT --> TS["建立 TouchState"]
-    ACT -->|"MOVE / POINTER / UP"| TS
-    TS --> WIN["TouchedWindow + pointerIds"]
-    TS --> MON["Gesture monitors"]
-    WIN --> SPLIT{"需要拆分?"}
-    SPLIT -->|"是"| CUT["splitMotionEvent"]
-    SPLIT -->|"否"| PUB["发布原事件"]
-    CUT --> PUB
-    PUB --> CH["各目标 InputChannel"]
-    ACT -->|"UP / CANCEL"| RESET["reset TouchState"]
-```
+## 2. 六个对象分别记录事实、所有权和一次投递
 
-## 4. 源码地图
+触摸链里最容易混淆的对象可以这样分层：
 
-native核心：
+| 对象 | 生命周期 | 回答的问题 |
+|---|---|---|
+| `MotionEntry` | 一条原始输入事件 | 设备这次报告了什么 action、坐标和 pointer 数组 |
+| `InputWindowHandle` | 一版 WMS 输入窗口快照 | 哪些窗口可见、可触摸，Region、flags、token 是什么 |
+| `TouchState` | 一个 display 当前的手势状态 | 这条流由哪个设备产生，哪些窗口/monitor 持有它 |
+| `TouchedWindow` | TouchState 中的窗口角色 | 此窗口有哪些 target flags，拥有哪些 pointer IDs |
+| `InputTarget` | 当前 MotionEntry 的投递计划 | 本次要向哪个 Channel 发送何种模式、坐标变换和 ID 子集 |
+| `DispatchEntry` | 面向一条 Connection 的协议账 | 最终 action、event ID、seq、delivery/deadline 是什么 |
 
-```text
-frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
-frameworks/native/services/inputflinger/dispatcher/InputDispatcher.h
-frameworks/native/services/inputflinger/dispatcher/TouchState.h
-frameworks/native/services/inputflinger/dispatcher/TouchState.cpp
-frameworks/native/services/inputflinger/dispatcher/TouchedWindow.h
-frameworks/native/services/inputflinger/dispatcher/InputTarget.h
-frameworks/native/include/input/InputWindow.h
-```
+`mTouchStatesByDisplay` 是 `displayId → TouchState` 的 map，所以多 display 可以各有一份状态；但 r48 的每份 TouchState 只有一组 `deviceId/source/displayId` 身份，不是“同一 display 任意多设备并行流”的通用容器。
 
-Java入口与系统桥接：
+`InputWindowHandle` 也不是 Java View。InputDispatcher 只能选 Window 与 Channel；事件进入应用以后，才由 ViewRoot/ViewGroup 在窗口内部寻找具体 View。
 
-```text
-frameworks/base/core/java/android/view/InputMonitor.java
-frameworks/base/core/java/android/view/IInputMonitorHost.aidl
-frameworks/base/services/core/java/com/android/server/input/InputManagerService.java
-frameworks/base/services/core/java/com/android/server/wm/InputMonitor.java
-frameworks/base/services/core/java/com/android/server/wm/WindowState.java
-```
+## 3. `dispatchMotionLocked()`先区分pointer，再决定monitor加入时机
 
-可帮助验证语义的测试：
+InputReader 交给 listener 的边界对象是 `NotifyMotionArgs`；`InputDispatcher::notifyMotion()` 接收它并创建内部 `MotionEntry`，之后才进入 `dispatchMotionLocked()`。后者用 source 的 `AINPUT_SOURCE_CLASS_POINTER` 位区分两条路线：
 
-```text
-frameworks/native/services/inputflinger/tests/InputDispatcher_test.cpp
-```
+- pointer Motion 进入 `findTouchedWindowTargetsLocked()`，使用本章的 TouchState。
+- trackball 等非 pointer Motion 进入上一章的 `findFocusedWindowTargetsLocked()`。
 
-## 5. 先区分三个层次
+目标选择成功后，代码才追加当前或 focused display 的 global monitor，再统一进入 `dispatchEventLocked()`。如果目标选择返回 `PENDING`，本轮先等待，不取消 monitor；permission denied 则直接丢弃。只有已经得到最终结果、且既非 success 也非 permission denied 时，代码才按 pointer/non-pointer 模式为注册表中的 monitor 合成取消语义。global monitor 不能把失败“救活”。
 
-本章很容易把三个对象混在一起：
+这与 gesture monitor 不同。gesture monitor 参与 `findTouchedWindowTargetsLocked()`，首个 DOWN 即使没有普通触摸窗口，只要有合格的 gesture monitor，也仍可能构成成功目标。两类 monitor 的加入时机与状态归属必须分账。
 
-```text
-InputWindowHandle：WMS交给InputDispatcher的一份窗口输入快照
-TouchState：某Display当前整条触摸手势的路由账本
-InputTarget：为当前这一个EventEntry生成的具体投递参数
-```
+目标选择还可能报告 `conflictingPointerActions`。权限允许且本次仍成功时，dispatcher 会先对所有 Connection 合成 pointer cancel，再发布新事件，使旧流不会和新设备/新 DOWN 的流悄悄重叠。
 
-窗口是候选者，TouchState是跨事件状态，InputTarget是一次投递计划。
+## 4. hit-test按前到后遍历，modal与Region共同决定是否穿透
 
-## 6. InputWindowHandle不是Java View
+`findTouchedWindowAtLocked(displayId, x, y, ...)` 取得该 display 的窗口列表并按 front-to-back 遍历。对每个 handle，依次关注：
 
-InputDispatcher看不到Button、RecyclerView或Compose节点。
+1. `windowInfo->displayId` 是否匹配。
+2. `visible` 是否为真。
+3. 是否没有 `FLAG_NOT_TOUCHABLE`。
+4. 窗口是否 touch modal，或 `touchableRegionContainsPoint(x, y)` 是否为真。
 
-它只看窗口级信息，例如：
+touch modal 的 r48 定义是同时没有 `FLAG_NOT_FOCUSABLE` 与 `FLAG_NOT_TOUCH_MODAL`。因此：
 
-```text
-displayId、visible、hasFocus
-frame、touchableRegion、Z序
-InputChannel token
-ownerPid、ownerUid
-WindowManager.LayoutParams flags
-paused、hasWallpaper、globalScaleFactor
-```
+- `NOT_TOUCHABLE` 让窗口不能成为正常命中/foreground 目标，不是“收到后不处理”；若它同时 visible 且声明 `WATCH_OUTSIDE_TOUCH`，仍可能作为 outside 观察者加入。
+- `NOT_TOUCH_MODAL` 使区域外坐标继续向低 z 序窗口查找。
+- `NOT_FOCUSABLE` 不等于不能接收触摸；它只是也让窗口不能靠 modal 语义吞掉 Region 外的点。
+- touchable Region 可以是非矩形，不能只拿 frame 判断命中。
 
-命中顶层窗口后，窗口进程内部才由ViewRootImpl和ViewGroup继续找具体View。
+触屏命中把 action pointer 的浮点 X/Y 转成 `int32_t`；投递给客户端的 PointerCoords 仍保留浮点值。mouse 则使用独立的 `xCursorPosition/yCursorPosition`。Case 1 的正常 split 判定会排除 mouse；slippery 分支缺少同一排除，后文单独说明。
 
-## 7. 窗口列表已经按前到后排列
+若命中的是 portal window，函数可递归到 `portalToDisplayId` 继续查找，同时把经过的 portal 记录进临时 TouchState。这里的 portal 不是最终前台接收者；它还会影响目标 display 上 monitor 的收集与坐标偏移。
 
-`findTouchedWindowAtLocked()`取得当前Display的`windowHandles`，从第一个向后遍历。
+## 5. 临时TouchState先演算，权限通过后才允许影响全局状态
 
-源码注释直接写着：
+`findTouchedWindowTargetsLocked()` 先从 `mTouchStatesByDisplay` 取旧状态，再 `copyFrom()` 到 `tempTouchState`。窗口加入、outside、split、hover 与 monitor 选择都先作用于临时副本。
 
-```cpp
-// Traverse windows from front to back to find touched window.
-```
+首个 DOWN、SCROLL 或 Hover 被视为 `newGesture`。代码重置临时状态并写入本次 `deviceId/source/displayId`；只有 DOWN 把 `down` 设为真。普通 MOVE、POINTER_UP、UP、CANCEL 和非 split 的 `POINTER_DOWN` 则沿旧状态进入延续分支。
 
-因此第一个满足条件的窗口就是视觉层级上最靠前的有效目标。
+这套“先演算”主要守住注入安全：软件注入必须对所有 foreground window 通过身份/`INJECT_EVENTS` 检查，才允许后续状态提交；outside、wallpaper 与 monitor 不逐项做这项检查。若本次只有 gesture monitor 而没有 foreground window，代码直接把 permission 状态记为 granted。真实 InputReader 事件没有 `InjectionState`，但仍走相同的窗口与 TouchState 算法。
 
-## 8. 不可见窗口不会成为触摸目标
+不过它不是“只有目标选择成功才提交”的数据库事务。到 `Failed:` 标签后，代码仍先收敛 injection permission；只要权限为 granted、且不是 `wrongDevice` 分支，某些失败路径仍会按 action 更新或保存临时状态。真实 InputReader 事件以 null injection state 通过这道权限检查，所以一个 hit-test 没记录任何窗口、也没有 gesture monitor 的 DOWN 虽然返回 failed，仍可能留下 `down=true`、且 `windows` 为空的状态；若途中已收集 outside 或 portal，失败尾还可能把这些一次性记录一并保存。准确边界是“未授权事件不能改真实路由账”，而不是“任何 injection failed 都绝不触碰 TouchState”。
 
-核心判断首先要求：
+设备冲突还要按 action 分开。map 已按本次 display 查找，所以另一个 display 通常使用另一份状态；同一 display 内，deviceId 或 source 任一改变都算切流。不同流的 MOVE 直接以 permission denied 返回且不写回；已有 down 时的 SCROLL 走 failed/`wrongDevice`，也不写回。新的 DOWN 或 Hover 会先重置临时状态；权限通过且不是 `wrongDevice` 时，失败尾也可能标记 conflict。其他 POINTER_DOWN/POINTER_UP/UP/CANCEL 则可能沿旧状态完成本次选择，再在尾部标记 conflict，其中 UP/CANCEL 还会 reset。只有成功结果回到 `dispatchMotionLocked()` 后，conflict 才会触发面向所有 Connection 的 pointer cancel。
 
-```cpp
-if (windowInfo->visible) {
-    ...
-}
-```
+## 6. Case 1的新窗口还要过paused、Connection与responsive三道门
 
-这里使用WMS同步来的输入窗口可见状态，不等价于某个子View的`View.VISIBLE`。
+在 new gesture 或 split `POINTER_DOWN` 的 Case 1 中，hit-test 得到 handle 后，代码先决定 split 能力，再检查目标是否可实际开始这次新投递：
 
-## 9. FLAG_NOT_TOUCHABLE的含义
+- paused window 被置空。
+- token 找不到 Connection 时被置空。
+- Connection 已是 `responsive=false` 时，不向它开始新 gesture。
+- 新选出的 gesture monitors 也会经 `selectResponsiveMonitorsLocked()` 过滤。
 
-若窗口带`FLAG_NOT_TOUCHABLE`，它不会成为正常触摸目标。
+若普通窗口为空且这次新选的 gesture monitor 也为空，目标选择失败。这里有两个容易误推的边界。
 
-注意：
+第一，这些门只约束 Case 1 的 `newTouchedWindowHandle`。已经记录在 TouchState 的窗口不会在每个 MOVE 上重新执行同一组 paused/responsive hit-test；outside、稍后批量加入的 wallpaper，以及 Case 2 的 slippery 新窗口也不经过这整组三道门。旧流要靠取消、窗口移除或完成协议收口。
 
-```text
-NOT_TOUCHABLE不是“收到事件但不处理”
-而是InputDispatcher在目标选择阶段直接跳过它
-```
+第二，paused 对 pointer 新手势不是上一章按焦点寻址事件的 pending 等待。没有 gesture monitor 接住时，它会走 injection failed/drop，也不会启动一只 paused 专用 ANR 计时器。
 
-事件可以继续命中它下面的窗口。
+正常窗口目标得到 `FLAG_FOREGROUND | FLAG_DISPATCH_AS_IS`，split 时再加 `FLAG_SPLIT`。这里的 FOREGROUND 表示“本次触摸的主要窗口”，不等于键盘 focused window；未持有键盘焦点的窗口完全可能因触点命中而成为 foreground touch target。
 
-## 10. touch modal窗口为什么能吃掉边界外触摸
+## 7. obscured flags描述遮挡事实，不等于dispatcher拒绝事件
 
-Android 11的判断是：
+InputDispatcher 在选定 foreground window 时计算两种标志：
 
-```cpp
-bool isTouchModal =
-        (flags & (FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL)) == 0;
+- 上层合格窗口的 frame 覆盖触点：`FLAG_WINDOW_IS_OBSCURED`。
+- 未覆盖触点，但上层窗口矩形与目标窗口相交：`FLAG_WINDOW_IS_PARTIALLY_OBSCURED`。
 
-if (isTouchModal || windowInfo->touchableRegionContainsPoint(x, y)) {
-    return windowHandle;
-}
-```
+`canBeObscuredBy()` 会排除同 token 克隆层、不可见窗口、同 owner PID、trusted overlay 与不同 display 的窗口。这里比较的是 owner PID，不是 owner UID；点遮挡看 frame，部分遮挡看窗口 overlap，均不能和命中所用的 touchable Region 混为一谈。
 
-一个既可聚焦、又没有声明`NOT_TOUCH_MODAL`的窗口被视作touch modal。
+进入 `DispatchEntry` 后，它们分别变成 `AMOTION_EVENT_FLAG_WINDOW_IS_OBSCURED` 与 `AMOTION_EVENT_FLAG_WINDOW_IS_PARTIALLY_OBSCURED`。r48 的这段 dispatcher 逻辑是在事件上携带事实，不是看到遮挡就一律丢触摸；应用或上层组件是否拒绝敏感操作，要看其安全策略。普通 continuation 不逐帧重算遮挡，而是沿 TouchState 中保留的 target flags；slippery enter 只重算 point-obscured，wallpaper 则固定同时带两种标志。
 
-它即使坐标不在touchable region内，也能阻止触摸落到后面的窗口。
+坐标变换同样属于 InputTarget/DispatchEntry，而非 TouchState 所有权：窗口目标记录 frame 左上角负偏移、window scale 与 global scale。理解“谁接收”和“客户端看到什么坐标”时要分别核对。
 
-## 11. NOT_TOUCH_MODAL的准确理解
+## 8. WATCH_OUTSIDE只参与首个DOWN，并在当前投递后退出状态
 
-带`FLAG_NOT_TOUCH_MODAL`后，窗口只在自己的touchable region包含触点时被选中。
+只有首个 `ACTION_DOWN` 调 hit-test 时传入 `addOutsideTargets=true`。遍历尚未命中的可见上层窗口时，若它带 `FLAG_WATCH_OUTSIDE_TOUCH`，临时 TouchState 会加入 `FLAG_DISPATCH_AS_OUTSIDE` 角色。
 
-触点在区域外时，InputDispatcher继续向更低Z序窗口查找。
+这类目标本次收到的是派生的 `ACTION_OUTSIDE`，不是原始 DOWN。生成当前 `inputTargets` 后，`filterNonAsIsTouchWindows()` 会删除纯 outside 角色，因此后续 MOVE/POINTER_UP/UP/CANCEL 不再投给它。
 
-它不是“窗口永远收不到外部触摸”；是否额外收到`ACTION_OUTSIDE`还取决于`FLAG_WATCH_OUTSIDE_TOUCH`。
+outside 不能独自让路由成功：仍需至少一个 foreground window 或 gesture monitor。若 outside window 与实际 foreground window 的 owner UID 不同，代码给 outside 目标追加 `FLAG_ZERO_COORDS`；发布前所有 PointerCoords 被 `clear()`，避免跨应用泄露精确位置。同 UID 的多个顶层窗口不会因这条规则自动清零。
 
-## 12. NOT_FOCUSABLE为何也影响touch modal
+这形成一个典型的“当前目标与下一状态不同”：outside 出现在本次 InputTarget，却不会留在下一次 TouchState。把二者当成同一个集合，就会误以为它也应持续收到整条手势。
 
-源码把`FLAG_NOT_FOCUSABLE`和`FLAG_NOT_TOUCH_MODAL`一起用于`isTouchModal`判断。
+## 9. MOVE沿旧账，POINTER_UP先投递再移除，UP或CANCEL才reset
 
-因此不可聚焦窗口默认不会仅靠modal属性吞掉整个Display上的触摸；它仍可在自己的touchable region内正常命中。
+TouchState 的持久化规则按动作分别处理：
 
-## 13. touchable region不一定等于窗口frame
+- 普通 MOVE 沿 `windows` 与 `gestureMonitors` 继续，不重新命中。
+- split `POINTER_UP` 先用旧 pointer ownership 生成当前 targets；随后才从带 `FLAG_SPLIT` 的窗口清除该 pointer ID，集合为空的窗口从状态移除。
+- `ACTION_UP` 与 `ACTION_CANCEL` 也先形成当前投递，然后 reset 整份临时状态并从 map 删除。
+- SCROLL 的临时 TouchState 只服务当前动作，不写回 map。
+- Hover 通过全局单例、而非按 display 分桶的 `mLastHoverWindowHandle` 补齐旧窗口 HOVER_EXIT、新窗口 HOVER_ENTER；保存的主要是 hover 设备身份，不是 `down` 手势窗口集合。
 
-WMS可为窗口提供非矩形Region。
+这体现出固定顺序：先从临时状态输出“当前事件发给谁”，再过滤一次性角色、更新 pointer ownership，最后决定写回或删除 map。
 
-例如窗口frame是一个大矩形，但只让其中一部分参与触摸命中。
+窗口快照在手势中途更新时，`setInputWindowsLocked()` 会逐项检查 `state.windows`。被移除的窗口若仍有 Channel，就按 `CANCEL_POINTER_EVENTS` 由该 Connection 的 `InputState` 生成取消语义，然后只移除这一项；其他 split 窗口、wallpaper 或 gesture monitor 可以继续。取消只是加入分发队列，不代表客户端已消费或回执。
 
-所以分析命中问题不能只看`frameLeft/frameTop/frameRight/frameBottom`。
+这里的清理范围并不对称：`setInputWindowsLocked()` 只查看“本次更新 display 所键控的 TouchState”里的 `windows`，不会顺手清 `portalWindows` 或 `gestureMonitors`；跨 portal 存在入口 display 状态时，更新嵌入 display 的窗口也不会反向扫描它。`unregisterInputChannelLocked()` 会移除 Connection 和 monitor 注册，却同样不遍历 TouchState。因此旧 handle/monitor 可能暂留到账本自然结束；窗口目标会在找不到 Channel 时跳过，monitor 目标会在找不到 Connection 时跳过。设备 reset 会为匹配设备的 Connection 合成取消，却不清 map；`resetAndDropEverythingLocked()` 才直接清空全部 TouchState。这些是生命周期清理边界，不是并发数据竞争。
 
-## 14. 命中使用整数坐标
+## 10. split资格由首窗建立，新指针只重新分配自己的pointer ID
 
-目标选择中，触摸坐标从`PointerCoords`读取后转成`int32_t`：
+首个 DOWN 命中的窗口支持 split 且 source 不是 mouse 时，本地 `isSplit` 变为真，foreground target 带 `FLAG_SPLIT`，action pointer ID 被记入 `TouchedWindow.pointerIds`。
 
-```cpp
-x = int32_t(entry.pointerCoords[pointerIndex]
-                    .getAxisValue(AMOTION_EVENT_AXIS_X));
-y = int32_t(entry.pointerCoords[pointerIndex]
-                    .getAxisValue(AMOTION_EVENT_AXIS_Y));
-```
+之后 `ACTION_POINTER_DOWN` 才会再次按 action index 对应的新指针坐标 hit-test。旧 pointer 不重新分配。若新命中窗口支持 split，就给它加入这一枚 pointer ID；同一个窗口再次命中时，`addOrUpdateWindow()` 对 BitSet 做 OR。
 
-这一步用于窗口命中；投递给客户端的MotionEvent仍保留浮点PointerCoords。
+若手势已经 split，而新命中的窗口不支持 split，代码忽略这个新窗口，再尝试把新 pointer 分给当前第一个 foreground window。若 hit-test 根本没找到窗口，也走相同 fallback。
 
-## 15. 鼠标使用cursor position
+但 paused、Connection 不存在或 unresponsive 的检查发生在 fallback 之后。一个先被命中、随后在这些门上被置空的新窗口，并不会再次 fallback；若本次也没有新 gesture monitor，`POINTER_DOWN` 会失败。这是顺序决定的 r48 边界。
 
-鼠标事件不直接用action pointer的X/Y，而使用：
+pointer ID 与 pointer index 也必须分开：index 是本次 MotionEvent 数组位置，抬指后可能重排；ID 在一条手势内稳定，才适合作为跨事件的窗口所有权。
 
-```cpp
-entry.xCursorPosition
-entry.yCursorPosition
-```
+## 11. `splitMotionEvent()`同时裁剪数组并重写局部action
 
-因为鼠标具有独立光标位置语义。
+只有目标带 `FLAG_SPLIT`，且其 pointer ID 数不等于原事件 `pointerCount` 时，`prepareDispatchCycleLocked()` 才构造新的 MotionEntry。函数复制目标 BitSet 中的 PointerProperties/PointerCoords，并按局部视角重写 action：
 
-## 16. 哪些动作会发起“新目标选择”
+| 原始动作 | 变化 pointer 是否属于目标 | 目标拥有 ID 数 | 局部动作 |
+|---|---:|---:|---|
+| `POINTER_DOWN` | 是 | 1 | `DOWN` |
+| `POINTER_UP` | 是 | 1 | `UP` |
+| `POINTER_DOWN/UP` | 是 | 多个 | 保留 masked action，action index 改为裁剪后位置 |
+| `POINTER_DOWN/UP` | 否 | 任意 | `MOVE` |
 
-源码将以下动作视作`newGesture`：
+例：id0 已在 A，id1 新落到 B。原始 `POINTER_DOWN(id0,id1; action=id1)` 会变成 `A: MOVE(id0)` 与 `B: DOWN(id1)`。id1 抬起时对应 `A: MOVE(id0)` 与 `B: UP(id1)`，最后 id0 的全局 UP 再成为 A 的 UP。
 
-```text
-ACTION_DOWN
-ACTION_SCROLL
-ACTION_HOVER_MOVE
-ACTION_HOVER_ENTER
-ACTION_HOVER_EXIT
-```
+一旦进入 `splitMotionEvent()`，若目标 BitSet 期望的某个 ID 在原 MotionEntry 中不存在，函数返回空并放弃该目标的 split 投递。成功拆分会取得新的 event ID，保留时间、设备、source、display、精度、downTime 等字段，并增加 InjectionState 引用。
 
-另外，已经进入split模式时的`ACTION_POINTER_DOWN`也会为新指针寻找窗口。
+但调用者先以“目标 ID 数是否等于原 pointerCount”决定要不要拆：若数量相等，即使具体 ID 集合异常地不同，也会绕过 `splitMotionEvent()` 而直接投递原事件。正常输入序列不应出现这种组合，但这说明 r48 的缺 ID 防御不是覆盖所有集合不一致的完备校验。
 
-## 17. 普通MOVE不会重新hit-test
+split 是逐 InputTarget 属性，不是把原始事件自动裁成全局唯一形态。没有 `FLAG_SPLIT` 的 wallpaper 与 monitor 仍可收到完整原始 pointer 数组。
 
-这是本章最重要的结论。
+## 12. slippery用同一MOVE派生旧CANCEL与新DOWN
 
-除`FLAG_SLIPPERY`特殊路径外，`MOVE`进入Case 2，直接沿`tempTouchState`里已有窗口继续分发。
+普通 MOVE 唯一的窗口重命中特例是 slippery。触发条件同时包括：
 
-假设手指在A窗口按下后移动到B窗口上方：
+- action 为 MOVE；
+- `pointerCount == 1`；
+- TouchState 恰好有一个 foreground window；
+- 该窗口带 `FLAG_SLIPPERY`。
 
-```text
-A收到 DOWN → MOVE → MOVE → UP
-B通常什么也收不到
-```
+只有新旧窗口都非空且不同才建立转移计划。旧窗口被标成 `DISPATCH_AS_SLIPPERY_EXIT`，当前 MOVE 在它的 DispatchEntry 中解析成 CANCEL；新窗口被标成 `DISPATCH_AS_SLIPPERY_ENTER`，同一个 MOVE 对它解析成 DOWN。若新窗口支持 split，`isSplit` 会被置真；但状态原本已经 split 时，即使新窗口不支持，分支也不会把它清回 false。只要 `isSplit` 最终为真，新目标就带 `FLAG_SPLIT` 并记录该 pointer ID。
 
-这样View才能得到完整且可解释的手势序列。
+r48 的 slippery 分支没有复用 Case 1 的 paused/Connection/responsive 检查。它先生成 enter target；到 `addWindowTargetLocked()` 时若 Channel 已不可查，本次投递目标会被跳过，但 enter 经过滤归一化后仍可能留在 TouchState。因此“新窗口收到 DOWN”应读作尝试形成并投递局部 DOWN，而不是同步送达保证。
 
-## 18. 为什么不能每次MOVE重新选择
+这条分支还没有 `isFromMouse` 排除：若 slippery 新窗口支持 split，本地状态也会设 `isSplit=true` 并带 `FLAG_SPLIT`。典型 mouse 仍只有一个 pointer，通常不会触发实际数组裁剪，但不能把“mouse 永不出现 split 状态”当作 r48 全局不变量。
 
-如果每帧重新命中：
+slippery 重命中还使用 `addOutsideTargets=false`、`addPortalWindows=false` 的默认参数。它可以递归穿过 portal 找到新窗口，却不会把这条新 portal 路径记入状态，也不会在 MOVE 时新选 gesture monitor；本次 MOVE 的 portal global monitor 追加仍只依据进入该事件前 TouchState 已保存的 `portalWindows`。
 
-```text
-A可能只收到DOWN和一半MOVE，却没有UP/CANCEL
-B可能凭空从MOVE开始，没有DOWN
-点击、拖拽、长按、VelocityTracker都会失去事件流不变量
-```
+本次 targets 输出后，`filterNonAsIsTouchWindows()` 删除旧 exit，把新 enter 归一为 AS_IS，于是下一次 MOVE 沿新窗口继续。新目标为空时不会把旧窗口静默丢掉；多指针也不进入这条路径。
 
-TouchState就是为维护这条不变量存在的。
+slippery 不是 `transferTouchFocus(from, to)`。后者是另一个显式 API，会改写 TouchState、合并两条 Connection 的 InputState，并在两端 Connection 都存在时为旧端生成 CANCEL、为新端合成 DOWN；本章不把它混入基于 MOVE 坐标的 slippery 判定。
 
-## 19. TouchState按Display保存
+## 13. wallpaper、portal、global monitor与gesture monitor有四种加入规则
 
-核心容器是：
+这些附加路由角色可以用一张表分开：
 
-```cpp
-std::unordered_map<int32_t, TouchState> mTouchStatesByDisplay;
-```
+| 角色 | 何时加入 | 是否留在 TouchState | 能否让无窗口 DOWN 成功 |
+|---|---|---:|---:|
+| wallpaper | 首个 DOWN 的 foreground window `hasWallpaper` | 是，直到流结束/被移除 | 否 |
+| portal | hit-test 穿过跨 display 门户 | 作为 portalWindows 留存 | 否 |
+| global monitor | pointer 目标选择成功后统一追加 | 否 | 否 |
+| gesture monitor | 首个 DOWN 选择响应式 monitor | 是 | 是 |
 
-一个Display保存一条当前触摸状态。多显示器可以分别维护自己的目标与监控者。
+wallpaper 收集发生在 foreground 确认后：代码枚举的是原始 MotionEntry/入口 `displayId` 上的全部 `TYPE_WALLPAPER`，即使 foreground 是经 portal 命中的嵌入 display 窗口，也不会改用那个嵌入 display。它们不另行筛 visible、paused、Connection、responsive 或注入权限，被加入 AS_IS 并固定带 full/partial obscured flags；缺少 Channel 时只在生成 InputTarget 时跳过。wallpaper 是锁定的副本目标，不是 foreground，也不因 A/B split 自动裁剪。Hover 与 SCROLL 不走 wallpaper 收集。
 
-## 20. TouchState的字段
+portalWindows 让 dispatcher 同时加入 portal 目标 display 上的 monitor。portal frame 左上角的负偏移用于对应 monitor 坐标；后续事件仍沿记录的 portal 路径追加相关 global monitors。
 
-Android 11定义：
+gesture monitor 只在首个 DOWN 新选并过滤 unresponsive Connection，随后作为 TouchState 一部分持续收流。它面向 pointer gesture，不接 Key；global monitor 则由 Key/Motion 的公共追加路径加入。两者都有 InputChannel、Connection、waitQueue 与 finished 协议，“监控者”不等于无需回执。
 
-```cpp
-struct TouchState {
-    bool down;
-    bool split;
-    int32_t deviceId;
-    uint32_t source;
-    int32_t displayId;
-    std::vector<TouchedWindow> windows;
-    std::vector<sp<InputWindowHandle>> portalWindows;
-    std::vector<TouchedMonitor> gestureMonitors;
-};
-```
+gesture monitor 的安全门在能力创建处：`InputManagerService.monitorGestureInput()` 先要求调用者持有 `MONITOR_INPUT`，再创建 Channel pair、注册 native monitor，并把 consumer Channel 与 `IInputMonitorHost` 一起封装进可跨进程传递的 `InputMonitor`。后续 `pilferPointers()` 不重新读取 Binder caller 权限，而是凭这枚已交付 host 最终携带的 Channel token 做 native 资格检查；“获准创建 capability”与“该 token 正参与当前 down 流”仍是两道独立条件。
 
-## 21. down表示什么
+## 14. pilfer先验证当前参与资格，再取消窗口并保留整组monitor
 
-`down == true`表示该Display上有一条指针按下流尚未结束。
-
-它不是窗口是否按下，也不是某个pointerId的单独状态；具体每个目标持有哪些pointerId由`TouchedWindow.pointerIds`表示。
-
-## 22. deviceId、source、displayId是流身份
-
-TouchState记录当前流来自哪个设备、哪类source和哪个Display。
-
-这用于防止两个不兼容的指针流意外混进同一份状态。
-
-## 23. 设备切换冲突
-
-若已有设备的指针仍down，却收到另一设备不合适的事件，代码会拒绝或标记`outConflictingPointerActions`。
-
-Android 11源码还留有TODO：
-
-```cpp
-// TODO: test multiple simultaneous input streams.
-```
-
-所以不要把这一版理解成“同一Display可无条件并行管理任意多设备触摸流”。
-
-## 24. windows里不仅有前台窗口
-
-`TouchState.windows`可以同时含：
-
-```text
-真正的FOREGROUND触摸目标
-WATCH_OUTSIDE_TOUCH临时目标
-wallpaper目标
-slippery exit/enter目标
-hover exit/enter目标
-```
-
-必须结合`targetFlags`理解每个元素的角色。
-
-## 25. TouchedWindow保存什么
-
-核心内容可抽象为：
-
-```text
-windowHandle：目标窗口
-targetFlags：前台、分发模式、遮挡、坐标清零等
-pointerIds：split模式下该窗口拥有的指针ID集合
-```
-
-## 26. 为什么用pointerId而不是pointerIndex
-
-pointer index只是当前MotionEvent数组中的位置，可能随指针抬起而重排。
-
-pointer ID在一条手势内稳定，适合表示“0号指针属于A，1号指针属于B”。
-
-## 27. 先复制再修改的事务式设计
-
-`findTouchedWindowTargetsLocked()`不会立刻改全局状态，而是：
-
-```cpp
-TouchState tempTouchState;
-tempTouchState.copyFrom(*oldState);
-```
-
-所有目标选择先写临时副本。
-
-## 28. 为什么不能边选边提交
-
-后面还可能发现：
-
-```text
-没有有效窗口或gesture monitor
-窗口paused
-连接不存在
-新手势目标已unresponsive
-注入权限不足
-设备流冲突
-```
-
-若前半段已污染全局TouchState，后续MOVE会沿一条从未成功投递DOWN的假手势继续发送。
-
-## 29. 注入权限是提交门
-
-源码注释明确说，出于安全原因，在确认事件注入被允许前暂缓更新触摸状态。
-
-只有注入者通过权限检查，临时状态才可能写回全局。
-
-## 30. 真实硬件事件也走相同路由算法
-
-`InjectionState`主要描述软件注入者。
-
-没有InjectionState不意味着跳过触摸目标选择；真实InputReader事件仍使用同一TouchState和窗口命中主链。
-
-## 31. 新DOWN先重置旧临时状态
-
-开始新手势时：
-
-```cpp
-tempTouchState.reset();
-tempTouchState.down = true;
-tempTouchState.deviceId = entry.deviceId;
-tempTouchState.source = entry.source;
-tempTouchState.displayId = displayId;
-```
-
-如果旧状态本来还down，又收到新DOWN，还会报告conflicting pointer actions。
-
-## 32. paused窗口不会接收新触摸
-
-命中窗口若`InputWindowInfo.paused == true`，代码把它清空，不向它开始新手势。
-
-“paused”是窗口输入调度状态，不等价于Activity Java生命周期的`onPause()`字面含义。
-
-## 33. 没有Connection也不能投递
-
-窗口存在但找不到token对应`Connection`时，InputDispatcher不能找到可发布的InputChannel，因此取消这个新目标。
-
-这常见于窗口快照与通道生命周期交界处。
-
-## 34. unresponsive窗口不接新手势
-
-若连接已被上一章的ANR机制标记为`responsive == false`，InputDispatcher不会向它开始新的触摸手势。
-
-但已经在它那里的旧手势需要通过取消、窗口移除或恢复流程收尾，不能用这一句概括所有事件。
-
-## 35. 没窗口但有监控者仍可成功
-
-如果找不到普通触摸窗口，但当前DOWN命中了有效gesture monitor集合，目标选择仍可以成功。
-
-所以“没有前台窗口”不必然等于“没有任何接收者”。
-
-## 36. 前台目标的基础flag
-
-正常命中窗口获得：
-
-```cpp
-FLAG_FOREGROUND | FLAG_DISPATCH_AS_IS
-```
-
-若允许拆分，再加`FLAG_SPLIT`。
-
-## 37. FLAG_FOREGROUND不等于窗口焦点
-
-它表示“这个窗口是本次触摸的主要目标”，用于注入权限和目标存在性判断。
-
-触摸可以落到未持有键盘焦点的窗口，因此不能把它与`hasFocus`等同。
-
-## 38. 遮挡标志在目标选择时计算
-
-若目标上方有可视、不同进程、非trusted overlay、同Display的窗口覆盖触点：
-
-```text
-FLAG_WINDOW_IS_OBSCURED
-```
-
-若没有覆盖触点，但目标窗口其他区域与上层窗口相交：
-
-```text
-FLAG_WINDOW_IS_PARTIALLY_OBSCURED
-```
-
-## 39. trusted overlay为何不算安全遮挡
-
-`canBeObscuredBy()`排除`otherInfo->isTrustedOverlay()`。
-
-同token克隆层、同ownerPid、不可见或不同Display的窗口也不计入此遮挡判断。
-
-## 40. frame与touchable region在这里角色不同
-
-正常命中用`touchableRegionContainsPoint()`。
-
-遮挡点判断却看上层窗口`frameContainsPoint()`；部分遮挡看窗口矩形是否overlap。
-
-读源码时不要把这三种几何判断混为一种。
-
-## 41. 遮挡结果怎样进入App
-
-创建`DispatchEntry`时，target flag被翻译到MotionEvent flags：
-
-```text
-AMOTION_EVENT_FLAG_WINDOW_IS_OBSCURED
-AMOTION_EVENT_FLAG_WINDOW_IS_PARTIALLY_OBSCURED
-```
-
-App可据此对敏感触摸做额外防护。
-
-## 42. 版本边界：不要倒灌新版本opacity规则
-
-本章基于Android 11 r48的`canBeObscuredBy + frame/overlap`逻辑。
-
-后续Android版本围绕不受信任覆盖层、最大遮挡不透明度等还有演进，不能直接套回本章源码。
-
-## 43. WATCH_OUTSIDE_TOUCH何时加入
-
-`findTouchedWindowAtLocked()`只有在首个`ACTION_DOWN`传入`addOutsideTargets=true`。
-
-遍历尚未命中的上层窗口时，如果它声明：
-
-```text
-FLAG_WATCH_OUTSIDE_TOUCH
-```
-
-就临时加入`FLAG_DISPATCH_AS_OUTSIDE`目标。
-
-## 44. 它收到的是ACTION_OUTSIDE
-
-投递阶段把该目标的动作改写为：
-
-```cpp
-AMOTION_EVENT_ACTION_OUTSIDE
-```
-
-它不是原始`ACTION_DOWN`，也不是手势的共同前台所有者。
-
-## 45. 为什么只收到一次
-
-成功输出本次目标后，代码调用：
-
-```cpp
-tempTouchState.filterNonAsIsTouchWindows();
-```
-
-仅保留`DISPATCH_AS_IS`或slippery enter目标。纯outside目标被从持续状态中删除。
-
-因此后续MOVE/UP不会继续发给它。
-
-## 46. outside窗口不能单独让手势成立
-
-目标选择要求至少有一个foreground窗口或gesture monitor。
-
-仅有`WATCH_OUTSIDE_TOUCH`观察者、却没有真正前台目标和监控者时，事件仍失败。
-
-## 47. 跨UID为何清零坐标
-
-若outside窗口ownerUid与实际前台目标ownerUid不同，TouchState为它增加：
-
-```cpp
-InputTarget::FLAG_ZERO_COORDS
-```
-
-这样只通知“外部发生了触摸”，不泄露另一应用精确触点。
-
-## 48. ZERO_COORDS清什么
-
-发布前为所有PointerCoords调用`clear()`，并不应用正常窗口偏移。
-
-因此不要依靠跨UID`ACTION_OUTSIDE`中的坐标定位用户点击了别的App哪里。
-
-## 49. 同UID窗口为何可保留坐标
-
-同一应用可有多个顶层窗口，例如Dialog、Popup关联窗口。
-
-同UID不存在同样的跨应用位置泄露边界，所以不会因这段规则自动清零。
-
-## 50. split touch解决什么
-
-假设同一触摸屏：
-
-```text
-pointer 0在A窗口DOWN
-pointer 1在B窗口POINTER_DOWN
-```
-
-若A、B支持split，InputDispatcher可让两个窗口分别拥有自己的指针子集。
-
-## 51. supportsSplitTouch从窗口flag得出
-
-窗口的`InputWindowInfo::supportsSplitTouch()`检查相应layout flag。
-
-是否拆分不是App在每个MotionEvent到来时动态返回的结果，而是WMS输入窗口快照中的能力。
-
-## 52. 鼠标永不split
-
-即使窗口支持拆分，源码仍明确：
-
-```cpp
-isSplit = !isFromMouse;
-```
-
-鼠标被视为单一光标流，不按多触点触摸语义拆分。
-
-## 53. 第一个窗口决定是否进入split模式
-
-首个DOWN命中的窗口支持split且不是鼠标时，`isSplit`变为true。
-
-它的action pointer ID被记录到该窗口`pointerIds`中。
-
-## 54. 新指针怎样选新窗口
-
-已有split手势收到`ACTION_POINTER_DOWN`时，代码读取action index对应新指针坐标，再次调用窗口命中。
-
-这次只是在为“新加入的pointer ID”选择归属，不是把旧指针重新分配。
-
-## 55. 新窗口不支持split怎么办
-
-如果已处于split模式，而新命中窗口不支持split，源码忽略这个新窗口。
-
-随后尝试使用TouchState中第一个foreground窗口。
-
-因此不会一半拆分后突然把整条流交给一个不支持拆分的新窗口。
-
-## 56. pointerIds怎样合并
-
-`addOrUpdateWindow()`发现相同窗口已存在时：
-
-```cpp
-touchedWindow.pointerIds.value |= pointerIds.value;
-```
-
-两个手指都落入A窗口时，A可以拥有多个ID，而不是出现两个A窗口目标项。
-
-## 57. split状态怎样被持久化
-
-只要target flags带`FLAG_SPLIT`，`addOrUpdateWindow()`就设置：
-
-```cpp
-split = true;
-```
-
-之后的POINTER_DOWN/MOVE/POINTER_UP均按拆分规则处理。
-
-## 58. split不是复制完整MotionEvent
-
-在`prepareDispatchCycleLocked()`中，如果目标有`FLAG_SPLIT`且目标ID数不等于原事件pointerCount，才调用：
-
-```cpp
-splitMotionEvent(originalMotionEntry, inputTarget.pointerIds)
-```
-
-输出事件只带该窗口拥有的PointerProperties和PointerCoords。
-
-## 59. pointer数组怎样裁剪
-
-函数遍历原始pointer数组，只复制ID在目标BitSet中的元素。
-
-同时建立原index到新index的关系，为action index重写做准备。
-
-## 60. POINTER_DOWN落在本窗口且它只有一个指针
-
-原始全局动作可能是`ACTION_POINTER_DOWN`。
-
-但对刚第一次看到该指针的B窗口，必须改写为：
-
-```text
-ACTION_DOWN
-```
-
-否则B会收到没有起点的事件流。
-
-## 61. POINTER_UP是本窗口最后一个指针
-
-全局`ACTION_POINTER_UP`对该窗口会改写为：
-
-```text
-ACTION_UP
-```
-
-这让每个窗口看到的局部流都符合DOWN到UP的配对。
-
-## 62. 本窗口仍有其他指针
-
-若发生变化的pointer属于本窗口，且本窗口拥有多个pointer，仍使用`POINTER_DOWN/UP`，但action index改为裁剪后数组中的新位置。
-
-## 63. 变化的pointer不属于本窗口
-
-例如B新增pointer 1时，A只拥有pointer 0。
-
-对A而言没有自己的指针发生上下变化，所以动作改为：
-
-```text
-ACTION_MOVE
-```
-
-## 64. 两窗口拆分示例
-
-```mermaid
-sequenceDiagram
-    participant HW as "原始触摸流"
-    participant ID as "InputDispatcher"
-    participant A as "窗口A: id0"
-    participant B as "窗口B: id1"
-    HW->>ID: "DOWN(id0 @ A)"
-    ID->>A: "DOWN(id0)"
-    HW->>ID: "POINTER_DOWN(id0,id1; action=id1 @ B)"
-    ID->>A: "MOVE(id0)"
-    ID->>B: "DOWN(id1)"
-    HW->>ID: "MOVE(id0,id1)"
-    ID->>A: "MOVE(id0)"
-    ID->>B: "MOVE(id1)"
-    HW->>ID: "POINTER_UP(id0,id1; action=id1)"
-    ID->>A: "MOVE(id0)"
-    ID->>B: "UP(id1)"
-    HW->>ID: "UP(id0)"
-    ID->>A: "UP(id0)"
-```
-
-## 65. 指针集合不一致会丢弃拆分事件
-
-若BitSet预期的某pointer ID在原始MotionEntry中找不到，`splitMotionEvent()`返回空并记录警告。
-
-这表示输入设备给出了破坏既有ID序列的不一致事件，继续投递反而会制造非法局部流。
-
-## 66. 拆分事件获得新event ID
-
-裁剪后的`MotionEntry`由`mIdGenerator.nextId()`生成新ID。
-
-它仍保留原事件时间、设备、source、display、flags、精度、downTime等语义，并继承InjectionState引用。
-
-## 67. POINTER_UP后何时移除归属
-
-当前`POINTER_UP`先按旧TouchState投递，让对应窗口收到UP。
-
-之后才遍历split窗口，清除此pointer ID；某窗口集合变空时从TouchState移除。
-
-“先发结束事件，再忘记所有权”保证序列闭环。
-
-## 68. 最终UP/CANCEL重置整条状态
-
-收到：
-
-```text
-ACTION_UP
-ACTION_CANCEL
-```
-
-会`tempTouchState.reset()`，清除windows、portalWindows、gestureMonitors及设备身份。
-
-## 69. SCROLL为何不持久保存
-
-滚轮`ACTION_SCROLL`会临时命中目标，但成功后不把临时TouchState写回全局。
-
-它是一次性generic motion，不是从DOWN延续到UP的触摸流。
-
-## 70. Hover有独立进入退出语义
-
-当新hover窗口与`mLastHoverWindowHandle`不同：
-
-```text
-旧窗口补HOVER_EXIT
-新窗口补HOVER_ENTER
-```
-
-之后清理临时状态，仅为仍在hover的设备保存身份。
-
-## 71. hover窗口消失怎么办
-
-`setInputWindowsLocked()`更新窗口快照时，如果找不到`mLastHoverWindowHandle`，就把它清空。
-
-这避免后续向已移除窗口补发hover事件。
-
-## 72. FLAG_SLIPPERY是MOVE重新命中的显式例外
-
-只有满足：
-
-```text
-ACTION_MOVE
-pointerCount == 1
-TouchState中恰好一个foreground窗口
-该窗口带FLAG_SLIPPERY
-```
-
-才会重新按当前坐标寻找窗口。
-
-## 73. slippery旧窗口收到什么
-
-当新旧目标不同且都存在，旧窗口加入：
-
-```text
-FLAG_DISPATCH_AS_SLIPPERY_EXIT
-```
-
-投递阶段把当前MOVE改写成`ACTION_CANCEL`。
-
-## 74. slippery新窗口收到什么
-
-新窗口加入：
-
-```text
-FLAG_DISPATCH_AS_SLIPPERY_ENTER
-```
-
-投递阶段把同一当前MOVE改写成`ACTION_DOWN`。
-
-因此两边仍分别得到合法的结束和起始事件。
-
-## 75. 为什么限制单指针
-
-多指针转移需要决定每个pointer归属、重写多个局部动作和状态，语义复杂。
-
-Android 11这条slippery路径只处理`pointerCount == 1`。
-
-## 76. slippery状态怎样留下新目标
-
-`filterNonAsIsTouchWindows()`会删除旧的slippery exit目标，并把slippery enter目标的分发模式归一为`DISPATCH_AS_IS`。
-
-下一次MOVE便沿新窗口继续。
-
-## 77. r48中的冗余赋值
-
-slippery进入支持split的新窗口时，源码连续两次写：
-
-```cpp
-isSplit = true;
-isSplit = true;
-```
-
-这是无行为差异的重复赋值，阅读时不要为第二句虚构额外语义。
-
-## 78. wallpaper何时收到副本
-
-首个`ACTION_DOWN`选出foreground窗口后，如果该窗口的`hasWallpaper`为true，InputDispatcher把同Display所有`TYPE_WALLPAPER`窗口加入目标。
-
-它们在整条手势期间被锁定。
-
-## 79. wallpaper目标为什么标记遮挡
-
-壁纸窗口获得：
-
-```text
-WINDOW_IS_OBSCURED
-WINDOW_IS_PARTIALLY_OBSCURED
-DISPATCH_AS_IS
-```
-
-因为前台应用位于壁纸之上；壁纸收到副本不意味着它成了foreground触摸目标。
-
-## 80. hover和scroll不收集wallpaper
-
-源码注释说明Wallpaper Engine只支持touch事件；没有类似`View.onGenericMotionEvent`的机制处理这些事件。
-
-因此这里只在首个DOWN收集壁纸。
-
-## 81. portal window是什么
-
-命中窗口如果把输入门户指向另一个Display，`findTouchedWindowAtLocked()`可递归到目标Display继续命中。
-
-TouchState同时记录经过的portal windows，以便把嵌入Display上的gesture monitor也加入当前手势。
-
-## 82. portal坐标偏移
-
-为portal后面的gesture monitor构造目标时，使用门户frame左上角的负偏移：
-
-```text
-xOffset = -frameLeft
-yOffset = -frameTop
-```
-
-这让监控者获得与其Display空间对应的坐标。
-
-## 83. global monitor与gesture monitor不要混淆
-
-InputDispatcher有两类monitor集合：
-
-```text
-mGlobalMonitorsByDisplay
-mGestureMonitorsByDisplay
-```
-
-本章的TouchState、DOWN锁定与`pilferPointers()`针对gesture monitor；全局监控目标由另一条统一加入路径处理。
-
-## 84. gesture monitor何时加入
-
-只有首个`ACTION_DOWN`时调用：
-
-```cpp
-findTouchedGestureMonitorsLocked(...)
-```
-
-选出的响应式monitor被保存到TouchState，之后沿整条流持续收事件副本。
-
-## 85. gesture monitor不收按键
-
-AOSP测试明确验证gesture monitor不接收KeyEvent。
-
-它面向当前Display的手势流，不是任意输入事件的通用监听器。
-
-## 86. unresponsive monitor被排除新手势
-
-代码调用`selectResponsiveMonitorsLocked()`，不向已无响应的gesture monitor开始新流。
-
-monitor本身也有Connection、waitQueue和输入ANR语义，并非“旁路观察就不用回执”。
-
-## 87. InputMonitor是受限系统能力
-
-Java `InputMonitor`文档把它描述为privileged applications/components用于监控事件流的能力。
-
-普通第三方App不能把它当作绕过窗口路由的公共监听API。
-
-## 88. pilfer不是“从下一次DOWN开始抢”
-
-`InputMonitor.pilferPointers()`针对当前正在发送给该monitor的pointer streams。
-
-它可以在手势进行到一半时改变后续所有权。
-
-## 89. Java到native的调用链
+调用链是：
 
 ```text
 InputMonitor.pilferPointers()
-→ IInputMonitorHost.pilferPointers() Binder
-→ InputManagerService.InputMonitorHost
-→ nativePilferPointers
-→ InputDispatcher::pilferPointers(token)
+  → oneway IInputMonitorHost.pilferPointers()
+  → InputManagerService.InputMonitorHost
+  → nativePilferPointers
+  → InputDispatcher::pilferPointers(token)
 ```
 
-token是monitor InputChannel的connection token。
+native 依次验证：token 仍属于已注册 gesture monitor；对应 display 有 TouchState；该 token 确实在 `state.gestureMonitors` 中；`state.down` 为真。只注册却没参与当前 DOWN，或流已经结束，都得到 native `BAD_VALUE`。
 
-## 90. pilfer第一道校验
+portal monitor 还有 display 键不对称：它虽然能通过 portal 被收进“入口 display”的 TouchState，但 pilfer 首先从 token 找到 monitor 自己的注册 display，再用该 display 查 TouchState。因此只经 portal 参与的 monitor 通常找不到那条跨 display 流，不能凭参与收包就推断它一定有 pilfer 资格。
 
-InputDispatcher先遍历`mGestureMonitorsByDisplay`，确认token属于已注册gesture monitor，并找出Display。
+验证通过后，dispatcher 遍历 `state.windows`，对仍能找到 Channel 的每个窗口使用限定当前 device/display 的 `CANCEL_POINTER_EVENTS`，由各 Connection 的 InputState 生成具体取消事件；它不按 source 或某个 pointer ID 子集再缩小，所以同一 Connection 上满足 device/display 的 pointer-class memento 都可能被取消。多个 TouchState 窗口若共享 Channel，循环可能重复请求，但第一次通常已经清掉可匹配 memento。随后 `state.filterNonMonitors()` 清空 windows 与 portalWindows。
 
-未注册token返回`BAD_VALUE`。
+它保留的是整组 gesture monitors，而非只有 pilfer 发起者；同时保留 `down/split/deviceId/source/displayId`。所以 TouchState 对已存在 pointer 的后续 MOVE/POINTER_UP/UP/CANCEL 不再产出窗口目标，只产出 gesture monitor；`dispatchMotionLocked()` 仍会另加 global monitors，UP 或 CANCEL 才 reset 状态。已发布或已经排在窗口 outbound 中的旧事件不会被“倒吸回来”，取消也要排队、送达和回执。
 
-## 91. pilfer第二道校验
+Java 侧还有一个完成边界：`IInputMonitorHost` 整个接口是 oneway，`nativePilferPointers()` 又忽略 native `status_t`。因此 `InputMonitor.pilferPointers()` 返回 void 只表示请求已提交；调用者既不能据此证明 native 已执行，也观察不到资格校验的 `BAD_VALUE`，更不能证明窗口已收到 CANCEL。即使 native 返回 `OK`，合成 CANCEL 也只是排入 Connection 队列：原有 outbound 项可能在它前面，pipe 满时它还会停在 outbound，真正消费与 finished 更晚。
 
-目标Display必须存在TouchState，而且该monitor必须在`state.gestureMonitors`中，`state.down`还必须为true。
+r48 还存在一个反直觉尖角：`filterNonMonitors()` 不清 `split`。若 pilfer 前已经是 split 流，后续又出现 `POINTER_DOWN`，代码仍会进入 split 新指针 hit-test；只要它命中可用且支持 split 的窗口，就可能重新把这个新窗口加入 TouchState，并让它收到局部 DOWN。因而“pilfer 后直到 UP/CANCEL 永远只有 monitor”只适用于既有 pointers 的 MOVE/POINTER_UP/UP/CANCEL，不能推广到这种新增指针。反过来，若这枚新 pointer 找不到合格窗口，Case 1 的立即失败门查看的是仅 DOWN 才填充的 `newGestureMonitors`，不是状态里保留的旧 monitors；该 POINTER_DOWN 仍会失败，并对注册表中的 monitor Connections 合成 pointer cancel，而权限通过的失败尾还可能把原 TouchState 保存回去。
 
-所以仅仅注册了monitor，却没有参与当前DOWN，不能半途偷另一条它未收到的流。
+pilfer 清空 portalWindows 后，既有 pointer 的普通 MOVE/POINTER_UP/UP/CANCEL 不再追加 portal display 的 global monitors；已经选入 `gestureMonitors` 的 portal monitor 仍保留。但 split `POINTER_DOWN` 会以 `addPortalWindows=true` 重新 hit-test，可能重建 portal 路径：成功时该事件就能再次追加 portal globals，失败尾也可能把新路径写回，供后续成功事件使用。这种 portal monitor 的 token 仍受前述注册 display 查表不对称限制，是否继续收包与是否能主动 pilfer 是两个问题。
 
-## 92. pilfer向谁发送CANCEL
+## 15. 九组只读练习：逐段重建路由账
 
-代码遍历`state.windows`，对仍存在InputChannel的每个窗口合成：
+下面命令只读，默认源码根目录为 `/Users/ninebot/androidSource`，也可把其他 AOSP 根目录作为第一个参数传入。每条 `grep` 都应独立命中；任何一条失败都表示源码版本或形态不同，应先核对基线再继续推理。
 
-```text
-CANCEL_POINTER_EVENTS
-reason = "gesture monitor stole pointer stream"
-deviceId、displayId限定为当前流
-```
-
-这包括TouchState中保留的普通窗口/壁纸等窗口目标。
-
-## 93. pilfer不会取消调用者自己
-
-gesture monitor存放在`state.gestureMonitors`，不在`state.windows`。
-
-取消循环只遍历windows，因此调用pilfer的monitor继续拥有当前流。
-
-## 94. pilfer后TouchState怎样变化
-
-最后调用：
-
-```cpp
-state.filterNonMonitors();
-```
-
-它清空`windows`和`portalWindows`，保留`gestureMonitors`以及down/device/source/display状态。
-
-于是后续MOVE/UP继续投给monitor，不再投给原窗口。
-
-## 95. 多个monitor会怎样
-
-`filterNonMonitors()`保留整组gesture monitors，而不是只保留发起pilfer的那个。
-
-因此Android 11这段实现的精确语义是：取消窗口接收者，监控者集合仍继续收流；不要表述成“唯一归调用者独占”。
-
-## 96. pilfer完整时间线
-
-```mermaid
-sequenceDiagram
-    participant W as "普通窗口"
-    participant ID as "InputDispatcher / TouchState"
-    participant M as "Gesture InputMonitor"
-    ID->>W: "ACTION_DOWN"
-    ID->>M: "ACTION_DOWN副本"
-    ID->>W: "ACTION_MOVE"
-    ID->>M: "ACTION_MOVE副本"
-    M->>ID: "pilferPointers(token)"
-    ID->>W: "合成ACTION_CANCEL"
-    Note over ID: "清空state.windows，保留gestureMonitors与down"
-    ID->>M: "后续ACTION_MOVE"
-    ID->>M: "ACTION_UP"
-    Note over ID: "UP后reset TouchState"
-```
-
-## 97. pilfer为何必须发CANCEL
-
-如果窗口已经收到DOWN和若干MOVE，InputDispatcher直接停止发送会留下悬空手势。
-
-合成CANCEL使ViewRoot、ViewGroup、GestureDetector、VelocityTracker等有机会清理pressed、drag和pointer capture相关局部状态。
-
-## 98. pilfer返回成功不等于窗口已处理CANCEL
-
-`synthesizeCancelationEventsForInputChannelLocked()`把取消事件加入分发链。
-
-`pilferPointers()`返回`OK`表示native已接受并改写路由状态，不代表App已经消费、回执，更不代表UI已经完成下一帧显示。
-
-## 99. Quickstep为什么需要pilfer
-
-系统手势通常先观察DOWN和小幅MOVE，确认用户确实开始导航手势后才抢占。
-
-在抢占前，App能获得正常触摸；越过阈值后monitor pilfer，App收到CANCEL，Launcher/Quickstep继续处理余下手势。
-
-这与第226章的window-move slop、pilfer slop和`OtherActivityInputConsumer`正好衔接。
-
-## 100. 窗口在手势中途被移除
-
-`setInputWindowsLocked()`更新窗口列表时，会检查TouchState中的每个window。
-
-若window handle不再存在：
-
-```text
-向仍存在的InputChannel合成CANCEL_POINTER_EVENTS
-→ 从state.windows移除
-```
-
-## 101. 为什么窗口移除不一定清空整个TouchState
-
-同一手势可能还有：
-
-```text
-另一个split窗口
-wallpaper目标
-gesture monitor
-```
-
-所以代码逐项删除失效窗口，而不是无条件reset整条Display状态。
-
-## 102. monitor可在窗口移除后pilfer
-
-AOSP测试覆盖了：窗口先从流中移除/释放channel，gesture monitor随后pilfer，后续UP仍由monitor接收。
-
-这说明monitor的持续性不是依赖普通窗口仍活着。
-
-## 103. addWindowTarget怎样转换坐标
-
-窗口目标记录：
-
-```text
-xOffset = -frameLeft
-yOffset = -frameTop
-windowXScale、windowYScale
-globalScaleFactor
-```
-
-后续发布阶段据source、ZERO_COORDS和scale决定实际PointerCoords处理。
-
-## 104. 目标合并以InputChannel token为准
-
-`addWindowTargetLocked()`先在本次`inputTargets`中按connection token查找已有目标。
-
-同一通道不会因多种路径随意产生互相矛盾的独立连接投递；pointer信息可合入同一InputTarget。
-
-## 105. dispatch mode怎样改写动作
-
-`enqueueDispatchEntriesLocked()`按固定顺序尝试：
-
-```text
-HOVER_EXIT
-OUTSIDE
-HOVER_ENTER
-AS_IS
-SLIPPERY_EXIT
-SLIPPERY_ENTER
-```
-
-创建DispatchEntry时分别解析为HOVER_EXIT、OUTSIDE、HOVER_ENTER、原动作、CANCEL、DOWN。
-
-## 106. 一个原始事件可生成多个DispatchEntry
-
-同一MotionEntry可能同时导致：
-
-```text
-前台窗口AS_IS
-outside窗口OUTSIDE
-wallpaper AS_IS
-多个gesture monitor AS_IS
-slippery旧窗口CANCEL和新窗口DOWN
-```
-
-因此EventEntry是一份事实，DispatchEntry才是“发给某连接的具体形态”。
-
-## 107. resolved event ID为何可能变化
-
-AS_IS动作通常保留原MotionEntry ID。
-
-动作被变形为OUTSIDE、CANCEL、DOWN等，或事件被split时，会生成新ID，便于跟踪派生后的独立投递事实。
-
-## 108. TouchState提交顺序
-
-成功路径先把临时窗口和monitor转成当前`inputTargets`，再过滤一次性目标，最后根据动作更新down/pointer集合并写回map。
-
-这让“当前事件应该发给谁”和“下一事件应记住谁”可以不同。
-
-## 109. 当前事件与下一状态的典型差异
-
-例子：
-
-```text
-ACTION_OUTSIDE接收者出现在当前inputTargets，却不留在下一TouchState
-POINTER_UP的窗口收到当前UP，然后其最后pointerId才被移除
-SLIPPERY旧窗口收到当前CANCEL，但下一状态只留下新窗口
-ACTION_UP当前仍发给旧目标，之后整条状态reset
-```
-
-## 110. 目标选择失败后的权限细节
-
-即使中途失败，代码仍会把尚未知的注入权限最终检查一次。
-
-只有注入权限被授予时，才继续处理某些冲突状态写回；权限被拒绝时直接返回，避免未授权事件改变真实路由账本。
-
-## 111. 常见误解一：触摸跟着手指跨窗口走
-
-错误。
-
-正常窗口在DOWN时取得流，MOVE不会因越界自动换目标；只有slippery、split新增指针、hover等明确机制例外。
-
-## 112. 常见误解二：split把完整多指事件复制给每个窗口
-
-错误。
-
-每个窗口只获得自己拥有的pointer ID，并得到重写后自洽的局部action。
-
-## 113. 常见误解三：WATCH_OUTSIDE参与整条手势
-
-错误。
-
-它只在首DOWN临时接收一次`ACTION_OUTSIDE`，随后从TouchState过滤掉。
-
-## 114. 常见误解四：pilfer把事件从App队列里倒吸回来
-
-错误。
-
-已经发布的DOWN/MOVE不会被收回；InputDispatcher为窗口合成CANCEL，并修改后续路由。
-
-## 115. 常见误解五：monitor不需要完成回执
-
-错误。
-
-monitor也有Connection和响应性；不完成事件可能触发输入ANR并被排除在新手势之外。
-
-## 116. 常见误解六：遮挡标志就是系统已经阻止触摸
-
-错误。
-
-本章这条Android 11路径主要给目标MotionEvent附加obscured flags。是否拒绝敏感操作还要看上层组件策略；不要把标志和“事件必然被系统丢弃”画等号。
-
-## 117. 用一个完整例子串起来
-
-设顶层到下层依次为：
-
-```text
-O：NOT_TOUCH_MODAL + WATCH_OUTSIDE_TOUCH
-A：支持split，hasWallpaper
-W：TYPE_WALLPAPER
-另有gesture monitor M
-```
-
-手指0落在A：
-
-```text
-O收到OUTSIDE（跨UID则坐标清零）
-A收到DOWN并拥有id0
-W收到遮挡标记的DOWN副本
-M收到DOWN副本
-O随后从TouchState删除
-```
-
-## 118. 第二根手指落到B
-
-若B也支持split：
-
-```text
-A对全局POINTER_DOWN看到MOVE(id0)
-B看到DOWN(id1)
-W没有FLAG_SPLIT，因而收到包含id0、id1的原始POINTER_DOWN副本；它仍是锁定的非foreground目标
-M作为monitor收到当前流
-```
-
-这里也说明split是逐目标属性：A、B按各自pointerIds裁剪，不代表同一事件的wallpaper和monitor副本也被自动裁剪。
-
-## 119. M随后pilfer
-
-InputDispatcher向A、B、W的通道合成pointer CANCEL，清空`state.windows`。
-
-M和其他已加入的gesture monitors保留，继续收MOVE和最终UP；UP后TouchState reset。
-
-## 120. 调试触摸路由应看哪些事实
-
-优先按顺序确认：
-
-```text
-1. 当前Display窗口Z序
-2. visible、flags、frame与touchableRegion
-3. DOWN坐标和action pointer ID
-4. TouchState是否down/split、当前windows与pointerIds
-5. Connection是否存在、responsive、paused
-6. 是否有outside/wallpaper/monitor附加目标
-7. 是否发生slippery、窗口移除或pilfer CANCEL
-8. 客户端是否及时finished
-```
-
-## 121. dumpsys只能反映观察时刻
-
-输入路由是动态状态。
-
-窗口层级、touchable region、焦点和TouchState可能在一次手势中变化；一份事后dump未必就是DOWN发生时的窗口快照。
-
-所以日志、trace和事件时间线应与dump结合。
-
-## 122. macOS只读练习一：手工追命中条件
+### 练习 1：从Motion入口走到窗口命中
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '800,850p' \
-  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'bool InputDispatcher::dispatchMotionLocked(nsecs_t currentTime, MotionEntry* entry,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'bool isPointerEvent = entry->source & AINPUT_SOURCE_CLASS_POINTER;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'findTouchedWindowTargetsLocked(currentTime, *entry, inputTargets, nextWakeupTime,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'sp<InputWindowHandle> InputDispatcher::findTouchedWindowAtLocked(' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F '// Traverse windows from front to back to find touched window.' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (!(flags & InputWindowInfo::FLAG_NOT_TOUCHABLE)) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (isTouchModal || windowInfo->touchableRegionContainsPoint(x, y)) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (addOutsideTargets && (flags & InputWindowInfo::FLAG_WATCH_OUTSIDE_TOUCH)) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'addGlobalMonitoringTargetsLocked(inputTargets, getTargetDisplayId(*entry));' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
 ```
 
-逐行回答：不可见、NOT_TOUCHABLE、touch modal、touchable region、portal和WATCH_OUTSIDE分别在哪一层判断。
+要求：按源码顺序说明 pointer/non-pointer 分流，以及 visible、NOT_TOUCHABLE、touch modal、Region、outside 与 global monitor 各在哪个阶段生效。
 
-## 123. macOS只读练习二：画出TouchState生命周期
+### 练习 2：区分临时演算、当前targets与下一状态
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '1560,2005p' \
-  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'std::unordered_map<int32_t, TouchState> mTouchStatesByDisplay GUARDED_BY(mLock);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.h
+grep -n -F 'tempTouchState.copyFrom(*oldState);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'bool newGesture = (maskedAction == AMOTION_EVENT_ACTION_DOWN ||' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F '// Success!  Output targets.' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'tempTouchState.filterNonAsIsTouchWindows();' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (injectionPermission != INJECTION_PERMISSION_GRANTED) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (!wrongDevice) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (maskedAction != AMOTION_EVENT_ACTION_SCROLL) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mTouchStatesByDisplay[displayId] = tempTouchState;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
 ```
 
-只读标出：copy、DOWN reset、目标加入、当前targets输出、过滤、POINTER_UP移除、UP/CANCEL reset和最终写回。
+要求：解释为何“权限确认前不改全局”不等于“目标选择失败必回滚”，并推演 outside、SCROLL、UP 三种当前目标与下一状态的差异。
 
-## 124. macOS只读练习三：手算split action
+### 练习 3：核对新目标门、注入权限与坐标保护
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '2925,3040p' \
-  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'if (newTouchedWindowHandle != nullptr && newTouchedWindowHandle->getInfo()->paused) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'sp<Connection> connection = getConnectionLocked(newTouchedWindowHandle->getToken());' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F '} else if (!connection->responsive) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'newGestureMonitors = selectResponsiveMonitorsLocked(newGestureMonitors);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (!haveForegroundWindow && !hasGestureMonitor) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (!checkInjectionPermission(touchedWindow.windowHandle, entry.injectionState)) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (inputWindowHandle->getInfo()->ownerUid != foregroundWindowUid) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'tempTouchState.addOrUpdateWindow(inputWindowHandle,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (dispatchEntry->targetFlags & InputTarget::FLAG_ZERO_COORDS) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'scaledCoords[i].clear();' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
 ```
 
-设原事件ID集合为`{0, 3}`，action pointer是3；分别计算目标集合`{0}`、`{3}`、`{0,3}`在POINTER_DOWN和POINTER_UP时看到的action。
+要求：说明仅有 outside 为什么不足以成功、gesture monitor 怎样补位、权限检查为何只遍历 foreground，以及跨 UID outside 坐标在哪两步被标记和清零。
 
-## 125. macOS只读练习四：验证pilfer边界
+### 练习 4：推演split资格与pointer ownership
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '4429,4480p' \
-  frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
-sed -n '40,75p' \
-  frameworks/base/core/java/android/view/InputMonitor.java
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'if (newGesture || (isSplit && maskedAction == AMOTION_EVENT_ACTION_POINTER_DOWN)) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'const bool isFromMouse = entry.source == AINPUT_SOURCE_MOUSE;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'newTouchedWindowHandle->getInfo()->supportsSplitTouch()) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'isSplit = !isFromMouse;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F '} else if (isSplit) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'newTouchedWindowHandle = tempTouchState.getFirstForegroundWindowHandle();' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'pointerIds.markBit(pointerId);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (targetFlags & InputTarget::FLAG_SPLIT) {' frameworks/native/services/inputflinger/dispatcher/TouchState.cpp
+grep -n -F 'touchedWindow.pointerIds.value |= pointerIds.value;' frameworks/native/services/inputflinger/dispatcher/TouchState.cpp
 ```
 
-写下三项：谁有资格pilfer、谁收到CANCEL、哪几类TouchState字段被保留。
+要求：分别代入首指、split 后的新指针、不支持 split 的新窗口和 mouse，写出 hit-test 与 pointer ID 归属结果。
 
-## 126. 复读后最容易不理解的地方
+### 练习 5：手算splitMotionEvent的局部action
 
-第一次读完最容易卡在四点：
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'if (inputTarget.flags & InputTarget::FLAG_SPLIT) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (inputTarget.pointerIds.count() != originalMotionEntry.pointerCount) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'MotionEntry* InputDispatcher::splitMotionEvent(' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (splitPointerCount != pointerIds.count()) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (pointerIds.hasBit(pointerId)) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (pointerIds.count() == 1) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F '? AMOTION_EVENT_ACTION_DOWN' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'action = AMOTION_EVENT_ACTION_MOVE;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'int32_t newId = mIdGenerator.nextId();' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'touchedWindow.pointerIds.clearBit(pointerId);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
+
+要求：原 ID 集合为 `{0,3}`、变化 pointer 为 3 时，分别计算目标集合 `{0}`、`{3}`、`{0,3}` 在 POINTER_DOWN 与 POINTER_UP 中看到的 action，并解释清 ownership 的时机。
+
+### 练习 6：比较普通MOVE、slippery、Hover与SCROLL
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'if (maskedAction == AMOTION_EVENT_ACTION_MOVE && entry.pointerCount == 1 &&' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'tempTouchState.isSlippery()) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'InputTarget::FLAG_DISPATCH_AS_SLIPPERY_EXIT,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'InputTarget::FLAG_FOREGROUND | InputTarget::FLAG_DISPATCH_AS_SLIPPERY_ENTER;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'isSplit = true;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (newHoverWindowHandle != mLastHoverWindowHandle) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F '(InputTarget::FLAG_DISPATCH_AS_IS | InputTarget::FLAG_DISPATCH_AS_SLIPPERY_ENTER)) {' frameworks/native/services/inputflinger/dispatcher/TouchState.cpp
+grep -n -F 'dispatchEntry->resolvedAction = AMOTION_EVENT_ACTION_CANCEL;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'dispatchEntry->resolvedAction = AMOTION_EVENT_ACTION_DOWN;' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (maskedAction != AMOTION_EVENT_ACTION_SCROLL) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
+
+要求：比较四条路径是否重新命中、当前事件怎样改写、下一 TouchState 保留什么；再指出 slippery 新窗口没有复用 Case 1 的哪些门。
+
+### 练习 7：分开wallpaper、portal与两类monitor
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'touchState->addPortalWindow(windowHandle);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'return findTouchedWindowAtLocked(portalToDisplayId, x, y, touchState,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'std::vector<TouchedMonitor> InputDispatcher::findTouchedGestureMonitorsLocked(' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'newGestureMonitors = selectResponsiveMonitorsLocked(newGestureMonitors);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (foregroundWindowHandle && foregroundWindowHandle->getInfo()->hasWallpaper) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'windowHandle->getInfo()->layoutParamsType == InputWindowInfo::TYPE_WALLPAPER) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'addMonitoringTargetLocked(touchedMonitor.monitor, touchedMonitor.xOffset,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'void InputDispatcher::addGlobalMonitoringTargetsLocked(std::vector<InputTarget>& inputTargets,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'addGlobalMonitoringTargetsLocked(inputTargets, windowInfo->portalToDisplayId,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
+
+要求：画出四类附加路由角色的加入时机，解释哪些进入 TouchState、哪一类可让无窗口 DOWN 成功，以及 portal 为何保存路径与偏移。
+
+### 练习 8：追pilfer的oneway调用与资格校验
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'public void pilferPointers() {' frameworks/base/core/java/android/view/InputMonitor.java
+grep -n -F 'mHost.pilferPointers();' frameworks/base/core/java/android/view/InputMonitor.java
+grep -n -F 'public InputMonitor monitorGestureInput(String inputChannelName, int displayId) {' frameworks/base/services/core/java/com/android/server/input/InputManagerService.java
+grep -n -F 'if (!checkCallingPermission(android.Manifest.permission.MONITOR_INPUT,' frameworks/base/services/core/java/com/android/server/input/InputManagerService.java
+grep -n -F 'return new InputMonitor(inputChannels[1], host);' frameworks/base/services/core/java/com/android/server/input/InputManagerService.java
+grep -n -F 'oneway interface IInputMonitorHost {' frameworks/base/core/java/android/view/IInputMonitorHost.aidl
+grep -n -F 'void pilferPointers();' frameworks/base/core/java/android/view/IInputMonitorHost.aidl
+grep -n -F 'nativePilferPointers(mPtr, mInputChannel.getToken());' frameworks/base/services/core/java/com/android/server/input/InputManagerService.java
+grep -n -F 'static void nativePilferPointers(' frameworks/base/services/core/jni/com_android_server_input_InputManagerService.cpp
+grep -n -F 'im->pilferPointers(token);' frameworks/base/services/core/jni/com_android_server_input_InputManagerService.cpp
+grep -n -F 'status_t NativeInputManager::pilferPointers(const sp<IBinder>& token) {' frameworks/base/services/core/jni/com_android_server_input_InputManagerService.cpp
+grep -n -F 'return mInputManager->getDispatcher()->pilferPointers(token);' frameworks/base/services/core/jni/com_android_server_input_InputManagerService.cpp
+grep -n -F 'status_t InputDispatcher::pilferPointers(const sp<IBinder>& token) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'findGestureMonitorDisplayByTokenLocked(token);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mTouchStatesByDisplay.find(displayId);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (!foundDeviceId || !state.down) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
+
+要求：追 token 跨层传递，区分“已注册”“参与当前流”“仍为 down”三道门，并证明 Java API 为什么观察不到 native 的 `OK/BAD_VALUE`。
+
+### 练习 9：验证pilfer的取消、保留状态与split尖角
+
+```bash
+set -eu
+ROOT=${1:-/Users/ninebot/androidSource}
+cd "$ROOT"
+grep -n -F 'CancelationOptions options(CancelationOptions::CANCEL_POINTER_EVENTS,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F '"gesture monitor stole pointer stream");' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'for (const TouchedWindow& window : state.windows) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'synthesizeCancelationEventsForInputChannelLocked(channel, options);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'state.filterNonMonitors();' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'void TouchState::filterNonMonitors() {' frameworks/native/services/inputflinger/dispatcher/TouchState.cpp
+grep -n -F 'windows.clear();' frameworks/native/services/inputflinger/dispatcher/TouchState.cpp
+grep -n -F 'portalWindows.clear();' frameworks/native/services/inputflinger/dispatcher/TouchState.cpp
+grep -n -F 'std::vector<TouchedMonitor> gestureMonitors;' frameworks/native/services/inputflinger/dispatcher/TouchState.h
+grep -n -F 'if (newGesture || (isSplit && maskedAction == AMOTION_EVENT_ACTION_POINTER_DOWN)) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'newTouchedWindowHandle->getInfo()->supportsSplitTouch()) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'if (!hasWindowHandleLocked(touchedWindow.windowHandle)) {' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'status_t InputDispatcher::unregisterInputChannelLocked(const sp<InputChannel>& inputChannel,' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'removeMonitorChannelLocked(inputChannel);' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+grep -n -F 'mTouchStatesByDisplay.clear();' frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+```
+
+要求：说明哪些窗口被加入 cancel、哪些 TouchState 字段被保留、为什么不是 pilfer 发起者独占；再推演已 split 流在 pilfer 后新增 pointer 时，窗口怎样可能重新进入。
+
+## 16. 从完整双指场景收束，并形成诊断顺序
+
+在同一个入口 display 上，设 top-to-bottom 依次有观察 outside 的 O、支持 split 且 `hasWallpaper` 的 A、也支持 split 的 B、wallpaper W，另有 gesture monitor M。O、A、B 都是可见且 `NOT_TOUCH_MODAL`：O 的 touchable Region 不含两处触点，A、B 的 Region 互不重叠，id0 命中 A、id1 命中 B。这样上层窗口才会按题设穿透，不能省略这个 hit-test 前提。
+
+第一根手指 id0 落在 A：
 
 ```text
-当前inputTargets与下一次TouchState不是同一集合
-pointer ID与pointer index不是同一东西
-FOREGROUND是触摸角色，不是键盘焦点
-pilfer清窗口但保留monitor和down，才能继续当前流
+O ← ACTION_OUTSIDE（跨 UID 时坐标清零，本次后从状态过滤）
+A ← ACTION_DOWN(id0)，成为 foreground + split owner
+W ← 带遮挡 flags 的完整 DOWN 副本
+M ← 完整 DOWN 副本，并写入 gestureMonitors
 ```
 
-## 127. 复读修订一：命中与持续分开发生
-
-更清楚的记法是：
+第二根手指 id1 落在 B：
 
 ```text
-DOWN解决“谁取得手势”
-TouchState解决“以后仍属于谁”
-InputTarget解决“这一帧以什么动作和坐标发给谁”
+A ← MOVE(id0)
+B ← DOWN(id1)
+W ← 未 split 的完整 POINTER_DOWN(id0,id1)
+M ← 未 split 的完整 POINTER_DOWN(id0,id1)
 ```
 
-三个问题分开后，outside、slippery和split就不再矛盾。
+若 M 随后 pilfer，A、B、W 的 Connection 被加入 pointer cancel，TouchState 清除窗口与 portal、保留 monitors 与流身份；既有 id0/id1 的后续 MOVE/POINTER_UP/UP/CANCEL 继续给 monitor。若这时再落下 id2，则必须记住上一节的 r48 split 尖角，不能假定窗口绝无重新加入的可能。
 
-## 128. 复读修订二：pilfer不是唯一monitor独占
+排查实际路由问题时，按下列顺序收证据：
 
-口语中的“偷走”容易让人以为只剩调用者。
+1. 确认原始 action、action index、pointer IDs、device/source/display。
+2. 还原首个 DOWN 当时的窗口 z 序、visible、flags、frame 与 touchable Region。
+3. 区分 foreground、outside、wallpaper、global monitor、gesture monitor 五种角色。
+4. 查看 TouchState 的 down/split/windows/pointerIds/portal/monitors，而不是用当前坐标猜目标。
+5. 对每个 InputTarget 核对 dispatch mode、是否 split、坐标偏移与 obscured flags。
+6. 若目标改变，找 slippery、窗口移除、显式 transfer 或 pilfer 的 CANCEL/DOWN 证据。
+7. 最后沿上一章的 outbound/waitQueue/finished 链确认“选中了目标”是否真的变成“客户端已完成”。
 
-r48实际执行`filterNonMonitors()`，保留整个`gestureMonitors`集合；准确表述应是“窗口接收者被取消，已参与的gesture monitors继续接收”。
+一份事后 dump 只反映观察时刻；窗口层级和 TouchState 都可能已变化。可靠结论需要把 DOWN 时的窗口快照、每次状态改写、派生 DispatchEntry 与客户端回执放在同一时间轴上。
 
-## 129. 复读修订三：wallpaper不是再次hit-test
-
-壁纸不是因为DOWN坐标穿透前台窗口后才被命中。
-
-它是在foreground窗口`hasWallpaper`成立后被显式加入副本目标，并锁定到手势结束。
-
-## 130. 复读修订四：outside的坐标清零有条件
-
-不是所有ACTION_OUTSIDE都必定为`(0,0)`。
-
-这段r48源码只在outside窗口与foreground窗口ownerUid不同的情况下增加`ZERO_COORDS`。
-
-## 131. 复读修订五：slippery是CANCEL加新DOWN
-
-“MOVE转交给另一个窗口”过于含糊。
-
-准确事件语义是：同一个原始MOVE派生出旧窗口CANCEL、新窗口DOWN，随后状态把新窗口归一为AS_IS目标。
-
-## 132. 本章版本勘误
-
-基于`android-11.0.0_r48`核准：
-
-```text
-slippery分支存在重复的isSplit = true，无额外效果
-TouchState按Display只记录一组device/source身份，源码仍有多并行流TODO
-pilfer保留所有gesture monitors，不是只保留调用者
-遮挡判断采用r48规则，不套用后续版本的完整opacity安全模型
-```
-
-## 133. 本章检查清单
-
-读完应能独立解释：
-
-```text
-[ ] 窗口如何按Z序、visible、flags和Region命中
-[ ] 为什么普通MOVE不重新命中
-[ ] TouchState与InputTarget的区别
-[ ] outside为何一次性、何时清零坐标
-[ ] split怎样按pointer ID重写局部动作
-[ ] slippery怎样以CANCEL/DOWN合法转移
-[ ] wallpaper和gesture monitor怎样加入
-[ ] pilfer的资格、CANCEL对象和保留状态
-[ ] 窗口移除为何合成pointer CANCEL
-[ ] r48实现边界与后续版本概念不能混用
-```
-
-## 134. 本章小结
-
-Android 11的触摸路由核心不是持续命中，而是状态化所有权：
-
-```text
-DOWN根据窗口快照建立TouchState
-→ windows记录角色与pointer ID归属
-→ InputTarget把同一原始事件变形为各连接需要的动作/坐标
-→ split让每个窗口得到自洽局部多指流
-→ outside、wallpaper、hover和monitor作为明确的附加角色
-→ slippery、窗口移除和pilfer用CANCEL维持事件序列不变量
-→ UP/CANCEL最终清空状态
-```
-
-把“谁拥有整条流”和“这一帧发成什么”分开，是读懂InputDispatcher触摸代码的关键。
-
-## 135. 下一章预告
-
-下一章继续追输入安全链：软件事件从Java/native怎样进入InputDispatcher，`INJECT_EVENTS`权限怎样按目标UID裁决，事件签名与`VerifiedInputEvent`究竟能证明什么，以及异步/等待结果的注入模式如何返回。
+下一章将继续追软件注入安全：Java/native 入口怎样进入 InputDispatcher，目标 UID 与 `INJECT_EVENTS` 权限怎样裁决，事件签名和 `VerifiedInputEvent` 能证明什么，以及异步/等待模式各自在哪个完成点返回。
