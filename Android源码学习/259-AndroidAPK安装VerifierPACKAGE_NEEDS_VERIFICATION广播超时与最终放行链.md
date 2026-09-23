@@ -285,7 +285,7 @@ PMS在 ordinary之前调用 `sendIntegrityVerificationRequest()`。r48默认开�
 
 r48有一处时长不对称：Integrity的临时 power whitelist用的是 ordinary `getVerificationTimeout()`，默认10秒；真正 Integrity timeout用 `getIntegrityVerificationTimeout()`，默认30秒。对 system_server内服务而言这未必直接制造休眠失败，但源码证据不能写成“两者都按30秒”。
 
-超时默认不可配置，方法返回 ordinary命名空间的 `PackageManager.VERIFICATION_REJECT=-1`，而 internal Integrity REJECT常量是0。timeout分支只判断结果是否等于 internal ALLOW=1，State又根本不保存 code、只置 complete，所以 -1仍产生拒绝后果：`mRet`写验证失败，Integrity主门结束。晚到结果若 State已删会被忽略；若 ordinary还没结束而 State仍在，ALLOW也不能撤销已经粘滞的失败。
+超时的默认响应不可配置：`getDefaultIntegrityVerificationResponse()`固定返回 ordinary命名空间的 `PackageManager.VERIFICATION_REJECT=-1`；超时时长本身则读取 `Global.APP_INTEGRITY_VERIFICATION_TIMEOUT`，但只能在30秒默认值之上增加。internal Integrity REJECT常量是0。timeout分支只判断结果是否等于 internal ALLOW=1，State又根本不保存 code、只置 complete，所以 -1仍产生拒绝后果：`mRet`写验证失败，Integrity主门结束。晚到结果若 State已删会被忽略；若 ordinary还没结束而 State仍在，ALLOW也不能撤销已经粘滞的失败。
 
 正常结果通过 `PackageManagerInternal.setIntegrityVerificationResult()`回到 PMS Handler。State仍只记录“完成”，真正的允许或拒绝由 Handler在写 State前后直接解释：ALLOW只记录日志，任何非 ALLOW把 `mRet`改为验证失败。不要从 `mIntegrityVerificationComplete=true`反推规则结果为允许。
 
@@ -328,7 +328,7 @@ Integrity服务不直接信任 installer package extra。extra为 null时把来�
 
 元数据包括规范化目标包名、active signer证书 SHA-256、long versionCode、规范化安装器名及证书、目标当前是否为 system app、Manifest的 allowed-installers映射，以及 Source Stamp的 present/verified/trusted与证书摘要。目录路径会把 `Files.list()`列出的全部条目路径交给 `SourceStampVerifier`；verified便直接设 trusted。
 
-包名规范化也有版本细节。注释说超过32 bytes就散列，实际条件却是 Java `packageName.length() <= 32`，即 UTF-16 code unit数量；只有超过该阈值才对 UTF-8 bytes做 SHA-256并输出 hex。对非 ASCII输入，不能按注释的 byte长度复现规则 key。
+包名规范化也有版本细节。注释说超过32 bytes就散列，实际条件却是 Java `packageName.length() <= 32`，即 UTF-16 code unit数量；只有超过该阈值才对 UTF-8 bytes做 SHA-256并输出 hex。有效 Android包名本来限定在 ASCII子集，所以差异主要暴露在尚未按包名语法验证的 allowed-installers元数据或测试输入中；这类非 ASCII输入不能按注释的 byte长度复现规则 key。
 
 ## 12. FORCE_ALLOW压过 DENY，无规则与内部故障多走 fail-open
 
@@ -386,13 +386,13 @@ grep -n -F 'verificationId, PackageManagerInternal.INTEGRITY_VERIFICATION_ALLOW)
 |---|---|---|---|
 | ordinary按配置旁路 | required被显式记 ALLOW | 初始 true | Integrity结束后正常汇合并删表 |
 | required正常响应，sufficient满足 | complete且可判断 allowed | false→true | 等 Integrity后删表并继续 |
-| required包名为 null | required永不 complete | 一直是初始 true | Integrity结束即可继续，pending残留 |
+| required包名为 null，且 ordinary进入发送分支 | required永不 complete | 一直是初始 true | Integrity结束即可继续，pending残留 |
 | required Component为 null | 响应 UID可能不命中 | 已置 false | 等 timeout；再受 Handler UID缺口影响 |
 | 副用户只有 sufficient响应 | appId与 full UID可能不匹配 | 仍等待 required共同完成 | timeout、残留或延期卡住 |
 | timeout默认 ALLOW但 UID不命中 | State可能仍不完整 | 被无条件置 true | 安装继续而 pending残留 |
 | 非参与者抢延期 | State始终不完整 | 仍为 false | 没有后备 timeout，安装可永久等待 |
 
-required包名为 null且 Manifest没有 sufficient时最能说明问题：Integrity结果若 ALLOW，`handleIntegrityVerificationFinished()`看到 ordinary完成位初始为 true，立即进入 `handleReturnCode()`；State却因 required UID=-1从未收到响应，`areAllVerificationsComplete()`永远为 false。若 Manifest声明 sufficient，广播甚至可能已经发出，但这些票不能补齐 required，也不阻止主流水线继续。
+required包名为 null、ordinary启用且不是 Incremental+V4时最能说明问题：代码进入发送分支，却没有 required广播，也不会把 required UID=-1记为 ALLOW。Integrity结果若 ALLOW，`handleIntegrityVerificationFinished()`看到 ordinary完成位初始为 true，立即进入 `handleReturnCode()`；State却因 required UID=-1从未收到响应，`areAllVerificationsComplete()`永远为 false。若 Manifest声明 sufficient，广播甚至可能已经发出，但这些票不能补齐 required，也不阻止主流水线继续。反之，只要 ordinary被禁用、origin是 existing或命中 Incremental+V4旁路，外层 `else`就会对 required UID=-1写 ALLOW，不能套用这条残留结论。
 
 声明非空却零个有效 sufficient匹配是另一种分账反例：`sendPackageVerificationRequest()`先把局部返回值改成验证失败，State却没有任何 sufficient UID；required随后 ALLOW会令 State判断 ordinary allowed并广播 `ACTION_PACKAGE_VERIFIED(ALLOW)`，但 `mRet`已经在 `handleStartCopy()`末尾锁成 -22。Integrity与 rollback结束后仍会跳过 copy并报告安装失败。ordinary ALLOW通知与最终失败并不矛盾，它们来自不同账。
 
@@ -408,7 +408,7 @@ required包名为 null且 Manifest没有 sufficient时最能说明问题：Integ
 
 staged也不是同一条一次性门。原 Session先向 commit receiver回 `INSTALL_SUCCEEDED / Session staged`；pre-reboot阶段抽取 APK内容创建临时非 staged Session，multi时只选择 APK children，随后只对这份 dry-run副本清 rollback并加 `INSTALL_DRY_RUN`，再进入本章验证入口。其中 ordinary仍服从启用矩阵、Integrity默认运行，dry run终点不 copy；原 staged事务的 rollback通知另有路径。重启后的实际 APK安装又创建 Session并加 `INSTALL_DISABLE_VERIFICATION`；这个 system_server创建的 Session走非 ADB disable分支，ordinary旁路，而默认开启的 Integrity再次运行，保留 rollback请求时还会再进入实际安装的 rollback门。APEX-only没有可抽取 APK，因而不进入这条 APK verifier链。ready、applied与failed才是 staged事务要继续观察的状态。
 
-r48的 staged与 DataLoader组合还会更早分叉：`SessionParams.copy()`保留 `dataLoaderParams`，StagingManager抽取 APK时却向新 Session调用常规 `write()`；DataLoader Session的 `assertCanWrite()`会拒绝写普通文件。因此这类组合可能在 pre-reboot抽取阶段失败，尚未进入 ordinary或Integrity，不能误报成 verifier timeout。
+r48的 staged与 DataLoader组合还会更早分叉：`SessionParams.copy()`保留 `dataLoaderParams`。StagingManager若从 staged目录找不到 APK会先按“没有 APK”失败；若找到并进入抽取循环，它又向新 Session调用常规 `write()`，而 DataLoader Session的 `assertCanWrite()`会抛出这里未就地捕获的 `IllegalStateException`。因此这类组合会在 pre-reboot抽取阶段沿这两类更早失败路径分叉，尚未进入 ordinary或Integrity，不能误报成 verifier timeout。
 
 ordinary或 Integrity造成的 `INSTALL_FAILED_VERIFICATION_FAILURE=-22`对外经 `installStatusToPublicStatus()`映射成 `PackageInstaller.STATUS_FAILURE_ABORTED`。公开状态刻意比 legacy原因粗；排障若只保存 public status，会知道安装被中止，却分不出是哪类 verification、哪个 verifier或哪一种 timeout边界。
 
@@ -416,9 +416,9 @@ ordinary或 Integrity造成的 `INSTALL_FAILED_VERIFICATION_FAILURE=-22`对外�
 
 只看 DataLoader与签名格式这一层特判：当 ordinary原本 enabled、origin也需要新 APK验证时，`mDataLoaderType==INCREMENTAL`且签名方案为 V4会跳过安装前 ordinary请求，State以 required ALLOW完成。它不是唯一旁路；disable flag、可信 Instant installer、ADB设置与 existing origin等已在第4节分别处理。App Integrity仍照常运行，rollback若请求也照常等待。V4数据块验证能力与 Incremental按需读取共同触发的是 ordinary时序特例，不是“整套验证关闭”，更不替代 Session阶段和后续 PMS阶段的签名、解析、scan、reconcile。
 
-这项特判只在 Session真正交给 PMS之后讨论。上游 `streamAndValidateLocked()`若 `prepareDataLoaderLocked()`尚未完成会返回 false，请求仍停在 loader/Session上游；只有 loader unavailable或相关远端异常等分支才会另发 `STATUS_PENDING_STREAMING`，不能把每次 false都等同于这项 status。`DATA_LOADER_IMAGE_READY`才触发后续 validate/commit，multi又要等所有 children ready，之后才会调用 `mPm.installStage()`并创建本章 State。loader未 ready时 ordinary与Integrity广播都没发出，它们的 timeout自然也尚未起算。
+这项特判只在 Session真正交给 PMS之后讨论。上游每次处理 parent时会调用 parent自身的 `streamValidateAndCommit()`，multi还会逐个 child重跑该方法；只有全部调用都返回 true才排入下一阶段安装消息。DataLoader Session的 `streamAndValidateLocked()`若 `prepareDataLoaderLocked()`尚未完成会返回 false，请求仍停在 loader/Session上游；非 DataLoader parent/child不需要等待 IMAGE_READY。只有 loader unavailable或相关远端异常等分支才会另发 `STATUS_PENDING_STREAMING`，不能把每次 false都等同于这项 status。某个 DataLoader child收到 `DATA_LOADER_IMAGE_READY`后会唤醒 parent重新检查全组，全部 ready后才会调用 `mPm.installStage()`并创建本章 State。loader未 ready时 ordinary与Integrity广播都没发出，它们的 timeout自然也尚未起算。
 
-只有安装事务已经成功 commit后，PMS在 `finally`中的 success分支遍历请求：筛出 Incremental+V4，读取已安装包的 base与 split code paths，另取一个递增 verificationId，计算 verification root hash string，然后发送 `ACTION_PACKAGE_VERIFIED`，result固定为 ALLOW，并附 root hash与 DataLoader type。失败事务不发送这份成功通知。
+`commitPackagesLocked()`返回后，PMS立即把局部 `success`置为 true；随后即使 `executePostCommitSteps()`再抛异常，`finally`仍会进入 success分支。该分支遍历请求，筛出 Incremental+V4，读取已安装包的 base与 split code paths，另取一个递增 verificationId，计算 verification root hash string，然后发送 `ACTION_PACKAGE_VERIFIED`，result固定为 ALLOW，并附 root hash与 DataLoader type。只有 commit尚未完成、`success`仍为 false的事务才不发送这份成功通知。
 
 这个新 ID没有对应的 `mPendingVerification` State，也不是安装前被跳过 ID的恢复使用。广播发生在 commit成功之后，没有等待回调的代码，Verifier不能靠它否决已经提交的包；它的角色是把 root hash和成功事实告知 agent。看到 `ACTION_PACKAGE_VERIFIED + root hash`应先判断是否为这种事后通知，而不是在 pending表中盲找同 ID。
 

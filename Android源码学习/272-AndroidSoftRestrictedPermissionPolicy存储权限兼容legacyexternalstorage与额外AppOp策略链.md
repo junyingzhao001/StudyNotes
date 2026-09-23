@@ -1,556 +1,413 @@
 # 272 Android SoftRestrictedPermissionPolicy：存储权限兼容、legacy external storage与额外AppOp策略链
 
-## 1. 本章目标
+## 1. 先看结论：这里至少有五种“legacy”，不能压成一个布尔值
 
-第271章看到了PermissionPolicyService调用`SoftRestrictedPermissionPolicy`，但还没有解释策略本身。本章将把“存储permission能否授予”“READ/WRITE AppOp是否允许”“进程是否得到legacy外部存储视图”三件事拆开，并追到StorageManagerService的挂载模式与remount。
+本文固定在 Android 11 `android-11.0.0_r48`，`frameworks/base`提交为 `1d9b9ab57d844b18b3b1b4297725141e7788109b`。`SoftRestrictedPermissionPolicy`不是一个“是否能访问外部存储”的总开关，而是把安装历史、包声明、permission flags和 shared UID事实投影成两类建议：能否明确 grant危险权限，以及 `OP_LEGACY_STORAGE`应该被允许、拒绝还是只保留已有 ALLOWED。
 
-## 2. Android 11版本边界
+完整链上至少有五个不同状态：
 
-本文严格基于`android-11.0.0_r48`。Android 11正处于scoped storage迁移期，后续版本弱化旧READ/WRITE_EXTERNAL_STORAGE并加入新的媒体权限；不能用Android 13的照片、视频、音频权限解释r48。
+| 状态 | 权威位置 | 它能证明什么 |
+|---|---|---|
+| READ/WRITE permission 与 flags | PermissionManager | permission事实，以及 restriction是否豁免或应用 |
+| `OP_LEGACY_STORAGE` UID/package mode | AppOpsService | legacy政策状态；默认是 DEFAULT，不是天然 ALLOWED |
+| `mUidsWithLegacyExternalStorage` | StorageManagerService内存 | 对 legacy AppOp的一份反馈快照，供下一轮策略读取 |
+| mount mode与进程 namespace | StorageManagerService、ProcessList、Zygote/vold | 进程实际拿到哪类挂载入口 |
+| `Environment.isExternalStorageLegacy()` | 应用进程中的 compat + AppOps查询 | API语义结果，不是对实际 namespace的反向验真 |
 
-## 3. soft restricted不是“软拒绝”
+`requestLegacyExternalStorage`和 `preserveLegacyExternalStorage`又只是解析后的意图输入。由此可得本章的排障原则：先问正在观察哪一种状态，再问它的生产者、刷新入口和完成点；不要用 Manifest属性、AppOp、缓存、mount mode或 API返回值相互代称。
 
-它是permission定义的限制属性：未满足政策时，permission可能不能grant，或只能得到受限能力。这里的soft与PermissionChecker的`PERMISSION_SOFT_DENIED`不是同一个枚举，也不是同一层状态。
+## 2. 两份同名类不是同一份策略，且只有 READ 产生 extra op
 
-## 4. r48只特化两个permission
+system_server与 PermissionController各有一份 `SoftRestrictedPermissionPolicy`，注释称彼此为 twin，但 r48 的公开形状已经不同。Controller侧只有两个 `shouldShow()`重载，用当前包 targetSdk与 exemption flags决定权限是否显示在 UI；它不计算 shared UID最小 target、不读取 StorageManager，也不产生 legacy AppOp建议。
 
-本类switch只对`READ_EXTERNAL_STORAGE`和`WRITE_EXTERNAL_STORAGE`返回特殊策略；其他名字走DUMMY_POLICY，`mayGrantPermission()`恒true且无extra AppOp。不要把类名泛化成所有soft restricted permission都有复杂分支。
+system_server侧才有 `forPermission()`、`mayGrantPermission()`、`mayAllowExtraAppOp()`与 `mayDenyExtraAppOpIfGranted()`。它只特化两个名字：
 
-## 5. 本章源码地图
+- READ与 WRITE都有 permission grant资格公式；
+- 只有 READ的 `getExtraAppOpCode()`返回 `OP_LEGACY_STORAGE`；
+- WRITE继承默认 `OP_NONE`，不会单独生成 legacy候选；
+- 其他名字返回 DUMMY策略：可 grant、无 extra op、allow/deny建议都为 false。
 
-```text
-frameworks/base/services/core/java/com/android/server/policy/
-  SoftRestrictedPermissionPolicy.java
-  PermissionPolicyService.java
-frameworks/base/services/core/java/com/android/server/pm/permission/
-  PermissionManagerService.java
-frameworks/base/services/core/java/com/android/server/StorageManagerService.java
-frameworks/base/core/java/android/os/Environment.java
-frameworks/base/core/java/android/os/storage/StorageManager.java
-frameworks/base/core/java/android/content/pm/parsing/ParsingPackageUtils.java
-frameworks/base/core/java/com/android/internal/os/Zygote.java
-```
+PermissionPolicyService启动监听时甚至用四个 null参数构造策略，只为发现某个 soft-restricted permission有没有 extra op。这条“发现路径”和带真实包的“裁决路径”目的不同。
 
-## 6. 同名twin为何存在
+### 练习 1：对照两份同名类的合同
 
-注释说明它与PackageInstaller/PermissionController侧的SoftRestrictedPermissionPolicy互为twin。system_server和可更新权限UI都要作一致判断，但本章只证明frameworks/base这份实现，不能假定另一份永远逐行同步。
-
-## 7. 三个核心问句
-
-`mayGrantPermission()`回答危险权限能否grant；`getExtraAppOpCode()`返回除permission主op外还需维护的op；`mayAllowExtraAppOp()`与`mayDenyExtraAppOpIfGranted()`分别回答能否新获、何时可夺走既有extra op。
-
-## 8. 为什么需要“获得”和“失去”两套条件
-
-存储迁移必须避免升级后突然看不见旧文件。一个App可能不再满足“新取得legacy”的条件，却仍因升级保留既有legacy视图；所以获取条件与撤销条件故意不完全对称。
-
-## 9. 三层状态先分开
-
-权限位由PermissionManager保存；主读写AppOp由PermissionPolicy同步；`OP_LEGACY_STORAGE`是没有对应Manifest permission的额外政策；最终挂载还结合compat change、FUSE/isolated storage和特殊UID。
-
-## 10. 总体关系图
-
-```mermaid
-flowchart TD
-    MAN["Manifest请求与targetSdk"] --> SOFT["SoftRestrictedPermissionPolicy"]
-    FLAGS["restriction/exempt flags"] --> SOFT
-    OLD["当前legacy视图和升级保留"] --> SOFT
-    SOFT --> GRANT["READ/WRITE permission能否grant"]
-    SOFT --> LEGACY["OP_LEGACY_STORAGE目标mode"]
-    GRANT --> MAINOP["READ/WRITE AppOp"]
-    LEGACY --> SMS["StorageManagerService"]
-    MAINOP --> SMS
-    SMS --> MOUNT["Zygote/vold/FUSE挂载视图"]
-    COMPAT["scoped storage compat changes"] --> MOUNT
-```
-
-## 11. 三种exempt flag
-
-SYSTEM_EXEMPT、UPGRADE_EXEMPT、INSTALLER_EXEMPT按位OR成`FLAGS_PERMISSION_RESTRICTION_ANY_EXEMPT`。任一存在即视为whitelisted；它们表示豁免来源，不等于用户grant，也不等于AppOp ALLOWED。
-
-## 12. APPLY_RESTRICTION是另一位
-
-`FLAG_PERMISSION_APPLY_RESTRICTION`表示当前要实际应用限制。豁免位和apply位可能同时出现在flags中，具体策略有的先看豁免、有的直接看apply；不能只凭一个总称“白名单”推断所有分支。
-
-## 13. 权限白名单API的授权
-
-查询system whitelist需要`WHITELIST_RESTRICTED_PERMISSIONS`；upgrade/installer whitelist还允许installer of record。修改接口把公开whitelist类型映射为三个内部exempt flags，并触发权限更新。
-
-## 14. 策略对象是输入快照
-
-`forPermission()`先把flags、targetSdk、legacy状态等读成final局部变量，再返回匿名对象。后续调用方法不会重新查询系统；状态改变后必须重新构造策略才能得到新结论。
-
-## 15. appInfo为空的保守默认
-
-READ/WRITE分支在appInfo为空时把whitelist=false、targetSdk=0及各种legacy条件设false。READ的`shouldApplyRestriction`反而是false；这个空上下文策略主要用于发现extra op，不适合代替真实包裁决。
-
-## 16. 最小targetSdk的shared UID规则
-
-`getMinimumTargetSDK()`枚举同UID全部包并取最小值。一个shared UID只要还有旧target成员，整个身份就按更旧兼容级别计算，避免不同成员争抢同一个UID AppOp。
-
-## 17. NameNotFound怎样处理
-
-枚举shared UID成员时若某包ApplicationInfo查不到便跳过，不让短暂包变化使整次策略构造失败。最低值至少保留当前appInfo自身targetSdk。
-
-## 18. READ和WRITE的grant公式相同
-
-两者`mayGrantPermission()`都是：任一restriction exempt，或者shared UID最小targetSdk大于等于Q。target低于Q且无豁免时不能经现代grant入口获得这个soft restricted permission。
-
-## 19. 公式为何看起来反直觉
-
-旧target应用常通过安装/升级兼容状态已有权限；这里约束的是一次明确grant操作和同步政策，不是声称所有旧App开机后权限必然DENIED。要结合既有grant、review和upgrade exemption理解。
-
-## 20. PermissionManager的硬门
-
-`grantRuntimePermissionInternal()`在真正写PermissionsState前调用本策略；返回false会记录“Cannot grant soft restricted permission”并直接return。策略不是UI提示，而是服务端授权门。
-
-## 21. hard与soft restricted的差别
-
-hard restricted只要没有任何exempt就拒绝grant；soft restricted把判断委托给每个permission策略。存储权限因此还能考虑targetSdk与迁移状态。
-
-## 22. 成功grant后的通知
-
-权限写入后PermissionManager通知runtime state listener，PermissionPolicyService再同步主AppOp和extra op。grant本身与AppOp收敛不是同一个锁内原子事务。
-
-## 23. 存储permission还触发remount
-
-READ或WRITE grant后，若user已initialized，PermissionManager清身份调用`StorageManagerInternal.onExternalStoragePolicyChanged(uid, packageName)`。它避免新用户尚无进程时进行昂贵remount。
-
-## 24. READ才有extra AppOp
-
-READ策略的`getExtraAppOpCode()`返回`OP_LEGACY_STORAGE`；WRITE策略沿用基类默认OP_NONE。legacy视图由READ的软限制策略统一驱动，不是READ和WRITE各存一份legacy mode。
-
-## 25. OP_LEGACY_STORAGE没有permission映射
-
-AppOpsManager表中该op对应permission为null。它不能通过Manifest直接申请，只能由系统迁移/政策写入并被StorageManager、Environment等消费。
-
-## 26. 七个READ输入
-
-策略读取：是否exempt、是否apply restriction、最小targetSdk、当前UID是否已有legacy、UID是否任一包请求legacy、当前包是否请求preserve legacy、UID是否获WRITE_MEDIA_STORAGE，以及包是否在forced-scoped列表。
-
-## 27. 当前legacy状态来自StorageManagerInternal
-
-`hasLegacyExternalStorage(uid)`读取StorageManagerService维护的UID集合。它表达当前系统观察到的legacy视图，不等于Manifest请求位；策略用它保护既有访问不因重算突然丢失。
-
-## 28. requested legacy按UID聚合
-
-`hasUidRequestedLegacyExternalStorage()`枚举UID所有包，只要任一ApplicationInfo的private flag为true便返回true。这与最小targetSdk一样遵循shared UID共同挂载现实。
-
-## 29. preserve legacy只看当前包
-
-`pkg.hasPreserveLegacyExternalStorage()`来自本次传入AndroidPackage，不在helper中聚合整个UID。后续PermissionPolicy会把shared UID多个包都加入候选，最终ALLOW优先可缓解差异，但单个策略对象的输入确实是package级。
-
-## 30. WRITE_MEDIA_STORAGE按UID聚合
-
-helper枚举UID所有包，只要任何包permission检查GRANTED即true。该signature/privileged能力可成为legacy extra op的强放行条件。
-
-## 31. forced scoped列表来源
-
-DeviceConfig namespace为`storage_native_boot`，key是`forced_scoped_storage_whitelist`，值以逗号分隔包名。命中列表会阻止新获legacy，并可使既有legacy失效。
-
-## 32. 列表是类加载时静态快照
-
-`sForcedScopedStorageAppWhitelist`在类初始化时读取一次，类内没有DeviceConfig listener。即使dumpsys能显示新属性，本进程中策略集合也不会由本类自动刷新；native_boot命名也暗示重启生效边界。
-
-## 33. 字符串解析没有trim
-
-实现直接`rawList.split(",")`放入HashSet。配置中若写`"a, b"`，第二项包含前导空格而无法匹配包名；运维配置必须精确。
-
-## 34. 新获legacy的第一门
-
-`shouldApplyRestriction`为true立即false。即使App请求legacy或当前target旧，实际应用restriction时也不能新设OP_LEGACY_STORAGE为ALLOWED。
-
-## 35. 新获legacy的第二门
-
-包在forced scoped列表时立即false。它独立于permission exempt；系统想强制某包进入scoped视图时，exempt并不能在此分支自动盖过forced列表。
-
-## 36. 新获legacy的强能力分支
-
-持有WRITE_MEDIA_STORAGE时，前两门通过后可返回true，不再要求target<R或requestLegacy。这是媒体系统级写能力，不适用于普通第三方App。
-
-## 37. 新获legacy的普通分支
-
-没有WRITE_MEDIA_STORAGE时，必须“当前已有legacy或UID任一包请求legacy”并且最小targetSdk<R。两部分缺一不可。
-
-## 38. requestLegacy的Manifest默认
-
-ParsingPackageUtils对target<Q默认把requestLegacy设true；Q及以上默认false，可由Manifest属性设置。到target R时即使请求位true，普通获取公式仍被`targetSDK < R`挡住。
-
-## 39. R为何不再接受requestLegacy
-
-Android 11对target R强制scoped storage，`requestLegacyExternalStorage`不再作为普通退出开关。升级保护改由当前legacy、preserveLegacy和WRITE_MEDIA_STORAGE等更窄条件处理。
-
-## 40. preserveLegacy的默认值
-
-解析器默认false，只有Manifest显式声明才true。它不是“继续请求legacy”的同义词，而是target R升级时是否允许保住已获legacy的迁移信号。
-
-## 41. target低于R的撤销公式
-
-`mayDenyExtraAppOpIfGranted()`直接返回`!mayAllowExtraAppOp()`。旧target只要仍满足获取条件就保留；一旦restriction、forced或legacy/request条件不再成立，就可撤销。
-
-## 42. target R及以上的撤销第一门
-
-`shouldApplyRestriction`为true便可撤销既有legacy。这里不再调用完整mayAllow，因为R的获取公式本来大多false，直接使用会让所有R迁移App无条件丢访问。
-
-## 43. target R及以上的撤销第二门
-
-forced scoped列表命中也返回true。它是产品/兼容控制的强制迁移开关。
-
-## 44. target R及以上的撤销第三门
-
-若既无WRITE_MEDIA_STORAGE，当前包也没请求preserveLegacy，则返回true。只要二者任一存在，且前两门未命中，已有legacy可暂时保留。
-
-## 45. R分支不要求当前hasLegacy
-
-撤销函数只决定“如果已经granted，是否允许deny”，调用者先看当前AppOp。hasLegacy不进入R的保留公式；当前未ALLOWED时也不会凭preserve自动新获legacy。
-
-## 46. 获取与撤销真值图
-
-```mermaid
-flowchart TD
-    START["READ_EXTERNAL_STORAGE extra op"] --> APPLY{"APPLY_RESTRICTION或forced?"}
-    APPLY -- yes --> NO["不可新获；既有可撤销"]
-    APPLY -- no --> WMS{"UID有WRITE_MEDIA_STORAGE?"}
-    WMS -- yes --> ALLOW["可新获或保留legacy"]
-    WMS -- no --> R{"最小targetSdk小于R?"}
-    R -- yes --> OLD{"已有legacy或任一包requestLegacy?"}
-    OLD -- yes --> ALLOW
-    OLD -- no --> NO
-    R -- no --> PRES{"当前包preserveLegacy?"}
-    PRES -- yes --> KEEP["不可新获，但既有可保留"]
-    PRES -- no --> NO
-```
-
-## 47. PermissionPolicy怎样消费extra策略
-
-mayAllow为true加入`mOpsToAllow`；否则mayDeny为true加入确定IGNORE；两者都false则加入IGNORE_IF_NOT_ALLOWED。最后按ALLOW→FOREGROUND→IGNORE→条件IGNORE执行。
-
-## 48. 条件IGNORE的迁移意义
-
-当R App不满足新获条件，却有preserve等原因不应丢既有legacy时，两方法都可能false。条件IGNORE会保留当前ALLOWED，只把其他异常非ALLOWED状态归一为IGNORED。
-
-## 49. shared UID最终取最宽结果
-
-多个包对同UID/OP_LEGACY_STORAGE产生不同候选时，ALLOW先占去重key，后续IGNORE跳过。某成员合法允许legacy便使共同UID挂载保持legacy，符合vold无法按同UID包名给不同视图的限制。
-
-## 50. “whitelist”不直接放行extra op
-
-exempt只参与`mayGrantPermission()`；READ的legacy获取公式实际看APPLY_RESTRICTION而非`isWhiteListed`变量。通常上层会据豁免调整apply flag，但源码层仍是两个独立输入。
-
-## 51. WRITE策略为何简单
-
-WRITE_EXTERNAL_STORAGE只决定permission可否grant，没有extra op。最终写访问还要结合WRITE permission、OP_WRITE_EXTERNAL_STORAGE和StorageManager挂载模式，不能因策略简单就认为写入不受scoped storage限制。
-
-## 52. Permission与AppOp的主链
-
-成功grant/revoke通知PermissionPolicy；它根据第271章公式把READ/WRITE主switch op设ALLOWED、FOREGROUND或IGNORED，同时根据READ策略维护OP_LEGACY_STORAGE。两类op用途不同。
-
-## 53. requestLegacy变更为何要强制同步
-
-包replace时若Manifest请求legacy且请求READ或WRITE，`checkIfLegacyStorageOpsNeedToBeUpdated()`把updatedUserIds扩为所有用户。即使grant位没变，extra op公式的Manifest输入已变，也必须触发同步。
-
-## 54. 这个更新条件有范围
-
-只有replace、`pkg.isRequestLegacyExternalStorage()`为true且请求READ/WRITE时扩展。移除requestLegacy的更新由其他权限/包changed链收敛；不能把该helper当完整Manifest diff引擎。
-
-## 55. OP_LEGACY_STORAGE的默认与设置
-
-它由PermissionPolicy的UID mode setter写入AppOpsService并持久化到appops.xml。策略本身不直接写AppOps，也不操作挂载点。
-
-## 56. StorageManagerService订阅mode
-
-在非FUSE分支systemReady会监听REQUEST_INSTALL_PACKAGES和LEGACY_STORAGE；FUSE路径还通过`StorageManagerInternal.onAppOpsChanged()`同步接收mode变化。不同产品配置下触发入口不同。
-
-## 57. legacy UID快照集合
-
-StorageManagerService扫描已安装应用，用AppOps check判断OP_LEGACY_STORAGE是否ALLOWED，并把完整UID加入`mUidsWithLegacyExternalStorage`。Soft policy的“当前已有legacy”便来自这份集合。
-
-## 58. 集合是反馈输入
-
-PermissionPolicy写legacy AppOp→StorageManager更新UID集合→下次Soft policy读取hasLegacy。它形成迁移反馈，但权威mode仍在AppOps；集合是StorageManager为当前视图维护的派生缓存。
-
-## 59. shared UID移除缺口
-
-`updateLegacyStorageApps(..., false)`直接remove UID，源码TODO明确未检查同shared UID是否另一个包仍有legacy。包级回调/移除可能使集合暂时低估，是r48已标注的实现边界。
-
-## 60. AppOps ALLOWED还不是最终文件能力
-
-StorageManager的mount决策同时检查READ/WRITE permission+对应AppOp。legacy ALLOWED但没有读写授权，仍不会获得MOUNT_EXTERNAL_READ/WRITE。
-
-## 61. getMountMode先处理特殊身份
-
-isolated UID与无包UID返回NONE；instant app也NONE。FUSE external storage service、Downloads/ExternalStorageProvider、平台MTP等有独立更高能力模式，早于普通App公式。
-
-## 62. READ/WRITE的双检查
-
-`StorageManager.checkPermissionAndCheckOp()`要求permission与主AppOp共同满足，生成hasRead/hasWrite。它再次说明grant位不是文件系统访问的唯一门。
-
-## 63. WRITE_MEDIA_STORAGE挂载
-
-UID持WRITE_MEDIA_STORAGE且hasWrite时返回MOUNT_EXTERNAL_FULL。这条路径优先于installer与legacy，是系统媒体组件能力。
-
-## 64. installer挂载
-
-INSTALL_PACKAGES permission或shared UID任一包REQUEST_INSTALL_PACKAGES AppOp ALLOWED，再加hasWrite，得到MOUNT_EXTERNAL_INSTALLER。注释强调vold不能按同UID包名分挂载，所以遍历所有成员取OR。
-
-## 65. 普通legacy写挂载
-
-OP_LEGACY_STORAGE evaluated为ALLOWED且hasWrite时返回MOUNT_EXTERNAL_WRITE。主WRITE授权和legacy视图必须同时存在。
-
-## 66. 普通legacy读挂载
-
-没有hasWrite但legacy ALLOWED且hasRead时返回MOUNT_EXTERNAL_READ。只授READ不会自然升级成写视图。
-
-## 67. scoped默认挂载
-
-不满足legacy读写时返回MOUNT_EXTERNAL_DEFAULT，不等于完全没有外部存储。App仍能看到自己的目录及通过MediaStore等受控接口访问媒体。
-
-## 68. 多个ExternalStorageMountPolicy怎样合并
-
-旧非isolated路径遍历policy并取数值最小模式，任何policy返回NONE立即拒绝。它是多方限制的交集，不是权限策略单方面决定。
-
-## 69. mode变化后的remount
-
-`onExternalStoragePolicyChanged()`重新计算mode并调用`remountUidExternalStorage(uid, mountMode)`。这是运行中进程视图更新，和下次Zygote启动时传mountMode两条生效路径。
-
-## 70. 进程启动时的mountMode
-
-ProcessList在创建进程前向StorageManagerInternal查询外部存储挂载模式，并保存到ProcessRecord、传给Zygote。进程不是启动后自行读取Manifest决定namespace。
-
-## 71. FUSE路径的kill策略
-
-REQUEST_INSTALL_PACKAGES在转入/转出ALLOWED时kill UID；MANAGE_EXTERNAL_STORAGE拒绝时kill；LEGACY_STORAGE则更新legacy集合。不同op为何kill不同由FUSE/GID与用户体验权衡决定。
-
-## 72. 非FUSE AppOp回调范围
-
-READ/WRITE/REQUEST_INSTALL_PACKAGES变为ALLOWED且user initialized时触发remount。代码条件只在mode==ALLOWED时进入；其他降级依赖别的权限回调、进程重启或路径处理，是诊断时要注意的不对称。
-
-## 73. Permission grant remount与AppOp回调可能重复
-
-grant存储权限直接通知StorageManager，同时PermissionPolicy写mode又可能触发Storage回调。实现以幂等重算mountMode承受重复，而非用跨模块事务只触发一次。
-
-## 74. Environment.isExternalStorageLegacy的第一门
-
-应用进程内先排除isolated与instant app。随后检查两个Compatibility change；compat结论可在查询AppOp前直接强制scoped或强制legacy。
-
-## 75. DEFAULT_SCOPED_STORAGE change
-
-它描述默认是否采用scoped storage；FORCE_ENABLE_SCOPED_STORAGE描述是否强制开启。Environment用辅助公式组合两者，而不是只看targetSdk硬编码。
-
-## 76. compat强制scoped
-
-若公式判定严格enforced，方法直接false，不查询OP_LEGACY_STORAGE。于是AppOp ALLOWED也不一定让应用API报告legacy。
-
-## 77. compat强制关闭scoped
-
-若公式判定严格disabled，方法直接true，同样跳过AppOp。compat框架可为测试或兼容覆盖默认政策。
-
-## 78. 中间态才看AppOp
-
-只有既非强制scoped、也非强制legacy时，Environment才`checkOpNoThrow(OP_LEGACY_STORAGE)`。Manifest请求位从不在此运行时API直接读取。
-
-## 79. API文档已提醒差异
-
-注释明确返回值可能与`requestLegacyExternalStorage`不同，因为安装时机、targetSdk和其他因素会影响继承。把Manifest属性当运行态真相会误诊。
-
-## 80. StorageManager的legacy兜底
-
-部分媒体访问检查用`noteAppOpAllowingLegacy()`：目标媒体AppOp即使DEFAULT/IGNORED/ERRORED，只要OP_LEGACY_STORAGE ALLOWED仍可视为通过。这是迁移兼容，不代表所有文件API都绕过主op。
-
-## 81. 为什么还要同时持旧新permission
-
-StorageManager注释要求调用者同时持相关旧/新permission，以覆盖设备从P升级到Q等罕见场景。legacy op是额外兼容条件，不是免permission通行证。
-
-## 82. request与preserve的时间方向
-
-requestLegacy表达“在仍允许选择时请求旧模型”；preserveLegacy表达“升级target后保留已经拥有的旧模型”。前者偏获取，后者偏保留。
-
-## 83. hasLegacy是现实状态
-
-它回答“当前UID是否已在legacy集合”，可来自过去安装/升级与AppOp。现实状态、请求意图和保留意图三者必须分别建模。
-
-## 84. forced列表是外部政策
-
-它既不改Manifest，也不直接revokepermission，而是改变extra AppOp生成/撤销结论。最终文件视图经AppOps和StorageManager收敛。
-
-## 85. targetSdk为何按最小值
-
-mount namespace绑定UID，shared UID成员无法各用一个target策略。取最小值优先兼容旧成员，代价是新成员也分享较宽视图；这也是平台逐步淘汰shared UID的背景之一。
-
-## 86. targetSdk与包级forced列表交叉
-
-minimum target按UID，forced whitelist按当前package。PermissionPolicy整组收集后ALLOW优先，因此某成员不forced且合法ALLOW可能覆盖另一个forced成员的IGNORE候选。单看某包策略无法断言最终UID mode。
-
-## 87. preserveLegacy同样可能产生包间差异
-
-它只读当前pkg，但最终UID去重取最宽。shared UID中一个R包声明preserve、另一个未声明时，允许保留的候选可能保护整个UID。
-
-## 88. 策略没有直接读用户选择
-
-USER_SET/USER_FIXED不进入公式；实际grant和restriction flags已体现用户/政策结果。策略只判断soft restriction允许范围，不重新解释权限弹窗按钮。
-
-## 89. 策略也不读取文件目录
-
-它不会扫描App在`/storage/emulated`中的旧文件数量。防数据丢失靠existing legacy与preserve等状态信号，不靠磁盘内容检测。
-
-## 90. 持久化边界
-
-permission flags在runtime-permissions.xml，Manifest请求在package解析/Settings，extra mode在appops.xml，legacy UID集合是StorageManager内存派生状态，DeviceConfig在独立配置存储。没有一个文件包含完整结论。
-
-## 91. 开机收敛
-
-PermissionPolicy每用户初始化会全量重算mode；StorageManager又快照/监听legacy op。两个服务启动顺序与回调最终使内存集合和AppOps一致，但不是一次原子恢复。
-
-## 92. 包更新收敛
-
-PMS发现requestLegacy相关replace时扩大updated users；包changed观察器触发PermissionPolicy重新构造策略；mode变化再通知StorageManager更新视图。
-
-## 93. 权限flags变化收敛
-
-修改restriction whitelist或APPLY_RESTRICTION会更新权限状态并触发runtime listener，随后主op与extra op重算。只改flags却不重建策略会使用旧快照，所以事件链不可省。
-
-## 94. DeviceConfig变化的窄边界
-
-本类没有listener且静态HashSet不重建，单纯运行时改属性不会由它立即重算。要判断设备行为，应看属性生效时机、system_server是否重启以及是否另有上层触发。
-
-## 95. grant失败不等于已有grant被撤销
-
-`mayGrantPermission=false`让一次grant请求return；撤销已有状态要走权限更新/限制逻辑与PermissionPolicy同步。授权入口不是后台清理器。
-
-## 96. mayDeny也不直接deny
-
-它只返回策略建议，PermissionPolicy将其加入IGNORE候选并调用AppOps setter。SoftRestrictedPermissionPolicy自身没有副作用。
-
-## 97. target Q例子
-
-target Q、requestLegacy=true、无restriction/forced、已有或请求legacy：permission可grant，且因Q<R可让extra op ALLOWED。若requestLegacy=false且从未legacy，permission仍可grant，但extra op不会新获。
-
-## 98. target R新安装例子
-
-target R、READ可grant、requestLegacy=true也不能凭此新获legacy；无WRITE_MEDIA_STORAGE时mayAllow false。没有既有ALLOWED可保留时，最终通常是scoped默认视图。
-
-## 99. target R升级保留例子
-
-App升级到R前已有legacy，升级后声明preserveLegacy、未restricted/forced：mayAllow仍false，但mayDeny也false；条件IGNORE不覆盖当前ALLOWED，因此保留旧视图。
-
-## 100. target R未声明preserve例子
-
-已有legacy但无WRITE_MEDIA_STORAGE、无preserve：mayDeny true，PermissionPolicy把extra op设IGNORED，StorageManager随后更新集合/视图。
-
-## 101. forced scoped例子
-
-无论旧target或R升级，只要当前包命中forced列表，获取失败且既有可撤销。shared UID最终还需把所有成员候选合并，不能只算一个包。
-
-## 102. exemption例子
-
-旧target包有任一restriction exempt时可grantREAD/WRITE；但legacy extra仍须APPLY_RESTRICTION为false、非forced并满足legacy获取/保留公式。exempt不等于自动legacy。
-
-## 103. 排障：permission已grant但不是legacy
-
-检查OP_LEGACY_STORAGE raw/evaluated、targetSdk最小值、request/preserve、forced列表、APPLY_RESTRICTION与compat changes；再查StorageManager集合和进程mountMode。
-
-## 104. 排障：Manifest写了request仍scoped
-
-先看target是否R；再看属性是否解析进ApplicationInfo、UID是否已有/requested legacy、是否forced/restricted；最后确认Environment compat是否强制scoped。
-
-## 105. 排障：AppOp允许但API返回false
-
-检查isolated/instant及DEFAULT_SCOPED_STORAGE、FORCE_ENABLE_SCOPED_STORAGE。Environment可能在查询AppOp前就返回false。
-
-## 106. 排障：mode改变但旧进程视图没变
-
-区分FUSE与非FUSE路径，查StorageManagerInternal同步callback、remount或kill是否发生，并看user initialized。下次新进程的Zygote mountMode可能已正确而旧进程尚未更新。
-
-## 107. 排障：shared UID集合突然丢legacy
-
-查包移除/mode false回调是否命中StorageManagerService中已标TODO的直接remove逻辑；再核对同UID其他包实际AppOp与全量快照是否会修复。
-
-## 108. 完整状态变化链
-
-Manifest/target/flags/grant变化→PermissionPolicy重建策略→按shared UID选extra mode→AppOpsService写内存并通知→StorageManager更新legacy集合、remount或kill→新/旧进程获得对应文件视图。
-
-```mermaid
-sequenceDiagram
-    participant PMS as Package/PermissionManager
-    participant PPS as PermissionPolicyService
-    participant AOS as AppOpsService
-    participant SMS as StorageManagerService
-    participant PROC as App进程
-    PMS->>PPS: 包、grant或restriction flags变化
-    PPS->>PPS: 重建soft policy并合并shared UID候选
-    PPS->>AOS: 设置主op与OP_LEGACY_STORAGE
-    AOS-->>SMS: onAppOpsChanged
-    SMS->>SMS: 更新legacy UID集合并重算mountMode
-    SMS->>PROC: remount或kill后重启
-```
-
-## 109. 与第22章存储总览的关系
-
-早期章节讲分区、vold和FBE；本章补的是应用共享存储namespace政策。FBE解锁和scoped/legacy视图是不同维度：用户已解锁不代表App能看全部共享文件。
-
-## 110. 与第271章的关系
-
-第271章解释候选列表和最宽mode；本章给出READ/WRITE候选如何产生，尤其为什么同一个READ permission既控制主read op，又额外影响legacy storage op。
-
-## 111. 阅读完成检查
-
-应能分别定义grant、requestLegacy、preserveLegacy、hasLegacy和OP_LEGACY_STORAGE；能手算Q/R获取与保留；能从mode追到StorageManager mountMode；能解释shared UID与static DeviceConfig快照边界。
-
-## 112. macOS只读练习一：列出精确公式
+先写出两份类各自真正公开的问题，再验证 READ、WRITE和其他 permission分别会返回什么。不要从 twin这个词推导实现等价。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '110,260p' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'public static boolean shouldShow(@NonNull PackageInfo pkg' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/utils/SoftRestrictedPermissionPolicy.java
+grep -n -F 'public static @NonNull SoftRestrictedPermissionPolicy forPermission' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'case READ_EXTERNAL_STORAGE:' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'return OP_LEGACY_STORAGE;' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'case WRITE_EXTERNAL_STORAGE:' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'return DUMMY_POLICY;' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'SoftRestrictedPermissionPolicy.forPermission(null, null, null,' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
 ```
 
-分别写出READ/WRITE mayGrant、READ mayAllowExtra和target<R/≥R的mayDeny；不要用自然语言“旧App允许”代替布尔条件。
+## 3. 策略对象冻结一次输入；null发现路径还暴露了合同裂缝
 
-## 113. macOS只读练习二：追shared UID输入
+对 READ的真实包裁决，可以把构造时捕获的量记成：
+
+| 记号 | 含义 | 维度 |
+|---|---|---|
+| `E_i` | 当前包 READ flags含任一 SYSTEM/UPGRADE/INSTALLER exemption | 包、用户、permission |
+| `R_i` | 当前包 READ flags含 APPLY_RESTRICTION | 包、用户、permission |
+| `T_u` | 同 UID可解析成员的最小 targetSdk | UID聚合 |
+| `L_u` | StorageManager反馈缓存称该 UID已有 legacy | UID缓存 |
+| `Q_u` | 同 UID任一成员请求 legacy | UID聚合 |
+| `P_i` | 当前 `AndroidPackage`请求 preserve legacy | 包级 |
+| `M_u` | 同 UID任一成员获 `WRITE_MEDIA_STORAGE` | UID聚合 |
+| `F_i` | 当前包名命中 forced-scoped静态集合 | 包级 |
+
+这些值在 `forPermission()`里读入局部变量，再被匿名策略对象捕获。对象的方法不会重新读取 flags、AppOps、DeviceConfig或包状态；事件发生后必须新建对象才有新结论。
+
+当 `appInfo == null`时，READ分支把所有布尔量置 false、`T_u`置 0，因此得到“不可 grant、extra为 LEGACY、不可 allow、可 deny”；WRITE得到“不可 grant、无 extra”。这正适合发现 op，却绝不能代表任何包。入口虽把 `context`标成非空，PPS却传 null，当前只因 null-app分支不解引用它而安全。
+
+反方向也有合同缺口：`pkg`标为可空，但 READ在 `appInfo != null`时无条件调用 `pkg.hasPreserveLegacyExternalStorage()`。实际两个裁决调用点都同时提供对象；第三方若只给 appInfo不给 pkg会直接空指针。该类只吞同 UID成员查询中的 `NameNotFoundException`，不会把服务缺失或其他运行时异常降级成保守值。
+
+### 练习 2：区分发现对象与裁决对象
+
+分别手算 null-app READ、null-app WRITE和真实包 READ；再标出哪些方法调用会重读系统状态，答案应为“没有”。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '70,115p' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
-sed -n '255,292p' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'if (appInfo != null) {' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'hasRequestedPreserveLegacyExternalStorage =' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'pkg.hasPreserveLegacyExternalStorage();' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'isWhiteListed = false;' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'targetSDK = 0;' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'hasWriteMediaStorageGrantedForUid = false;' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'catch (PackageManager.NameNotFoundException e) {' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
 ```
 
-标出minimum target、requestLegacy和WRITE_MEDIA_STORAGE哪些按UID聚合，preserve与forced哪些按当前package，并用两个共享包手算最终候选。
+## 4. shared UID聚合混合了 UID级与包级输入，grant入口还有跨用户 UID差异
 
-## 114. macOS只读练习三：从权限到挂载
+`getMinimumTargetSDK()`从当前 appInfo的 target开始，遍历 `getPackagesForUid(appInfo.uid)`返回的全部名字，再按显式 `user`查询 ApplicationInfo并取最小值。兄弟包不必请求 READ/WRITE；只要共享 UID且查询成功，就能把 `T_u`拉低。查询失败的成员被跳过，包列表为空时则只保留当前包 target。
+
+`Q_u`与 `M_u`也先用传入 uid取包集合，再做 OR：前者看 ApplicationInfo的 request位，后者逐包检查 `WRITE_MEDIA_STORAGE`。`L_u`直接按 uid查询 StorageManager缓存。相反，`P_i`与 `F_i`只看当前包，`E_i`、`R_i`还绑定当前用户下该包的 READ flags。一个策略对象因此故意混合 UID聚合与包级事实。
+
+PermissionPolicyService用目标 user context取得 `PackageInfo.applicationInfo.uid`，这里是完整的 per-user UID。PermissionManager的直接 grant门却传 `pkg.toAppInfoWithoutState()`；解析包在扫描时保存的是 appId，`toAppInfoWithoutState()`原样写入 appInfo.uid。对非 system user，flags查询仍使用显式目标 user，但 `getPackagesForUid`、`L_u`、`Q_u`和 `M_u`可能按 user 0的数字身份取样。
+
+这是 r48两个调用点的输入差异，不宜在没有设备复现前扩大成所有安装流程都会失败；但它足以否定“传入 UserHandle会自动修正 UID聚合”的说法。排查 secondary user的 grant拒绝时，应同时记录 appInfo.uid和目标 user。
+
+### 练习 3：用两个用户、三个共享包建立输入表
+
+让 user 10独有一个包，另两个同 appId包存在于 user 0；逐行标出 PPS同步与 PMS grant两条调用会枚举哪些名字、在哪个 user查询 flags与 ApplicationInfo。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '1460,1565p' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
-sed -n '4250,4360p' frameworks/base/services/core/java/com/android/server/StorageManagerService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private static int getMinimumTargetSDK' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'String[] uidPkgs = pm.getPackagesForUid(appInfo.uid);' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'minimumTargetSDK = min(minimumTargetSDK, uidPkgInfo.targetSdkVersion);' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'private static boolean hasUidRequestedLegacyExternalStorage' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'private static boolean hasWriteMediaStorageGrantedForUid' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'pkg.toAppInfoWithoutState(), pkg, UserHandle.of(userId), permName)' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'appInfo.uid = uid;' frameworks/base/services/core/java/com/android/server/pm/parsing/pkg/PackageImpl.java
+grep -n -F 'parsedPackage.setUid(pkgSetting.appId);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
 ```
 
-画出grant→listener→AppOps→StorageManager与直接onExternalStoragePolicyChanged两条线，列出FULL、INSTALLER、WRITE、READ、DEFAULT五种普通决策顺序。
+## 5. mayGrant只判断一次授权是否合法，不代表 permission已授或存储已放宽
 
-## 115. macOS只读练习四：验证运行时API边界
+READ与 WRITE的公式完全相同：
+
+`mayGrant_i = E_i || T_u >= 29`
+
+它不读取 APPLY_RESTRICTION、request、preserve、legacy缓存、forced名单或 `WRITE_MEDIA_STORAGE`。target M以下的 runtime permission请求在 PMS更早处已经返回；target M至 P的包若无 exemption，会被 soft-restricted门拒绝；shared UID最小 target达到 Q后，即使没有 exemption也可通过这个资格门。
+
+`overridePolicy`只影响 POLICY_FIXED检查，不会绕过 soft-restricted公式。通过之后，PMS还要真正写 `PermissionsState`；失败、已有状态或其他门都可能让结果不同。成功 grant READ也没有自动写 `OP_LEGACY_STORAGE`，两者不是同一提交。
+
+PermissionPolicyService同步主 READ/WRITE op时还会先看实际 grant、REVOKED_COMPAT、hard/soft规则；REVIEW_REQUIRED则让主 op根本不产生候选。extra-op路径没有这些三项前置检查，只要解析后的 requestedPermissions中出现 READ就会单独算 legacy建议。因此“先获 READ，才可能允许 LEGACY”不是源码合同；最终 mount仍会用 READ/WRITE permission与主 op把能力卡住。
+
+Controller侧 `shouldShow()`只用当前包 target，而服务端 grant公式用 shared UID最小 target。UI显示与服务端资格在 shared UID边界可以不同；UI方法不是授权裁决。
+
+### 练习 4：拆开 UI、grant门、主 op与 extra op
+
+构造一个 target 30包和一个 target 28包共享 UID、两者均无 exemption。预测 Controller是否显示、PMS是否允许 grant、PPS是否产生主候选和 extra候选，不要只给一个“允许/拒绝”。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '1240,1320p' frameworks/base/core/java/android/os/Environment.java
-rg -n "PROP_FORCED_SCOPED_STORAGE_WHITELIST|sForcedScopedStorageAppWhitelist" \
-  frameworks/base/{core/java/android/os/storage/StorageManager.java,services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java}
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'return isWhiteListed || targetSDK >= Build.VERSION_CODES.Q;' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'return isWhiteListed || pkg.getTargetSdkVersion() >= Build.VERSION_CODES.Q;' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/utils/SoftRestrictedPermissionPolicy.java
+grep -n -F 'if (bp.isSoftRestricted() && !SoftRestrictedPermissionPolicy.forPermission' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'if (!overridePolicy && (flags & PackageManager.FLAG_PERMISSION_POLICY_FIXED) != 0)' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'boolean isGranted = mPackageManager.checkPermission(permissionName, packageName)' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'boolean isReviewRequired = (permissionFlags & FLAG_PERMISSION_REVIEW_REQUIRED) != 0;' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'addPermissionAppOp(packageInfo, pkg, permissionInfo);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'addExtraAppOp(packageInfo, pkg, permissionInfo);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
 ```
 
-解释compat change为何可覆盖AppOp，并确认forced列表在策略类中只于类加载时读取一次。
+## 6. READ的新获公式有两个强否决门，WRITE_MEDIA_STORAGE也不能越过
 
-## 116. 易混点一：request不是结果
+READ的 `mayAllowExtraAppOp()`可精确写成：
 
-`requestLegacyExternalStorage=true`只是Manifest输入；target R、restriction、forced列表、existing/preserve状态、AppOp和compat change都能让最终结果不同。
+`A_i = !R_i && !F_i && (M_u || ((L_u || Q_u) && T_u < 30))`
 
-## 117. 易混点二：READ授权不是legacy授权
+判断有明确顺序。APPLY_RESTRICTION先否决，forced-scoped包名再否决，之后才轮到 `WRITE_MEDIA_STORAGE`。所以这个 signature|privileged能力能绕过 target、历史与 request条件，却不能绕过 restriction或 forced名单。
 
-READ permission与OP_READ_EXTERNAL_STORAGE解决“是否具备读取合同”，OP_LEGACY_STORAGE解决“是否获得旧式宽视图”。scoped App也可通过MediaStore读被授权媒体。
+普通应用则同时需要两部分：当前已有 legacy反馈或 shared UID任一包请求 legacy，并且 shared UID最小 target小于 R。典型结果如下：
 
-## 118. 易混点三：preserve不能新建legacy
+| 输入 | 新获 LEGACY建议 |
+|---|---|
+| target 28，默认 request=true，无强否决 | ALLOW |
+| target 29，显式 request=true，无强否决 | ALLOW |
+| target 29，request=false且缓存无 legacy | 不 ALLOW |
+| target 30，request=true、无 WMS | 不 ALLOW |
+| target 30，有 WMS、无强否决 | ALLOW |
+| 任意 target，`R_i`或 `F_i`为 true | 不 ALLOW |
 
-target R的preserveLegacy只影响是否撤销已经ALLOWED的extra op；当前未获legacy时，单独声明preserve不会让mayAllow变true。
+名字 `forced_scoped_storage_whitelist`很容易误导：命中集合的语义是允许平台把该包强制送入 scoped，而不是 exemption白名单。另一个反直觉点是 extra路径不要求 READ当前已 grant；它能先形成 UID政策，但没有主 READ/WRITE能力时不会凭空给出读写挂载。
 
-## 119. 复读纠偏记录
+### 练习 5：逐短路计算新获公式
 
-复读后修正七点：r48只特化READ/WRITE；WRITE没有extra op；exempt允许grant却不自动允许legacy；request、preserve和existing是三种状态；minimum target/request/WMS按UID而preserve/forced按包；forced列表为未trim的类加载静态快照；Environment compat可先于AppOp决定结果。另记录StorageManager shared UID false回调直接remove的源码TODO与非FUSE回调只在部分mode转ALLOWED时remount。
+按源码执行顺序依次翻转 `R_i`、`F_i`、`M_u`、`L_u`、`Q_u`和 `T_u`，记录哪个条件已决定返回值，避免把公式只背成一串 OR。
 
-## 120. 本章小结与下一章
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'shouldApplyRestriction = (flags & FLAG_PERMISSION_APPLY_RESTRICTION) != 0;' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'isForcedScopedStorage = sForcedScopedStorageAppWhitelist' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'if (shouldApplyRestriction) {' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'if (isForcedScopedStorage) {' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'return hasWriteMediaStorageGrantedForUid' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'hasLegacyExternalStorage || hasRequestedLegacyExternalStorage' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F '&& targetSDK < Build.VERSION_CODES.R);' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'if (applicationInfo.hasRequestedLegacyExternalStorage()) {' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'checkPermission(WRITE_MEDIA_STORAGE, packageName)' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'private static final HashSet<String> sForcedScopedStorageAppWhitelist' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'StorageManager.PROP_FORCED_SCOPED_STORAGE_WHITELIST' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'return rawList.split(",");' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+```
 
-SoftRestrictedPermissionPolicy把Android 10到11的存储迁移编码为一组非对称公式：permission grant与legacy视图分开，旧target可按request获取，R target只能在严格条件下保留，shared UID取最宽共同结果。最终能力还要经过主AppOp、compat change和StorageManager挂载。下一章进入Android 11 scoped storage主链，继续读MediaProvider/FUSE、应用隔离目录、MediaStore授权与MANAGE_EXTERNAL_STORAGE。
+## 7. preserve表达“不撤销 ALLOWED”，而不是“给我 ALLOWED”
+
+撤销建议 `D_i`分成两段：
+
+- `T_u < 30`时，`D_i = !A_i`；
+- `T_u >= 30`时，`D_i = R_i || F_i || (!M_u && !P_i)`。
+
+PPS按三路消费：
+
+| 策略结果 | extra候选 | 含义 |
+|---|---|---|
+| `A_i=true` | ALLOW | 明确写 ALLOWED |
+| `A_i=false, D_i=true` | IGNORE | 明确写 IGNORED |
+| 两者都 false | IGNORE_IF_NOT_ALLOWED | raw恰为 ALLOWED时保留；否则归一 IGNORED |
+
+所以 target R及以上、已有 ALLOWED、无 restriction/forced/WMS而 `P_i=true`的包会走条件候选：它能保住 ALLOWED，却不能把 DEFAULT或已经 IGNORED恢复为 ALLOWED。`L_u`没有进入 R以上撤销式，正因为“是否已有 ALLOWED”由消费端的 raw读取再判断。
+
+shared UID里的 preserve也不能简单做 OR。假设两个请求 READ的 R包共享 UID，一个 `P_i=true`、另一个 false：前者给条件候选，后者给确定 IGNORE；若没有第三个 ALLOW候选，确定 IGNORE先占键，整个 UID仍被压到 IGNORED。反过来，某成员有 WMS产生 ALLOW时，ALLOW会压过其他成员的 IGNORE。
+
+最后还要继承第271章的限制：ALLOW→IGNORE→条件 IGNORE只是候选优先级。`unsafeCheckOpRaw()`会合成 package override、suspend与 restriction；合成值可能让 UID setter误判 no-op，所以“最宽候选优先”不保证每个 shared成员最终 effective mode最宽。
+
+### 练习 6：用三个 R包验证 preserve不是 UID级 OR
+
+让 A声明 preserve、B不声明、C持有 WMS，分三轮加入 A、A+B、A+B+C。分别写出候选表、执行顺序、raw为 DEFAULT与 ALLOWED时的结果。
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'if (targetSDK < Build.VERSION_CODES.R) {' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F '&& !hasRequestedPreserveLegacyExternalStorage) {' frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+grep -n -F 'if (policy.mayAllowExtraAppOp()) {' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'if (policy.mayDenyExtraAppOpIfGranted()) {' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'mOpsToIgnoreIfNotAllowed.add(extraOpToChange);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'final int allowCount = mOpsToAllow.size();' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'final int ignoreCount = mOpsToIgnore.size();' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'final int ignoreIfNotAllowedCount = mOpsToIgnoreIfNotAllowed.size();' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'if (currentMode != MODE_ALLOWED) {' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+```
+
+## 8. request与preserve的解析默认值不同，包更新还有反扩权撤销
+
+解析器令 request的默认值为 `targetSdk < Q`，Q及以上默认 false，但 Manifest可显式覆盖；preserve无条件默认 false。target R包即使把 request写成 true，也会被 `T_u < R`挡住普通新获，除非 shared旧成员拉低最小 target或 UID持 WMS。preserve则只参与 R以上撤销式，从来不进入新获公式。
+
+PMS在包更新时另有一条安全链。若 target从 Q及以上降到 Q以下，或不是这次跨 Q升级且 request从 false变 true，它会遍历所有 user，把新包所请求的 storage permissions逐项撤销。这防止包通过降 target或突然请求更宽旧模型继承既有授权；它改变的是 permission事实，不是直接改 legacy AppOp。
+
+另一 helper只要看到“replace + 新包当前 request=true + 请求 READ或WRITE”，就把 updatedUserIds扩成所有用户，以便后续 runtime-state通知触发策略重算。它不比较旧 request，因此持续为 true的普通更新也会过度触发；request从 true移除则不靠这个 helper命中，但包 changed观察仍可能带来同步。
+
+r48的 CTS把时间方向写得很清楚：target 30的 preserve能延续一次真实 legacy更新，首次安装、从非 legacy更新、卸载后重装或已经丢失后再加 preserve都不能新建 ALLOWED。
+
+### 练习 7：画出四种包更新的 permission与AppOp时钟
+
+比较 target降级、新增 request、target跨 Q升级、仅保留 request四种 replace。先判断是否撤 permission，再判断是否把所有 user加入更新集，最后才追 PPS的异步 AppOps收敛。
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'setRequestLegacyExternalStorage(bool(targetSdk < Build.VERSION_CODES.Q' frameworks/base/core/java/android/content/pm/parsing/ParsingPackageUtils.java
+grep -n -F 'setPreserveLegacyExternalStorage(bool(false' frameworks/base/core/java/android/content/pm/parsing/ParsingPackageUtils.java
+grep -n -F 'boolean downgradedSdk = oldPackage.getTargetSdkVersion() >= Build.VERSION_CODES.Q' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'boolean newlyRequestsLegacy = !upgradedSdk && !oldPackage.isRequestLegacyExternalStorage()' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'STORAGE_PERMISSIONS.contains(permInfo.name)' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'if (replace && pkg.isRequestLegacyExternalStorage() && (' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'return getAllUserIds();' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'testStorageTargetingSdk30CanPreserveLegacyOnUpdateFromLegacy' cts/tests/tests/permission2/src/android/permission2/cts/RestrictedStoragePermissionTest.java
+grep -n -F 'testStorageTargetingSdk30CannotPreserveLegacyOnInstall' cts/tests/tests/permission2/src/android/permission2/cts/RestrictedStoragePermissionTest.java
+```
+
+## 9. exemption、forced名单与 WRITE_MEDIA_STORAGE属于三套独立控制
+
+SYSTEM、UPGRADE、INSTALLER exemption按位 OR成 `E_i`，它们允许旧 target通过 permission grant门。APPLY_RESTRICTION是另一个 flag，extra公式只直接读取它，不直接读取 `E_i`。上游权限更新通常会协调两者，但策略源码没有把“有 exemption”写成“legacy自动 ALLOW”。
+
+forced集合来自 DeviceConfig的 `storage_native_boot/forced_scoped_storage_whitelist`。类加载时读取一次，null或空串变空集合，否则直接按逗号 split；没有 trim，也没有本类 listener。运行中改属性不会改变既有 HashSet，也不会由本类自动要求 PPS重算。命名里的 whitelist描述可被强制迁移的包集合，作用方向与 exemption相反。
+
+`WRITE_MEDIA_STORAGE`在 Manifest中是 signature|privileged且已标记 deprecated、不再附送旧 `media_rw` GID，但 r48仍把它作为活跃兼容输入。它能在没有强否决时使 READ策略新授或保留 legacy；StorageManager另要求它与有效 WRITE结合，才返回 FULL mount。单独持有 WMS不是完整文件能力。
+
+forced和 preserve是当前包级输入，而候选最后写 UID mode。于是 shared UID中的另一成员若合法产生 ALLOW，可能压过命中 forced的成员所提 IGNORE；反过来，一个未 preserve的 R成员也可能压过另一成员的条件保留。配置名与单包策略都不能直接推出 shared UID终态。
+
+## 10. PermissionPolicy合并的是候选，不是一份可回滚事务
+
+单包同步会加入触发包和同 user的所有 shared成员；全量同步也按每个包产生候选。每个包只遍历自己解析后的 requestedPermissions，所以未请求 READ的 shared成员不会直接创建 legacy候选，却仍能通过最小 target、request或 WMS聚合影响别人的公式。
+
+对 `OP_LEGACY_STORAGE`没有 FOREGROUND候选，实质优先级是 ALLOW→IGNORE→IGNORE_IF_NOT_ALLOWED。ALLOW循环不预去重；确定 IGNORE遇到已占的 `(uid,op)`会跳过；条件候选只有 setter返回 true后才占键。多个条件候选若各包 raw不同，可能逐个执行，任一非 ALLOWED便可把 UID写成 IGNORED。
+
+setter先以具体候选包查询 effective raw，再决定是否写 UID mode；普通 setter写后还可能用同一个包清 package覆盖。这让 package名参与“是否写”的判断，而目标状态又是 UID级。restriction、suspend或旧 package override可以遮住底层值，候选列表正确也可能漏写，具体反例已在第271章证明。
+
+同步过程中没有锁住 PMS permission、AppOps mode、StorageManager缓存和进程 namespace。前一个 setter成功、后一个抛异常时不会回滚；下一轮包事件、permission通知、AppOps watcher或用户启动扫描才可能继续收敛。
+
+## 11. OP_LEGACY_STORAGE是持久政策；StorageManager通知却早于磁盘提交
+
+AppOps表给 `OP_LEGACY_STORAGE`配置的 permission为 null、默认 mode为 DEFAULT。PPS通常通过 policy专用 UID setter写 ALLOWED或 IGNORED；这是 AppOps运行时政策，而不是 Manifest permission或 StorageManager集合。
+
+`setUidMode()`先在 `mUidStates`改内存并安排普通延迟写，再异步通知 mode watchers；随后还在 setter调用线程通过 LocalServices同步调用 `StorageManagerInternal.onAppOpsChanged()`。默认普通写延迟是30分钟，正常关机另有同步 flush，因此下面四个完成点不能合并：
+
+1. UID mode内存已变；
+2. StorageManager同步回调已返回；
+3. 普通 watcher已运行；
+4. `appops.xml`已经提交。
+
+policy callback只会从普通 watcher集合排除 PPS自身，不会屏蔽同步 StorageManager回调。UID setter给该回调的 packageName是 null；package setter则传具体包，而且即使没有真正改变持久 mode也会走同步内部通知。StorageManager收到的是 setter报告的目标 mode，不是一次重新读取后的跨层事务结果。
+
+## 12. legacy UID集合是有意参与反馈的缓存，也带着顺序与 shared UID缺口
+
+StorageManagerService在 user starting时枚举包含 direct-boot、uninstalled和 any-user匹配标志的 ApplicationInfo，逐包用 `checkOperation(OP_LEGACY_STORAGE)`取 effective结果，再 add/remove完整 UID。SystemServer先注册 StorageManagerService、后注册 PermissionPolicyService，而 SystemServiceManager按服务表顺序发 user-start回调；正常路径因此先快照旧 AppOps，再让 PPS把 `L_u`作为迁移历史输入重算。
+
+这不是从空集合重建的数据库。若 shared UID成员因 package override得到不同 effective结果，逐包 add/remove会令最后一次更新决定集合；包移除也直接按 UID remove，源码注释明确指出没有检查同 shared UID的其他安装包。user stop只注销 PackageMonitor，不按 user清集合；下一次 start也没有先清空该 user的旧 UID。
+
+FUSE开启时，AppOps→StorageManager同步回调遇到 LEGACY会按新 mode更新集合。非 FUSE时，专用 Binder watcher负责重算活跃 UID的 mount，却不维护这份集合。因而 `hasLegacyExternalStorage(uid)`最多是迁移反馈缓存：它不等于实际 AppOps权威值，更不等于某个进程当前 namespace。
+
+### 练习 8：制造“AppOp正确、反馈缓存错误”的 shared UID
+
+让两个成员保留不同 package override，并交换扫描顺序；再模拟移除其中一个包和 user stop/start。逐步记录 AppOps effective值、集合成员与 mount实时查询，找出哪些步骤会重新校准。
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'static final long WRITE_DELAY = DEBUG ? 1000 : 30*60*1000;' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'null, // no permission for OP_LEGACY_STORAGE' frameworks/base/core/java/android/app/AppOpsManager.java
+grep -n -F 'AppOpsManager.MODE_DEFAULT, // LEGACY_STORAGE' frameworks/base/core/java/android/app/AppOpsManager.java
+grep -n -F 'new File(systemDir, "appops.xml")' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'notifyOpChangedSync(code, uid, null, mode, previousMode);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'storageManagerInternal.onAppOpsChanged(code, uid, packageName, mode, previousMode);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'mSystemServiceManager.startService(STORAGE_MANAGER_SERVICE_CLASS);' frameworks/base/services/java/com/android/server/SystemServer.java
+grep -n -F 'mSystemServiceManager.startService(PermissionPolicyService.class);' frameworks/base/services/java/com/android/server/SystemServer.java
+grep -n -F 'final SystemService service = mServices.get(i);' frameworks/base/services/core/java/com/android/server/SystemServiceManager.java
+grep -n -F 'snapshotAndMonitorLegacyStorageAppOp(user.getUserHandle());' frameworks/base/services/core/java/com/android/server/StorageManagerService.java
+grep -n -F 'MATCH_UNINSTALLED_PACKAGES | MATCH_ANY_USER,' frameworks/base/services/core/java/com/android/server/StorageManagerService.java
+grep -n -F 'mUidsWithLegacyExternalStorage.add(uid);' frameworks/base/services/core/java/com/android/server/StorageManagerService.java
+grep -n -F 'mUidsWithLegacyExternalStorage.remove(uid);' frameworks/base/services/core/java/com/android/server/StorageManagerService.java
+grep -n -F 'PackageMonitor monitor = mPackageMonitorsForUser.remove(userId);' frameworks/base/services/core/java/com/android/server/StorageManagerService.java
+grep -n -F 'return mUidsWithLegacyExternalStorage.contains(uid);' frameworks/base/services/core/java/com/android/server/StorageManagerService.java
+```
+
+## 13. mount计算不读反馈集合，而是实时查 permission、主 op与 legacy op
+
+先分清两个正交开关：boot快照的 `ENABLE_ISOLATED_STORAGE`决定用哪套 mount算法，`mIsFuseEnabled`决定底层挂载与运行中更新怎样执行。前者开启时，`getExternalStorageMountMode()`进入 `getMountModeInternal()`；关闭时则遍历所有 `ExternalStorageMountPolicy`并取数值最小值，任何 NONE立即拒绝。AppOpsService只在这个关闭分支安装旧 mount policy，而那份 policy只 note READ/WRITE AppOp，不读取 LEGACY op。
+
+以下普通决策属于 isolated-storage开启分支。`getMountModeInternal()`先处理 isolated、无包与 instant app；FUSE external-storage service、Downloads/ExternalStorageProvider和平台签名 MTP进程还有专门返回。普通应用随后计算 `hasRead`与 `hasWrite`，每一项都要求 permission和对应主 AppOp同时通过。
+
+普通决策顺序是：
+
+| 条件 | mount mode |
+|---|---|
+| WMS granted且 hasWrite | FULL |
+| INSTALL_PACKAGES granted，或 shared UID任一包 REQUEST_INSTALL_PACKAGES op为 ALLOWED；并且 hasWrite | INSTALLER |
+| LEGACY op为 ALLOWED且 hasWrite | WRITE |
+| LEGACY op为 ALLOWED且 hasRead | READ |
+| 其他 | DEFAULT |
+
+isolated-storage开启时，这里直接向 AppOpsService查询 LEGACY，不读取 `mUidsWithLegacyExternalStorage`。因此反馈缓存错误会影响下一轮 soft策略，却不会直接污染本次 mount计算。反过来，LEGACY ALLOWED而 READ/WRITE双门都失败，仍只能得到 DEFAULT。关闭 isolated-storage时，旧 policy甚至不消费 LEGACY；此时 Environment仍可能按 compat/AppOps报告 legacy，与 mount fallback形成另一种分歧。
+
+枚举里虽然存在 `MOUNT_EXTERNAL_LEGACY`，但这个正常决策函数不会返回它；legacy op最终选择的是 READ或WRITE。非 FUSE的 Zygote映射又让 LEGACY、WRITE与 INSTALLER都绑定 write视图，所以不能从常量名字反推生产路径。
+
+## 14. “mode变化后生效”要按 FUSE、非 FUSE与新进程三条路拆开
+
+新进程启动时，ProcessList同步问 StorageManagerInternal取得 mount mode，写入 `ProcessRecord.mountMode`并传给 Zygote。非 FUSE时，Zygote按 DEFAULT/READ/WRITE等选择 `/mnt/runtime/*`视图；vold的 `remountUid()`还能扫描现有进程、进入各自 mount namespace并换绑。
+
+r48给 FUSE与 isolated storage的默认值都设为开启，但设备可分别覆盖。FUSE分支中，普通 DEFAULT/READ/WRITE都由 Zygote绑定同一个 `/mnt/user/<userId>`入口，真实可见性主要由 FUSE/MediaProvider在请求时裁决；vold看到 FUSE属性后让 `remountUid()`直接返回。此时 LEGACY op变化在 StorageManager内部只更新反馈集合，不 kill，也没有有效 remount。
+
+非 FUSE配置下，`servicesReady()`为 REQUEST_INSTALL_PACKAGES与 LEGACY注册专用 watcher；callback还要求 boot快照的 isolated-storage功能开启且 UID活跃，才重算并调用 remount。另一条 AppOps同步内部回调会先让 FUSE专用的 REQUEST、MANAGE与 LEGACY分支提前返回；余下的 READ/WRITE，以及非 FUSE下的 REQUEST，只有新 mode为 ALLOWED且 user initialized时才调用重挂载，对降级不对称。
+
+PMS成功 grant READ/WRITE也会在 user initialized时直接要求一次重算。它与 AppOps ALLOWED通知可能重复，但重复调用并不提供事务屏障；FUSE下最终又可能是 no-op。故“LEGACY改变就 remount或 kill”是错误模型：源码没有 LEGACY kill分支。
+
+## 15. Environment的 compat真值表是并行语义门，不是 mount输入
+
+`Environment.isExternalStorageLegacy()`在应用调用线程先排除 isolated和 instant app，再读取两个 compatibility change：
+
+| DEFAULT_SCOPED_STORAGE | FORCE_ENABLE_SCOPED_STORAGE | 返回路径 |
+|---:|---:|---|
+| 1 | 1 | 直接 false，强制 scoped |
+| 0 | 0 | 直接 true，强制 legacy |
+| 1 | 0 | 查询 LEGACY op |
+| 0 | 1 | 查询 LEGACY op |
+
+DEFAULT change默认开启，FORCE被声明为默认关闭，所以通常落在“查 AppOp”的混合状态。FORCE单独为 true并不会强制 scoped，只有两者都 true才触发严格 enforced；两者都 false则绕过 AppOp直接报告 legacy。
+
+这个 API不调用 StorageManagerService，也不核验当前进程 namespace。`isExternalStorageLegacy(File path)`在 r48实现里还完全不使用 path参数；它不是按卷裁决。于是 AppOp ALLOWED可能被双 true压成 false，AppOp非 ALLOWED也可能被双 false抬成 true，而 mount仍另受 READ/WRITE双门与 FUSE路径约束。
+
+MediaProvider的 `LocalCallingIdentity`复制了同一组 change ID和两位公式，说明 compat是文件访问上层的并行政策输入；它并没有被 `getMountModeInternal()`读取。下一章再进入 FUSE/MediaProvider逐请求裁决。
+
+### 练习 9：让 API结果、AppOp与 mount故意三者不同
+
+先列四种 compat组合，再分别令 LEGACY=ALLOWED、READ denied与 FUSE开关变化。对每组写出 Environment返回、StorageManager mount mode和新进程绑定；不要把任一列当作另外两列的代理。
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private static final long DEFAULT_SCOPED_STORAGE = 149924527L;' frameworks/base/core/java/android/os/Environment.java
+grep -n -F 'private static final long FORCE_ENABLE_SCOPED_STORAGE = 132649864L;' frameworks/base/core/java/android/os/Environment.java
+grep -n -F 'return defaultScopedStorage && forceEnableScopedStorage;' frameworks/base/core/java/android/os/Environment.java
+grep -n -F 'return !defaultScopedStorage && !forceEnableScopedStorage;' frameworks/base/core/java/android/os/Environment.java
+grep -n -F 'return appOps.checkOpNoThrow(AppOpsManager.OP_LEGACY_STORAGE,' frameworks/base/core/java/android/os/Environment.java
+grep -n -F 'if (ENABLE_ISOLATED_STORAGE) {' frameworks/base/services/core/java/com/android/server/StorageManagerService.java
+grep -n -F 'for (ExternalStorageMountPolicy policy : mPolicies) {' frameworks/base/services/core/java/com/android/server/StorageManagerService.java
+grep -n -F 'if (!StorageManager.hasIsolatedStorage()) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'final boolean hasRead = StorageManager.checkPermissionAndCheckOp' frameworks/base/services/core/java/com/android/server/StorageManagerService.java
+grep -n -F 'if (hasFull && hasWrite) {' frameworks/base/services/core/java/com/android/server/StorageManagerService.java
+grep -n -F 'if (hasLegacy && hasWrite) {' frameworks/base/services/core/java/com/android/server/StorageManagerService.java
+grep -n -F 'mountExternal = storageManagerInternal.getExternalStorageMountMode(uid,' frameworks/base/services/core/java/com/android/server/am/ProcessList.java
+grep -n -F 'private static final boolean DEFAULT_FUSE_ENABLED = true;' frameworks/base/services/core/java/com/android/server/StorageManagerService.java
+grep -n -F 'BindMount(user_source, "/storage", fail_fn);' frameworks/base/core/jni/com_android_internal_os_Zygote.cpp
+grep -n -F '"/mnt/runtime/write",   // MOUNT_EXTERNAL_LEGACY' frameworks/base/core/jni/com_android_internal_os_Zygote.cpp
+grep -n -F 'case OP_LEGACY_STORAGE:' frameworks/base/services/core/java/com/android/server/StorageManagerService.java
+grep -n -F 'if (GetBoolProperty(android::vold::kPropFuse, false)) {' system/vold/VolumeManager.cpp
+```
+
+## 16. 用完成点矩阵收束排障，并把下一章边界留清楚
+
+| 已观察到 | 可以证明 | 仍不能证明 |
+|---|---|---|
+| Manifest request或preserve为 true | 解析意图存在 | permission会 grant、LEGACY会 ALLOW |
+| `mayGrantPermission()=true` | 这次 soft资格门允许继续 | permission已经写入、主 op已同步 |
+| LEGACY raw为 ALLOWED | 某层 AppOps政策当前报告允许 | StorageManager缓存正确、READ/WRITE双门通过 |
+| UID在 legacy反馈集合 | soft策略下一轮会看到 `L_u=true` | 当前 AppOps或 namespace仍为 legacy |
+| `syncPackages()`返回 | 本轮候选 setter均返回 | AppOps XML提交、shared成员effective结果统一 |
+| ProcessRecord记录 READ/WRITE | 启动时算出的 mount mode已保存 | FUSE逐请求访问一定通过 |
+| Environment返回 true | compat/AppOps这条 API公式成立 | 实际 mount宽度或任意文件操作成功 |
+
+排查时按“解析输入→真实 user与完整 UID→permission及 flags→三项策略结果→候选优先级与 raw遮蔽→AppOps内存→Storage反馈缓存→新/旧进程路径→compat API”逐层记录。尤其要保留包名：forced、preserve、flags和 package override都是包级，而最终 UID mode、WMS、request聚合与 mount namespace又跨成员共享。
+
+第272章的核心结论是：soft-restricted存储策略维护的是迁移中的非对称建议，不是最终文件能力。permission grant、LEGACY政策、反馈缓存、mount和 compat API各有自己的时钟，shared UID与 r48的跨用户输入差异又会放大偏差。下一章进入 Android 11 scoped storage主链，继续拆 MediaProvider/FUSE、应用隔离目录、MediaStore授权与 `MANAGE_EXTERNAL_STORAGE`。

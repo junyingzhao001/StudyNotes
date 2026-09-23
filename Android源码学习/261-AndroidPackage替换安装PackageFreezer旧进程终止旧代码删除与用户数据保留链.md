@@ -1,672 +1,449 @@
 # 261 Android Package替换安装、PackageFreezer、旧进程终止、旧代码删除与用户数据保留链
 
-## 1. 本章目标
+## 1. 更新不是覆盖文件，而是让五个世界在不同完成点交接
 
-第260章已经把候选APK送进`prepare → scan → reconcile → commit`。本章只盯住“更新已有应用”这一条分支：为什么新APK能替换旧APK，原来的账号、数据库、SharedPreferences和多数权限状态却仍然存在；旧进程、旧代码和更新广播又分别在什么时候处理。
+第260章把候选APK送过prepare、scan、reconcile、commit与post-commit。本章只看replace：为什么账号、数据库和UID通常连续，旧进程与旧APK却要退出；也解释为什么安装器已经收到成功时，旧代码仍可能存在，广播接收者甚至还没运行。
 
-## 2. 先记住一句话
+先把五类对象拆开：旧进程由AMS管理；旧base/split/native/dex是磁盘资源；`PackageSetting`保存appId与每用户账；AppData保存应用业务数据；新`AndroidPackage`则是候选代码的解析模型。替换不是让五者同时翻面，而是按下列坐标逐步推进：
 
-更新不是普通意义上的“完整卸载再首次安装”，而是一次受保护的替换事务：冻结并通常杀死旧进程，用`DELETE_KEEP_DATA`撤下旧包的活动注册和旧代码，把新包提交为当前版本，最后发送带`EXTRA_REPLACING`的广播并清理旧代码。
+| 坐标 | 已经成立 | 仍不能推出 |
+|---|---|---|
+| `replace=true` | 请求获准覆盖一个现有身份 | 新签名能继承旧数据 |
+| freezer构造返回 | 包名可能已冻结，kill请求可能已入AMS队列 | 旧进程已经死亡 |
+| `DELETE_KEEP_DATA`删除计划成立 | 普通旧包允许按保数据方式撤下 | 旧注册或旧代码已经删除 |
+| `commitPackagesLocked()`返回 | 活动包模型与Settings已经切到新版本 | AppData、profile和结果回程完成 |
+| post-commit返回 | 资源准备链正常走完 | POST_INSTALL已经解冻 |
+| 广播发送调用返回 | 对应发送任务已排入PMS Handler | AMS已接收或receiver已执行 |
+| `doPostDeleteLI()`返回 | 旧资源清理被尝试 | 文件与dex一定消失 |
+| install observer成功 | 安装结果已交付调用者 | no-kill旧代码已删除 |
 
-## 3. 五类对象不要混在一起
+本文的install observer特指`IPackageInstallObserver2`结果回调。post-commit较早调用的`notifyPackageChangeObserversOnUpdate()`是另一套包变化观察者，不能拿它替代安装结果完成点。
 
-```text
-旧进程：AMS管理的运行实例
-旧代码：旧base.apk、split APK、native/dex相关文件
-PackageSetting：PMS持久化的包、appId和每用户状态账本
-AppData：/data/user*下的数据库、SP、files、cache等
-新AndroidPackage：本次解析、扫描并准备提交的新包模型
-```
+核心结论是：替换保留的是经签名允许的连续身份，不是旧世界的每个字节；它依靠预检查、冻结、锁内切换和锁外补偿收敛，也不是带通用undo log的ACID事务。
 
-更新时它们的命运并不相同。
+## 2. replace先由flag与活动包判定，静态共享库还有合成包名
 
-## 4. 本章源码地图
+`preparePackageLI()`完整解析候选后，先令`replace=false`。只有`INSTALL_REPLACE_EXISTING`存在，PMS才在`mLock`下查活动包：普通情况要求`mPackages`已有同名包；rename迁移情况还要求候选`originalPackages`包含Settings保存的旧名，并确实存在该旧名活动包，然后把候选包名改回旧名。
 
-```text
-frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
-frameworks/base/services/core/java/com/android/server/pm/PackageSetting.java
-frameworks/base/services/core/java/com/android/server/pm/PackageSettingBase.java
-frameworks/base/core/java/android/content/pm/PackageManager.java
-frameworks/base/core/java/android/content/Intent.java
-```
+所以“同包名已存在”不等于替换获准。缺少replace flag时，后面的new-package分支会以`INSTALL_FAILED_ALREADY_EXISTS`拒绝；同样，flag存在但活动包表没有对应身份时仍是新装语义。prepare稍后又重新读取`oldPackage`和`PackageSetting`，因为Session校验后的包世界可能已经变化。
 
-核心方法是`preparePackageLI()`、`reconcilePackagesLocked()`、`commitPackagesLocked()`、`executeDeletePackageLIF()`、`removePackageDataLIF()`和`handlePackagePostInstall()`。
+静态共享库先按`staticSharedLibVersion`改成合成包名。常规的新库版本因此是另一个包身份，不走replace；命中同一合成名后，prepare还要求package的`longVersionCode`相等，只有两条版本轴都相同的开发式覆盖才可能进入这条链。
 
-## 5. 本章先回答三个问题
-
-1. 为什么替换期间不允许旧进程继续启动或读取旧世界？
-2. 为什么“删除旧包”没有删除用户数据和appId账本？
-3. 为什么旧代码不一定在commit瞬间删除？
-
-抓住这三问，后面的类名就不会散。
-
-## 6. 替换安装总图
-
-```mermaid
-flowchart TD
-    N["新APK已进入最终候选路径"] --> P["preparePackageLI识别replace"]
-    P --> F["PackageFreezer登记冻结<br/>通常请求AMS杀旧进程"]
-    F --> V["复核签名、sharedUserId、系统更新hash"]
-    V --> S["scan新包"]
-    S --> R["reconcile构造DeletePackageAction<br/>DELETE_KEEP_DATA"]
-    R --> C["commit撤下旧包注册<br/>提交新AndroidPackage与PackageSetting"]
-    C --> D["post-commit准备AppData/profile<br/>清code cache"]
-    D --> U["POST_INSTALL先close freezer"]
-    U --> B["REMOVED replacing → ADDED replacing<br/>→ REPLACED → MY_PACKAGE_REPLACED"]
-    B --> O["清旧代码；no-kill时延迟3秒"]
-```
-
-## 7. `replace`最早怎样确定
-
-`preparePackageLI()`解析候选包后，会根据安装flag、现有包和重命名关系判断这是新装还是替换。只有请求允许替换且系统中存在相同包身份，才进入`replace`分支。
-
-所以“包名相同”只是必要线索，不等于一定允许覆盖。
-
-## 8. 为什么还要在prepare再次查旧包
-
-从Session校验到真正安装之间，系统包世界可能变化。prepare在`mLock`下重新取得`mPackages`中的旧`AndroidPackage`和`mSettings.mPackages`中的`PackageSetting`，不能只信前一阶段的快照。
-
-## 9. 新旧包的角色
-
-`oldPackage`描述当前活动版本；`parsedPackage`描述候选版本；`ps`保存旧包的持久状态；`disabledPs`在更新系统应用时指向只读分区上的工厂基线。
-
-后续代码正是靠这四者决定“普通App替换”和“系统App更新”两种路径。
-
-## 10. 为什么先做`doRename()`再冻结
-
-r48中候选stage先被改名或绑定到最终随机code path，随后设置fs-verity、启动App Links验证，才创建`PackageFreezer`。
-
-这里的“最终路径”不等于“已对查询者生效”；真正替换全局包世界仍在commit。
-
-## 11. `PackageFreezer`是什么
-
-它是PMS内部的`AutoCloseable`保护对象。真实freezer在构造时把包名加入`mFrozenPackages`，并向AMS请求杀死对应包进程；`close()`时把自己加入的冻结标记移除。应用启动前的`checkPackageStartable()`也会拒绝仍在该集合中的包。
-
-它不是文件锁，也不是Linux freezer cgroup。
-
-## 12. 为什么更新需要冻结
-
-替换会改变代码路径、组件、资源、权限声明和类加载世界。若旧进程在中途继续启动Activity或加载资源，就可能同时看见旧进程内存与新PMS元数据，形成混合版本。
-
-冻结的目标是让这段“包手术”期间不能重新启动该包。
-
-## 13. 创建freezer时先登记还是先杀
-
-源码在`mLock`下先执行`mFrozenPackages.add(packageName)`，再从Settings取得appId并调用`killApplication()`。
-
-因此其他PMS提交路径检查冻结状态时，已经能看到该包处于冻结集合。
-
-## 14. 杀进程调用跨过哪个边界
-
-PMS调用`ActivityManager.getService().killApplication(...)`，从system_server中的PMS逻辑进入AMS服务接口。虽然二者通常同在system_server，仍通过`IActivityManager`接口表达进程管理职责；本地Binder对象并不必然发生一次跨进程传输。
-
-PMS不直接向Linux PID发送signal。
-
-## 15. 为什么要清除Binder调用身份
-
-`killApplication()`先`Binder.clearCallingIdentity()`，最终再restore。这样AMS看到的是系统服务自己的身份，不会把安装器或其他外层Binder调用者误当成执行杀进程的主体。
-
-## 16. 不要把“请求kill”理解成事务回滚点
-
-PMS侧`killApplication()`捕获并忽略`RemoteException`，没有把杀进程失败转换成安装失败；AMS入口也只是向自己的Handler投递`KILL_APPLICATION_MSG`。所以构造freezer返回只代表“冻结标记已建立、kill已请求”，不证明旧进程已经退出。冻结集合同时阻止新的启动，二者共同缩小混合版本窗口。
-
-## 17. `INSTALL_DONT_KILL_APP`的freezer
-
-如果安装flag包含`INSTALL_DONT_KILL_APP`，`freezePackageForInstall()`返回一个空壳`PackageFreezer`：不加入冻结集合，也不杀进程。
-
-这是一条显式放宽一致性的特殊路径。
-
-## 18. 空壳freezer为什么仍要close
-
-空壳也打开`CloseGuard`并实现相同生命周期。调用者无需写两套释放逻辑；失败或POST_INSTALL时统一`close()`即可。
-
-## 19. `close()`为什么可重复
-
-`AtomicBoolean mClosed.compareAndSet(false, true)`保证真正移除动作只发生一次。失败清理、正常POST_INSTALL和finalize兜底即便碰到一起，也不会重复解除。
-
-## 20. `CloseGuard`解决什么
-
-它在freezer被遗忘时发出资源泄漏警告，`finalize()`还会尝试close。但finalize时机不可预测，所以它只是兜底，不是正常控制流。
-
-## 21. 重要版本边界：它不是引用计数
-
-r48的`mFrozenPackages`是`Set<String>`。构造器记录`mWeFroze = set.add(name)`，只有第一次加入者在close时remove。
-
-不要把它讲成“嵌套freezer引用计数”。若多个真实freezer生命周期异常重叠且首次加入者先关闭，集合可在另一个对象仍存活时被移除。
-
-## 22. 正常安装怎样降低上述风险
-
-prepare把唯一的freezer存进`PackageInstalledInfo.freezer`，成功时贯穿scan、reconcile、commit和post-commit；失败时统一关闭。主安装链并不有意创建同包的多层freezer。
-
-## 23. freeze检查发生在哪里
-
-`commitPackageSettings()`在非boot、非`SCAN_DONT_KILL_APP`、非忽略冻结的普通提交中调用`checkPackageFrozen(pkgName)`。
-
-它发现集合中没有包名时执行`Slog.wtf`，用于暴露破坏一致性的调用路径。
-
-## 24. `checkPackageFrozen()`不是安全权限检查
-
-它验证内部协议是否被遵守，不判断调用者有没有安装权限，也不阻止恶意APK。安装授权、签名和policy门在其他阶段完成。
-
-## 25. 签名为什么在替换分支复核
-
-保留旧AppData意味着新代码将读取旧应用私有数据并继续使用原appId。只有签名谱系或upgrade keyset允许的新版本，才应获得这种连续身份。
-
-## 26. upgrade keyset优先路径
-
-若旧Setting声明需要按upgrade keyset检查，PMS调用`checkUpgradeKeySetLocked()`。不满足就以`INSTALL_FAILED_UPDATE_INCOMPATIBLE`拒绝。
-
-## 27. 默认签名能力检查
-
-否则要求新签名对旧签名具有`INSTALLED_DATA`能力，或旧签名对新签名具有`ROLLBACK`能力。它比简单比较当前证书字节更能表达签名轮换和回滚关系。
-
-## 28. 为什么能力名叫`INSTALLED_DATA`
-
-这一能力直接表达“新签名能否继承旧版本已经安装的数据”。它把本章的数据保留与签名安全联系起来，而非仅仅判断两个APK是不是同作者。
-
-## 29. 系统包`restrictUpdateHash`
-
-若旧系统包带有更新hash限制，PMS对新base和所有split按顺序计算SHA-512，必须与旧包记录完全一致，并把限制复制到新解析对象。
-
-签名通过并不自动绕过这一产品级限制。
-
-## 30. sharedUserId为什么不能变
-
-新旧包的`sharedUserId`必须相同。改变它会重写UID共享、权限和数据访问边界，因此PMS返回`INSTALL_FAILED_SHARED_USER_INCOMPATIBLE`。
-
-## 31. Full App不能被Instant App覆盖
-
-对目标用户，原来不是Instant的完整应用不能在替换中变成Instant App。PMS会检查所有受影响用户或指定用户，避免把既有完整安装降成另一套隔离语义。
-
-## 32. 为什么先快照所有用户
-
-PMS记录`allUsers`、旧包已安装用户`installedUsers`和未安装用户`uninstalledUsers`。同一APK可对用户0已安装、对用户10卸载但保留全局包代码，更新不能把所有人粗暴改成相同状态。
-
-## 33. `origUsers`的作用
-
-`res.removedInfo.origUsers = installedUsers`。post-install用它把新版本用户分成“第一次看到包”和“原本就有、这次是更新”两组。
-
-## 34. 安装原因也要保留
-
-每个旧已安装用户的`installReason`被放进`removedInfo.installReasons`，例如设备策略、用户请求或系统来源。更新不应把原始归因覆盖成本次安装器的统一原因。
-
-## 35. 卸载原因也要保留
-
-旧未安装用户的`uninstallReason`同样被快照。否则一次全局代码更新可能让某个用户“为什么未安装”的账本丢失。
-
-## 36. Freezer与prepare生命周期图
-
-```mermaid
-sequenceDiagram
-    participant PMS as "PMS install线程"
-    participant SET as "mFrozenPackages/Settings"
-    participant AMS as "ActivityManager"
-    participant POST as "PMS Handler POST_INSTALL"
-    PMS->>SET: add(packageName)
-    PMS->>AMS: killApplication(package, appId, ALL)
-    PMS->>PMS: 签名/用户快照/scan/reconcile/commit
-    alt 任一阶段失败
-        PMS->>SET: freezer.close()并解除
-    else 成功
-        PMS->>POST: 保存res.freezer并排队
-        POST->>SET: 先freezer.close()
-        POST->>POST: 再发更新广播与清旧代码
-    end
-```
-
-## 37. 为什么freezer从prepare返回
-
-prepare的`finally`总把对象写入`res.freezer`。只有prepare失败才立即关闭；成功则把`shouldCloseFreezerBeforeReturn`设为false，让保护跨越后续阶段。
-
-## 38. 扫描成功不释放freezer
-
-scan只产生新包、组件、Setting候选和派生信息；它还没把完整世界提交。此时释放会留下“候选已扫描但旧包仍活动”的窗口。
-
-## 39. reconcile失败怎样处理
-
-`installPackagesLI()`的finally在整组未成功时遍历请求，关闭存在的freezer，并把仍标成成功的结果改为`INSTALL_UNKNOWN`。
-
-多包事务失败也不会把某个子包永久冻住。
-
-## 40. 什么是`DeletePackageAction`
-
-它是reconcile预先生成的删除计划，保存旧PackageSetting、disabled系统Setting、`PackageRemovedInfo`、删除flags和用户范围。
-
-commit只执行已裁决的动作，尽量不在修改世界时才发现可预见错误。
-
-## 41. 为什么只为非系统替换构造它
-
-普通App旧版本可以走通用删除机制；系统App还涉及只读系统分区的工厂版和`disabled-system-packages`账本，commit里有独立分支。
-
-## 42. 替换的关键删除flags
-
-源码核心是：
-
-```java
-final int deleteFlags = PackageManager.DELETE_KEEP_DATA
-        | (killApp ? 0 : PackageManager.DELETE_DONT_KILL_APP);
-```
-
-`DELETE_KEEP_DATA`不是附属优化，而是更新区别于完整卸载的核心开关。
-
-## 43. `killApp`怎样推导
-
-若scan flags没有`SCAN_DONT_KILL_APP`，`killApp=true`；而prepare会把`INSTALL_DONT_KILL_APP`转换成`SCAN_DONT_KILL_APP`。
-
-因此安装flag、冻结策略、删除flag和广播extra使用的是同一条“是否杀进程”意图链。
-
-## 44. `mayDeletePackageLocked()`做什么
-
-它先要求旧Setting存在；若是系统App，还检查`DELETE_SYSTEM_APP`、用户范围和disabled工厂基线等约束。不能合法撤下旧包时返回null。
-
-## 45. 删除计划失败怎样映射
-
-reconcile得到null会抛`INSTALL_FAILED_REPLACE_COULDNT_DELETE`。这发生在commit之前，避免新包已经发布后才发现旧包不能删。
-
-## 46. commit为何要先保存时间
-
-替换时新Setting继承旧`firstInstallTime`，`lastUpdateTime`设为当前时间。用户看到的是“最初安装时间不变，最近更新时间刷新”，而不是一次全新首装。
-
-## 47. 广播白名单为何在删除前计算
-
-`mAppsFilter.getVisibilityWhitelist()`依赖旧/新包世界。commit在撤下旧包前计算`removedInfo.broadcastWhitelist`，供稍后的REMOVED和REPLACED通知按包可见性过滤。
-
-## 48. 普通App commit先做什么
-
-它调用：
-
-```java
-executeDeletePackageLIF(deletePackageAction, packageName,
-        true, allUsers, false, parsedPackage);
-```
-
-这里的delete是替换过程内部撤下旧版本，不是用户在设置页点击完整卸载。
-
-## 49. `removePackageLI()`撤掉什么
-
-`removePackageDataLIF()`先调用`removePackageLI()`，把旧包从活动`mPackages`及组件/共享库等运行期结构中移除。
-
-这一步让旧版本不再作为当前可解析包存在。
-
-## 50. `DELETE_KEEP_DATA`让什么代码不执行
-
-在`removePackageDataLIF()`中，只有未设置KEEP_DATA才调用`destroyAppDataLIF()`、`destroyAppProfilesLIF()`，并把`dataRemoved`设为true。
-
-替换路径因此保留DE/CE/external AppData和现有profile。
-
-## 51. KEEP_DATA也保留PackageSetting身份账
-
-只有非KEEP_DATA分支才从Settings删除package、释放appId、移除keyset数据并以null包更新权限。替换不会走这些完整卸载动作。
-
-所以新版本能继续使用原appId和每用户状态。
-
-## 52. 保留Setting不等于所有状态永远不变
-
-commit新包时仍会根据新Manifest重新协调组件、权限、共享库和包信息。KEEP_DATA保住连续身份与数据，不保证已删除的权限声明或组件还继续存在。
-
-## 53. 用户数据库为什么还在
-
-数据库、SharedPreferences和files通常位于包的CE/DE数据目录。替换没有调用destroyAppData，随后`prepareAppDataAfterInstallLIF()`只是确保目录和标签适配新版本，因此原内容继续存在。
-
-## 54. 更新为什么仍可能丢业务数据
-
-Framework只保证不主动完整删除目录。新版本自己的数据库迁移、首次启动逻辑、签名相关加密设计或应用Bug仍可能修改、清空或无法读取数据。
-
-## 55. cache是否完全保留
-
-普通数据目录保留，但`PrepareResult`在replace时把`clearCodeCache=true`。post-commit调用`clearAppDataLIF(... FLAG_CLEAR_CODE_CACHE_ONLY)`清理代码缓存。
-
-所以“KEEP_DATA等于每个字节都不动”是错误结论。
-
-## 56. 为什么更新要清code cache
-
-旧版本生成的代码缓存可能依赖旧APK、类结构或优化结果。清除可重建缓存，比让新代码误用旧产物更安全。
-
-## 57. ART profile怎样处理
-
-替换删除阶段因KEEP_DATA不销毁profile；post-commit又为新code path准备应用profile，并通知DexManager包已更新。
-
-profile会参与新版本优化，但具体内容是否可复用由ART链继续判断。
-
-## 58. 旧代码目录何时登记为待删
-
-`deleteInstalledPackageLIF()`在要求删除code/resource时，用旧code path、resource path和instruction sets构造`InstallArgs`，保存到`removedInfo.args`。
-
-它没有在持有PMS核心锁的commit中立刻递归删除目录。
-
-## 59. 为什么删除动作被包装成InstallArgs
-
-`FileInstallArgs.cleanUpResourcesLI()`会先尽力解析旧PackageLite收集所有code paths，再删code目录并调用installd移除对应dex文件。
-
-复用InstallArgs让普通目录、容器或历史安装形态走各自清理实现。
-
-## 60. commit之后怎样发布新包
-
-旧包撤下后，`commitReconciledScanResultLocked()`把新包及Setting提交到全局结构，`updateSettingsLI()`恢复和更新每用户状态，随后写Settings。
-
-这才是“当前包版本”从旧切换为新的中心点。
-
-## 61. 用户安装状态怎样恢复
-
-`updateSettingsLI()`把prepare保存的旧已安装用户集合投影回新Setting。`USER_ALL`安装不会顺手把原来对某用户卸载的包重新启用。
-
-## 62. 安装原因怎样恢复
-
-它逐项把`removedInfo.installReasons`写回旧已安装用户；仅对本次真正新增的用户使用新的installReason。
-
-## 63. 卸载原因怎样恢复
-
-旧未安装用户的uninstall reason也写回；对当前已经安装的用户，uninstall reason统一变为UNKNOWN，因为这些用户现在并未处于卸载状态。
-
-## 64. 首次时间与每用户状态是两层账
-
-`firstInstallTime/lastUpdateTime`是包级时间；installed、enabled、instant、installReason等是每用户状态。更新逻辑必须同时维护，不能只看一个packages.xml字段。
-
-## 65. 系统App更新为何不同
-
-系统App原始APK位于只读system/product/vendor等分区，OTA外的普通安装不能真正删掉它。数据分区上的更新版只是覆盖活动版本，工厂版仍作为disabled system package基线。
-
-## 66. 首次覆盖工厂版
-
-commit先`removePackageLI(oldPackage)`，再`disableSystemPackageLPw(oldPackage)`。若成功，说明这是第一次把活动工厂版压到disabled账本，`removedInfo.args=null`。
-
-工厂APK在只读分区，本来就不能由普通FileInstallArgs删除。
-
-## 67. 再次更新系统App
-
-若`disableSystemPackageLPw()`返回false，说明活动旧版本本身已是数据分区更新版，工厂基线早已被禁用保存。此时PMS为旧更新版code path创建清理args，稍后删除它。
-
-## 68. 系统属性flags怎样继承
-
-新系统更新版继承旧包的system、privileged、oem、vendor、product、odm和systemExt扫描属性。数据分区路径不会让它失去系统身份来源。
-
-## 69. 卸载系统更新与本章的边界
-
-“安装一个更新版”会让新APK覆盖工厂版；“卸载更新”则删除数据分区更新并重新扫描/恢复工厂版。两条链都使用disabled system Setting，但方向相反。
-
-## 70. 外置/ASEC旧包的特殊通知
-
-普通替换若旧包位于external storage，commit会先发送资源不可用通知，让使用者释放资源，然后继续切换。更新结束后新外置包还会发送资源可用通知。
-
-## 71. `mOldCodePaths`是什么
-
-r48 commit把旧base/split路径写入新`PackageSetting.mOldCodePaths`，注释称为内存中的previous code paths副本。
-
-但在本版本源码树中，它几乎没有后续消费点，也没有常规持久化语义，不能把它当成可靠的旧代码删除队列。
-
-## 72. r48的可疑flag比较
-
-这段代码检查的是`installFlags & PackageManager.DONT_KILL_APP`，而正式安装flag是`INSTALL_DONT_KILL_APP`；两者值和语义不同。
-
-真实旧代码延迟删除判断在post-install使用正确的`INSTALL_DONT_KILL_APP`推导出的`killApp`，不要让这处可疑账本代码改变主链结论。
-
-## 73. `removedForAllUsers`为何更新中也存在
-
-`PackageRemovedInfo`会记录旧包是否已从活动包表对所有用户消失。更新的REMOVED广播仍需要描述中间撤下事件，但`EXTRA_REPLACING=true`告诉接收者后面会回来。
-
-## 74. 为什么更新也发PACKAGE_REMOVED
-
-系统先表达旧版本被撤下，再表达新版本加入。接收者可用`EXTRA_REPLACING`区分更新和真正卸载，不能看到REMOVED就立刻永久清理业务状态。
-
-## 75. `EXTRA_DATA_REMOVED`在更新中是什么
-
-KEEP_DATA路径没有设置`dataRemoved=true`，因此REMOVED广播的`EXTRA_DATA_REMOVED=false`。
-
-这是公开信号：代码版本被撤下，但应用数据没有作为完整卸载被删除。
-
-## 76. `EXTRA_DONT_KILL_APP`怎样产生
-
-post-install从`INSTALL_DONT_KILL_APP`得到`killApp`，`PackageRemovedInfo`放入`EXTRA_DONT_KILL_APP = !killApp`。
-
-它告诉广播接收者是否应避免默认重启/杀进程处理。
-
-## 77. `EXTRA_REPLACING`怎样产生
-
-`removedInfo.isUpdate=true`，REMOVED广播因此带REPLACING；随后ADDED广播在update分支也带REPLACING。
-
-两个广播共同构成“先撤旧、再加新”的成对语义。
-
-## 78. 为什么不发FULLY_REMOVED
-
-只有`dataRemoved`为true且不是系统更新撤回时才发`ACTION_PACKAGE_FULLY_REMOVED`。替换保留数据，因此不会把它公告成完整卸载。
-
-## 79. UID是否被移除
-
-KEEP_DATA不从Settings释放appId，普通替换不应被理解为获得了一个新UID。新版本继续使用相同appId，并按userId组合出各用户UID。
-
-## 80. 广播对哪些用户发送
-
-post-install比较`res.origUsers`与`res.newUsers`：原来已有且现在仍有的是update users；新出现的是first users；Instant App用户另分数组。
-
-同一次全局包更新，对不同用户可能产生“更新”或“首次加入”的不同通知。
-
-## 81. 数据、代码、进程和广播时序
-
-```mermaid
-sequenceDiagram
-    participant OLD as "旧App进程/旧代码"
-    participant PMS as "PMS"
-    participant DATA as "PackageSetting + AppData"
-    participant NEW as "新包"
-    participant RCV as "广播接收者"
-    PMS->>OLD: 通常kill并冻结包名
-    PMS->>DATA: DELETE_KEEP_DATA撤下旧活动注册
-    Note over DATA: AppData、appId、每用户账本保留
-    PMS->>NEW: commit新包与新code path
-    PMS->>DATA: 恢复用户状态，清code cache，准备profile
-    PMS->>PMS: POST_INSTALL关闭freezer
-    PMS->>RCV: PACKAGE_REMOVED(REPLACING, DATA_REMOVED=false)
-    PMS->>RCV: PACKAGE_ADDED(REPLACING)
-    PMS->>RCV: PACKAGE_REPLACED
-    PMS->>NEW: 定向MY_PACKAGE_REPLACED
-    PMS->>OLD: 删除旧code/dex；no-kill则延迟
-```
-
-## 82. POST_INSTALL第一件与本章相关的事
-
-Handler取出`PostInstallData`后，先关闭`res.freezer`，再执行`handlePackagePostInstall()`。
-
-因此广播发生时包已经不在PMS冻结集合，但新包已经commit，旧进程通常也早已被杀。
-
-## 83. 为什么不是发完广播才解冻
-
-广播接收者可能需要启动新版本组件。若仍保持冻结，接收者和新应用自身可能无法正常被拉起。
-
-## 84. 更新为何通常不走Backup restore
-
-`restoreAndPostInstall()`仅在成功、非更新且应用允许备份时尝试普通Backup Manager restore。更新已有数据，不把它当成一次空目录首装恢复。
-
-## 85. Rollback restore是另一条可能等待
-
-成功更新且可能降级时，PMS会询问Rollback Manager是否需要恢复/快照相关用户数据。若异步工作接管，POST_INSTALL会等待回调后再执行。
-
-这不改变普通KEEP_DATA主线，但会延长freezer生命周期。
-
-## 86. REMOVED广播何时发送
-
-`handlePackagePostInstall()`在成功分支开头调用`res.removedInfo.sendPackageRemovedBroadcasts(killApp)`，之后才处理新包权限授予和ADDED/REPLACED广播。这里描述的是PMS的发送/入队顺序，不表示前一个广播的所有接收者已经执行完毕才发送下一个。
-
-## 87. 权限授予为何在ADDED之前
-
-如果安装器请求并获准预授运行时权限，PMS先完成restricted白名单和grant，再广播新包加入。接收者观察到的是更接近最终状态的新版本。
-
-## 88. ADDED在更新中也会发
-
-对update users，PMS发送`ACTION_PACKAGE_ADDED`并设置`EXTRA_REPLACING=true`。它不是只用于第一次安装。
-
-## 89. REPLACED广播面向谁
-
-`ACTION_PACKAGE_REPLACED`发送给可见范围内的其他接收者，也定向通知installer和required verifier等特定包。
-
-包可见性白名单会影响普通广播接收范围。
-
-## 90. `MY_PACKAGE_REPLACED`的不同
-
-它以新包自身为`targetPackage`，没有package data URI和额外extras。新版本可注册它，在自己被覆盖更新后执行迁移或重新调度。
-
-## 91. 不要在旧进程等待MY_PACKAGE_REPLACED
-
-正常更新已请求杀死旧进程。该广播的意义是让系统按新版本组件定义启动接收器，而不是在旧进程内热切换ClassLoader。
-
-## 92. 旧代码为什么放到广播后清理
-
-到post-install时新包已稳定发布，系统也完成了主要通知。旧资源不再需要作为当前包，但延后到核心锁外清理能缩短锁区并避免复杂I/O阻塞包查询。
-
-## 93. kill路径怎样清旧代码
-
-若`killApp=true`且`removedInfo.args`存在，PMS在`mInstallLock`下同步调用`args.doPostDeleteLI(true)`，普通File路径最终删除旧目录并清dex。
-
-## 94. no-kill为何不能立即删
-
-旧进程可能仍把旧APK映射为代码或资源，甚至在ApplicationInfo传播完成前启动新Activity。立刻删路径会制造资源/类加载故障。
-
-## 95. no-kill延迟多久
-
-r48的`DEFERRED_NO_KILL_POST_DELETE_DELAY_MS = 3 * 1000`。PMS Handler延迟3秒处理`DEFERRED_NO_KILL_POST_DELETE`，再在`mInstallLock`下删除。
-
-这是经验性缓冲，不是进程已确认停止的协议。
-
-## 96. no-kill observer也会延迟
-
-成功更新且no-kill时，安装observer回调延迟500ms；旧代码清理延迟3秒。observer收到成功时，旧目录可能仍为兼容而暂存。
-
-## 97. 安装成功不等于旧文件已经消失
-
-成功语义的中心是新包已提交并完成post-install通知。尤其no-kill路径，物理旧目录清理可以稍后发生。
-
-## 98. 3秒后一定安全吗
-
-源码只是定时消息，没有逐进程mmap、Resources或ClassLoader引用确认。它“缓解问题”，并不证明所有旧引用都已消失。
-
-## 99. `doPostDeleteLI(true)`实际做什么
-
-普通`FileInstallArgs`调用`cleanUpResourcesLI()`：尝试解析旧PackageLite收集code paths，移除code目录，再按instruction set调用installd `rmdex`清理优化文件。
-
-## 100. 解析旧包失败会怎样
-
-解析只是为了更完整收集dex路径；失败被忽略，仍继续删主code目录。源码注释表达的是“尽力枚举”。
-
-## 101. `delete`参数的r48疑点
-
-`FileInstallArgs.doPostDeleteLI(boolean delete)`无论参数是什么都执行清理，并留有“是否应该尊重delete flag”的TODO式注释。
-
-本章路径传true，所以不影响正常替换结论，但阅读通用接口时要看到实现边界。
-
-## 102. 没有旧清理args时为什么请求GC
-
-系统工厂APK不可删等情况下`removedInfo.args=null`。PMS请求一次并发GC，希望释放旧资源对象；这不是同步保证，也不删除只读分区文件。
-
-## 103. 失败发生在commit前
-
-prepare/scan/reconcile失败时，新包没有成为活动版本，freezer会关闭，临时安装路径走失败清理。旧包与旧数据仍应作为当前世界保留。
-
-## 104. commit为何声称只剩不可避免错误
-
-源码注释要求可预见失败尽量在prepare/reconcile解决。commit要修改全局状态，若此处才频繁失败，很难提供真正数据库式回滚。
-
-## 105. 这是不是ACID事务
-
-不是。它借助锁、预裁决、freezer、原子Settings写和阶段化清理提高一致性，但没有通用undo log把所有文件、进程、Binder通知和外部服务恢复到某个快照。
-
-## 106. 更新期间查询的关键切换点
-
-在commit撤旧并提交新包的锁区内，外部查询不能穿过`mLock`看到任意中间组合。锁释放后，查询应看到新包；广播和旧文件物理删除仍可稍后完成。
-
-## 107. 应用开发者最该理解什么
-
-系统保留数据目录，却不会替应用完成schema迁移。新版本第一次启动和`MY_PACKAGE_REPLACED`处理必须能面对旧版本数据、跨版本任务和可能被系统重启的执行环境。
-
-## 108. 第一次复读：修正“freezer等于kill”
-
-真实freezer同时登记冻结和请求kill；`INSTALL_DONT_KILL_APP`却返回完全空壳，既不kill也不冻结。因此两者相关但不是同义词。
-
-## 109. 第二次复读：修正“KEEP_DATA只保目录”
-
-它还阻止Settings package/appId/keyset/权限账的完整卸载分支。更新连续身份来自“目录 + PackageSetting + appId”共同保留，而非只剩几个文件。
-
-## 110. 第三次复读：修正“commit立即删旧APK”
-
-commit只产生并保存旧资源清理args；真正`doPostDeleteLI()`在post-install广播之后执行，no-kill还会再延迟3秒。
-
-## 111. 版本边界与可疑点汇总
-
-- 本章严格基于Android 11 `android-11.0.0_r48`的单体PMS实现；新版本已拆分多个helper/service。
-- freezer集合不是引用计数。
-- `mOldCodePaths`在r48缺少清晰消费链，且附近比较了可疑的`PackageManager.DONT_KILL_APP`常量。
-- no-kill的500ms observer和3秒旧代码清理是固定延迟，不是资源引用ACK。
-- 安装事务不是通用ACID回滚。
-
-## 112. macOS只读练习1：核对freezer
+### 练习 1：从flag、rename与活动表还原replace
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '23090,23190p' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
-rg -n "checkPackageFrozen|mFrozenPackages" frameworks/base/services/core/java/com/android/server/pm
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'boolean replace = false;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if ((installFlags & PackageManager.INSTALL_REPLACE_EXISTING) != 0) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'String oldName = mSettings.getRenamedPackageLPr(pkgName);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F '&& mPackages.containsKey(oldName)) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F '} else if (mPackages.containsKey(pkgName)) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'PackageSetting ps = mSettings.mPackages.get(pkgName);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'res.origUsers = ps.queryInstalledUsers(mUserManager.getUserIds(), true);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'renameStaticSharedLibraryPackage(parsedPackage);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'existingPkg.getLongVersionCode()' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
 ```
 
-回答：DONT_KILL空壳做了哪两件“没有做”的事？为什么`mWeFroze`不能解释成引用计数？
+分别手算“同名但无replace flag”“rename映射命中”“有flag但活动表无包”和“静态库新版本”四例。标出最终包名、replace值和失败位置，不能把Settings里存在历史记录等同于当前活动版本。
 
-## 113. macOS只读练习2：追KEEP_DATA
+## 3. prepare内两轮身份复核后，reconcile提交前还会再检查
+
+保留AppData意味着新代码能以原appId读取旧数据库、密钥材料与私有文件，因此签名检查不是形式步骤。prepare早期先针对现有`PackageSetting`做upgrade keyset或`verifySignatures()`快速检查，避免候选在权限重定义等后续步骤走得过远；freezer建立后，replace分支再取一次旧`AndroidPackage`与Setting，执行面向替换的完整复核。
+
+第二轮优先检查upgrade keyset。否则，新签名必须对旧签名具有`INSTALLED_DATA`能力，或旧签名对新签名具有`ROLLBACK`能力；这支持受控证书轮换和回滚，却不等于任意同作者声明。系统包若保存`restrictUpdateHash`，还会按base、split顺序计算SHA-512并要求完全相同。
+
+scan完成后，`reconcilePackagesLocked()`还会以scan得到的Setting、disabled system基线和批次版本信息第三次执行upgrade-keyset或`verifySignatures()`，并决定是否带着keyset/SigningDetails更新进入commit。因此前两次通过不是提交授权的永久缓存。
+
+另外两道边界不能由签名代替：新旧`sharedUserId`必须相同；已有full app不能对受影响用户降成instant app。通过这些门只能证明候选可以继承旧身份，不能证明旧数据内容适配新schema。
+
+### 练习 2：核对旧数据继承的身份门槛
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '16435,16470p' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
-sed -n '18790,18910p' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'oldPackage = mPackages.get(pkgName11);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'ps = mSettings.mPackages.get(pkgName11);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (ksms.shouldCheckUpgradeKeySetLocked(ps, scanFlags)) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'SigningDetails.CertCapabilities.INSTALLED_DATA)' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'SigningDetails.CertCapabilities.ROLLBACK)) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (!Objects.equals(oldPackage.getSharedUserId(),' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'installedUsers = ps.queryInstalledUsers(allUsers, true);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'uninstalledUsers = ps.queryInstalledUsers(allUsers, false);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'res.removedInfo.installReasons = new SparseArray<>(installedUsers.length);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'res.removedInfo.uninstallReasons = new SparseArray<>(uninstalledUsers.length);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'final PackageSetting signatureCheckPs =' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'final boolean compatMatch = verifySignatures(signatureCheckPs,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
 ```
 
-列出KEEP_DATA跳过的AppData、profile、Settings、appId和权限清理动作。
+画出upgrade keyset、正向`INSTALLED_DATA`、反向`ROLLBACK`和全部失败四格。再解释：为什么“APK验签成功”与“获准继承当前设备上的旧数据”不是同一个命题。
 
-## 114. macOS只读练习3：比较系统与普通App
+## 4. 每用户账先快照，提交后却不是逐位原样恢复
+
+prepare较早把旧Setting查询到的installed用户写入`res.origUsers`；post-install用它和`res.newUsers`划分“原有用户更新”与“本次新增”。replace第二轮则在`mLock`内重新取得全部userId，把旧Setting分成installed与uninstalled两组，并另写`removedInfo.origUsers`；两个`SparseArray`分别快照旧installed用户的installReason与旧uninstalled用户的uninstallReason。包级`firstInstallTime`在commit继承，`lastUpdateTime`刷新。
+
+`DELETE_KEEP_DATA`保留Setting和appId，使普通替换沿用Linux appId、权限状态与大部分`PackageUserState`。但“保留”不是逐位封印：
+
+- 指定单用户安装会对该用户执行`setInstalled(true)`和`setEnabled(DEFAULT)`。
+- system更新会把受请求覆盖的原有用户设为DEFAULT，并为所有用户清component label/icon override。
+- 旧install/uninstall reason先回填；随后所有当前installed用户的uninstall reason改为UNKNOWN。
+- `USER_ALL`分支只把旧installed用户加入`previousUserIds`，却给其他所有用户写本次installReason；源码旁边也质疑这些用户是否真的新装。因此旧uninstalled用户可能仍未安装，但installReason已经变化。
+
+应用业务数据是否可读还取决于新版本自身的数据库迁移、加密协议和启动逻辑。`DELETE_KEEP_DATA`的正常撤旧分支不主动完整删除业务数据目录，不等于替应用完成schema升级；post-commit的system恢复例外见第13节。
+
+## 5. 候选先rename，freezer随后才保护活动包手术窗口
+
+prepare的真实顺序是ABI/native处理、`doRename()`、fs-verity、调用`startIntentFilterVerifications()`把App Links验证任务排入同一PMS Handler，然后才`freezePackageForInstall()`。当前安装Runnable没有让出Handler前，验证任务还不会实际执行。候选在最终随机code path出现并不说明旧包已被冻结，更不说明查询已切到新版本；此时它仍不是活动包。
+
+freezer也不只服务replace。prepare对新装和更新都创建它：若Settings还没有新包，真实freezer仍会把包名加入`mFrozenPackages`，只是找不到appId所以不请求kill。这能让稍后的普通commit遵守同一“重大包手术不得启动”协议。
+
+`mFrozenPackages`影响`checkPackageStartable()`，还让其他move路径拒绝同包并发。commit侧`checkPackageFrozen()`却只是`Slog.wtf`诊断；它不是安装授权，也不会在集合缺项时抛出并中止commit。boot、`SCAN_DONT_KILL_APP`和`SCAN_IGNORE_FROZEN`会跳过这项协议检查。
+
+## 6. PackageFreezer是一枚可关闭的Set所有权令牌，不是引用计数
+
+真实`PackageFreezer`在`mLock`下执行`mFrozenPackages.add(name)`，把返回值保存为`mWeFroze`，再根据Setting决定是否请求kill。`close()`用`AtomicBoolean`保证对象自身只关一次；只有`mWeFroze=true`的对象才从Set移除。`CloseGuard`与finalizer能报警并尝试补关，但时间不可预测。
+
+这套设计是“第一次加入者拥有remove权”，不是嵌套计数。若两个真实freezer异常重叠，第二个`add()`返回false；第一个先close就会移除唯一Set项，即使第二个仍存活。正常安装力求只让一个freezer贯穿主链，但数据结构本身没有证明这个不变量。
+
+`INSTALL_DONT_KILL_APP`返回空壳freezer：包名为null、`mWeFroze=false`，既不冻结目标也不请求kill，但仍打开CloseGuard，调用者必须正常close。这个flag放弃的是目标包的两层保护，不是“只不发signal、仍禁止启动”。
+
+### 练习 3：拆解freezer的Set所有权
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '16735,16820p' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
-rg -n "disableSystemPackageLPw|disabled-system" frameworks/base/services/core/java/com/android/server/pm
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private class PackageFreezer implements AutoCloseable {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mWeFroze = mFrozenPackages.add(mPackageName);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'killApplication(ps.name, ps.appId, userId, killReason);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'private final AtomicBoolean mClosed = new AtomicBoolean();' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (mClosed.compareAndSet(false, true)) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (mWeFroze) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mFrozenPackages.remove(mPackageName);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (mFrozenPackages.contains(packageName)) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'is currently frozen!' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'private void checkPackageFrozen(String packageName) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'Message msg = mHandler.obtainMessage(START_INTENT_FILTER_VERIFICATIONS);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mHandler.sendMessage(msg);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
 ```
 
-画出“首次覆盖工厂版”和“再次覆盖数据分区更新版”的旧代码去向。
+手算两个freezer依次构造、第一枚先close、第二枚再close的Set状态。再比较空壳对象，说明对象可重复close为什么不等于包名具有引用计数。
 
-## 115. macOS只读练习4：核对广播与延迟删除
+## 7. killApplication返回只表示AMS消息入队，persistent进程还是反例
+
+PMS清除外层Binder身份后调用`IActivityManager.killApplication()`，最后恢复身份；同在system_server并不保证调用必然跨进程，但接口边界仍把进程管理交给AMS。AMS service可以为null，PMS也吞掉`RemoteException`，没有把kill请求失败映射成安装失败。
+
+AMS只允许system appId调用，然后把`KILL_APPLICATION_MSG`排入自己的Handler。消息稍后才在AMS锁下进入`forceStopPackageLocked()`；该调用传`evenPersistent=false`，`ProcessList`会跳过persistent进程，而且即便选中普通进程也没有向PMS返回“内核已确认死亡”的ACK。因此真实freezer构造返回只证明冻结项已建立且PMS尝试调用AMS；只有AMS正常受理时才能推出kill消息已入队，仍不能推出旧PID已终止。
+
+这与persistent更新形成真实反例：prepare允许带`INSTALL_STAGED` flag的persistent app更新，AMS这条kill路径却不杀persistent进程。冻结集合能阻止新的startability检查通过，却不会抹掉已经存活的persistent进程。
+
+`INSTALL_DONT_KILL_APP`也只约束目标包。commit更新共享库时会另行遍历依赖者并无条件`killApplication(..., "update lib")`；不能从目标no-kill推导所有相关进程都不受影响。
+
+### 练习 4：从PMS请求追到AMS异步force-stop
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '2085,2280p' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
-sed -n '2325,2430p' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
-rg -n "DEFERRED_NO_KILL.*DELAY" frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'if ((installFlags & PackageManager.INSTALL_DONT_KILL_APP) != 0) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'return new PackageFreezer();' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'final long token = Binder.clearCallingIdentity();' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'am.killApplication(pkgName, appId, userId, reason);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'Binder.restoreCallingIdentity(token);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'public void killApplication(String pkg, int appId, int userId, String reason) {' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'if (UserHandle.getAppId(callerUid) == SYSTEM_UID) {' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'Message msg = mHandler.obtainMessage(KILL_APPLICATION_MSG);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'mHandler.sendMessage(msg);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'case KILL_APPLICATION_MSG: {' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'forceStopPackageLocked(pkg, appId, false, false, true, false,' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'if (app.isPersistent() && !evenPersistent) {' frameworks/base/services/core/java/com/android/server/am/ProcessList.java
 ```
 
-写下REMOVED、ADDED、REPLACED、MY_PACKAGE_REPLACED顺序，以及observer与旧代码清理的延迟值。
+分别标出PMS返回、AMS Handler取消息、ProcessList选中进程和实际进程死亡四个坐标。说明哪一处有可见ACK，哪三处不能互相替代。
 
-## 116. 第四次复读：最容易混淆的四个“保留”
+## 8. freezer跨四阶段和rollback等待，commit后异常却可能漏掉显式close
 
-更新通常保留appId、AppData、每用户安装账和firstInstallTime；它不会保留旧活动包模型、旧组件解析结果、旧code cache，也最终不会保留可删除的旧APK目录。
+创建freezer后，prepare用`shouldCloseFreezerBeforeReturn`管理所有权。异常返回前由finally关闭；成功则把对象写进`res.freezer`并把关闭责任转交主安装链。scan或reconcile受控失败时，`installPackagesLI()`的failure finally统一关闭整组freezer，并把仍标成功的请求改成`INSTALL_UNKNOWN`。
 
-## 117. 自测题
+commit成功不会立即解冻。更新不走普通Backup Manager restore，但带`INSTALL_ENABLE_ROLLBACK`或`INSTALL_REQUEST_DOWNGRADE`时，Rollback Manager可异步接管所有已安装用户的数据snapshot/restore；`mRunningInstalls`继续强引用`PostInstallData`与freezer，直到`finishPackageInstall()`重新投递POST_INSTALL。token没被取走时对象根本不满足不可达条件，不能靠finalizer解冻，只能等回调、system_server重启等外部收口。
 
-1. PackageFreezer怎样同时解决旧进程和重新启动问题？
-2. 为什么更新能读取旧私有数据？
-3. `DELETE_KEEP_DATA`还保留哪些身份账？
-4. 系统工厂APK为什么没有旧代码清理args？
-5. no-kill路径为何延迟删旧代码？
-6. 更新广播如何区别于完整卸载？
-7. freezer在广播之前还是之后close？
-8. 更新是否等价于ACID事务？
+锁也要分层：`processInstallRequestsAsync()`在`mInstallLock`内调用整个`installPackagesLI()`，所以prepare、scan、reconcile、commit和`executePostCommitSteps()`都仍持安装锁；reconcile/commit另持`mLock`，所谓post-commit只是离开`mLock`。后来的POST_INSTALL不持续持`mInstallLock`，只有同步或延迟旧代码cleanup再单独取得它。
 
-## 118. 自测题参考答案
+正常POST_INSTALL取出账本后先`freezer.close()`，再处理权限、广播、旧代码和observer。这让新版本组件可以在广播阶段启动。
 
-1. 真实freezer先把包名加入PMS冻结集合，再请求AMS杀旧进程；提交时还检查包处于冻结状态。
-2. 新旧签名身份通过后，替换使用KEEP_DATA，不销毁CE/DE目录，并保留appId/Setting连续身份。
-3. PackageSetting、appId、每用户installed/reason等状态以及相关权限连续账；新Manifest仍会重新协调它们。
-4. 工厂APK在只读系统分区，只需把基线放入disabled system账本，不能按普通数据目录删除。
-5. 旧进程可能仍映射或加载旧代码/资源；r48用3秒经验性缓冲降低混合版本故障。
-6. REMOVED的DATA_REMOVED=false、REPLACING=true，随后还有带REPLACING的ADDED、REPLACED和定向MY_PACKAGE_REPLACED。
-7. POST_INSTALL先close freezer，再进入广播处理。
-8. 不等价；它是锁、预裁决、冻结、持久化和补偿清理组成的阶段化协议。
+还有一个第260章已经遇到的破口：`installPackagesLI.success`在commit返回时就置true，`executePostCommitSteps()`随后若抛未捕获运行时异常，finally会走success分支而不关闭freezer；外层Runnable也到不了`doPostInstall()`、`restoreAndPostInstall()`和POST_INSTALL。此时新包已提交，freezer只能等非正常兜底。
 
-## 119. 本章总结
+### 练习 5：比较prepare失败、整组失败和正常POST_INSTALL
 
-替换安装的真正核心不是“把新APK覆盖到同名文件”，而是保住可信身份和用户数据，同时切换活动包世界：签名能力允许新代码继承旧数据；PackageFreezer保护手术窗口；`DELETE_KEEP_DATA`撤旧而不完整卸载；commit恢复appId、用户状态和首次安装时间；post-install用成对广播公布更新，再按kill/no-kill策略清理旧代码。
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'freezePackageForInstall(pkgName, installFlags, "installPackageLI");' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'boolean shouldCloseFreezerBeforeReturn = true;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'shouldCloseFreezerBeforeReturn = false;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'res.freezer = freezer;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (shouldCloseFreezerBeforeReturn) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'cleanUpAppIdCreation(result);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (request.installResult.freezer != null) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'request.installResult.freezer.close();' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'request.installResult.returnCode = PackageManager.INSTALL_UNKNOWN;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'request.args.doPostInstall(' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (status != PackageManager.INSTALL_SUCCEEDED) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'data.res.freezer.close();' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'installPackagesTracedLI(installRequests);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'success = true;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'executePostCommitSteps(commitRequest);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+```
 
-## 120. 下一章预告
+画三条所有权线并给每次close标明持有者。再加入“commit后post-commit运行时异常”，解释为什么它不走整组failure finally的关闭分支。
 
-第262章继续读安装后的权限处理：`PermissionManagerService.updatePermissions()`怎样对比新旧Manifest，保留或撤销install/runtime权限，shared UID、restricted permission、permission tree和GID变化又怎样影响进程与用户状态。
+## 9. reconcile只预裁决普通旧包，DeletePackageAction还没有执行删除
+
+对non-system replace，reconcile从scan flags推导`killApp`，构造`DELETE_KEEP_DATA | DELETE_DONT_KILL_APP?`，再调用`mayDeletePackageLocked()`。得到的`DeletePackageAction`封装旧Setting、disabled system基线、`PackageRemovedInfo`、flags与用户范围，只是一份可以在commit执行的计划。
+
+`mayDeletePackageLocked()`若判定旧包不可合法撤下，reconcile以`INSTALL_FAILED_REPLACE_COULDNT_DELETE`让整组在commit前失败。system replace不走这份通用计划，因为它必须保留只读工厂版与disabled-system账；静态共享库虽是特殊包形态，精确同版本覆盖仍可能在non-system条件下取得普通删除计划。
+
+`killApp`来自`SCAN_DONT_KILL_APP`，后者由install flag传播。reconcile仍把no-kill意图编码进`DeletePackageAction`，但replace commit直接调用的`executeDeletePackageLIF()`及其下游不再读取`DELETE_DONT_KILL_APP`；目标包到底是否请求kill，实际由更早的`freezePackageForInstall()`决定。真正是否已有旧进程退出，仍要回到上一节的AMS异步账。
+
+### 练习 6：区分删除裁决与commit执行
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'if (isInstall && prepareResult.replace && !prepareResult.system) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'final boolean killApp = (scanResult.request.scanFlags & SCAN_DONT_KILL_APP) == 0;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'final int deleteFlags = PackageManager.DELETE_KEEP_DATA' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F '| (killApp ? 0 : PackageManager.DELETE_DONT_KILL_APP);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'deletePackageAction = mayDeletePackageLocked(res.removedInfo,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'PackageManager.INSTALL_FAILED_REPLACE_COULDNT_DELETE,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'executeDeletePackageLIF(reconciledPkg.deletePackageAction, packageName,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'commitReconciledScanResultLocked(reconciledPkg, request.mAllUsers);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+```
+
+在reconcile与commit之间画一条硬线。指出`DeletePackageAction`中哪些只是输入事实，以及null如何阻止新`AndroidPackage`成为活动版本。
+
+## 10. DELETE_KEEP_DATA撤下活动注册，但不走完整卸载的身份销毁分支
+
+commit执行普通delete计划时，`removePackageDataLIF()`无条件先`removePackageLI()`：旧`AndroidPackage`从`mPackages`、组件解析器、共享库和permission定义等活动结构撤下。`DELETE_KEEP_DATA`并不保留旧活动注册。
+
+它控制的是随后两个大分支：
+
+| 资源或账本 | replace撤旧阶段 | 完整卸载阶段 |
+|---|---|---|
+| DE/CE/external AppData | 不调用`destroyAppDataLIF()` | 主动销毁 |
+| 旧ART profiles | 此阶段不调用`destroyAppProfilesLIF()` | 主动销毁 |
+| PackageSetting与appId | 保留 | `removePackageLPw()`并释放 |
+| keyset、AppsFilter与null-package权限重算 | 不走完整卸载分支 | 移除或重算 |
+| 旧活动包、组件、共享库与permission定义 | 从活动结构移除 | 从活动结构移除 |
+| 旧code/resource | 仍创建延后清理args | 同样可清理 |
+
+因此UID连续来自Setting/appId没有被完整卸载，不是commit重新分配出“碰巧相同”的值。权限与组件随后还会按新Manifest重新协调，保留身份不等于旧声明永久有效。
+
+KEEP_DATA也不是“包外状态原封不动”：若旧包在某用户持有`SUSPEND_APPS`，delete尾段仍会解除它施加的package suspension，并清掉该用户所有包的distraction restrictions。这一步位于普通与system删除分支汇合之后，不受KEEP_DATA分支保护。
+
+`deleteInstalledPackageLIF()`即使带KEEP_DATA，仍用旧code/resource path与instruction sets构造`removedInfo.args`。r48的`createInstallArgsForExisting()`固定返回`FileInstallArgs`，并没有按历史容器类型动态选择多种清理实现。
+
+## 11. commit完成新旧模型切换，mOldCodePaths却在常见路径立即被清空
+
+普通replace先执行旧包删除计划，再由`commitReconciledScanResultLocked()`把扫描结果写回活动Setting与`mPackages`，随后`updateSettingsLI()`恢复用户账、更新权限、写Settings，并把结果中的pkg、uid和成功码填好。`firstInstallTime`来自旧Setting，`lastUpdateTime`取当前时间。
+
+r48在撤旧后还试图把旧base/split写入`ps1.mOldCodePaths`，注释说它服务“不重启升级”时给活动classloader补新APK。但这段账有两层实现断裂：
+
+1. 条件检查的是值为`0x1`的`PackageManager.DONT_KILL_APP`，不是值为`0x1000`的`INSTALL_DONT_KILL_APP`。
+2. scan为现有Setting构造`new PackageSetting(pkgSetting)`时，copy明确跳过`mOldCodePaths`；commit紧接着`pkgSetting.updateFrom(result.pkgSetting)`，若live字段非null而副本字段为null，就把live字段清成null。
+
+所以在`existingSettingCopied`的普通replace路径里，这份刚写入的旧路径集合并不是稳定队列，不能拿它证明旧代码何时删除。真正清理所有权仍在`removedInfo.args`与post-install。
+
+### 练习 7：证明数据、appId连续并复现mOldCodePaths断链
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'removePackageLI(deletedPs.name, (flags & PackageManager.DELETE_CHATTY) != 0);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if ((flags & PackageManager.DELETE_KEEP_DATA) == 0) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'destroyAppDataLIF(resolvedPkg, UserHandle.USER_ALL,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'destroyAppProfilesLIF(resolvedPkg);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mSettings.mKeySetManagerService.removeAppKeySetDataLPw(packageName);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'removedAppId = mSettings.removePackageLPw(packageName);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mPermissionManager.updatePermissions(deletedPs.name, null);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (removedAppId != -1) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'reconciledPkg.pkgSetting.firstInstallTime = deletedPkgSetting.firstInstallTime;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'final int[] installedForUsers = res.origUsers;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'ps.setInstallReason(previousInstallReason, previousUserId);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'ps.setUninstallReason(previousReason, previousUserId);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if ((reconciledPkg.installArgs.installFlags & PackageManager.DONT_KILL_APP)' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'public static final int INSTALL_DONT_KILL_APP = 0x00001000;' frameworks/base/core/java/android/content/pm/PackageManager.java
+grep -n -F 'public static final int DONT_KILL_APP = 0x00000001;' frameworks/base/core/java/android/content/pm/PackageManager.java
+grep -n -F 'ps1.mOldCodePaths = new ArraySet<>();' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'pkgSetting.updateFrom(result.pkgSetting);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'Intentionally skip mOldCodePaths; it' frameworks/base/services/core/java/com/android/server/pm/PackageSettingBase.java
+grep -n -F 'mOldCodePaths = null;' frameworks/base/services/core/java/com/android/server/pm/PackageSettingBase.java
+grep -n -F 'if (reconciledPkg.prepareResult.clearCodeCache) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if ((flags & Installer.FLAG_CLEAR_APP_DATA_KEEP_ART_PROFILES) == 0) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'clearAppProfilesLIF(pkg, UserHandle.USER_ALL);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'destroyAppDataLeafLIF(pkg, userId, flags);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'Not entirely true at the moment. There is still one side effect' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mUserState.put(orig.mUserState.keyAt(i), orig.mUserState.valueAt(i));' frameworks/base/services/core/java/com/android/server/pm/PackageSettingBase.java
+grep -n -F 'setInstantAppForUser(injector, pkgSetting, userId, instantApp, fullApp);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'ksms.removeAppKeySetDataLPw(parsedPackage.getPackageName());' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'sourcePackageSetting.signatures.mSigningDetails =' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (hadSuspendAppsPermission.get(affectedUserId)) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'unsuspendForSuspendingPackage(packageName, affectedUserId);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'removeAllDistractingPackageRestrictions(affectedUserId);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'resolveUserIds(reconciledPkg.installArgs.user.getIdentifier()),' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'The method may throw an excpetion in the middle' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'of committing the package, leaving the system in an inconsistent state.' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+```
+
+先圈出KEEP_DATA跳过的完整卸载区，再按“live Setting → scan副本 → 临时写旧路径 → updateFrom”画对象图。解释为什么字段注释描述设计意图，却不能覆盖r48的实际赋值顺序。
+
+## 12. 系统包与静态共享库各自绕开普通替换的一部分
+
+system replace不在reconcile构造通用`DeletePackageAction`。commit先`removePackageLI(oldPackage)`，再调用`disableSystemPackageLPw()`：
+
+- 第一次覆盖只读工厂版时，disable成功并把工厂基线放进disabled-system账，`removedInfo.args=null`；工厂APK本来也不能由数据分区清理器删除。
+- 再次覆盖时，当前活动包已是数据分区更新版，disable返回false；PMS才用旧更新版路径创建`removedInfo.args`，稍后清它。
+
+这不是“卸载系统更新并恢复工厂版”的`deleteSystemPackageLIF()`方向。安装更新会提交新数据分区版本，同时继承system、privileged、vendor/product等来源属性；卸载更新才重新启用与扫描工厂包。
+
+静态共享库则先按version合成包名，只有同一版本的精确覆盖才可能replace。`PackageRemovedInfo`的`isStaticSharedLib`会让REMOVED直接返回；新包侧也跳过ADDED、REPLACED和MY_PACKAGE_REPLACED，只可能向library consumers发送PACKAGE_CHANGED。标准四广播序列不能套给它。
+
+## 13. KEEP_DATA不等于AppData和profile在post-commit中完全不动
+
+commit之后，`prepareAppDataAfterInstallLIF()`只为installed且正在运行、非dying的用户调用installd `createAppData()`：已解锁用户准备DE与CE，运行但未解锁用户只准备DE。第三方包失败只记日志，避免擅自wipe业务数据；system包失败却会先`destroyAppDataLeafLIF()`再重建。因此KEEP_DATA只保证“撤旧阶段不主动完整删除”，不能保证系统包恢复分支永远不触碰目录。
+
+每个replace的`PrepareResult.clearCodeCache=true`。post-commit调用`clearAppDataLIF(... FLAG_CLEAR_CODE_CACHE_ONLY)`请求清理DE、CE与external code cache；由于flags没有`FLAG_CLEAR_APP_DATA_KEEP_ART_PROFILES`，wrapper随后请求对所有用户执行`clearAppProfilesLIF()`。这纠正了“KEEP_DATA整体保留旧profile”的常见误读。
+
+本链先请求清除所有用户的code cache与该包profiles；随后replace通知DexManager code paths已更新，并仅为`installArgs.user`解析出的本次用户请求`prepareAppProfiles(..., true)`，再进入条件dexopt。profile清理与准备内部遇到`InstallerException`都只记日志，不改变安装成功码。因此单用户更新会请求清其他用户旧profile，却不在这条调用中替他们重建；源码也不保证请求后的最终profile状态。
+
+## 14. POST_INSTALL先解冻；四类更新广播只是按顺序再次入队
+
+普通更新不走首次安装的Backup restore；rollback/downgrade数据工作若未接管，`restoreAndPostInstall()`把POST_INSTALL消息排入PMS Handler。Handler先从`mRunningInstalls`移除token并close freezer，再调用`handlePackagePostInstall()`。
+
+若成功包在这段间隙已被另一路移除，`pkgSetting==null`会把结果改为`INSTALL_FAILED_PACKAGE_CHANGED`并直接通知install observer；本链不发送更新广播，也不会消费`removedInfo.args`。这是一条旧代码清理可失去正常入口的竞态。
+
+正常普通replace的逻辑调用顺序是：
+
+1. REMOVED，`DATA_REMOVED=false`、`REPLACING=true`，`DONT_KILL_APP`按请求填写；
+2. 处理restricted whitelist与请求的runtime grants；
+3. 对原来没有而现在有的用户发首次ADDED；对update users发`ADDED(REPLACING)`；
+4. 向update users及特定installer/verifier发REPLACED，再向新包自身定向MY_PACKAGE_REPLACED。
+
+但`sendPackageBroadcast()`本身只是`mHandler.post()`。由于当前正处理POST_INSTALL，这些调用只是把实际AMS发送任务排到当前消息之后；顺序是PMS入队顺序，不是前一广播全部receiver执行完成的屏障。static shared library还会跳过上述标准序列。
+
+### 练习 8：还原解冻、广播入队与static例外
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'AndroidPackage pkg = commitReconciledScanResultLocked(reconciledPkg, request.mAllUsers);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'updateSettingsLI(pkg, reconciledPkg.installArgs, request.mAllUsers, res);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'data.res.freezer.close();' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'res.removedInfo.sendPackageRemovedBroadcasts(killApp);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'extras.putBoolean(Intent.EXTRA_DATA_REMOVED, dataRemoved);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'extras.putBoolean(Intent.EXTRA_DONT_KILL_APP, !killApp);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'extras.putBoolean(Intent.EXTRA_REPLACING, true);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'sendPackageBroadcast(Intent.ACTION_PACKAGE_ADDED, packageName,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'sendPackageBroadcast(Intent.ACTION_PACKAGE_REPLACED,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'sendPackageBroadcast(Intent.ACTION_MY_PACKAGE_REPLACED,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (dataRemoved && !isRemovedPackageSystemUpdate) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'sendPackageBroadcast(Intent.ACTION_PACKAGE_FULLY_REMOVED,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'public void sendPackageBroadcast(final String action, final String pkg, final Bundle extras,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mHandler.post(() -> {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (isStaticSharedLib) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (res.pkg.getStaticSharedLibName() == null) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mInjector.getActivityManagerInternal().broadcastIntent(' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'else if (!ArrayUtils.isEmpty(res.libraryConsumers)) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'sendPackageChangedBroadcast(pkg.getPackageName(), false /* dontKillApp */,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'notifyPackageChangeObserversOnUpdate(reconciledPkg);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+```
+
+把“调用send”“PMS Handler实际调用AMS”“AMS完成发送决策”“receiver执行”画成四个坐标。再分别推导普通更新、static shared library覆盖与完整卸载的广播集合。
+
+## 15. 标准更新广播在kill清理之后才真正发送，no-kill另有两条延迟账
+
+以下先限定为没有未捕获异常的正常控制流，并只比较`handlePackagePostInstall()`里REMOVED、ADDED、REPLACED、MY_PACKAGE_REPLACED这组标准生命周期广播。旧external包的UNAVAILABLE在commit阶段已经另行入队，新external包的AVAILABLE也单独入队；它们不能拿来证明下表里的标准广播顺序。
+
+| 路径 | 当前POST_INSTALL消息内 | 当前消息返回后 |
+|---|---|---|
+| kill且`removedInfo.args != null` | 依次排标准广播任务；同步持`mInstallLock`调用`doPostDeleteLI(true)`；直接回install observer | PMS才处理标准广播任务并调用AMS |
+| no-kill且`removedInfo.args != null` | 依次排标准广播任务；排3秒旧代码清理；按包名登记install observer并排500ms后备 | 标准广播先有机会真正发送；有效内部确认或500ms后备可回observer；3秒后尝试清旧代码 |
+| `removedInfo.args == null` | 标准广播仍按包形态入队，但只请求并发GC；kill直接回observer，no-kill仍登记500ms后备 | 不存在3秒物理清理任务；GC不提供删除完成证明 |
+
+因此就这四类标准广播而言，当`removedInfo.args != null`时，kill路径会先尝试清旧APK，再让PMS Handler真正调用AMS。但这次清理只排在PMS较早的kill调用尝试之后，并不等待AMS处理`KILL_APPLICATION_MSG`或内核确认PID死亡；persistent进程甚至不会被选中。
+
+no-kill也没有等待所有manifest receiver。ProcessList会向全部有thread的运行进程异步`dispatchPackageBroadcast(PACKAGE_REPLACED)`，但`foundProcess`只检查是否存在“以目标包为主包”的进程；没找到时直接通知PMS。有进程时，首个通过可见性过滤的ActivityThread回调就能移除唯一observer映射。这是首个有效回调或无主进程时的捷径，不是所有进程Resources已刷新ACK。static shared library没有REPLACED内部确认，所以其no-kill更新只能走500ms后备。
+
+即使普通包也只有在“同包名没有重叠更新”时，才能把内部确认或500ms理解为本次安装的两条回程。r48用`packageName`而非安装token向`mNoKillInstallObservers`写一个Pair；下一次同包no-kill更新会覆盖前一个Pair，旧REPLACED回调或旧500ms消息又可能移除并通知新的Pair。因此它不保证逐安装关联，旧install observer也可能永远收不到结果。
+
+旧资源清理本身是best-effort。`createInstallArgsForExisting()`固定给`FileInstallArgs`；它先尽力parse旧PackageLite，再`cleanUp()`和`rmdex`。parse失败仍能删存在的主code目录；codeFile已不存在则提前返回，外置resourceFile也不单独删。目录删除的`InstallerException`只记日志，普通文件`delete()`返回值被忽略，`rmdex`异常被吞，`doPostDeleteLI()`仍恒定返回true。安装成功与清理函数返回都不能证明磁盘已干净。反过来，Incremental旧路径的`closeStorage()`若抛未捕获运行时异常，在kill路径会于标准广播任务入队后截断当前POST_INSTALL并阻断install observer；no-kill路径则到独立的3秒清理消息才触发，500ms observer后备通常已经先到。“best-effort”不等于所有异常都被吞，也不能把两条路径的异常窗口混为一谈。
+
+`removedInfo.args`为null常见于首次覆盖只读工厂APK；此时并发GC既不等待也不是文件删除协议。3秒也只是Handler的最早调度点，线程拥塞或`mInstallLock`竞争还会更晚；它没有逐进程mmap、Resources或ClassLoader引用确认。
+
+### 练习 9：验证物理清理、REPLACED确认与observer边界
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'outInfo.args = createInstallArgsForExisting(' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'res.removedInfo.args = createInstallArgsForExisting(' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'private InstallArgs createInstallArgsForExisting(String codePath,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'return new FileInstallArgs(codePath, resourcePath, instructionSets);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'InstallArgs args = res.removedInfo != null ? res.removedInfo.args : null;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (!killApp) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'scheduleDeferredNoKillPostDelete(args);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'args.doPostDeleteLI(true);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'static final int DEFERRED_NO_KILL_POST_DELETE_DELAY_MS = 3 * 1000;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'static final int DEFERRED_NO_KILL_INSTALL_OBSERVER_DELAY_MS = 500;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'getPackageManager().notifyPackagesReplacedReceived(' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'AppGlobals.getPackageManager().notifyPackagesReplacedReceived(packages);' frameworks/base/services/core/java/com/android/server/am/ProcessList.java
+grep -n -F 'Pair<PackageInstalledInfo, IPackageInstallObserver2> pair =' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mNoKillInstallObservers.put(packageName, Pair.create(info, observer));' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'Message message = mHandler.obtainMessage(DEFERRED_NO_KILL_INSTALL_OBSERVER, packageName);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'boolean foundProcess = false;' frameworks/base/services/core/java/com/android/server/am/ProcessList.java
+grep -n -F 'r.thread.dispatchPackageBroadcast(cmd, packages);' frameworks/base/services/core/java/com/android/server/am/ProcessList.java
+grep -n -F 'VMRuntime.getRuntime().requestConcurrentGC();' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'sendResourcesChangedBroadcast(false, true, pkgList, uidArray, null);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'sendResourcesChangedBroadcast(true, true, pkgList, uidArray, null);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mIncrementalManager.closeStorage(codePath);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'List<String> allCodePaths = Collections.EMPTY_LIST;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (codeFile == null || !codeFile.exists()) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'final PackageLite pkg = PackageParser.parsePackageLite(codeFile, 0);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'cleanUp();' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'removeCodePathLI(codeFile);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'removeDexFiles(allCodePaths, instructionSets);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+```
+
+分别推演kill、no-kill有运行进程、no-kill无运行进程和旧codeFile已丢失四例。对每例写出广播任务、observer、3秒消息与物理删除的最早可证完成点。
+
+## 16. 用失败矩阵排查“新包已生效，旧世界却没收口”
+
+“commit是唯一系统状态修改点”只能理解成新活动包的中心发布边界，不能扩大成commit前绝无副作用。r48至少有三类反例：prepare的兼容签名路径可提前移除keyset数据或更新permission owner的SigningDetails；scan虽声称无副作用，源码紧接着自我否定，而且`PackageSetting` copy把`PackageUserState`对象引用直接放入副本，instant/full切换可能改到live用户态；乐观appId也在reconcile前注册，再靠failure finally补偿。
+
+commit自身也不是原子区。`commitReconciledScanResultLocked()`的源码注释明确警告，它可能在提交中途抛异常并留下不一致状态；外层failure finally只关闭freezer并回收乐观创建的appId，不会把已经完成的旧包撤下、Setting改写或注册表修改逐项逆转。
+
+因此受控prepare/scan/reconcile失败能保证“新`AndroidPackage`没有作为活动版本提交”，却不能证明每份Settings辅助状态按位回滚；commit中途异常连这一保证也不具备。rename、fs-verity、App Links验证任务入队和这些辅助修改都要分别审计。
+
+| 现场 | 最可能的阶段 | 重点证据 |
+|---|---|---|
+| 新随机目录存在，旧包仍可查询 | rename后、commit前 | freezer、prepare/scan错误、failure cleanup |
+| 新包可查询但一直提示frozen | commit后post-commit异常或rollback回调未归还 | Handler异常、`mRunningInstalls`、CloseGuard |
+| 成功但system AppData丢失 | `createAppData`失败恢复 | critical日志与destroy/retry |
+| REMOVED已调用但receiver未运行 | 广播只在PMS Handler排队 | PMS与AMS两层队列 |
+| kill路径observer成功但广播尚未实际发送 | 当前POST_INSTALL仍未返回 | Handler消息顺序 |
+| no-kill observer成功但旧APK还在 | REPLACED内部确认或500ms后备早于3秒清理 | 两个延迟消息与cleanup日志 |
+| 前一次no-kill observer沉默，后一次被旧消息提前回调 | 同包名更新重叠 | `mNoKillInstallObservers`单Pair与旧ACK/timeout |
+| 新旧注册表只改了一部分且整组报失败 | commit中途异常 | commit警告、failure finally没有undo |
+| 新包已提交、无更新广播/install observer且仍冻结 | post-commit运行时异常 | commit结果、Incremental/AppData/dex日志 |
+| `INSTALL_FAILED_PACKAGE_CHANGED`且旧代码残留 | POST_INSTALL前包被另一路移除 | `pkgSetting==null`早退与`removedInfo.args` |
+
+最后自检九问：replace为什么需要flag；签名能力为什么等同数据访问授权；freezer返回为何不等进程死亡；persistent为何是反例；KEEP_DATA跳过哪些动作又不跳过什么；`mOldCodePaths`为何会被立即清空；系统首次与再次覆盖的旧代码去向有何不同；kill与no-kill的广播、install observer、清理顺序为何相反；static shared library为什么没有标准四广播。
+
+第262章将继续沿`updateSettingsLI()`之后的权限链，区分permission定义、Manifest请求、Package/SharedUser权限状态和每用户runtime账，解释替换时哪些授权继承、撤销或触发GID变化。

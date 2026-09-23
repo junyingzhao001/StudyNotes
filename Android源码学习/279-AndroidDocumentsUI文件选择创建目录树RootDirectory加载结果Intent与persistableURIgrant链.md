@@ -1,573 +1,481 @@
-# 279 Android DocumentsUI文件选择、创建、目录树、Root/Directory加载、结果Intent与persistable URI grant链
+# 279 Android DocumentsUI 文件选择、创建、目录树、Root/Directory 加载、结果 Intent 与 persistable URI grant 链
 
-## 1. 本章目标
+## 1. 先看结论：选择器交付的是 URI 能力，不是文件路径
 
-第278章站在DocumentsProvider一侧看分类文档，本章站到系统文件选择器DocumentsUI：App发出`ACTION_OPEN_DOCUMENT`、`ACTION_CREATE_DOCUMENT`、`ACTION_GET_CONTENT`或`ACTION_OPEN_DOCUMENT_TREE`后，PickActivity如何形成State、筛root、加载目录、返回单个URI或ClipData，以及调用App如何把“可持久化授权”真正保存下来。
+本文固定在 Android 11 `android-11.0.0_r48`：`frameworks/base` 位于 `1d9b9ab57d844b18b3b1b4297725141e7788109b`，`packages/apps/DocumentsUI` 位于 `50b9994d52e58514b8cb652dac2d76e0d6100e35`。这一章追踪四个公开入口：`ACTION_OPEN_DOCUMENT`、`ACTION_CREATE_DOCUMENT`、`ACTION_GET_CONTENT` 与 `ACTION_OPEN_DOCUMENT_TREE`。它们共用 `PickActivity`，却不是四个皮肤不同的相同操作。
 
-## 2. Android 11版本边界
+最重要的结论可以先压缩成一条链：调用 App 发出 Intent，DocumentsUI 把它归一成 `State`，从多个 DocumentsProvider 的 root 与 document Cursor 中组装界面，用户选择后产生带 URI 和 flags 的结果 Intent；ActivityTaskManager 再校验 DocumentsUI 是否有资格转授，并在结果投递前给调用 App 安装临时 grant；只有调用 App 随后显式 `takePersistableUriPermission()`，可持久化的读写位才进入 system_server 的持久状态。
 
-本文依据本地`android-11.0.0_r48`的`packages/apps/DocumentsUI`与framework UriGrants源码。跨profile、scoped storage目录树限制、EXTRA_INITIAL_URI及内部cache行为都有版本差异；学习时应把公开Intent/flag契约与r48 UI实现边界分开。
+这条链至少有七个独立完成点：
 
-## 3. DocumentsUI不是DocumentsProvider
+1. Intent 是否被正确归一，MIME、multiple、openable、local-only 与调用者身份是否符合预期；
+2. root 是否被发现、缓存并通过 action/MIME/profile 筛选；
+3. 当前目录、Recents 或全局搜索是否完成 Provider 查询和客户端过滤；
+4. leaf、当前目录、已有文件或新建 document 是否通过各自选择规则；
+5. DocumentsUI 是否真正走到 `RESULT_OK`，并把一个 URI 放进 `data` 或把多个 URI 放进 `ClipData`；
+6. system_server 是否接受 flags、校验每个 URI 并在结果目标上安装临时 grant；
+7. App 是否及时 take，且请求的 read/write 位确实由同一个 exact 或 prefix grant 完整覆盖。
 
-DocumentsUI是受信任的系统选择器和文件管理UI；各DocumentsProvider提供roots/documents数据。它持有MANAGE_DOCUMENTS来浏览Provider，却不会把这项组件权限交给调用App，而是由系统只授予用户最终选中的URI。
+后段成功不能反证前段状态。例如，root 出现在侧栏不代表当前 document 可选；结果含 `FLAG_GRANT_WRITE_URI_PERMISSION` 不代表 Provider 实现了写操作；Intent 声明 `FLAG_GRANT_PERSISTABLE_URI_PERMISSION` 也不代表权限已跨重启保存。排查时应始终问“停在哪个完成点”，而不是笼统地说“SAF 失效”。
 
-## 4. 四种公开action先分清
+## 2. Manifest 只建立入口；默认结果、Provider 与 system_server 各有边界
 
-OPEN_DOCUMENT选择已有文档并可提供persistable grant；CREATE_DOCUMENT让Provider先创建一个新row/文件入口再返回；GET_CONTENT偏一次性取得内容，还可转发到其他App；OPEN_DOCUMENT_TREE选择目录并返回带prefix语义的tree URI。
+Manifest 中 `.picker.PickActivity` 是 exported、对 instant app 可见的 Activity，四个公开 action 分别有 intent-filter。OPEN、CREATE、GET 的 filter 带 `CATEGORY_OPENABLE`，TREE 没有 MIME data；这只是解析入口，不会替调用 Intent 自动补 category，也不会让所有 Provider document 都变成可打开对象。
 
-## 5. URI不是文件路径
+`BaseActivity.onCreate()` 在基础初始化末尾先把结果设为 `RESULT_CANCELED`。用户返回、Activity 被结束、异步工作未回调，都会保留取消结果；对DocumentsUI自产结果，只有 `ActionHandler.onPickFinished()` 最终调用三参数测试适配层的 `setResult(RESULT_OK, intent, 0)` 才覆盖它。因此“用户点过某行”与“调用方收到成功”之间仍隔着选择校验、last-access 写入、创建 IPC、结果组装和 Activity finish。GET_CONTENT选择外部handler时则把结果责任转给外部Activity。
 
-结果通常是`content://authority/document/docId`或tree URI。调用App应继续通过ContentResolver读写，不应依赖DATA列或把docId当路径；远端、云盘、虚拟文档都可能没有普通文件系统路径。
+四方职责不能混在一起：
 
-## 6. 源码地图
+| 参与者 | 负责什么 | 不负责什么 |
+|---|---|---|
+| DocumentsUI | root/document 展示、导航、选择策略、结果 URI 与请求 flags | 不替普通 App 持久化 grant，不把 URI 变成路径 |
+| DocumentsProvider | roots、document、children/search Cursor 与 open/create 等能力 | 不决定调用 App 最终是否收到 Activity 结果 |
+| system_server | 校验URI转授，把临时grant绑定到接收ActivityRecord的owner，并保存/恢复已take的持久grant | 不保证 Provider 的 write/delete/create 操作真的实现 |
+| 调用 App | 构造规范 Intent、消费 data/ClipData、在需要时 take、实际读写 | 不能从结果 flags 推导底层文件所有权 |
 
-```text
-packages/apps/DocumentsUI/AndroidManifest.xml
-packages/apps/DocumentsUI/src/com/android/documentsui/picker/PickActivity.java
-packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
-packages/apps/DocumentsUI/src/com/android/documentsui/picker/CreatePickedDocumentTask.java
-packages/apps/DocumentsUI/src/com/android/documentsui/roots/ProvidersCache.java
-packages/apps/DocumentsUI/src/com/android/documentsui/roots/ProvidersAccess.java
-packages/apps/DocumentsUI/src/com/android/documentsui/DirectoryLoader.java
-packages/apps/DocumentsUI/src/com/android/documentsui/MultiRootDocumentsLoader.java
-frameworks/base/core/java/android/content/ContentResolver.java
-frameworks/base/services/core/java/com/android/server/uri/UriGrantsManagerService.java
-```
+`grantUriPermissions=true`、Provider 的读写权限门与 document flags 是 Provider 侧能力面；选择器的 `State` 和 `Config` 是 UI 策略面；UriGrantsManager 中的 `UriPermission` 是调用者能力面。三层状态可能同时不同步，源码阅读必须分别取证。
 
-## 7. PickActivity的Manifest入口
+### 练习 1：核对四个入口、默认取消与最终成功覆盖
 
-exported且visibleToInstantApps的PickActivity为OPEN_DOCUMENT、CREATE_DOCUMENT、GET_CONTENT注册`*/*`与OPENABLE category，为OPEN_DOCUMENT_TREE注册独立filter，priority为100。Intent解析和用户交互发生在DocumentsUI进程，provider查询跨Binder执行。
-
-## 8. RESULT_CANCELED是默认结果
-
-BaseActivity启动时先设置取消结果；只有真正完成选择才覆盖为RESULT_OK。返回键、窗口关闭、Provider失败或用户取消都不会意外留下上次URI，调用App必须先判断resultCode。
-
-## 9. 三方职责
-
-调用App声明“想选什么”；DocumentsUI负责可信UI、导航和结果Intent；DocumentsProvider负责实际query/open/create。UriGrantsManagerService则保存临时与持久grant。把四方代码混在一个“文件选择器返回路径”概念里会丢掉安全边界。
-
-## 10. 端到端总图
-
-```mermaid
-sequenceDiagram
-    participant User as "用户"
-    participant App as "调用App"
-    participant UI as "DocumentsUI PickActivity"
-    participant P as "DocumentsProvider"
-    participant ATM as "system_server结果/临时grant链"
-    participant UGM as "UriGrantsManagerService"
-    App->>UI: startActivityForResult(action + MIME/extras)
-    UI->>P: query roots/documents（MANAGE_DOCUMENTS）
-    P-->>UI: Root/Document Cursor
-    User->>UI: 在可信UI中确认对象
-    opt ACTION_CREATE_DOCUMENT
-        UI->>P: createDocument(parent,mime,name)
-        P-->>UI: 新document URI
-    end
-    UI->>ATM: setResult(RESULT_OK, data/ClipData + grant flags)
-    ATM-->>App: 交付结果并形成临时URI grant
-    opt App需要跨重启保存
-        App->>UGM: takePersistableUriPermission(uri, read/write)
-    end
-```
-
-## 11. action归一成内部State
-
-PickActivity.includeState把四个公开action分别映射为`ACTION_OPEN`、`ACTION_CREATE`、`ACTION_GET_CONTENT`、`ACTION_OPEN_TREE`。其余内部copy destination action也复用同一UI，但不属于普通App的SAF结果协议。
-
-## 12. MIME默认值
-
-Intent type为空时使用`*/*`；存在`EXTRA_MIME_TYPES`时用字符串数组覆盖单一type。后续root筛选、文档enable、搜索和结果ClipData description都读取`state.acceptMimes`。
-
-## 13. EXTRA_MIME_TYPES不是附加条件
-
-实现是“有数组就使用数组，否则使用type”，不是把两者做AND。调用方应提供合法具体MIME或通配类型，不要期待type和extra同时收窄。
-
-## 14. multiple只对OPEN与GET生效
-
-只有ACTION_OPEN/ACTION_GET_CONTENT读取`EXTRA_ALLOW_MULTIPLE`。CREATE必须返回一个新文档，OPEN_TREE只选一个目录；即使Intent错误携带multiple，内部State也不会把这两类变成多选。
-
-## 15. CATEGORY_OPENABLE的作用
-
-OPEN、GET、CREATE记录`state.openableOnly`。Config遇到`FLAG_VIRTUAL_DOCUMENT`且openableOnly为true会禁用该leaf；目录仍可进入。OPENABLE表达调用者需要普通openFile能力，不接受只能通过typed stream转换的虚拟文档。
-
-## 16. localOnly怎样过滤root
-
-`Intent.EXTRA_LOCAL_ONLY=true`时，ProvidersAccess排除没有`Root.FLAG_LOCAL_ONLY`的root。它限制数据源能力，不保证每个对象都在某个公开POSIX路径，也不等同于离线内容已经完整缓存。
-
-## 17. EXTRA_EXCLUDE_SELF
-
-若请求带`DocumentsContract.EXTRA_EXCLUDE_SELF`，DocumentsUI根据可信calling package读取该包声明的所有provider authority并加入excludedAuthorities，root匹配时排除。常用于Provider自己的“导入/选择”UI避免用户选回自身。
-
-## 18. calling package怎样确定
-
-默认取Activity.getCallingPackage；只有system/updated-system调用方可用`Intent.EXTRA_PACKAGE_NAME`覆盖。这防止普通App冒充另一个包污染last-accessed状态或绕过exclude-self策略。
-
-## 19. scoped storage树限制开关
-
-R上compat change `141600225`对target Q之后启用`restrictScopeStorage`。它不是全局禁止SAF，而是让UI尊重Provider在目录Document flags中标记的`FLAG_DIR_BLOCKS_OPEN_DOCUMENT_TREE`。
-
-## 20. 哪些目录会被block
-
-ExternalStorageProvider继承FileSystemProvider，在受限目录上设置BLOCKS_OPEN_DOCUMENT_TREE；典型意图是阻止App用tree grant拿整棵存储根或Android/data、Android/obb等敏感范围。UI仍可浏览某些位置，但确认按钮会禁用并覆盖提示层。
-
-## 21. action决定底部控件
-
-CREATE显示SaveFragment收集MIME、文件名和替换目标；OPEN_TREE与内部copy destination显示PickFragment确认当前目录；OPEN/GET直接点击leaf完成，不需要底部“保存到此处”。
-
-## 22. GET_CONTENT为何可显示其他App
-
-RootsFragment仅在GET_CONTENT时`includeApps=true`。ActionHandler转发到外部App前移除read/write/persistable/prefix flags，再添加FORWARD_RESULT，避免把DocumentsUI自己的能力错误扩大给被启动组件。
-
-## 23. 跨profile State
-
-R且feature开启时，除内部copy/move外picker支持profile tabs。每个RootInfo、DocumentInfo都带UserId；真正返回前`canShare()`再次确认能与目标profile交互，而不是只相信UI列表曾经过滤。
-
-## 24. 初始位置优先级
-
-恢复的saved State最高；内部copy destination固定Home；feature允许且Intent有`EXTRA_INITIAL_URI`时尝试root/document；否则读取该calling package上次访问stack，失败才按action选默认位置。
-
-## 25. EXTRA_INITIAL_URI只是一条hint
-
-root URI直接loadRoot；document URI用findDocumentPath重建DocumentStack。URI无效、Provider不支持路径、root已被当前State过滤或权限失败时会回退，不承诺一定停在指定目录。
-
-## 26. tree URI先窄化成plain document
-
-LoadDocStackTask遇到tree URI，取当前document id重建普通document URI，再调用findDocumentPath寻找从root到目标的路径。它这样做是为了恢复完整导航stack，而不是扩大原调用App的tree权限。
-
-## 27. findDocumentPath是best effort
-
-Provider可不支持或返回null，网络/权限也会失败。DocumentsUI记录日志并回退；初始URI功能不应成为选择流程的单点故障。
-
-## 28. r48的null日志bug
-
-`buildStack()`发现root为null时，异常消息却访问`root.userId`，会先触发NullPointerException。外层catch仍把整个初始URI恢复当失败处理，所以UI通常回退，但日志不再是设计的IllegalStateException。
-
-## 29. last accessed按调用包隔离
-
-LastAccessedProvider以calling package为key持久化DocumentStack。不同App打开选择器会恢复各自最近位置；成功create/pick前ActionHandler更新它，不能把它理解为全系统统一“最近目录”。
-
-## 30. 默认位置按action不同
-
-CREATE默认Home，OPEN_TREE默认device root，OPEN与GET默认Recents。默认只是无可恢复stack时的策略，root筛选仍可能让目标不可用。
-
-## 31. ProvidersCache怎样发现Provider
-
-后台UpdateTask按可交互UserId调用PackageManager.queryIntentContentProviders，查询action为`android.content.action.DOCUMENTS_PROVIDER`，并为每个authority加载roots。Recents是DocumentsUI自己合成的特殊root，不来自远端Provider。
-
-## 32. root Provider必须通过结构验证
-
-loadRootsForAuthority再次检查provider exported、grantUriPermissions，且read/write权限都必须是MANAGE_DOCUMENTS。不合规provider即使声明intent-filter也不会进入root列表。
-
-## 33. stopped package延迟唤醒
-
-常规全量更新先跳过FLAG_STOPPED的DocumentsProvider，记录到stoppedAuthorities；只有UI真正请求相关authority时再加载，避免启动选择器就唤醒所有长期未用应用。
-
-## 34. roots查询使用unstable client
-
-DocumentsUI取得对应用户ContentResolver，用unstable ContentProviderClient查询`content://authority/root`。一个Provider崩溃不会让DocumentsUI永久绑定稳定引用；异常只让该authority本轮roots缺失。
-
-## 35. system roots cache
-
-非强制刷新时先查ContentResolver的system cache，key是roots URI；新查询成功后把RootInfo ArrayList放回长寿命system进程缓存。包或URI变化由系统负责失效，减少DocumentsUI进程重启后的远端查询。
-
-## 36. 空roots通常不缓存
-
-除白名单authority外，Provider返回空roots会被视作可疑并不写system cache，下一次还能重试。这也与第278章MediaDocumentsProvider ready前先返回空、随后roots notify的设计呼应。
-
-## 37. roots ContentObserver
-
-第一次观察authority时注册roots URI且notifyForDescendants=true。Provider调用`notifyChange(buildRootsUri())`后，main looper observer触发该package/authority异步刷新，再由本地broadcast推动UI更新。
-
-## 38. first load最多等15秒
-
-同步取roots的方法调用`waitForFirstLoad()`，CountDownLatch等待15秒后即使失败也继续，以避免永久卡住UI。超时意味着本轮列表可能暂不完整，后续package/roots更新仍能补齐。
-
-## 39. action级root筛选
-
-CREATE和copy destination要求Root.FLAG_SUPPORTS_CREATE；OPEN_TREE要求FLAG_SUPPORTS_IS_CHILD且排除Recents；OPEN/GET排除EMPTY；另外统一应用localOnly、profile交互、MIME overlap和excluded authority。
-
-## 40. MediaDocuments roots不能选tree
-
-第278章四个媒体分类root没有FLAG_SUPPORTS_IS_CHILD，所以ProvidersAccess会在ACTION_OPEN_TREE直接排除。它们适合OPEN/GET分类选媒体，不是可持久遍历的真实目录树。
-
-## 41. MIME overlap双向比较
-
-root derived MIME与state accept MIME做两个方向的`mimeMatches`，兼容`image/*`与具体`image/jpeg`的宽窄组合。完全不重叠的root在侧栏消失，避免进入后才发现全是禁用项。
-
-## 42. Recents是跨root聚合
-
-OPEN/GET默认进入DocumentsUI合成Recents。RecentsLoader只查询LOCAL_ONLY且SUPPORTS_RECENTS、属于当前用户的root，再按authority并发请求各root recent URI，过滤旧项/MIME并合并排序。
-
-## 43. root发现与筛选图
-
-```mermaid
-flowchart TD
-    PM["PackageManager查询DOCUMENTS_PROVIDER"] --> VALID["exported + grantUriPermissions + MANAGE_DOCUMENTS"]
-    VALID --> CACHE{"system roots cache命中?"}
-    CACHE -->|否| QUERY["query content://authority/root"]
-    CACHE -->|是| ROOTS["RootInfo集合"]
-    QUERY --> ROOTS
-    ROOTS --> ACTION{"按action过滤"}
-    ACTION --> CREATE["CREATE: supportsCreate"]
-    ACTION --> TREE["OPEN_TREE: supportsIsChild且非Recents"]
-    ACTION --> OPEN["OPEN/GET: 非EMPTY"]
-    CREATE --> COMMON["localOnly/profile/MIME/exclude-self"]
-    TREE --> COMMON
-    OPEN --> COMMON
-    COMMON --> UI["RootsFragment侧栏"]
-    OBS["roots URI observer"] --> QUERY
-```
-
-## 44. 当前目录由DocumentStack表示
-
-State.stack保存RootInfo和从root到当前目录的DocumentInfo序列。导航进入目录push，返回pop；root、当前工作目录和用户身份都从stack获得，不能只靠一个裸document URI恢复完整面包屑。
-
-## 45. DirectoryLoader按authority选择executor
-
-普通目录加载使用`ProviderExecutor.forAuthority(root.authority)`，让同一Provider的工作在其专用执行器上有序进行，避免一个慢authority占住所有任务；不同authority仍可并行。
-
-## 46. children与search共用loader
-
-构造时有queryArgs即search mode，否则查询当前children URI。SortModel把结构化排序参数加入Bundle；search再合并名称、MIME等query args，交给DocumentsProvider新式Bundle query入口。
-
-## 47. CancellationSignal真实下传
-
-loadInBackground创建signal并传给ContentProviderClient.query；cancelLoadInBackground会cancel同一对象。Provider是否及时响应取决于自身实现，第278章已看到MediaDocumentsProvider部分查询没有继续下传。
-
-## 48. 多profile搜索条件
-
-只有State支持跨profile、root也支持cross-profile，且queryArgs含DISPLAY_NAME时才跨可交互user执行相同authority搜索；普通目录浏览仍绑定root.userId。
-
-## 49. quiet mode与权限错误
-
-当前profile不可交互时返回CrossProfileNoPermissionException，工作profilequiet时返回CrossProfileQuietModeException。它们进入DirectoryResult让UI显示可操作状态，而不是把空Cursor误当目录真的没有文件。
-
-## 50. unstable client与archive特例
-
-普通query通过每个用户的unstable client；若当前DocumentInfo位于DocumentsUI ArchivesProvider，还先acquire archive并把client留到DirectoryResult生命周期结束，保证压缩包虚拟目录可继续读取。
-
-## 51. Cursor观察与重新加载
-
-query结果注册LockingContentObserver；onChange标记loader content changed并重新query。Provider通知只是刷新信号，旧Cursor不会自动增加行，这与第278章MatrixCursor通知模型一致。
-
-## 52. 隐藏文件过滤在客户端补一层
-
-底层Cursor先包`FilteringCursorWrapper`，按用户设置决定是否展示隐藏项。Provider仍可能返回它们，DocumentsUI展示策略与Provider数据可见性是两层。
-
-## 53. 搜索目录过滤
-
-feature未开启“搜索结果显示文件夹”时，search mode拒绝directory MIME，因为旧Provider不一定支持findDocumentPath，点搜索目录后难以可靠重建导航路径。
-
-## 54. 图片选择过滤
-
-当OPEN/GET且所有acceptMimes都是图片时，`isPhotoPicking()`成立，DirectoryLoader只保留directory与image MIME。这是UI结果整形，不等于启用后来的系统Photo Picker API。
-
-## 55. Provider排序与本地排序
-
-若paging feature和Cursor extras表明排序已被honor，DocumentsUI可跳过；否则SortModel重新排序Cursor。r48注释承认检测方式仍是临时方案，因此Provider收到sort hint不代表最终UI一定保留它的顺序。
-
-## 56. query异常不会崩Activity
-
-RemoteException、Provider错误或Cursor处理异常被写入DirectoryResult.exception，并关闭client；UI据此显示错误/重试。选择器把不可信Provider当故障域隔离。
-
-## 57. loader结果生命周期
-
-新DirectoryResult替换旧结果时关闭旧Cursor，Activity停止会cancel，reset会注销observer并关闭资源。Cursor和Provider client不能泄漏到调用App；最终只返回选中URI。
-
-## 58. stale检查的代价
-
-复用缓存结果前，`checkIfCursorStale()`把Cursor从-1遍历到count验证可读；任一异常视为stale并重载。它能发现死亡远端Cursor，但大目录会产生一次O(n)探测。
-
-## 59. MultiRoot第一阶段只等短窗口
-
-Recents等聚合loader按authority启动QueryTask，用CountDownLatch只等待`MAX_FIRST_PASS_WAIT_MILLIS`；未完成任务通过EXTRA_LOADING=true告诉UI仍在加载，后续完成再发结果，避免一个云Provider拖住首屏。
-
-## 60. authority级并发限流
-
-MultiRootDocumentsLoader还用Semaphore限制同时查询数，低内存设备额度更小。它按authority聚合root并行，而不是为每个root无限开线程，降低启动时Binder和缩略图压力。
-
-## 61. leaf是否可点击由Config决定
-
-目录始终enabled以便导航；OPEN_TREE/copy destination不允许直接“选中列表里的目录”，必须进入目录后点底部确认；普通leaf再按action、flags、virtual/openable和MIME判断。
-
-## 62. OPEN与GET的leaf规则
-
-非目录、MIME匹配即可候选；若是`FLAG_VIRTUAL_DOCUMENT`且请求带CATEGORY_OPENABLE则禁用。没有OPENABLE时，调用方应准备使用`getStreamTypes/openTypedAssetFile`处理Provider可转换格式。
-
-## 63. CREATE下已有文件为何要求write flag
-
-在CREATE界面点击同名已有leaf表示替换目标，Config要求`Document.FLAG_SUPPORTS_WRITE`。只读文件会禁用，防止UI返回一个调用方随后无法写入的旧URI。
-
-## 64. 点击目录与点击文件分流
-
-PickActivity.onDocumentPicked遇目录就openContainerDocument并记录搜索历史；OPEN/GET的leaf先做跨profile最终检查，再finishPicking；CREATE点击leaf只交给SaveFragment设replaceTarget，不立即返回。
-
-## 65. 多选怎样转URI数组
-
-onDocumentsPicked仅服务OPEN/GET，逐个取`doc.getDocumentUri()`，同时检查是否含跨profile对象，然后调用finishPicking(Uri[])。任何一项不可share都会拒绝整组，不返回部分成功。
-
-## 66. archive可以选但不内联打开
-
-注释明确不要自动把archive当目录进入，否则用户永远无法选择zip本身；而在archive内部挑文件又不受支持。DocumentsUI需在“容器导航能力”和“这个对象就是选择结果”之间按场景取舍。
-
-## 67. OPEN_TREE选择的是当前目录
-
-列表中的目录只用于导航，PickFragment的pickTarget是stack.peek当前目录。用户点击“使用此文件夹”后先弹确认，再由ActionHandler把该document的URI转成结果tree语义。
-
-## 68. root先要求supportsChildren
-
-ACTION_OPEN_TREE在root筛选阶段要求`Root.FLAG_SUPPORTS_IS_CHILD`，因为后续tree URI访问必须验证目标是tree root后代。只有能回答isChildDocument的Provider才适合prefix授权。
-
-## 69. 当前目录还可能被R策略阻止
-
-即使root支持tree，DocumentInfo若含`FLAG_DIR_BLOCKS_OPEN_DOCUMENT_TREE`且compat restriction生效，PickFragment禁用确认。这个Document flag由Provider按具体目录设置，比root级过滤更细。
-
-## 70. CREATE先验证cwd可创建
-
-SaveFragment.prepareForDirectory只有当前DocumentInfo存在且`FLAG_DIR_SUPPORTS_CREATE`时启用保存按钮。Root supportsCreate只是入口粗筛，深入某个只读子目录后仍会禁用。
-
-## 71. 新建任务运行在哪
-
-CreatePickedDocumentTask通过`getExecutorForCurrentDirectory()`选择当前authority执行器，在后台调用DocumentsAccess.createDocument，UI prepare/finish阶段切换保存按钮进度状态，避免Binder或远端I/O阻塞主线程。
-
-## 72. createDocument真正创建对象
-
-DocumentsAccess取得parent所在user的ContentResolver和unstable client，调用`DocumentsContract.createDocument(parentUri,mime,displayName)`。Provider可清洗或修改名称，返回的新URI才是权威结果。
-
-## 73. CREATE返回时内容可能仍为空
-
-DocumentsUI只负责让Provider建立document并返回URI，不替调用App写业务字节。调用方收到RESULT_OK后仍需`openOutputStream/openFileDescriptor`写内容并处理异常。
-
-## 74. cross-profile创建补user authority
-
-跨用户ContentResolver返回的URI本身可能不带user info，DocumentsAccess用parent document URI的encoded authority补回用户标识，否则调用App会把它错误路由到当前用户Provider。
-
-## 75. 创建失败不会返回假URI
-
-任何Provider异常被DocumentsAccess记录并返回null；Task显示save_error Snackbar、恢复按钮，不调用结果callback。RESULT仍保持默认CANCELED，用户可修名、换目录或退出。
-
-## 76. replace不是DocumentsUI主动截断
-
-选择已有可写leaf并确认替换时，ActionHandler直接finishPicking(existingUri)，不调用delete、create或truncate。真正覆盖行为取决于调用App随后用何种mode打开URI。
-
-## 77. last accessed写入时机
-
-新建成功后Task立即记录stack；普通finishPicking则先运行SetLastAccessedStackTask，再组装结果。它保存导航体验，不参与URI授权，也不证明App已成功读取/写入结果。
-
-## 78. 单选结果放data
-
-`uris.length==1`时创建空Intent并`setData(uri)`；调用App从`resultIntent.getData()`取值。没有同时复制一份单项ClipData，因此接收端要正确处理两种形态。
-
-## 79. 多选结果放ClipData
-
-大于一项时，以acceptMimes创建ClipData并逐项addItem，data保持null。调用App必须遍历`getClipData().getItemCount()`，不要只读data后误判用户取消。
-
-## 80. 零URI不应成为成功选择
-
-onPickFinished理论上可构造无data/ClipData的Intent，但正常调用路径只在有效选择/create成功后进入。默认取消结果与UI检查共同防御空结果；接收端仍应验证URI非null。
-
-## 81. GET_CONTENT只返回read flag
-
-ACTION_GET_CONTENT在结果Intent只加`FLAG_GRANT_READ_URI_PERMISSION`，没有write、persistable或prefix。它偏向当前交互的一次性内容消费，不能在App端合法调用takePersistable保存。
-
-## 82. OPEN_DOCUMENT的flags
-
-ACTION_OPEN落入通用else，加入READ、WRITE、PERSISTABLE。Provider具体Document flags仍决定写FD等操作是否实现；write URI capability还可能用于delete等独立操作，不能由结果flag推断文件一定可编辑。
-
-## 83. CREATE_DOCUMENT的flags
-
-CREATE同样返回READ、WRITE、PERSISTABLE，让调用App写入刚创建对象并可跨重启保留。DocumentsUI不因create动作自动打开输出流，也不替App调用take持久授权。
-
-## 84. 结果Intent与grant图
-
-```mermaid
-flowchart TD
-    PICK{"action"} -->|"GET_CONTENT"| GET["data/ClipData + READ"]
-    PICK -->|"OPEN_DOCUMENT"| OPEN["data/ClipData + READ|WRITE|PERSISTABLE"]
-    PICK -->|"CREATE_DOCUMENT"| CREATE["新URI + READ|WRITE|PERSISTABLE"]
-    PICK -->|"OPEN_DOCUMENT_TREE"| TREE["tree URI + READ|WRITE|PERSISTABLE|PREFIX"]
-    GET --> TEMP["Activity结果形成临时URI grant"]
-    OPEN --> TEMP
-    CREATE --> TEMP
-    TREE --> TEMP
-    TEMP --> NEED{"App需要跨重启?"}
-    NEED -->|"是且收到PERSISTABLE"| TAKE["ContentResolver.takePersistableUriPermission"]
-    NEED -->|"否"| LIFE["随Activity/task或显式撤销结束"]
-    TAKE --> XML["UriGrantsManager延迟写持久grant XML"]
-```
-
-## 85. OPEN_TREE再多两个flag
-
-tree结果除read/write/persistable外还带PREFIX，授权覆盖tree document及Provider判定为后代的document URI。prefix不是字符串路径前缀猜测，而是DocumentsContract tree结构与`isChildDocument()`安全验证。
-
-## 86. DocumentsUI不直接调用grantUriPermission
-
-它只在RESULT_OK Intent上附data/ClipData和access flags；Activity结果交付链由system_server核验URI provider允许grant、选择器有资格转授，再为目标调用App建立临时UriPermission。结果flags是授权请求描述，不是普通extras。
-
-## 87. 为什么可信选择器能转授
-
-DocumentsUI持有MANAGE_DOCUMENTS并从Provider读取对象，Provider又要求`grantUriPermissions=true`。UriGrantsManager检查content scheme、authority、provider policy及调用/目标UID，不能由任意App把自己无权访问的URI塞进结果Intent完成转授。
-
-## 88. persistable只是“可被take”
-
-结果含`FLAG_GRANT_PERSISTABLE_URI_PERMISSION`表示当前grant的read/write位允许目标App选择持久化。若App不调用`takePersistableUriPermission()`，跨进程重启/任务生命周期后的长期访问没有保证。
-
-## 89. App应怎样取modeFlags
-
-通常从resultIntent flags中只保留READ与WRITE，再传给take；不能把PERSISTABLE或PREFIX本身作为modeFlags，因为ContentResolver API只接受read/write两位。
-
-## 90. take进入哪个服务
-
-ContentResolver去掉URI内嵌user id、解析userId，然后Binder调用UriGrantsManagerService。普通重载以Binder calling UID为目标；隐藏的toPackage重载需要`FORCE_PERSISTABLE_URI_PERMISSIONS`。
-
-## 91. isolated进程不能take
-
-服务先`enforceNotIsolatedCaller()`，再用Preconditions限制flags。持久授权绑定正常应用UID/package身份，isolated UID生命周期短且不能拥有这类长期能力。
-
-## 92. 必须已有可持久化grant
-
-服务查目标UID对该URI的exact与prefix UriPermission，要求请求的read/write子集被`persistableModeFlags`覆盖；两者都不满足就SecurityException。App不能对任意content URI主动制造持久权限。
-
-## 93. exact与prefix可以同时take
-
-若同一URI同时命中exact和prefix grant，服务对两者都调用takePersistableModes。tree选择通常依赖prefix，普通OPEN/CREATE常见exact；查询权限时二者按各自GrantUri key保存。
-
-## 94. take不扩大read/write
-
-`persistedModeFlags |= persistableModeFlags & requested`，只固化已被offer且App请求的位。只收到read就不能take write；App也可有意只保存read，降低长期权限范围。
-
-## 95. persisted time会被touch
-
-只要持久mode非零，takePersistableModes就把`persistedCreateTime`更新为当前时间；文档也说明重复take会touch时间。该时间用于旧grant裁剪排序，不是文档内容修改时间。
-
-## 96. r48重复take的写盘边界
-
-方法返回值只比较persisted mode前后是否变化。重复take相同flags虽更新内存时间却返回false；若没有其他变更触发schedule，新的touch时间可能不会单独写盘，重启后仍是旧磁盘时间。
-
-## 97. 每UID上限512
-
-`MAX_PERSISTED_URI_GRANTS=512`。take后调用prune，按persistedCreateTime从旧到新排序，超过上限时释放最老项，防止App无限积累长期capability。
-
-## 98. prune使用总permission map作前置判断
-
-它先看该UID所有UriPermission map size是否小于512，再收集persisted项；包含临时项的总数只会让它更早进入统计，最终trimCount仍按persisted数量计算，不会误删纯临时grant。
-
-## 99. prune真实变化会触发写盘
-
-没有超限或无需裁剪时helper返回false；实际release并remove旧grant后返回true。调用者把它OR进`persistChanged`，所以即使本次take没有新增mode，只要发生裁剪仍会安排持久化。不要把前面的多处早退误读成函数最终固定返回false。
-
-## 100. 写盘有10秒去抖
-
-状态变化时`schedulePersistUriGrants()`若无同类消息，延迟10秒发送；handler在锁内snapshot所有persisted permission，再用AtomicFile语义写grant XML。take成功不等于调用返回瞬间磁盘文件已更新。
-
-## 101. 持久文件保存什么
-
-每项记录source/target user、source/target package、URI、prefix、persisted mode flags和created time。它保存授权关系而不是文件内容；Provider删除document或撤grant后该能力仍可失效。
-
-## 102. release只撤持久部分
-
-`releasePersistableUriPermission(uri,read/write)`清persistedModeFlags并安排写盘；API文档明确同URI的非持久临时grant可继续存在。release不是删除文档，也不通知Provider改row。
-
-## 103. getPersisted只看incoming persisted
-
-调用App的`getPersistedUriPermissions()`向服务查询本包incoming且persistedOnly列表；它不会列出尚未take的临时结果grant。第278章MediaStore.getDocumentUri正是把这份列表交给ExternalStorageProvider匹配。
-
-## 104. 旋转与进程重建
-
-PickActivity把State和PickResult写savedInstanceState；恢复时已初始化stack优先，不重新读initial/last accessed。进行中的Provider AsyncTask仍需按组件生命周期处理，结果未完成前默认CANCELED保持安全。
-
-## 105. 当前目录通知如何回到UI
-
-Provider Cursor notification触发DirectoryLoader observer，loader重新query、过滤和排序，再让DirectoryFragment更新Model。roots变更则走ProvidersCache observer和RootsMonitor，两条刷新链不要混用。
-
-## 106. MIME正确不代表可打开
-
-root MIME只做入口筛选，document MIME与virtual/openable决定leaf状态，最终open还可能因Provider权限、离线或格式转换失败。选择器尽量前置过滤，但调用App仍必须捕获FileNotFound/IOException。
-
-## 107. CREATE成功也可能后续写失败
-
-Provider create与App write是两个Binder操作，中间没有跨组件事务。空间耗尽、远端断线或grant被撤都会让写失败；App应关闭FD、展示错误，必要时通过Provider能力删除空document。
-
-## 108. OPEN_TREE不是MANAGE_EXTERNAL_STORAGE
-
-tree grant只覆盖用户明确选定树且受Provider后代检查与R目录block约束；MANAGE_EXTERNAL_STORAGE是AppOps/权限层面的广域共享存储能力。二者来源、范围和撤销模型完全不同。
-
-## 109. 排查“root不显示”
-
-依次检查Provider intent-filter和Manifest四条件、是否stopped、roots是否ready/EMPTY、action要求create/isChild、localOnly、profile、MIME overlap及exclude-self，再看roots observer和system cache，不要只查Provider queryDocument。
-
-## 110. 排查“拿到URI重启后失效”
-
-确认action不是GET_CONTENT，result flags含PERSISTABLE，App确实以READ/WRITE子集调用take且未捕获后忽略SecurityException，再用getPersisted验证；还要确认Provider没有删除document或主动revoke。
-
-## 111. 阅读完成检查
-
-你应能从Intent→State→Provider discovery/root filter→DirectoryLoader→用户选择→data/ClipData→临时grant→App take→UriGrants XML完整复述，并解释CREATE只建对象不写业务内容、OPEN_TREE prefix不等全盘权限。
-
-## 112. macOS只读练习一：比较四种action
+在源码根目录运行；也可把源码根目录作为第一个参数从任意目录运行。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '35,90p' packages/apps/DocumentsUI/AndroidManifest.xml
-sed -n '200,315p' packages/apps/DocumentsUI/src/com/android/documentsui/picker/PickActivity.java
-sed -n '400,455p' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'android:name=".picker.PickActivity"' packages/apps/DocumentsUI/AndroidManifest.xml
+grep -n -F 'android:visibleToInstantApps="true"' packages/apps/DocumentsUI/AndroidManifest.xml
+grep -n -F 'android.intent.action.OPEN_DOCUMENT' packages/apps/DocumentsUI/AndroidManifest.xml
+grep -n -F 'android.intent.action.CREATE_DOCUMENT' packages/apps/DocumentsUI/AndroidManifest.xml
+grep -n -F 'android.intent.action.GET_CONTENT' packages/apps/DocumentsUI/AndroidManifest.xml
+grep -n -F 'android.intent.action.OPEN_DOCUMENT_TREE' packages/apps/DocumentsUI/AndroidManifest.xml
+grep -n -F 'setResult(AppCompatActivity.RESULT_CANCELED);' packages/apps/DocumentsUI/src/com/android/documentsui/BaseActivity.java
+grep -n -F 'void finishPicking(Uri... docs)' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'mActivity.setResult(FragmentActivity.RESULT_OK, intent, 0);' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'mActivity.finish();' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
 ```
 
-制作表格记录每种action的internal State、multiple/openable、默认位置、单/多结果载体和READ/WRITE/PERSISTABLE/PREFIX flags，特别解释GET_CONTENT为何不能take。
+分别推演“按返回键”“点中 leaf 但 final share check 失败”“last-access 任务尚未回调”“正常完成”四种路径的 resultCode；指出哪一行才是从默认取消跨到成功的提交点。
 
-## 113. macOS只读练习二：追root与目录加载
+## 3. Intent 归一成 State：action 相同之前，MIME 与选择模式已经分叉
+
+`PickActivity.includeState()` 先取 `intent.getType()`，为空才用 `*/*` 作为默认接受类型，再交给 `State.initAcceptMimes()`。这里有一个容易忽略的优先级：只要 Intent **存在** `EXTRA_MIME_TYPES` 这个 key，就直接采用 `getStringArrayExtra()` 的结果，而不是把数组追加到主 MIME；r48 没在这里拒绝 null 或空数组。调用者应发送非空数组，并把主 `type` 设成合理的共同上界，不能依赖选择器替它修复畸形输入。
+
+随后 action 被映射为内部常量：
+
+| 公开 action | 内部 action | `EXTRA_ALLOW_MULTIPLE` | `CATEGORY_OPENABLE` 参与 leaf 规则 | 常规默认位置 |
+|---|---|---:|---:|---|
+| OPEN_DOCUMENT | ACTION_OPEN | 读取 | 读取 | Recents |
+| GET_CONTENT | ACTION_GET_CONTENT | 读取 | 读取 | Recents |
+| CREATE_DOCUMENT | ACTION_CREATE | 忽略 | 读取 | 配置的默认 root，r48 默认为 Downloads |
+| OPEN_DOCUMENT_TREE | ACTION_OPEN_TREE | 忽略 | 不读取 | 设备 root |
+
+multiple 只是让 OPEN/GET 的 selection manager 可以形成多个 URI；它不会改变 CREATE 或 TREE 的完成方式。openableOnly 只在 OPEN/GET/CREATE 被记录，主要用于拒绝 virtual document；它不是对 Provider `openFile()` 成功的运行时探测。
+
+CREATE 还有一条刻意保留的双轨：列表筛选使用 `state.acceptMimes`，但 `setupLayout()` 传给 `SaveFragment` 的新建 MIME 是原始 `intent.getType()`，保存时又从 fragment arguments 取回该值。换言之，`EXTRA_MIME_TYPES` 能改变可见/可选的已有 leaf，却不替换实际 `createDocument()` 的 MIME；主 type 为空时，新建链甚至可能把 null 继续传向 Provider。规范调用者不能只填 EXTRA 数组而省略主 type。
+
+若用显式component绕开Manifest filter并传入未知action，映射链不会设置内部action，值保持0；后续没有可恢复位置而进入默认位置switch时会抛 `UnsupportedOperationException`。四个公开filter并不构成对显式启动输入的运行时校验。
+
+### 练习 2：画出 action、MIME、multiple、openable 与 CREATE MIME 双轨
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '185,360p' packages/apps/DocumentsUI/src/com/android/documentsui/roots/ProvidersCache.java
-sed -n '60,135p' packages/apps/DocumentsUI/src/com/android/documentsui/roots/ProvidersAccess.java
-sed -n '80,280p' packages/apps/DocumentsUI/src/com/android/documentsui/DirectoryLoader.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'String defaultMimeType = (intent.getType() == null) ? "*/*" : intent.getType();' packages/apps/DocumentsUI/src/com/android/documentsui/picker/PickActivity.java
+grep -n -F 'state.initAcceptMimes(intent, defaultMimeType);' packages/apps/DocumentsUI/src/com/android/documentsui/picker/PickActivity.java
+grep -n -F 'if (intent.hasExtra(Intent.EXTRA_MIME_TYPES)) {' packages/apps/DocumentsUI/src/com/android/documentsui/base/State.java
+grep -n -F 'acceptMimes = intent.getStringArrayExtra(Intent.EXTRA_MIME_TYPES);' packages/apps/DocumentsUI/src/com/android/documentsui/base/State.java
+grep -n -F 'if (Intent.ACTION_OPEN_DOCUMENT.equals(action)) {' packages/apps/DocumentsUI/src/com/android/documentsui/picker/PickActivity.java
+grep -n -F 'state.action = ACTION_CREATE;' packages/apps/DocumentsUI/src/com/android/documentsui/picker/PickActivity.java
+grep -n -F 'state.action = ACTION_GET_CONTENT;' packages/apps/DocumentsUI/src/com/android/documentsui/picker/PickActivity.java
+grep -n -F 'state.action = ACTION_OPEN_TREE;' packages/apps/DocumentsUI/src/com/android/documentsui/picker/PickActivity.java
+grep -n -F 'state.allowMultiple = intent.getBooleanExtra(' packages/apps/DocumentsUI/src/com/android/documentsui/picker/PickActivity.java
+grep -n -F 'state.openableOnly = intent.hasCategory(Intent.CATEGORY_OPENABLE);' packages/apps/DocumentsUI/src/com/android/documentsui/picker/PickActivity.java
+grep -n -F 'final String mimeType = intent.getType();' packages/apps/DocumentsUI/src/com/android/documentsui/picker/PickActivity.java
+grep -n -F 'final String mimeType = getArguments().getString(EXTRA_MIME_TYPE);' packages/apps/DocumentsUI/src/com/android/documentsui/picker/SaveFragment.java
 ```
 
-画出Provider发现、Manifest验证、system cache、roots observer、action过滤、authority executor、CancellationSignal、Cursor observer和客户端filter/sort，指出MediaDocuments root为何不能用于OPEN_TREE。
+构造 `type=image/*` 且 `EXTRA_MIME_TYPES={image/png,image/jpeg}` 的 CREATE Intent，分别写出“已有 leaf 筛选”和“新建 document MIME”读取哪一个字段；再推演只放 EXTRA 数组、不设主 type 的风险。
 
-## 114. macOS只读练习三：追CREATE与tree限制
+## 4. 调用者身份、恢复 State 与跨 profile 是三条策略线
+
+`BaseActivity.getState()` 只在没有 saved instance state 时创建新 `State`，读取 `EXTRA_LOCAL_ONLY`、excluded authorities、scoped-storage compat change，再调用 `includeState()`。旋转恢复时直接取 Parcelable State，不会按可能变化的 launch Intent 重新归一。更尖锐的是，r48 的 parcel字段没有写入/读回 `supportsCrossProfile`、`canShareAcrossProfile`、copy operation subtype与 `showHiddenFiles`；新State中的这些值回到默认值，`setupLayout()`也可能因supports为false而不再探测forwarder。已浏览工作profile的picker旋转后，因而可能失去跨profile交互，内部copy可丢子类型，隐藏文件显示策略也可回到false。调试重建不能把“恢复State”误写成“每个运行时策略都完整恢复”。
+
+调用包默认来自 `Activity.getCallingPackage()`。只有真实调用者本身是 system app 或 updated system app 时，`Shared.getCallingPackageName()` 才允许非空 `Intent.EXTRA_PACKAGE_NAME` 覆盖。这个选定包同时用于 last-access key 和 `EXTRA_EXCLUDE_SELF`：后者枚举该包声明的所有 Provider authority，放进 `state.excludedAuthorities`，root 筛选阶段逐 authority 排除。它排除的是 root 提供者，不是把结果列表里“本 App 创建的文件”逐行删除。
+
+`EXTRA_LOCAL_ONLY` 只要求 root 广告 `Root.FLAG_LOCAL_ONLY`。它是 Provider 的能力声明，不等于 POSIX 意义上的“文件就在某块本地磁盘”，也不检查网络实现是否偷偷访问远端。
+
+Android 11 的跨 profile tabs 让 OPEN/GET/CREATE/TREE 支持 profile 切换，内部 copy destination 例外。`canShareAcrossProfile` 来自清掉component/package后的Intent能否解析到系统cross-profile forwarder，不是泛化为“某个调用App有跨用户权限”；DocumentsUI自己可枚举的profile集合又受设备能力、profile group与 `INTERACT_ACROSS_USERS` 约束。`State.canInteractWith(userId)` 本质上是当前用户或 `canShareAcrossProfile`；root 的 `supportsCrossProfile()` 也不是 Provider 新 flag，而是 DocumentsUI 根据 library、downloads、phone-storage 等 derived type 推导。普通目录的单 profile 路径会提前报告 quiet/no-permission；双 profile 文本搜索与全局聚合却可能吞掉 secondary 的 RemoteException，只显示部分结果。最终 `PickActivity.canShare()` 又只复核 `canInteractWith`，不重新查询 quiet mode。于是“标签可见”“root 可查”“leaf 可分享”并不是一个原子许可判断。
+
+scoped-storage tree 限制由 compat change `141600225` 针对选定 calling package 计算，稍后与 document 的 `FLAG_DIR_BLOCKS_OPEN_DOCUMENT_TREE` 联合决定确认按钮。它不是 root 发现开关，也不影响 OPEN_DOCUMENT 返回单个 document URI。
+
+## 5. 初始位置有严格优先级；精确 root 定位会绕过普通 root 匹配
+
+picker 的位置决策顺序不是“有 initial 就一定用 initial”，而是：
+
+1. restored `DocumentStack` 已 initialized：恢复 root/directory，立即返回；
+2. 内部 `ACTION_PICK_COPY_DESTINATION`：调用 `loadHomeDir()`，不恢复调用包上次位置；
+3. feature 打开且 `EXTRA_INITIAL_URI` 是 root/document URI：尝试直接加载；
+4. 从以 calling package 为 key 的 LastAccessedProvider 读取 stack；
+5. initial异步加载失败仍先尝试last-access；该记录也不可用时才按action选择默认位置。
+
+名称 `loadHomeDir()` 容易造成误判。r48 的 overlayable `default_root_uri` 实际是 `content://com.android.providers.downloads.documents/root/downloads`，所以默认 CREATE 与内部 copy destination 通常落在 Downloads；OEM overlay 可以改它。OPEN/GET 默认 Recents，TREE 默认 device root。`loadHomeDir()` 与 `loadDeviceRoot()` 也会经 `loadRoot()`、`LoadRootTask` 调到 `getRootOneshot()`，并不经过普通 matching-roots 筛选；精确root定位的旁路不只属于 initial URI，本文特别强调后者，是因为它由外部调用者控制。
+
+initial root 走 `getRootOneshot()`，initial document 走 `LoadDocStackTask` 与 `findDocumentPath()`。只有 `/tree/<treeId>/document/<docId>` 这种 tree-document URI同时满足 `isDocumentUri()`，进入任务后才会取其中documentId、重建plain document URI再找完整路径；裸 `/tree/<treeId>` 只满足 `isTreeUri()`，不会被这里识别为initial document。得到的末项不是目录时会 pop 到父目录。DocumentsUI内部ArchivesProvider的URI不支持这条初始定位；原Provider中代表压缩包的普通document URI是另一回事。Provider不支持 `findDocumentPath()`、返回null或查询失败时，`onStackLoaded(null)` 会转入 `launchToDefaultLocation()`；picker在这里先异步重试last-access stack，只有该记录也不可用时才按action落到Recents、Downloads或device root。
+
+公开DocumentsContract说明主要把 `EXTRA_INITIAL_URI` 配给OPEN、CREATE与TREE；r48实现本身没有按action挡住GET_CONTENT，所以GET也会实际尝试它，这是实现扩展而非可跨版本依赖的契约。initial识别还用当前PackageManager把URI authority与DocumentsProvider authority直接比对，随后固定传 `UserId.DEFAULT_USER`；这个常量是DocumentsUI进程 `CURRENT_USER` 的别名，并未从URI解析source user。带 `10@authority` 之类user-info的跨profile URI通常不能被识别/定位，不能靠这个extra跳到另一profile。
+
+最关键的边界是：initial root/document 路径没有先调用 `getMatchingRoots()`。所以它能绕过 normal sidebar 对 local-only、MIME、exclude-self、EMPTY、CREATE-supports-create 的 root 筛选；精确root加载的 `onRootLoaded()` 只额外拒绝 TREE 中不支持 children 的 root。进入目录后，leaf 与当前目录仍受 `Config`、Save/PickFragment 规则约束，initial 不是自动选中，更不是授权。
+
+`LoadDocStackTask.buildStack()` 还有一个 r48 异常路径：`getRootOneshot()` 返回 null 后，构造错误消息却解引用 `root.userId`，会先触发 NullPointerException；外层 catch 仍把它归为构建 stack 失败并回落。因此日志里的 NPE 不证明 Provider 自己抛了空指针。
+
+last-access 恢复与 initial 不同：`DocumentStack.fromLastAccessedCursor()` 接收 `providers.getMatchingRootsBlocking(state)`，会服从普通 root 筛选。记录按 calling package 隔离；若完成时 stack root 属于非当前 profile，r48 写入的是 null stack，下次回默认位置，而不是跨 profile 自动恢复。
+
+这里判断的是 **stack root**，不是结果leaf的user。若用户停在当前profile的合成Recents，却从跨profile聚合结果选中另一个profile的document，仍可能保存当前profile Recents stack；不能把“结果URI含user-info”直接等同于“last-access一定清空”。
+
+### 练习 3：验证位置优先级、Downloads 默认值与 initial 绕过点
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '145,210p' packages/apps/DocumentsUI/src/com/android/documentsui/picker/PickFragment.java
-sed -n '35,110p' packages/apps/DocumentsUI/src/com/android/documentsui/picker/CreatePickedDocumentTask.java
-sed -n '145,180p' packages/apps/DocumentsUI/src/com/android/documentsui/DocumentsAccess.java
-sed -n '580,625p' frameworks/base/core/java/com/android/internal/content/FileSystemProvider.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'if (mState.stack.isInitialized()) {' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'if (launchHomeForCopyDestination(intent)) {' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'if (mFeatures.isLaunchToDocumentEnabled() && launchToInitialUri(intent)) {' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'initLoadLastAccessedStack();' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'Uri uri = intent.getParcelableExtra(DocumentsContract.EXTRA_INITIAL_URI);' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'DocumentsContract.isRootUri(mActivity, uri)' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'DocumentsContract.buildDocumentUri(uris[0].getAuthority(), docId);' packages/apps/DocumentsUI/src/com/android/documentsui/LoadDocStackTask.java
+grep -n -F 'final Path path = mDocs.findDocumentPath(docUri, mUserId);' packages/apps/DocumentsUI/src/com/android/documentsui/LoadDocStackTask.java
+grep -n -F '"Failed to load root on user " + root.userId' packages/apps/DocumentsUI/src/com/android/documentsui/LoadDocStackTask.java
+grep -n -F '<string name="default_root_uri" translatable="false">content://com.android.providers.downloads.documents/root/downloads</string>' packages/apps/DocumentsUI/res/values/config.xml
+grep -n -F 'providers.getMatchingRootsBlocking(state), activity);' packages/apps/DocumentsUI/src/com/android/documentsui/picker/LastAccessedStorage.java
+grep -n -F 'values.put(Columns.STACK, (Byte) null);' packages/apps/DocumentsUI/src/com/android/documentsui/picker/LastAccessedProvider.java
 ```
 
-解释root supportsCreate、cwd DIR_SUPPORTS_CREATE、BLOCKS_OPEN_DOCUMENT_TREE各在哪一层生效，并推演新建空document、返回URI、App写字节三个独立阶段。
+分别给出 restored stack、内部 copy、合法 initial root、失效 initial document、可恢复 last stack 五种输入，写出命中的第一条分支；再解释为何 initial 指向被 exclude-self 的 CREATE root 时，root 仍可能打开但保存按钮仍取决于当前目录能力。
 
-## 115. macOS只读练习四：验证persistable grant
+## 6. ProvidersCache：发现、结构验证、两层缓存和停止态加载不是一次快照
+
+`ProvidersCache.UpdateTask` 在 `UserIdManager.getUserIds()` 给出的profile inventory上逐一查询 `DocumentsContract.PROVIDER_INTERFACE`，并为每个user加一个DocumentsUI合成的Recents root。ProvidersCache自身没有State，也不在发现阶段调用 `canInteractWith`；交互筛选发生在后续UI/loader层。真实 Provider 必须有非空 authority，并在加载前通过四项结构检查：exported、grantUriPermissions、readPermission 为 MANAGE_DOCUMENTS、writePermission 也为 MANAGE_DOCUMENTS。通过后才注册 roots URI 的 descendant observer，并用 unstable `ContentProviderClient` 查询 roots Cursor。
+
+这里有两层容易混称“缓存”的状态：
+
+- `ContentResolver.getCache()/putCache()` 是长寿命 system cache。非 force 查询会优先采用它；普通 authority 返回零个 root 时不写这层缓存，MTP 与 Archives 是例外。注意“零行”不同于“返回一个带 `FLAG_EMPTY` 的 RootInfo”，后者是正常 root，照常缓存。
+- `mRoots` 是 DocumentsUI 进程内这一轮 UpdateTask 的结果。即使 Provider 返回零行，本轮仍把该 authority 的零项结果提交进去；之后普通 `getMatchingRootsBlocking()` 不会仅因 system cache 为空便自动重查。要等新的 UpdateTask、roots/package/profile 等事件，或 exact `getRootOneshot()` miss 才可能再次查询。
+
+正常 UpdateTask 跳过 `FLAG_STOPPED` 的 Provider，把 authority 记进 `mStoppedAuthorities`。名称容易误导：`getRootBlocking()`、`getRootsBlocking()`、`getMatchingRootsBlocking()` 会同步加载集合中**全部** stopped authorities；只有 `getRootsForAuthorityBlocking()` 做目标 authority 加载。`getRootOneshot()` 能直接查询一个 exact authority/root，但不等待 first-load latch，且查询时持有 `mLock`，一个慢 Binder 调用可阻住其他 cache 用户。
+
+`waitForFirstLoad()` 的 15 秒只包住 `CountDownLatch.await()`，不是整个 Provider 查询的超时。即使 latch 超时返回，随后 `loadStoppedAuthorities()` 仍能无期限卡在某个 Provider；oneshot 本来也不走这 15 秒。因此不能把“15 秒”当 root 加载端到端 SLA。
+
+roots observer 收到 authority URI 变化后解析 package，再启动一个 UpdateTask。该任务仍遍历所有 user/provider，只有目标 package 强制刷新，其他 authority可以复用 system cache；完成后整体替换 `mRoots`。多个 UpdateTask 都跑 THREAD_POOL，代码没有 generation 比较，因而较旧任务若最后完成，存在以旧快照覆盖新快照的竞态，这是由赋值顺序直接推得的实现风险。查询过程中异常会保留已收集的部分 roots、不写 system cache，但这些部分仍进入该任务的进程内结果。
+
+### 练习 4：追踪 Provider 发现、空结果、stopped 集合与 15 秒边界
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '2835,2920p' frameworks/base/core/java/android/content/ContentResolver.java
-sed -n '340,405p' frameworks/base/services/core/java/com/android/server/uri/UriGrantsManagerService.java
-sed -n '545,580p' frameworks/base/services/core/java/com/android/server/uri/UriGrantsManagerService.java
-sed -n '1075,1090p' frameworks/base/services/core/java/com/android/server/uri/UriGrantsManagerService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'final Intent intent = new Intent(DocumentsContract.PROVIDER_INTERFACE);' packages/apps/DocumentsUI/src/com/android/documentsui/roots/ProvidersCache.java
+grep -n -F 'final List<ResolveInfo> providers = pm.queryIntentContentProviders(intent, 0);' packages/apps/DocumentsUI/src/com/android/documentsui/roots/ProvidersCache.java
+grep -n -F 'if (!provider.exported) {' packages/apps/DocumentsUI/src/com/android/documentsui/roots/ProvidersCache.java
+grep -n -F 'if (!provider.grantUriPermissions) {' packages/apps/DocumentsUI/src/com/android/documentsui/roots/ProvidersCache.java
+grep -n -F 'android.Manifest.permission.MANAGE_DOCUMENTS.equals(provider.readPermission)' packages/apps/DocumentsUI/src/com/android/documentsui/roots/ProvidersCache.java
+grep -n -F 'resolver.registerContentObserver(rootsUri, true,' packages/apps/DocumentsUI/src/com/android/documentsui/roots/ProvidersCache.java
+grep -n -F 'final Bundle systemCache = resolver.getCache(rootsUri);' packages/apps/DocumentsUI/src/com/android/documentsui/roots/ProvidersCache.java
+grep -n -F 'if (roots.isEmpty() && !PERMIT_EMPTY_CACHE.contains(authority)) {' packages/apps/DocumentsUI/src/com/android/documentsui/roots/ProvidersCache.java
+grep -n -F 'success = mFirstLoad.await(15, TimeUnit.SECONDS);' packages/apps/DocumentsUI/src/com/android/documentsui/roots/ProvidersCache.java
+grep -n -F 'for (UserAuthority userAuthority : mStoppedAuthorities) {' packages/apps/DocumentsUI/src/com/android/documentsui/roots/ProvidersCache.java
+grep -n -F 'mRoots = mTaskRoots;' packages/apps/DocumentsUI/src/com/android/documentsui/roots/ProvidersCache.java
+grep -n -F 'AsyncTask.THREAD_POOL_EXECUTOR' packages/apps/DocumentsUI/src/com/android/documentsui/roots/ProvidersCache.java
 ```
 
-用“offer→temporary→take→persisted→release”五态画状态机，验证exact/prefix、read/write子集、512上限、10秒写盘，并标出重复take只touch时间却不改变mode、真实prune返回true的分支。
+推演一个 Provider 依次经历“stopped、首次同步访问、返回零行、发 roots 通知、第二次返回两行”的状态；逐步写出 system cache、mRoots 与 mStoppedAuthorities 的变化，并标出哪一段不受 15 秒约束。
 
-## 116. 易混点一：PERSISTABLE flag不等于已经持久化
+## 7. Root 筛选是 action 能力矩阵；精确定位是旁路
 
-DocumentsUI只offer；Activity结果先形成临时grant。调用App必须主动take，且只能take收到的read/write位。getPersisted能提供比“代码执行过take”更强的验证证据。
+所有普通 sidebar、last-access 和 MultiRoot 入口最终以 `ProvidersAccess.getMatchingRoots()` 做 action 级筛选。顺序虽不是公开契约，但每个条件都值得单独检查：
 
-## 117. 易混点二：CREATE不是写文件全过程
+| 条件 | 被排除的 root |
+|---|---|
+| CREATE / internal copy | 不支持 `Root.FLAG_SUPPORTS_CREATE` |
+| OPEN_TREE | 不支持 `Root.FLAG_SUPPORTS_IS_CHILD`，以及合成 Recents |
+| `EXTRA_LOCAL_ONLY=true` | 未广告 `FLAG_LOCAL_ONLY` |
+| OPEN / GET_CONTENT | 带 `Root.FLAG_EMPTY` |
+| action 不支持 cross profile | 非当前 user root |
+| MIME | root 与请求 MIME 两个方向都不 overlap |
+| `EXTRA_EXCLUDE_SELF=true` | authority 属于选定 calling package |
 
-Picker调用Provider createDocument得到新URI后立即返回；文件内容由调用App写入。创建成功、授权成功、写入成功是三个可分别失败的状态。
+CREATE **不会**因为 `FLAG_EMPTY` 被排除；空但可创建的 root 正是合理目标。TREE 所谓 `supportsChildren()` 实际映射的是 `FLAG_SUPPORTS_IS_CHILD`，意味着 Provider承诺能验证 descendant，不能只因 queryChildDocuments 可用就显示为树授权根。上一章的 MediaDocumentsProvider 四个分类 root 没有该 flag，因此普通 TREE 侧栏不会列出它们。
 
-## 118. 易混点三：tree不是任意目录递归通行证
+MIME overlap 做双向匹配，是为了兼容 root 广告宽类型、请求具体类型，或反过来的组合；这只是 root 粒度预筛，document leaf仍会再比较实际 MIME。`FLAG_EMPTY` 同样只是一份 Provider root 快照：OPEN/GET 隐藏它，CREATE/TREE不按它过滤，不代表 Provider 查询在点击时一定仍为空或非空。
 
-root要支持isChild，具体目录可能被R策略block，后代访问还要Provider验证。PREFIX描述授权形态，不绕过Provider的树结构和用户范围。
+把这张矩阵和上一节精确root定位对照，才能理解一个看似矛盾的现象：某 root 不出现在侧栏，却可能被合法 initial URI或配置默认root直接打开。旁路只改变定位，不替调用 App 产生 URI grant，也不跳过进入目录后的 leaf/current-directory policy。
 
-## 119. 复读纠偏记录
+侧栏root被选中后也还没到children查询。非Recents路径先由 `BaseActivity.changeRoot()` 切换root，再通过 `GetRootDocumentTask`查询 `content://authority/document/<rootDocumentId>`；只有拿到有效root document才push进stack并开始目录加载，失败则以空stack刷新错误状态。该root-document查询使用null CancellationSignal，也没有first-load的15秒总时限。于是“RootInfo已发现”与“root document可进入”是两个完成点。
 
-复读后修正十二点：GET_CONTENT仅临时read；OPEN/CREATE offer read/write/persistable；OPEN_TREE再加prefix；DocumentsUI不替App take；单选在data、多选在ClipData；CREATE只创建对象；replace不主动truncate；MediaDocuments roots因无supports-is-child不进tree；initial URI只是hint；DirectoryLoader下传signal但Provider可丢；persist写盘延迟10秒；重复take相同mode只touch内存时间而真实prune会返回true触发写盘。
+## 8. Recents 与 GlobalSearch 共用 MultiRoot，但失败、并发和过滤语义不同
 
-## 120. 本章小结与下一章
+`MultiRootDocumentsLoader` 先从 matching roots 中按 authority 分组，为每个 authority 建一个 `QueryTask`，再交给 authority executor。Semaphore 把同时运行的任务限制为普通设备 4 个、low-RAM 设备 2 个；这里限制的是 authority task，每个 task 内仍按 root 顺序查询。
 
-DocumentsUI把不可信Provider集合包装成可信用户决策：Intent先变State，ProvidersCache发现并筛root，DirectoryLoader以取消、观察、过滤和排序加载目录，选择/创建后以data或ClipData加最小action语义的grant flags返回；临时授权由系统交付，长期授权必须调用App显式take并由UriGrantsManager持久化。下一章继续深入Android UriGrantsManagerService的GrantUri、UriPermissionOwner、Activity/ClipData递归授权、prefix匹配、跨用户检查、撤销与持久文件恢复链。
+首轮只等待 500ms。到点后收集已经完成的 Cursor，合并并在客户端排序，同时把 `DocumentsContract.EXTRA_LOADING` 设成 `!allDone`。迟到 task 完成时，在 first pass 已结束的条件下调用 `onContentChanged()`，触发下一轮合并。因此首屏为空或少文件可以只是部分结果，不能直接归因于 Provider 无数据。每次 raw Cursor 还会注册 observer；Provider 必须为 Cursor 设置 notification URI，后续数据变化才会唤醒。迟到完成通知与 Provider 数据通知是两条不同触发源。
+
+不过framework对 `queryRecentDocuments()` 的契约明确不承诺change notifications。r48客户端即使给recent raw Cursor注册observer，也只能在具体Provider确实设置notification URI并发送匹配通知时获益，不能把这写成所有Recents都会实时刷新。
+
+这套 QueryTask 把 `null` 作为 CancellationSignal 传给 `client.query()`，没有底层取消。loader reset 也只是把 close 动作排到同一个 authority executor；如果该 executor 正被挂起 query 占住，关闭会延迟。单个 root 查询异常只 log 并跳过，不会给 `DirectoryResult.exception` 赋值，所以聚合页更可能显示部分或空结果，而不是统一错误页。
+
+Recents 的规则是：只选当前**所选 tab 的 `mUserId`**、LOCAL_ONLY、SUPPORTS_RECENTS roots；该 user 不可交互或 quiet 时才显式返回异常。每个 root 的 `RootCursorWrapper` 先最多暴露 64 行，MultiRoot随后才过滤 hidden、目录、请求 MIME 与 45 天以前的条目，最后做全局排序。因此某 root 的前 64 行大量被过滤时，不会回头补第 65 行以后；总结果也没有全局 64 上限。
+
+GlobalSearch 只取 LOCAL_ONLY 与 SUPPORTS_SEARCH roots，并故意忽略 storage root以减少与 media roots 的重复。它向 Provider加入 `QUERY_ARG_EXCLUDE_MEDIA=true`，但 Provider是否 honour 是另一回事。默认 `getRejectMimes()` 为 null，所以它不像普通 `DirectoryLoader` 文本搜索那样统一隐藏目录。其跨profile条件要按源码原样读：当State支持跨profile、某root也被DocumentsUI判为支持跨profile、query又不含display-name时，非所选 `mUserId` 的该root被忽略；有文本条件时不触发这条排除。其余root还要经过MultiRoot的 `canInteractWith` 门，不能把这一条件简化成所有profile的一条通则。每root失败仍只是log+skip。
+
+### 练习 5：观察 500ms 部分结果、每 root 64 条与全局搜索差异
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private static final int MAX_OUTSTANDING_TASK = 4;' packages/apps/DocumentsUI/src/com/android/documentsui/MultiRootDocumentsLoader.java
+grep -n -F 'private static final int MAX_OUTSTANDING_TASK_SVELTE = 2;' packages/apps/DocumentsUI/src/com/android/documentsui/MultiRootDocumentsLoader.java
+grep -n -F 'private static final int MAX_FIRST_PASS_WAIT_MILLIS = 500;' packages/apps/DocumentsUI/src/com/android/documentsui/MultiRootDocumentsLoader.java
+grep -n -F 'extras.putBoolean(DocumentsContract.EXTRA_LOADING, !allDone);' packages/apps/DocumentsUI/src/com/android/documentsui/MultiRootDocumentsLoader.java
+grep -n -F 'res[i] = client.query(uri, null, queryArgs, null);' packages/apps/DocumentsUI/src/com/android/documentsui/MultiRootDocumentsLoader.java
+grep -n -F 'if (mFirstPassDone) {' packages/apps/DocumentsUI/src/com/android/documentsui/MultiRootDocumentsLoader.java
+grep -n -F 'private static final int MAX_DOCS_FROM_ROOT = 64;' packages/apps/DocumentsUI/src/com/android/documentsui/RecentsLoader.java
+grep -n -F 'return !root.isLocalOnly() || !root.supportsRecents() || !mUserId.equals(root.userId);' packages/apps/DocumentsUI/src/com/android/documentsui/RecentsLoader.java
+grep -n -F 'return System.currentTimeMillis() - REJECT_OLDER_THAN;' packages/apps/DocumentsUI/src/com/android/documentsui/RecentsLoader.java
+grep -n -F 'if (!root.isLocalOnly() || !root.supportsSearch()) {' packages/apps/DocumentsUI/src/com/android/documentsui/GlobalSearchLoader.java
+grep -n -F 'return root.isStorage();' packages/apps/DocumentsUI/src/com/android/documentsui/GlobalSearchLoader.java
+grep -n -F 'queryArgs.putBoolean(DocumentsContract.QUERY_ARG_EXCLUDE_MEDIA, true);' packages/apps/DocumentsUI/src/com/android/documentsui/GlobalSearchLoader.java
+```
+
+设两个 authority：A 在 100ms 返回 10 行，B 在 800ms 返回 100 行且前 64 行有 60 个目录。分别推演 Recents 在首屏与迟到刷新后的可见数量上界；再说明同一数据放进 GlobalSearch 时为何“目录过滤”和“每 root 64 条”都不能照搬。
+
+## 9. DirectoryLoader：同一根下的查询、过滤、排序、取消和观察要分层看
+
+`AbstractActionHandler.LoaderBindings` 先做三分流：Recents 且未搜索用 `RecentsLoader`，Recents 且正在搜索用 `GlobalSearchLoader`，普通 root 才用 `DirectoryLoader`。最后一类再根据 search state 构造 search URI 或当前 document 的 children URI。因而“children 与 search 共用 DirectoryLoader”只对普通 root成立，不能覆盖 Recents。
+
+DirectoryLoader 的 executor 由 `ProviderExecutor.forAuthority(mRoot.authority)` 决定，避免同 authority 的普通目录加载无序踩踏。它先把 SortModel 参数装进 Bundle，搜索时再合并 query args；只有同时满足 State支持跨 profile、当前 root支持跨 profile、query args含 display-name 时，才收集所有 `canInteractWith` user进行普通 root 的跨 profile文本搜索。否则只查询 root所属 user。
+
+异常表现取决于 user 数量：
+
+- 单 user 会先检查 `canInteractWith`、quiet mode 与 root document是否为空，分别放入明确的 `DirectoryResult.exception`；
+- 多 user路径跳过这组统一预检，每个 user用自己的 ContentResolver查询；当前 user的 RemoteException继续抛出，secondary user的 RemoteException只记日志，剩余 Cursor仍可合并。
+
+每次后台加载创建一个 `CancellationSignal`，同一对象传给 `ContentProviderClient.query()`；`cancelLoadInBackground()` 调用它的 `cancel()`。但 signal到达 framework `DocumentsProvider.final query()` 后，r48 只把它传给 recent callback；document、children与search分支调用的 Provider方法签名不含 signal。因此普通 DirectoryLoader 的 UI/transport 有取消请求，不等于目标 Provider 的 children/search SQL会合作中止。上一节 MultiRoot 更直接传 null，两条链不能混写。
+
+查询成功后依次发生：在 raw Cursor注册 `LockingContentObserver`、用 `FilteringCursorWrapper`处理隐藏项、普通 search feature关闭时拒绝目录、photo picking只保留目录与图片，然后决定是否本地排序。排序判断有一个 r48 启发式缺陷：paging开启时只看 Cursor extras是否**直接含有** `QUERY_ARG_SORT_COLUMNS`，没有读取标准 `EXTRA_HONORED_ARGS`。Provider即使规范报告已处理排序，也可能被本地再排；反之只回显那个 key也可能错误跳过排序。MultiRoot则总在合并后本地排序。
+
+observer 只有在 Provider 为 Cursor设置了匹配 notification URI后才有意义；注册本身不会监听所有数据库变化。`onStartLoading()` 重用旧 result前还会把 Cursor从头走到尾做 stale检查，代价是 O(n)，异常或无法走完整便强制重载。新结果替换时关闭旧 DirectoryResult；reset注销 observer并关闭当前结果。archive目录另有一条 client持有路径，不能由普通目录结论推导其远端生命周期。
+
+### 练习 6：区分三种 loader、取消请求、客户端过滤与排序启发式
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'loader = new RecentsLoader(' packages/apps/DocumentsUI/src/com/android/documentsui/AbstractActionHandler.java
+grep -n -F 'loader = new GlobalSearchLoader(' packages/apps/DocumentsUI/src/com/android/documentsui/AbstractActionHandler.java
+grep -n -F 'return new DirectoryLoader(' packages/apps/DocumentsUI/src/com/android/documentsui/AbstractActionHandler.java
+grep -n -F 'return ProviderExecutor.forAuthority(mRoot.authority);' packages/apps/DocumentsUI/src/com/android/documentsui/DirectoryLoader.java
+grep -n -F 'mSignal = new CancellationSignal();' packages/apps/DocumentsUI/src/com/android/documentsui/DirectoryLoader.java
+grep -n -F 'Cursor c = userClient.query(mUri, /* projection= */null, queryArgs, mSignal);' packages/apps/DocumentsUI/src/com/android/documentsui/DirectoryLoader.java
+grep -n -F 'mSignal.cancel();' packages/apps/DocumentsUI/src/com/android/documentsui/DirectoryLoader.java
+grep -n -F 'cursor.registerContentObserver(mObserver);' packages/apps/DocumentsUI/src/com/android/documentsui/DirectoryLoader.java
+grep -n -F 'cursor = new FilteringCursorWrapper(cursor, mState.showHiddenFiles);' packages/apps/DocumentsUI/src/com/android/documentsui/DirectoryLoader.java
+grep -n -F 'cursor = new FilteringCursorWrapper(cursor, null, SEARCH_REJECT_MIMES);' packages/apps/DocumentsUI/src/com/android/documentsui/DirectoryLoader.java
+grep -n -F 'cursor.getExtras().containsKey(ContentResolver.QUERY_ARG_SORT_COLUMNS)' packages/apps/DocumentsUI/src/com/android/documentsui/DirectoryLoader.java
+grep -n -F 'cursor = mModel.sortCursor(cursor, mFileTypeLookup);' packages/apps/DocumentsUI/src/com/android/documentsui/DirectoryLoader.java
+grep -n -F 'for (int pos = 0; pos < cursor.getCount(); ++pos) {' packages/apps/DocumentsUI/src/com/android/documentsui/DirectoryLoader.java
+```
+
+选择一个普通 root，分别推演 children、文本 search、跨 profile文本 search三个 query路径；再把 Provider设为“收到 cancellation但其 callback没有 signal参数”，说明 UI停止、Binder返回与底层SQL停止为何是三个时刻。
+
+## 10. 用户点击不是统一的“选择”：目录、leaf、virtual、archive 与多选各有门
+
+picker `Config.isDocumentEnabled()` 先把目录无条件标为 enabled，因为四种 action都需要导航。是否“可进入”与是否“可作为结果”随后分开：`canSelectType()` 对目录返回 false；TREE与内部 copy destination甚至让列表中的任何 item都不可直接选，用户必须进入目录后点底部确认当前目录。
+
+leaf规则如下：
+
+| action | leaf enabled 条件 | 点击结果 |
+|---|---|---|
+| OPEN / GET_CONTENT | MIME匹配；若 openableOnly 则不能是 VIRTUAL_DOCUMENT | 经过自产 leaf 的跨 profile final check后完成 |
+| CREATE | 要求 `FLAG_SUPPORTS_WRITE`；若openableOnly则不能是VIRTUAL_DOCUMENT；最后MIME匹配 | 设为 replace target，等待保存/确认 |
+| OPEN_TREE / internal copy | leaf不作为列表选择结果 | 当前目录由底部 PickFragment完成 |
+
+这里没有直接拒绝 `FLAG_PARTIAL` 的分支，也没有在点击前试开文件。document flags是 Provider 对能力的声明；真实 `openFile()`、网络下载、认证或写入仍可稍后失败。`CATEGORY_OPENABLE` 只使 virtual leaf不可选，不是“所有 enabled leaf已经打开过”的证明。
+
+`PickActivity.onDocumentPicked()` 对目录执行导航；对 OPEN/GET leaf调用 `canShare()`，它只检查每个 `DocumentInfo.userId` 是否满足 `mState.canInteractWith()`，失败时显示 action-not-allowed。这个 final gate只属于 DocumentsUI自产的 OPEN/GET单选和多选：TREE确认直接 finish，CREATE成功直接 callback，外部 GET_CONTENT handler也不会经过它。
+
+archive是刻意的例外：在OPEN/GET中，MIME匹配的archive作为leaf可被返回，picker不把它内联打开，否则用户无法选择archive文件本身；注释同时明确不支持选择archive内部文件。这不表示每种action都可选择archive。`DocumentInfo.isContainer()` 在预览等路径可能比 `isDirectory()` 更宽，不能看到“容器”一词就假设点击一定push普通DocumentStack。
+
+多选只存在于 OPEN/GET。selection manager交给 `onDocumentsPicked()` 的列表会逐项做相同 `canShare` 检查，再转成 URI数组；它不会把一个失败项静默丢掉后返回其余项。正常 UI会阻止空选择，但 `onPickFinished(Uri... uris)` 本身没有零长度拒绝，这个防线属于上游交互而不是结果组装函数。
+
+## 11. CREATE 有三个提交点：创建对象、记录目录、返回 URI
+
+CREATE 页面先用 `SaveFragment.prepareForDirectory()` 检查当前 document 的 `isCreateSupported()`，对应 `Document.FLAG_DIR_SUPPORTS_CREATE`；不支持时保存按钮禁用。任意已有leaf被点中时，它必须有 `FLAG_SUPPORTS_WRITE`、通过openableOnly/virtual门且MIME匹配，随后成为replace target，并把输入框改成该leaf名称。若用户再修改名称，replace target被清空，重新走创建链；反过来，仅手工输入一个碰巧已存在的名称不会自动识别为replace，仍调用Provider的createDocument。
+
+真正创建由 `CreatePickedDocumentTask` 在当前 authority executor上运行：取 `stack.peek()` 为 parent，调用 `DocumentsAccess.createDocument()`；后者用 parent所属 user的 ContentResolver取得 unstable Provider client，再调用 `DocumentsContract.createDocument()`。这里没有 CancellationSignal，也没有事务把 UI、Provider对象与last-access行包在一起。
+
+`CheckedTask` 在prepare前、后台run前和主线程finish前各检查一次旧Activity是否destroyed，但Provider IPC期间没有持续取消检查。若配置重建或返回使 owner销毁发生在 Provider IPC进行中，后台 `createDocument()` 仍可能提交，而 `onPostExecute`不再调用 finish；用户看不到结果，Provider里却已有对象。即使 Activity仍活着，创建成功后任务也先同步写 LastAccessedProvider，再返回 URI给 `onPickFinished()`；若这次记录抛 RuntimeException，child已经创建，结果回调却可能缺席。这是三个提交点非原子的直接后果。
+
+Provider调用异常由 `DocumentsAccess.createDocument()` 捕获并变成 null。`CreatePickedDocumentTask.finish()` 对 null只显示长 Snackbar、恢复按钮状态，picker继续停留，不触发成功结果。对非 null URI则直接回调，没有重新 query document、校验 MIME或验证它真的位于parent下；Provider返回值的契约正确性仍由 Provider承担。
+
+跨 profile创建时，另一个 user的 ContentResolver返回 URI通常不带 user-info，DocumentsAccess用 parent document URI的 encoded authority补回例如 `10@authority`，让最终授权指向正确 source user。这不是把新对象复制到当前 profile。
+
+CREATE只创建一个 document对象，不写调用 App 的业务字节。Activity结果到达后，调用 App才用 resolver打开并写入；所以“CREATE result成功”与“文件内容写完”是两个完成点。反过来，replace也不调用 delete/create/truncate：确认后直接 `finishPicking(existingUri)`。调用 App随后以何种 mode打开、是否截断，是它自己的行为。
+
+### 练习 7：定位 CREATE 的三个提交点、跨用户修饰与 replace边界
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'setSaveEnabled(cwd != null && cwd.isCreateSupported());' packages/apps/DocumentsUI/src/com/android/documentsui/picker/SaveFragment.java
+grep -n -F 'new CreatePickedDocumentTask(' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F '.executeOnExecutor(getExecutorForCurrentDirectory());' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'Uri childUri = mDocs.createDocument(cwd, mMimeType, mDisplayName);' packages/apps/DocumentsUI/src/com/android/documentsui/picker/CreatePickedDocumentTask.java
+grep -n -F 'mLastAccessed.setLastAccessed(mOwner, mStack);' packages/apps/DocumentsUI/src/com/android/documentsui/picker/CreatePickedDocumentTask.java
+grep -n -F 'mCallback.accept(result);' packages/apps/DocumentsUI/src/com/android/documentsui/picker/CreatePickedDocumentTask.java
+grep -n -F 'Uri createUri = DocumentsContract.createDocument(' packages/apps/DocumentsUI/src/com/android/documentsui/DocumentsAccess.java
+grep -n -F '? createUri : appendEncodedParentAuthority(parentDoc, createUri);' packages/apps/DocumentsUI/src/com/android/documentsui/DocumentsAccess.java
+grep -n -F 'return null;' packages/apps/DocumentsUI/src/com/android/documentsui/DocumentsAccess.java
+grep -n -F 'if (mCheck.stop()) {' packages/apps/DocumentsUI/src/com/android/documentsui/base/CheckedTask.java
+grep -n -F 'finishPicking(replaceTarget.getDocumentUri());' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'mActions.finishPicking(mTarget.getDocumentUri());' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ConfirmFragment.java
+```
+
+画出 `createDocument → setLastAccessed → onPickFinished` 三节点时序，分别在每个节点后注入失败；写出 Provider对象、last-access行、resultCode三份状态。再说明 overwrite确认路径为何没有第一个节点。
+
+## 12. OPEN_TREE 选当前目录；blocked、hidden、prefix 是三种不同限制
+
+普通 root先要广告 `FLAG_SUPPORTS_IS_CHILD` 才进入 TREE侧栏。用户点击列表目录只是导航；`PickFragment` 的目标持续更新为当前工作目录，点“使用此文件夹”后弹 `ConfirmFragment`，由 `DocumentInfo.getTreeDocumentUri()` 构造 `/tree/<documentId>` 结果。这与 OPEN返回 `/document/<documentId>` 不同，也不是返回当前 children Cursor URI。
+
+Android 11 scoped-storage限制由两个条件联合生效：当前 document带 `FLAG_DIR_BLOCKS_OPEN_DOCUMENT_TREE`，并且 calling package的 compat restriction为 true，确认按钮才 disabled。ExternalStorageProvider的 `shouldBlockFromTree()` 对非USB存储阻止卷root、顶层 Download、顶层 Android；removable USB root明确例外。FileSystemProvider在生成目录行时把该判断变成 document flag。
+
+这不能与“隐藏目录”混为一谈。FileSystemProvider另以正则从普通 children/search结果隐藏精确的 `Android/data`、`Android/obb`、`Android/sandbox` 路径。顶层 Android本身可以在界面中出现但被禁止作为TREE目标，三个敏感子目录则可能根本不在普通列表；blocked selection与hidden discovery是两层机制。
+
+TREE结果请求 READ、WRITE、PERSISTABLE、PREFIX。system_server中的 prefix匹配只是 `Uri.isPathPrefixMatch()`：比较 scheme、authority和原子path segments，不理解 Provider内部 documentId层级。后续拿 tree URI访问 `/tree/<rootId>/document/<childId>` 时，DocumentsProvider的 `enforceTree()` 再调用 `isChildDocument(parent, child)`。因此安全性依赖两个门：URI grant命中和Provider descendant验证；`FLAG_SUPPORTS_IS_CHILD` 正是 Provider对第二个门的承诺。
+
+TREE并非 `MANAGE_EXTERNAL_STORAGE`。它只给目标 App相应 tree URI范围内、Provider认可后代的能力；Provider仍可按 document flags或方法实现拒绝write/delete/create。TREE确认也没有 OPEN/GET自产 leaf的 `canShare()` final loop，跨 profile可用性依赖此前UI状态与后续system_server检查，不能把那条 final check泛化到这里。
+
+## 13. 结果 Intent：data、ClipData、flags、last-access 与外部 handler 必须一起读
+
+DocumentsUI自产结果先构造空 Intent。恰好一个 URI只放 `intent.data`；多于一个才创建 `ClipData`，其 MIME description取 `mState.acceptMimes`，每个 item只放 URI，data保持 null。零个 URI时两者都为空，但函数仍会继续统计、加flags并设 `RESULT_OK`；正常选择UI承担“不以空数组调用”的上游约束。§3所述畸形 `EXTRA_MIME_TYPES=null` 在单选data路径未必当场暴露，多选却会把null数组交给 `ClipDescription` 构造器并立即抛出 `NullPointerException`；空数组与null不是同一条失败边。
+
+flags矩阵是：
+
+| 公开 action / 内部 copy 分支 | DocumentsUI自产结果 flags |
+|---|---|
+| GET_CONTENT | READ |
+| OPEN_DOCUMENT | READ、WRITE、PERSISTABLE |
+| CREATE_DOCUMENT | READ、WRITE、PERSISTABLE |
+| OPEN_DOCUMENT_TREE | READ、WRITE、PERSISTABLE、PREFIX |
+| internal copy destination | data仍携目标URI；不加URI grant flags，另附DocumentStack和operation type extras |
+
+这些是向system_server请求授予的模式，不是“每个操作已验证可用”。尤其OPEN也请求WRITE，但被选leaf可能没有 Provider写能力；调用 App应按自己的操作、结果 flags和Provider行为处理失败，不能无条件以 `rw` 打开。
+
+除CREATE任务自己写last-access外，普通 `finishPicking()` 先启动 `SetLastAccessedStackTask`，等它在当前 authority executor写完后才调用 `onPickFinished()`。于是用户点击与结果交付之间存在数据库关键路径；旧 Activity被销毁或写入异常，都可能保留默认取消。TREE和replace也走这条路径。导航、Back与取消本身不写last-access。
+
+GET_CONTENT还有一条完全不同的“其他 App”路径。RootsFragment可以展示可处理原 Intent的外部 Activity；用户选择后，ActionHandler复制原 Intent，清除 READ、WRITE、PERSISTABLE、PREFIX四类URI flags，加入 `FLAG_ACTIVITY_FORWARD_RESULT` 和 `FLAG_ACTIVITY_PREVIOUS_IS_TOP`，再启动外部组件并结束DocumentsUI。外部 Activity直接成为原调用者的结果生产者：DocumentsUI不再组装data/ClipData、不做自产结果的read-only限制、不写普通finishPicking的last-access，也不审查外部最终URI。故“GET只返回READ”必须限定为DocumentsUI自产结果。
+
+### 练习 8：验证结果容器、四类URI grant flags与 GET_CONTENT 转发
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'if (uris.length == 1) {' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'intent.setData(uris[0]);' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F '} else if (uris.length > 1) {' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'intent.setClipData(clipData);' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'if (mState.action == ACTION_GET_CONTENT) {' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F '| Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'intent.putExtra(Shared.EXTRA_STACK, (Parcelable) mState.stack);' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'new SetLastAccessedStackTask(' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'final int flagsRemoved = Intent.FLAG_GRANT_READ_URI_PERMISSION' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'intent.setFlags(intent.getFlags() & ~flagsRemoved);' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'intent.addFlags(Intent.FLAG_ACTIVITY_FORWARD_RESULT);' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+grep -n -F 'mActivity.startActivity(intent);' packages/apps/DocumentsUI/src/com/android/documentsui/picker/ActionHandler.java
+```
+
+分别给 `onPickFinished` 传0、1、2个URI，记录data、ClipData与resultCode；再比较DocumentsUI自产GET和外部handler GET，指出谁决定最终flags、谁负责last-access、谁接受system_server的转授校验。
+
+## 14. ActivityTaskManager 在结果投递前安装临时 grant，但不验证业务操作
+
+DocumentsUI本身不调用 `grantUriPermission()`。当它 `finish()` 时，`ActivityTaskManagerService.finishActivity()` 先拒绝结果 Intent携带file descriptors，解析目标 `r.resultTo`，随后在不持全局锁时调用 `collectGrants(resultData, target)`。UriGrantsManager递归检查顶层 `data`、`ClipData`每个item的 URI；item没有URI但含嵌套Intent时继续递归，并沿用顶层result Intent的mode flags，而不是改用嵌套Intent自己的flags。普通 extras不会被扫描，所以 `EXTRA_INITIAL_URI` 和internal copy的 stack extras不会凭空变成grant。
+
+检查使用finish调用者UID，也就是DocumentsUI进程身份，解析目标UID与source user，并读取Provider元数据：`exported`、顶层权限与 `<path-permission>` 参与判断目标或转授者是否已直接持权，`grantUriPermissions` 与 `<grant-uri-permission>` 生成的 `uriPermissionPatterns` 决定该URI是否允许转授；`exported=false` 本身不是URI grant的绝对否决。非content URI、找不到Provider，或目标对basic grant已能直接访问时，检查通常返回“不需新增grant”，结果仍可能交付；除basic cross-user特例外，Provider禁止转授，或DocumentsUI既无直接权限也无足够强度的既有URI grant，才会抛出 `SecurityException` 中止正常finish路径。任何URI能进入结果字符串，都不等于调用方最终获得了可用能力。
+
+`ActivityRecord.finishActivityResults()` 的顺序很关键：先调用 `grantUriPermissionUncheckedFromIntent(resultGrants, resultTo.getUriPermissionsLocked())`，再 `resultTo.addResultLocked(...)`。也就是说，正常路径在Activity结果排队给调用方之前已把grant绑定到接收ActivityRecord的 `UriPermissionOwner`。这解释了调用方回调一到即可用URI，而不是回调后另有一个竞态授权窗口。
+
+这份 owned grant仍是临时能力。接收ActivityRecord离开history时，其 owner会被移除并撤相应模式；进程/Activity生命周期与具体owner关系将在下一章细拆。若结果提供PERSISTABLE，调用 App可在临时grant仍有效时显式take，把允许的位提升为持久状态；单纯保存URI字符串没有这种效果。
+
+结果 flags只决定授权模式候选，system_server不调用 `queryDocument()` 检查 `Document.COLUMN_FLAGS`，也不试执行 `openFile/create/delete`。所以权限链成功只回答“这个UID能否尝试该URI的read/write”，不回答对象存在、网络在线、Provider无bug或具体操作受支持。
+
+对TREE还要再区分 grant匹配与Provider校验：UriGrantsManager按原子URI path segment做prefix命中；真正调用DocumentsProvider时，`enforceTree()` 对不同parent/child documentId调用 `isChildDocument()`。前者不是文件路径递归算法，后者也不能弥补一个被授错authority/source-user的grant。
+
+## 15. takePersistableUriPermission：exact/prefix 不拼权限，重复 take 也未必写盘
+
+调用 App通常从结果 flags中只保留 READ/WRITE：
+
+`val takeFlags = result.flags and (FLAG_GRANT_READ_URI_PERMISSION or FLAG_GRANT_WRITE_URI_PERMISSION)`
+
+随后对需要跨重启保存的OPEN/CREATE/TREE结果调用 `ContentResolver.takePersistableUriPermission(uri, takeFlags)`。DocumentsUI自产GET结果本身不新增PERSISTABLE offer；若该UID事先没有同一规范URI与source user下可持久化的exact/prefix permission，随后以READ/WRITE take会抛 `SecurityException`。
+
+ContentResolver先从可能带 `10@authority` 的URI解析source user，再移除embedded user-info，把普通URI与userId分别交给UriGrantsManager。对跨profile URI，调用者不能先删掉 `10@` 再take；否则 `resolveUserId()` 退回resolver所属user，通常与原grant的source user不同而查找失败。isolated进程禁止take；公开入口只接受READ/WRITE两位，夹带PREFIX、PERSISTABLE或其他flag会在参数检查时报错。
+
+服务在目标UID的map中分别找同URI的exact key和prefix key。这里的prefix lookup仍用传入URI构造带prefix位的**同URI key**，不会像一般访问检查那样遍历祖先prefix grant；TREE应对返回的 `/tree/<id>` 本身take，不能拿后代 `/tree/.../document/...` 代替。请求的所有read/write位必须被某一个候选的 `persistableModeFlags` 完整覆盖，`exact只读 + prefix只写`不会拼成一次READ|WRITE成功。如果exact和prefix各自都完整覆盖，r48会同时对两份permission执行take，而不是只选一个。
+
+`UriPermission.takePersistableModes()` 只把已offer的交集OR进 `persistedModeFlags`。只要持久位非零，它每次都会把 `persistedCreateTime` 更新为当前时间；返回值却只表示mode bits是否变化。于是重复take相同mode会更新内存时间，但如果没有mode变化、也没有prune，服务不会调用schedule，新的时间可能在重启前从未写到磁盘。不能把“touch时间”直接等同于“立即刷新持久文件”。
+
+每UID最多保留512份persisted grants。`maybePrunePersistedUriGrantsLocked()` 先以整个permission map大小做快捷判断，真正收集的却只有 `persistedModeFlags != 0` 的项目；超过512才按时间排序、释放最旧项。map很大只会更早进入扫描，不会把未持久临时grant算进512或误删它们。mode变化或真实prune发生后，服务会在没有待处理写消息时排一个10秒后的任务；窗口内后续变更合并写入且不重置期限，最终使用AtomicFile。system_server若在这段延迟窗口内重启或异常终止，最新变更尚未落盘。
+
+`releasePersistableUriPermission()` 只清持久部分，文档明确其他non-persistent grant保留；它检查传入同URI的exact/prefix key，不遍历祖先prefix。`getPersistedUriPermissions()`只返回授给调用包的incoming且已taken项目，不等于当前所有临时URI能力，也不含该包作为Provider发出的outgoing列表。持久记录跨重启恢复时会核对authority对应Provider仍属于source package，并确认target package仍能解析出UID；恢复后的实际使用仍可能因user未解锁、Provider或包移除、对象删除或Provider运行时拒绝而失败。
+
+### 练习 9：验证 user-info、exact/prefix、512上限与10秒写盘
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'ContentProvider.getUriWithoutUserId(uri), modeFlags, /* toPackage= */ null,' frameworks/base/core/java/android/content/ContentResolver.java
+grep -n -F 'resolveUserId(uri));' frameworks/base/core/java/android/content/ContentResolver.java
+grep -n -F 'enforceNotIsolatedCaller("takePersistableUriPermission");' frameworks/base/services/core/java/com/android/server/uri/UriGrantsManagerService.java
+grep -n -F 'Preconditions.checkFlagsArgument(modeFlags,' frameworks/base/services/core/java/com/android/server/uri/UriGrantsManagerService.java
+grep -n -F 'UriPermission exactPerm = findUriPermissionLocked(uid,' frameworks/base/services/core/java/com/android/server/uri/UriGrantsManagerService.java
+grep -n -F 'UriPermission prefixPerm = findUriPermissionLocked(uid,' frameworks/base/services/core/java/com/android/server/uri/UriGrantsManagerService.java
+grep -n -F 'if (!(exactValid || prefixValid)) {' frameworks/base/services/core/java/com/android/server/uri/UriGrantsManagerService.java
+grep -n -F 'persistedModeFlags |= (persistableModeFlags & modeFlags);' frameworks/base/services/core/java/com/android/server/uri/UriPermission.java
+grep -n -F 'persistedCreateTime = System.currentTimeMillis();' frameworks/base/services/core/java/com/android/server/uri/UriPermission.java
+grep -n -F 'private static final int MAX_PERSISTED_URI_GRANTS = 512;' frameworks/base/services/core/java/com/android/server/uri/UriGrantsManagerService.java
+grep -n -F 'if (perm.persistedModeFlags != 0) {' frameworks/base/services/core/java/com/android/server/uri/UriGrantsManagerService.java
+grep -n -F 'mH.sendMessageDelayed(mH.obtainMessage(PERSIST_URI_GRANTS_MSG),' frameworks/base/services/core/java/com/android/server/uri/UriGrantsManagerService.java
+grep -n -F '10 * DateUtils.SECOND_IN_MILLIS);' frameworks/base/services/core/java/com/android/server/uri/UriGrantsManagerService.java
+grep -n -F 'mGrantFile.startWrite(startTime);' frameworks/base/services/core/java/com/android/server/uri/UriGrantsManagerService.java
+grep -n -F 'mPackageName, true /* incoming */, true /* persistedOnly */' frameworks/base/core/java/android/content/ContentResolver.java
+```
+
+构造exact只读、prefix只写两份offer，证明一次READ|WRITE为何失败；再令两者都提供READ|WRITE，推演服务会修改几份permission。最后比较首次take、重复相同take、超过512触发prune三种情况下的内存时间、schedule与磁盘状态。
+
+## 16. 用完成点矩阵排错，并把 grant owner 深入留给下一章
+
+遇到“选择器里看不见、点不了、返回失败、重启失效”，可按下面的最短矩阵定位：
+
+| 症状 | 第一检查点 | 关键反例 |
+|---|---|---|
+| root不出现 | ProvidersCache结构门、system/in-process cache、matching roots | initial URI仍可能直接打开；`FLAG_EMPTY`不是零个root |
+| 进入root却无内容 | root document query、Directory/Recents/GlobalSearch分流、Provider Cursor | 500ms首屏可为partial；聚合异常可只表现为空 |
+| Recents少结果 | 每root先截64、45天窗口、目录/MIME/hidden过滤 | 截断发生在过滤前，合并后没有全局64上限 |
+| 搜索少结果 | 普通root还是GlobalSearch、display-name跨profile条件、root能力与storage排除 | GlobalSearch无每root64限制且不统一滤目录，secondary失败可被吞 |
+| leaf灰掉 | MIME、VIRTUAL+OPENABLE、CREATE的SUPPORTS_WRITE | enabled不保证真实open/write成功 |
+| TREE按钮灰掉 | compat restriction与BLOCKS flag | hidden敏感目录与blocked当前目录不是同一规则 |
+| CREATE后无回调 | Provider create、last-access写入、旧Activity是否destroyed | 对象可能已创建；replace根本不创建或截断 |
+| 收到RESULT_OK却URI打不开 | 自产还是外部GET结果、data/ClipData flags、owner存活、source user与Provider对象 | 正常自产结果在投递前已过ATMS检查，但flags不验证Provider业务方法 |
+| 重启后失效 | 是否offer PERSISTABLE、是否及时take、请求mode覆盖 | URI字符串、重复take内存touch都不是磁盘提交证明 |
+
+再补三个容易被日志误导的边界。第一，普通root点击后还要查询root document：`BaseActivity.changeRoot()` 之后的 `GetRootDocumentTask` 用 document URI取真实行，成功才push/open；root出现在侧栏不代表这一步必成，且该查询没有CancellationSignal。第二，roots observer与directory Cursor observer是两条刷新链；前者更新package snapshot并广播侧栏，后者依赖Cursor notification URI重启内容loader。第三，RootsMonitor判断当前root是否还存在时用不编码user的root URI，另一profile同authority/rootId可能掩盖当前profile root消失；不要把它当跨profile状态的强一致仲裁器。
+
+本章的核心不是背四组flags，而是守住分层：Intent/State决定候选，Provider Cursor决定可见快照，Config决定UI可选性，Provider方法决定对象操作，ActivityTaskManager决定临时能力，显式take才决定持久位。任一层的“支持”都不能替下一层作保证。
+
+下一章进入 `UriGrantsManagerService` 内部，继续追 `GrantUri`、`UriPermissionOwner`、Activity与ClipData递归授权、prefix匹配、跨用户校验、撤销以及持久文件恢复，把本章停在“结果已交付/调用方已take”的边界继续向system_server收束。

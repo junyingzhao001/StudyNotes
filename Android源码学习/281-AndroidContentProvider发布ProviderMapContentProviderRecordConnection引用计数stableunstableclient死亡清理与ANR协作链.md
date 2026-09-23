@@ -1,578 +1,422 @@
-# 281 Android ContentProvider发布：ProviderMap、ContentProviderRecord/Connection引用计数、stable/unstable client、死亡清理与ANR协作链
+# 281 Android ContentProvider 发布链：ProviderMap、ContentProviderRecord/Connection、引用计数、死亡清理与 ANR 协作
 
-## 1. 本章目标
+## 1. 先看结论：拿到 Provider 不是一次查表，而是跨进程租约的建立与收束
 
-第280章解释了URI能力怎样授权，本章转向Provider本身的运行时生命周期：客户端怎样按authority取得`IContentProvider`，system_server怎样启动宿主并等待发布，两端怎样记stable/unstable引用，Provider或client死亡时为什么有不同后果，以及ContentProviderClient怎样把长时间无响应上报到ANR链。
+本文固定在 Android 11 `android-11.0.0_r48`，`frameworks/base` 提交为 `1d9b9ab57d844b18b3b1b4297725141e7788109b`。上一章追到 URI grant 如何在 system_server 落账；本章回到更底层的问题：客户端执行一次 ContentResolver 调用之前，authority 怎样找到 Provider，冷进程怎样完成安装和发布，调用期间谁保护宿主进程，Binder 死亡后又由谁承担后果？
 
-## 2. Android 11版本边界
+先把完整链压成八个完成点：
 
-本文依据本地`android-11.0.0_r48`。10秒publish timeout、20秒ready timeout、客户端1秒retain、`ContentProviderConnection`双计数和stable依赖死亡策略均为该tag实现；新版Android的AMS拆分类、attribution和Provider超时策略可能不同。
+1. `ApplicationContentResolver` 把 authority 拆成规范 authority 与 userId，`ActivityThread` 先查本进程缓存；
+2. 缓存未命中时，客户端按 `(authority,userId)` 取得一把长期驻留的小锁，再向 AMS 请求 Holder；
+3. AMS 先做调用者、跨用户、Provider 可能访问性与 association 检查，再查全局 singleton / 用户级 ProviderMap；
+4. 已发布的远端 Provider 立即建立或累加 `ContentProviderConnection`，同步更新 LRU/OOM 后返回 Binder；可本地运行的 Provider 只返回元数据，让调用进程自行实例化；
+5. 未发布时，AMS 解析 ProviderInfo、决定 singleton 与宿主进程、登记 launching demand，并把调用者连接标成 waiting；
+6. 宿主 attach 后收到 ProviderInfo 列表，先实例化 Provider、执行 `attachInfo()` / `onCreate()`，再批量 `publishContentProviders()`；
+7. publish 把可信的 ContentProviderRecord 映射到 class 与全部 authority，在记录锁内写 Binder 与 ProcessRecord、唤醒等待者；
+8. 客户端安装 Binder、聚合引用；最后一份引用经过一秒缓冲才从客户端缓存移除，服务端连接、外部句柄、进程死亡和 ANR 上报各有独立终点。
 
-## 3. 先分清三个进程
+这些步骤不是一个原子事务。ProviderMap 中可以已有“正在启动但尚无 Binder”的记录；等待者超时可以返回 null，却留下 connection、launching 记录和隐式可见性；Provider 可以先于 `Application.onCreate()` 对外发布；一次 publish 也可能只完成同一进程中的部分 Provider。排查时不能只问“Provider 在不在”，而要分别问：记录是否存在、宿主是否活着、Binder 是否发布、调用者租约是否仍在、哪一层已经超时或死亡。
 
-调用方App进程持有`ContentResolver`、`ActivityThread`本地缓存和Provider Binder代理；system_server中的AMS保存全局Provider/连接账并负责拉起与OOM调整；Provider宿主App进程实例化`ContentProvider`并发布Transport Binder。Provider与调用方也可能同进程，此时不经过远端Binder数据路径。
+本章中的 stable / unstable 也不是两档 Binder 或 OOM 强度。两者指向同一个 `IContentProvider`，OomAdjuster 遍历 Connection 时并不检查引用类型；差异主要发生在 Provider 死亡时：stable 依赖可能连带终止客户端，unstable 依赖则允许客户端收到死亡通知并重新获取。
 
-## 4. 四类核心对象
+## 2. 两端对象图：authority、class、Binder、Connection 与引用聚合不能混成一张表
 
-服务端`ContentProviderRecord`代表一个Provider组件及宿主状态，`ContentProviderConnection`代表一个Framework客户端进程对它的依赖，`ProviderMap`按authority和组件索引；客户端`ProviderClientRecord`缓存Binder与authority，`ProviderRefCount`聚合本进程stable/unstable使用次数。
+system_server 的 `ProviderMap` 有四张索引：singleton 按 authority、singleton 按 ComponentName，以及按 userId 分片的 authority/class 两组 Map。查找总是先查全局 singleton，再查指定用户。写入依据 `ContentProviderRecord.singleton` 选择全局或用户表，用户表的 key 来自记录中 Provider 应用 UID，而不是当前请求参数的一份旁路标签。
 
-## 5. 源码地图
+同一个 Provider class 可以声明用分号分隔的多个 authority。class 索引回答“这个组件是否已有唯一的 ContentProviderRecord”，authority 索引回答“这个名字当前路由到哪个记录”。冷启动时只会先放入本次请求的 authority，publish 才把 `dst.info.authority` 中全部名字补齐；因此“按 class 已有记录”“某个别名可查”“所有别名已发布”是三个不同状态。
 
-```text
-frameworks/base/core/java/android/content/ContentResolver.java
-frameworks/base/core/java/android/content/ContentProviderClient.java
-frameworks/base/core/java/android/content/ContentProvider.java
-frameworks/base/core/java/android/app/ActivityThread.java
-frameworks/base/services/core/java/com/android/server/am/ProviderMap.java
-frameworks/base/services/core/java/com/android/server/am/ContentProviderRecord.java
-frameworks/base/services/core/java/com/android/server/am/ContentProviderConnection.java
-frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
-frameworks/base/services/core/java/com/android/server/am/OomAdjuster.java
-```
+服务端核心对象各管一件事：
 
-## 6. App入口不直接解析组件
+| 对象 | 主要身份 | 代表什么 | 不代表什么 |
+|---|---|---|---|
+| `ContentProviderRecord` | component + ProviderInfo + user/singleton | 一代 Provider 的发布、宿主、连接与 launching 状态 | 不保证 `provider` Binder 已非空 |
+| `ContentProviderConnection` | 一个 client ProcessRecord → 一个 CPR | framework 客户进程对该 CPR 的 stable/unstable 服务端账 | 不是每个 Java Cursor 一项 |
+| external handle | token 或匿名计数 → CPR | 没有 ProcessRecord 的系统侧 demand 与 OOM 保护 | 没有 stable 客户端死亡语义 |
+| `ContentProviderHolder` | ProviderInfo + 可选Binder + 可选connection | 一次获取返回给调用端的快照 | 不是长期真相或死亡监听本身 |
 
-`ContentResolver`从content URI取得authority，交给`ContextImpl.ApplicationContentResolver`，后者调用`ActivityThread.acquireProvider(context, auth, userId, stable)`。客户端先查进程内缓存，miss才通过AMS按authority解析ProviderInfo并可能启动进程。
+客户端也有四类索引。`mProviderMap` 以 `(authority,userId)` 指向 `ProviderClientRecord`；`mProviderRefCountMap` 以 Provider Binder identity 指向 `ProviderRefCount`；`mLocalProviders` 以本地 Binder 指向本地记录；`mLocalProvidersByName` 以 ComponentName 去重本地实例。多个 authority 可以指向同一 Binder 与同一个引用聚合对象，释放时不能按 authority 猜引用数。
 
-## 7. authority还带用户语义
+对象边界决定了诊断顺序：先用 ProviderMap 判断名字路由，再用 CPR 看 `proc/provider/launchingApp`，再用 Connection 看 `s/u/WAITING/DEAD`，最后回到客户端 Binder 引用聚合。只看某一端容易出现“服务端还有 Connection，但客户端已经没有可释放 Holder”或“客户端 authority 缓存仍有项，但 Binder 已死”的错觉。
 
-客户端先从可能嵌入user-id的authority解析userId，再去掉user-id字符串；本地`ProviderKey`由标准authority与userId组成。同一`media` authority在用户0和工作资料不是同一个缓存项。
-
-## 8. stable与unstable先给直觉
-
-stable表示调用方把自身命运与Provider宿主绑定：宿主异常死亡时AMS可杀依赖它的非persistent客户端，维护“已取得稳定服务就不应无声消失”的合同。unstable允许Provider死而客户端继续活，但客户端必须处理`DeadObjectException`并重新获取。
-
-## 9. stable不是更可靠的Binder协议
-
-两者最终调用同一个`IContentProvider` Binder；没有stable专用transaction，也不会让Provider代码不崩。区别在AMS连接计数、宿主OOM保护和死亡清理策略，属于生命周期合同而非传输层重试开关。
-
-## 10. ContentProviderRecord保存什么
-
-它固定保存ProviderInfo、ApplicationInfo、组件名、UID、singleton与noReleaseNeeded；运行态保存provider Binder、宿主`proc`、正在拉起的`launchingApp`、客户端connections、external handles与重启次数。一个对象连接“包管理声明”和“当前进程实例”。
-
-## 11. ProviderMap为何有四张表
-
-singleton Provider按authority和ComponentName各一张全局表；普通Provider按userId再各有authority表和组件表。authority用于客户端查找，组件用于同一个Provider类多authority去重、进程发布和包级清理。
-
-## 12. 全局与客户端双层账图
-
-```mermaid
-flowchart LR
-    CR["ContentResolver"] --> AT["ActivityThread客户端缓存"]
-    AT --> PK["ProviderKey: authority + userId"]
-    PK --> PCR["ProviderClientRecord"]
-    PCR --> B["IContentProvider Binder"]
-    B --> PRC["ProviderRefCount: stable/unstable"]
-    AT -->|"getContentProvider"| AMS["AMS / ProviderMap"]
-    AMS --> CPR["ContentProviderRecord"]
-    CPR --> CPC["ContentProviderConnection"]
-    CPC --> CLIENT["client ProcessRecord"]
-    CPR --> HOST["provider ProcessRecord"]
-    HOST -->|"publish"| B
-```
-
-## 13. 服务端authority查找先看singleton
-
-`ProviderMap.getProviderByName(name,user)`先查`mSingletonByName`，再查指定user表；组件查询同理。singleton真正运行在system user，但只有满足`isSingleton`与`isValidSingletonCall`的调用才可复用，不能把“全局表”理解成任何UID都能访问。
-
-## 14. 读操作也可能创建空user map
-
-`getProviderByName`内部调用`getProvidersByName(userId)`，不存在时会创建空HashMap放进SparseArray。它不产生Provider记录，但大量无效user查询理论上可留下空容器，属于r48实现细节，不是“查询纯只读”的严格数据结构语义。
-
-## 15. 客户端先走existing快路
-
-`acquireExistingProvider`在`mProviderMap`锁内找ProviderKey；找到后先用`isBinderAlive()`排除明显死亡Binder，再在存在`ProviderRefCount`时增加对应引用。命中可省去AMS、PackageManager解析和进程启动。
-
-## 16. 同authority获取锁避免本进程惊群
-
-cache miss后`getGetProviderLock(auth,userId)`为同一键提供长期复用锁，本进程多个线程只让一个进入AMS慢路径。它不覆盖不同进程，也不能替代安装阶段对Binder身份的最终去重。
-
-```java
-synchronized (getGetProviderLock(auth, userId)) {
-    holder = ActivityManager.getService().getContentProvider(
-            getApplicationThread(), c.getOpPackageName(), auth, userId, stable);
-}
-```
-
-## 17. AMS入口先绑定真实调用进程
-
-普通App必须传非空`IApplicationThread`，AMS用它查`ProcessRecord`；找不到就SecurityException。callingPackage还要经AppOps `checkPackage(uid, package)`核对，isolated caller被拒绝，防止伪造包名或脱离已登记进程取得Provider。
-
-## 18. 先查已发布记录
-
-`getContentProviderImpl`先按authority/user查ProviderMap；若普通user未找到，再尝试system user singleton并重新验证调用合法性。记录存在且`cpr.proc`未killed才视为running，记录存在不等于Binder当前可用。
-
-## 19. killedByAm但尚未完成死亡清理
-
-若宿主已被AMS标记killed/killedByAm而`appDiedLocked`尚未到达，源码保存`dyingProc`并等待旧实例清理，避免立刻把旧ContentProviderRecord错误复用于新客户端。必要时复制一份只含静态声明的新record隔离两代实例。
-
-## 20. canRunHere触发本地实例
-
-Provider声明multiprocess，或其processName与调用进程相同，并且UID相同，`canRunHere`才成立。AMS返回只含ProviderInfo、`provider=null`且无Connection的Holder，让调用方本进程自行实例化；这不是把远端Binder搬进来。
-
-## 21. 本地Provider不建跨进程Connection
-
-同进程调用最终可得到`ContentProvider.Transport`的本地Binder优化，AMS不需要通过connection保护另一个宿主进程。ActivityThread把本地Provider永久放入`mLocalProviders`与`mLocalProvidersByName`，不走普通远端引用归零移除。
-
-## 22. instant app隔离再检查一次
-
-即使已有运行记录，AMS仍用PackageManager对当前user解析authority；解析结果对调用方不可见时返回null，避免普通App与instant App之间仅因全局运行记录存在而泄露Provider。
-
-## 23. package association策略先于权限
-
-`checkContentProviderAssociation`通过AMS包关联策略验证调用进程所含包能否关联Provider包。它与read/write permission不同，先回答“这两个包是否允许建立运行依赖”，拒绝时直接SecurityException。
-
-## 24. get阶段权限只是“可能访问”
-
-AMS检查顶层read或write permission、任一PathPermission，或该authority上的URI grant；只要存在一种可能就允许拿到Binder。它没有本次具体URI和操作类型，不能完成最终row/path级授权。
-
-## 25. Transport仍做最终精确检查
-
-真正query/open/update时，Provider Transport根据具体URI、read/write方向、calling UID/package、URI grant与AppOps重新裁决。取得`IContentProvider`只代表获得调用入口，不代表对authority下所有数据都有读写权。
-
-## 26. ContentProviderConnection双向挂账
-
-首次跨进程取得时，AMS创建Connection，同时加入`cpr.connections`和`client.conProviders`；之后同一client ProcessRecord访问同一CPR复用连接，只增加stable或unstable计数。双向索引让宿主死亡和客户端死亡都能按本进程关联清理。
-
-## 27. 服务端计数不是每个Java对象一条连接
-
-同一客户端进程对同一Provider只有一个Connection，其`stableCount/unstableCount`累计多个ContentResolver、Cursor、FD或ContentProviderClient的使用。`numStableIncs/numUnstableIncs`是调试累计值，不会随release减回去。
-
-## 28. 客户端又做一次聚合
-
-ActivityThread按Provider Binder维护一个`ProviderRefCount`，记录本进程Java层实际stable/unstable次数；只有某类引用从0变1或1变0时才通知AMS变更Connection，减少每次短操作的Binder记账调用。
-
-## 29. 为什么两边看到的数字不同
-
-客户端可能有5个stable使用，但服务端Connection的stableCount只看到1，因为服务端只需知道该进程是否存在stable依赖。首次AMS获取本身先创建1；后续客户端同类型0↔1转换再用`refContentProvider`校正。
-
-## 30. 新连接立即影响OOM关系
-
-Connection建立后AMS调用`updateOomAdjLocked`。OomAdjuster沿Provider connections读取客户端adj/procState，把宿主至少提升到不低于重要客户端的受限级别；因此“持有Provider”不仅是一条Binder引用，也会改变宿主被回收概率。
-
-## 31. 可感知客户端还会抬高LRU位置
-
-当这是该client到Provider的第一份引用且client足够重要，AMS把Provider宿主在LRU中向活跃端移动。ContentProvider启动通常昂贵，这个策略减少刚被前台使用就迅速回收的抖动。
-
-## 32. OOM调整后还验证进程确实活着
-
-源码比较verifiedAdj、setAdj并读`/proc/<pid>/stat`与真实UID，降低宿主在获取窗口被LMK杀掉却仍返回旧Binder的竞态。仍承认信号pending的小窗口无法完全消除，因此调用方永远要能面对DeadObjectException。
-
-## 33. 不存在时重新走PackageManager
-
-AMS按authority/user以`GET_URI_PERMISSION_PATTERNS`解析ProviderInfo，处理singleton后将ApplicationInfo改写到目标user。找不到Provider返回null；系统未允许启动第三方进程、system Provider尚未安装或目标user未running则明确拒绝/返回。
-
-## 34. 组件record先按class去重
-
-用`ComponentName(package,class)`查ProviderMap；没有才创建ContentProviderRecord并先放组件表。这样一个Provider声明多个以分号分隔的authority时共享同一组件、宿主和Binder，而不是每个authority实例化一次。
-
-## 35. permissions review可能暂停获取
-
-旧兼容模式下若目标包需要权限复审，只有前台调用方可触发review Activity，本次Provider获取仍返回null；后台调用不弹UI直接失败。这里的“启动Provider”也受用户交互门约束。
-
-## 36. 正在拉起只登记一次
-
-AMS在`mLaunchingProviders`按对象身份检查；首次才unstop包并选择现有进程或启动新进程，后续请求只新增connection并一起等待同一CPR发布，避免多个进程实例竞争同一Provider。
-
-## 37. 已有宿主进程走scheduleInstallProvider
-
-如果目标ProcessRecord已有thread且未killed，但尚未发布该Provider，AMS先把CPR放进`proc.pubProviders`，再通过`IApplicationThread.scheduleInstallProvider`发消息。ActivityThread主线程执行`handleInstallProvider`完成类加载、attach与发布。
-
-## 38. 没有宿主则以Provider为HostingRecord启动
-
-`startProcessLocked`的原因记录为content provider并带组件名，随后`cpr.launchingApp=proc`、加入mLaunchingProviders。进程attach时AMS生成该进程应安装的全部ProviderInfo，不只触发获取的一个。
-
-## 39. 等待前已经放入authority表
-
-首次请求会把组件表和当前请求authority映射到尚未发布的CPR，再增加Connection并标记waiting。其他线程可发现“正在启动”的同一record并加入等待，而不会重复解析成第二个对象。
-
-## 40. 隐式包可见性也在获取链补齐
-
-完成服务端结构更新后，AMS为calling UID授予对Provider包的implicit access，解决包可见性与已取得内容入口冲突。它不替代Provider read/write权限，也不改变stable计数。
-
-## 41. 等待发生在CPR对象锁上
-
-AMS退出自身全局锁后`synchronized(cpr)`等待`cpr.provider`非null，避免阻塞整个AMS。发布方设置Binder、宿主proc后`notifyAll()`；失败清理把launchingApp置null并notify，等待者据此返回null。
-
-## 42. 两个超时不要混为一个
-
-进程attach后若含launching Provider，AMS安排10秒`CONTENT_PROVIDER_PUBLISH_TIMEOUT`；单个get调用等待`CONTENT_PROVIDER_READY_TIMEOUT`为20秒。前者判宿主初始化失败并移除进程，后者保护具体调用方不无限等。
-
-## 43. Provider发布超时不等普通query超时
-
-10秒只覆盖进程已attach但Provider尚未publish的启动阶段；正常Provider方法执行默认没有统一10秒强杀。`ContentProviderClient.setDetectNotResponding()`是另一个显式、特权且可配置的运行期监控机制。
-
-## 44. 启动失败会唤醒所有等待者
-
-publish超时调用`cleanupAppInLaunchingProvidersLocked(..., true)`，removeDyingProvider清launchingApp、ProviderMap和连接策略并notify；随后以初始化失败原因移除进程。等待者不是各自启动一份替代实例。
-
-## 45. 获取与发布时序图
-
-```mermaid
-sequenceDiagram
-    participant C as "客户端ActivityThread"
-    participant AMS as "system_server AMS"
-    participant H as "Provider宿主ActivityThread"
-    participant P as "ContentProvider"
-    C->>C: 查authority+user缓存
-    C->>AMS: getContentProvider(stable?)
-    AMS->>AMS: 解析权限/CPR/Connection
-    alt 宿主未运行
-        AMS->>H: 启动进程并bindApplication
-    else 宿主已运行但Provider未装
-        AMS->>H: scheduleInstallProvider
-    end
-    H->>P: instantiateProvider + attachInfo/onCreate
-    H->>AMS: publishContentProviders(holder)
-    AMS->>AMS: ProviderMap全authority、setProcess、notifyAll
-    AMS-->>C: Holder(provider Binder, connection)
-    C->>C: installProvider并建立本地引用账
-```
-
-## 46. 进程attach时生成Provider清单
-
-`generateApplicationProvidersLocked`按processName与UID向PMS查询Provider，过滤不应在非system user进程初始化的singleton，按组件复用/创建CPR，加入`app.pubProviders`并通知PackageManager本包因ContentProvider被使用。
-
-## 47. manifest initOrder由PMS排序体现
-
-ProviderInfo清单的安装顺序来自包管理查询结果与`initOrder`规则，ActivityThread逐项实例化。不要从HashMap中的pubProviders顺序推导初始化顺序；真正客户端安装使用的是传入List。
-
-## 48. Provider早于Application.onCreate
-
-`handleBindApplication`先创建Application对象，再在非restricted backup模式安装providers，之后才调用Instrumentation和`Application.onCreate()`。因此Provider.onCreate不能假设自定义Application.onCreate已完成，但`Application`对象和基础Context已经存在。
-
-## 49. attachInfo才真正调用Provider.onCreate
-
-ActivityThread用AppComponentFactory实例化类，取Transport Binder，再调用`localProvider.attachInfo(context, info)`；attachInfo设置read/write/path permission、exported、singleUser、authorities与AppOps后调用onCreate，保证业务初始化看到声明信息。
-
-## 50. onCreate布尔返回值在这里未参与发布决策
-
-`ContentProvider.onCreate()`声明返回boolean，但r48 `attachInfo`直接调用而不检查结果；只要没有抛异常且Transport存在，Provider仍继续加入发布列表。阅读旧文档时不要把false自动解释为AMS拒绝publish。
-
-## 51. onCreate异常会中断启动链
-
-实例化或attach异常先交Instrumentation.onException；未处理则RuntimeException使Provider安装失败，通常进一步导致进程崩溃/发布超时。publish函数自己不会收到一个“失败Holder”来逐项报告错误。
-
-## 52. 一个Provider可发布多个authority
-
-客户端和AMS都以`info.authority.split(";")`展开；多个ProviderKey/ProviderMap name条目指向同一个ClientRecord/CPR和同一Binder。release按Binder聚合，所以从不同authority取得也可能共享一份底层引用账。
-
-## 53. 宿主批量publish
-
-`installContentProviders`为每个成功安装项构造Holder并置`noReleaseNeeded=true`，最后一次Binder调用`publishContentProviders(applicationThread, results)`。宿主发布的是已经执行完onCreate的Transport Binder，不是Provider类名占位符。
-
-## 54. AMS只接受该ProcessRecord预登记组件
-
-publish时AMS从caller找真实ProcessRecord，再以`src.info.name`从`r.pubProviders`取目标CPR；不存在的组件不会凭客户端上传Info新建全局记录。这阻止App任意伪造authority向AMS注册Binder。
-
-## 55. publish补全组件和所有authority映射
-
-找到CPR后，AMS把ComponentName放入class表，并把声明中的每个authority放入name表。此前可能只有触发启动的authority，发布后同组件其他authority可直接命中运行记录。
-
-## 56. 发布原子点是设置Binder并notify
-
-在CPR对象锁内依次设置`dst.provider=src.provider`、`dst.setProcess(r)`并notifyAll。等待线程醒来后读取同一对象的provider；setProcess还会为已有connections/external handles启动procstats association。
-
-## 57. 成功发布取消进程级timeout
-
-只要该CPR曾在mLaunchingProviders，publish会移除它；若本进程至少发布一个launching Provider，则删除以ProcessRecord为obj的publish timeout消息。这里消息按进程而非单Provider组织，因为启动清单是批量安装。
-
-## 58. 成功后重启计数归零
-
-`dst.mRestartCount=0`，再更新宿主OOM adj与Provider使用统计。启动过程曾失败但后来成功，不应让历史重试次数继续把下一次正常重启误判为超过三次。
-
-## 59. publish对空项选择跳过
-
-src、ProviderInfo或provider Binder为null时直接continue；没有逐项错误回传。若整批都没成功，仍可能由publish timeout或进程死亡清理结束等待；若同批另一个CPR成功并取消共享的进程级timeout，被跳过项会落入第105节的窄边界。
-
-## 60. Holder把两端账连接起来
-
-返回客户端的`ContentProviderHolder`含ProviderInfo、IContentProvider、noReleaseNeeded及服务端ContentProviderConnection Binder。业务调用走provider Binder；后续ref/remove/ANR上报走connection Binder，两者身份和用途不能互换。
-
-## 61. 客户端installProvider负责竞态收口
-
-AMS返回后ActivityThread在自身进程实例化本地Provider或接收远端Binder，最后在`mProviderMap`锁内检查Binder/组件是否已安装。慢路径不能全程持锁，因为类加载、onCreate和AMS Binder都可能耗时或重入，所以最终必须再做一次“谁先发布”的裁决。
-
-## 62. 本地Provider有两张额外表
-
-`mLocalProviders`以Transport Binder为键，`mLocalProvidersByName`以ComponentName为键；authority仍放公共客户端mProviderMap。按组件表去重能处理同一实现的多个authority，按Binder表支持从接口反查本地Provider实例。
-
-## 63. 本地竞争失败前可能已经执行onCreate
-
-实例化和attachInfo发生在进入mProviderMap锁之前；若另一条安装路径抢先登记相同ComponentName，当前路径改用既有Provider。也就是说竞争落败的临时实例可能已执行onCreate却不会发布，源码未对它调用显式shutdown，这是编写Provider初始化副作用时要留意的r48窗口。
-
-## 64. 远端按Binder维护ProviderRefCount
-
-`mProviderRefCountMap`的key是provider.asBinder，不是authority；首次普通远端获取按stable创建`(1,0)`或`(0,1)`。ProviderClientRecord再被多个authority键引用，因此计数保护的是实际远端宿主接口。
-
-```java
-prc = stable
-        ? new ProviderRefCount(holder, client, 1, 0)
-        : new ProviderRefCount(holder, client, 0, 1);
-mProviderRefCountMap.put(jBinder, prc);
-```
-
-## 65. noReleaseNeeded的实际哨兵实现
-
-本地Provider不进ref-count map；来自system_server且不可释放的远端Provider却创建`stable=1000, unstable=1000`哨兵，使正常增减永远难以归零。源码注释概括为“不引用计数”，实现并非所有情形都真的没有ProviderRefCount。
-
-## 66. ContentProviderRecord也计算noReleaseNeeded
-
-uid为root/system通常标记true，但Settings包被特意排除；Holder把它传给客户端。宿主启动时发布的Holder先设true，是因为“自己进程安装自己的Provider”本来就不应通过远端release拆掉。
-
-## 67. stable从0到1才通知服务端
-
-客户端stableCount每次加一，但仅旧值为0时调用`refContentProvider(connection,+1,delta)`；已有stable时服务端无需知道具体对象数。服务端检查结果不能降到负数，也禁止在ref接口中让stable+unstable总数直接归零。
-
-## 68. unstable从0到1同理
-
-若没有pending remove，首个unstable把服务端unstable加一；已有unstable只加本地数。业务必须成对release，否则客户端本地数一直非零，服务端连接与OOM依赖也不会消失。
-
-## 69. 最后stable释放会临时转换成unstable
-
-当stable降到0且本地也没有unstable，ActivityThread向AMS发送`stable -1, unstable +1`，在1秒延迟移除期间保留一份服务端unstable引用。这样Provider仍可快速被重新获取，同时它若死亡不会因这份纯保留引用杀客户端。
-
-## 70. pending remove期间重新stable获取
-
-新stable把本地stable从0变1，取消removePending并向AMS发送`stable +1, unstable -1`，把临时保留引用转换回真实stable。即使Handler消息因竞态未移除，completeRemove会看到removePending=false并安全退出。
-
-## 71. pending remove期间重新unstable获取
-
-新unstable只需取消removePending；服务端原本就持有那一份临时unstable，所以无需再发+1。这个不对称是引用转换协议的一部分，不能只看本地`unstableCount`推断服务端瞬时值。
-
-## 72. 最后unstable释放也延迟1秒
-
-本地无stable时，最后unstable不立刻向AMS发-1，而是置removePending并安排`H.REMOVE_PROVIDER`延迟`CONTENT_PROVIDER_RETAIN_TIME=1000ms`。短时间重复query可复用Binder和宿主，降低抖动。
-
-## 73. completeRemove处理两种竞态
-
-若removePending已被新获取取消，旧消息直接退出；若经历“重新获取后又释放”，removePending又为true，旧消息继续执行并让后一个消息将来因false退出。最终先移除本地binder/authority缓存，再通知AMS删除最后那份unstable连接。
-
-## 74. 服务端remove最终拆双向连接
-
-AMS把connection Binder强转为ContentProviderConnection，根据stable参数减计数；两类都归零时停止procstats association，从`cpr.connections`和`client.conProviders`同时移除，并触发全局OOM重算。
-
-## 75. 最近Provider保留时间是另一层策略
-
-若释放连接时客户端重要性高于LAST_ACTIVITY，AMS记录宿主`lastProviderTime`；OomAdjuster在配置的CONTENT_PROVIDER_RETAIN_TIME内把宿主至少保到PREVIOUS_APP_ADJ/LAST_ACTIVITY。它与客户端固定1秒Handler延迟不是同一个常量或同一目的。
-
-## 76. 非Framework外部调用用handle而非Connection
-
-`getContentProviderExternal`要求`ACCESS_CONTENT_PROVIDERS_EXTERNALLY`，caller没有IApplicationThread/ProcessRecord，CPR改用token→ExternalProcessHandle和acquisitionCount；token可linkToDeath，null token只能用匿名计数并要求显式remove。
-
-## 77. external handle同样提升宿主
-
-OomAdjuster发现CPR有external handles时至少提升到FOREGROUND_APP_ADJ与IMPORTANT_FOREGROUND。显式remove若真正减少handle会触发OOM重算；Binder死亡回调只从CPR移除handle，r48代码没有在该回调中直接调用updateOomAdj，因此降级可能等后续全局调整。
-
-## 78. external错误token有计数下溢疑点
-
-`removeExternalProcessHandleLocked`在“存在某个token handle但传入token未命中”时会走匿名计数减一，即使`externalProcessNoHandleCount`原为0。r48缺少针对该分支的正数断言，错误配对可能产生-1；这是特权API健壮性审计点，不是普通App可直接利用结论。
-
-## 79. Provider连接怎样传播进程重要性
-
-OomAdjuster遍历宿主发布的每个CPR及connections，递归计算client状态；宿主adj通常不差于client且最低受FOREGROUND_APP_ADJ上界约束，TOP client映射为BOUND_TOP procState。连接还参与进程可达图与LRU联动，防止依赖链计算漏掉Provider。
-
-## 80. stable死亡合同的真正后果
-
-宿主进程死亡时，`removeDyingProviderLocked`逐连接标dead；只要connection stableCount>0，AMS会kill非persistent、仍有thread且不是system_server自身的客户端，退出原因是DEPENDENCY_DIED。它不会尝试给该客户端透明换一个新Binder。
-
-## 81. unstable连接让客户端收到通知
-
-stableCount为0且客户端thread仍在时，AMS调用`IApplicationThread.unstableProviderDied(oldBinder)`；随后服务端主动从CPR和client移除此connection，因为协议不期待客户端再正确release这个死亡连接。
-
-## 82. waiting连接有重启例外
-
-Provider仍在launching且未超过重试限制时，waiting connection可暂不触发客户端死亡/通知，让AMS重启宿主继续满足原等待；always remove、已不在launching或超过最多三次重试时才彻底清理。
-
-## 83. ProviderMap删除先做对象身份校验
-
-死亡清理仅当class/name当前值仍等于旧CPR时才remove，避免旧宿主迟到的death把已经启动的新一代Provider映射删掉。这与第19节复制新record共同处理代际竞态。
-
-## 84. Provider死亡状态清理顺序
-
-宿主ProcessRecord的pubProviders逐项removeDyingProvider，随后`cpr.provider=null`、setProcess(null)，清空宿主pubProviders；再检查其他launching记录是否需重启。清provider Binder与Map/connection处理是同一AMS死亡清理的一部分。
-
-## 85. 客户端接到unstableProviderDied
-
-ApplicationThread Binder线程只向主Handler发送`UNSTABLE_PROVIDER_DIED`，ActivityThread再在mProviderMap锁内按旧Binder移除ProviderRefCount与所有指向它的authority缓存。下一次获取不会继续命中死亡代理。
-
-## 86. 主动发现死亡还要向AMS举证
-
-若业务在unstable调用中捕获DeadObjectException，ActivityThread清本地缓存并调用AMS.unstableProviderDied(connection)。AMS读取当前provider Binder并先`pingBinder()`；仍活着就拒绝调用方的死亡声明，防止不诚实或竞态上报误杀宿主。
-
-## 87. ping确认后等价于提前death回调
-
-若Binder确实不活且CPR仍指向同一provider，AMS调用`appDiedLocked(proc,"unstable content provider")`，立即走完整进程死亡清理，缩小下一次获取与系统正式Binder death通知之间的竞态。
-
-## 88. stable/unstable死亡分叉图
-
-```mermaid
-flowchart TD
-    D["Provider宿主死亡"] --> CLEAN["AMS removeDyingProviderLocked"]
-    CLEAN --> EACH["逐ContentProviderConnection标dead"]
-    EACH --> S{"stableCount > 0?"}
-    S -->|"是"| K["杀非persistent依赖客户端\nDEPENDENCY_DIED"]
-    S -->|"否"| U["unstableProviderDied(old Binder)"]
-    U --> LC["客户端清binder与authority缓存"]
-    LC --> RETRY["业务捕获DeadObjectException后可重新acquire"]
-    CLEAN --> MAP["仅在对象仍匹配时移除旧ProviderMap"]
-    MAP --> RESTART{"launching且仍有依赖?"}
-    RESTART -->|"满足重试条件"| NEW["重启宿主并等待重新publish"]
-```
-
-## 89. 普通query为何先用unstable
-
-ContentResolver.query先取得unstable provider执行远程query；若调用瞬间死亡，通知AMS后改取stable provider重试一次。这样一次短暂宿主崩溃不必先把调用App也绑死，同时保留显式恢复机会。
-
-## 90. Cursor返回前再持stable引用
-
-query成功并强制`getCount()`后，ContentResolver取得stable provider，把Cursor包装为CursorWrapperInner；wrapper关闭时释放stable。远程Cursor后续可能继续向Provider取窗口数据，所以不能在query方法返回时立刻完全释放宿主。
-
-## 91. 打开FD也把stable生命周期交给包装器
-
-openAsset/openTyped等先用unstable尝试，成功后取得stable，再把它交给`ParcelFileDescriptorInner`；FD关闭时才release。这里stable保护长生命周期资源的宿主合同，但已传出的内核FD是否仍可读还取决于具体文件/pipe实现。
-
-## 92. ContentProviderClient必须close
-
-稳定或不稳定Client都由构造时的一份引用支撑；`closeInternal`用AtomicBoolean保证只释放一次，并关闭CloseGuard。依靠finalize只是泄漏告警和最后补救，不能替代try-with-resources。
-
-## 93. 不稳定Client不会自动替换Binder
-
-其每个API捕获DeadObjectException时通知`unstableProviderDied`后原样抛出；对象已失效，调用者应close并重新acquire。ContentResolver某些便捷方法的一次重试策略，不能泛化成ContentProviderClient自身自动重连。
-
-## 94. setDetectNotResponding是显式监控
-
-ContentProviderClient可配置每次remote call前在主Looper异步Handler排延迟Runnable，调用结束移除；到期就通过ContentResolver→ActivityThread→AMS上报。设置0关闭，并恢复Binder默认blocking策略。
-
-## 95. ANR检测API有特权门
-
-该System/Test API要求REMOVE_TASKS；AMS入口也再次enforce同一权限。普通App不能用它把任意Provider宿主标成ANR，更不能把它当通用网络/数据库timeout API。
-
-## 96. 到期不是客户端直接kill
-
-Runnable只携Provider Binder查本地ProviderRefCount，取Holder.connection上报；AMS由connection定位`conn.provider.proc`，再交`mAnrHelper.appNotResponding(host,"ContentProvider not responding")`进入统一ANR证据与处置链。
-
-## 97. 关闭Client与未决ANR Runnable的并发边界
-
-close先`setDetectNotResponding(0)`，使字段置null并恢复blocking行为，然后释放引用；该方法本身没有对旧Runnable调用removeCallbacks。正常远程调用结束由afterRemote移除，但若违反类文档约束，在调用尚阻塞时从另一线程close，afterRemote可能因字段已null无法找到旧对象，已排队Runnable仍可能触发上报。
-
-## 98. 默认Provider调用并无统一强制3秒ANR
-
-ContentResolver中的3秒常量用于特定异步类型查询等等待协议，不能概括所有CRUD Binder调用；普通同步query是否阻塞由Provider执行、Binder与CancellationSignal决定。只有显式ContentProviderClient监控才按配置主动上报宿主ANR。
-
-## 99. stable也不保证业务结果成功
-
-Provider可以抛SecurityException、SQLiteException、OperationCanceledException，宿主也可能被force-stop或崩溃；stable只影响AMS对依赖死亡的一致性处理。应用设计仍要区分可重试错误、数据事务失败与宿主死亡。
-
-## 100. Cursor、FD与Binder是不同资源
-
-IContentProvider负责控制调用，Cursor可能持跨进程BulkCursor，FD是内核对象；wrapper用stable引用把Java资源关闭与AMS连接释放联系起来。只关闭Cursor/FD而泄漏ContentProviderClient，或反过来提前close Client，都可能破坏预期生命周期。
-
-## 101. 客户端进程死亡怎样清连接
-
-AMS清理死亡ProcessRecord时遍历`app.conProviders`，从每个CPR.connections移除并停止association，最后清空列表。无需等待客户端逐个release；ProcessRecord death本身就是所有本地Java引用一起消失的权威事件。
-
-## 102. 宿主是否重启取决于仍有需求
-
-死亡Provider若仍在launching、未bad、允许restart且有connection或external handle，AMS把宿主纳入重启；普通已发布Provider失去所有需求后不会只因Manifest声明常驻。persistent进程另有全局重启规则。
-
-## 103. 最大重试次数的边界
-
-ContentProviderRecord.MAX_RETRY_COUNT为3，代码用前置递增后`>3`判定强制移除，意味着进入坏状态前可经历多次拉起失败。不要把常量名称直接等同于“总共最多启动三次”，应按具体递增位置推演。
-
-## 104. force-stop和禁用组件直接always remove
-
-包/组件禁用、force-stop会收集对应CPR并调用`removeDyingProviderLocked(..., true)`，移除Map、唤醒等待者并执行stable/unstable死亡策略；不会把这种管理动作当作普通可重启launching失败。
-
-## 105. publish timeout按进程消息有窄边界
-
-成功publish任一在launching列表中的CPR就移除以该ProcessRecord为obj的timeout消息；通常宿主一次批量发布全部Provider。若结果列表异常地部分为空而另一些成功，被跳过CPR可能仍launching却失去原消息，这是r48健壮性审计点，正常安装路径不应制造该组合。
-
-## 106. publish清CallingIdentity缺finally边界
-
-r48在publish函数中clearCallingIdentity后循环，末尾直接restore而非try/finally；正常路径会恢复，若中间出现未捕获RuntimeException则本次调用栈的恢复不够结构化。Binder事务结束还有框架边界，但源码审计仍应标记本方法的异常安全性。
-
-## 107. dumpsys数字怎样读
-
-CPR列出宿主、authority、connections与external handles；Connection字符串`s当前/累计 u当前/累计 WAITING DEAD`。当前计数回答仍有何种依赖，累计incs只辅助发现频繁获取，WAITING表示等publish，DEAD表示宿主死亡清理已处理。
-
-## 108. 排查“获取Provider一直卡住”
-
-先分进程尚未attach、已attach未执行Provider.onCreate、onCreate阻塞/崩溃、publish被跳过四类；对照10秒publish和20秒ready，检查mLaunchingProviders、launchingApp、WAITING connection、process start/attach日志及宿主主线程堆栈。
-
-## 109. 排查“Provider死后调用App也死了”
-
-检查调用是否持stable ContentProviderClient、未关闭Cursor/FD或便捷API已转换为stable；再看Connection stableCount。若stable>0，DEPENDENCY_DIED是设计合同，不应先归因于客户端自身Java崩溃。
-
-## 110. 排查“Provider一直不被回收”
-
-检查客户端ProviderRefCount是否因Client/Cursor/FD泄漏未归零、服务端connections/external handles、noReleaseNeeded哨兵、recent-provider保留窗口以及宿主是否还承载Activity/Service。Binder对象存在本身不等于还有AMS连接。
-
-## 111. 阅读完成检查
-
-你应能画出client cache→AMS ProviderMap→宿主publish，解释两端引用聚合、stable/unstable死亡分叉、1秒pending remove、10/20秒启动超时、Provider早于Application.onCreate、OOM传播和特权ANR上报。
-
-## 112. macOS只读练习一：画服务端数据模型
+### 练习 1：验证服务端四张索引与客户端四类缓存
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '35,180p' frameworks/base/services/core/java/com/android/server/am/ProviderMap.java
-sed -n '35,170p' frameworks/base/services/core/java/com/android/server/am/ContentProviderRecord.java
-sed -n '25,155p' frameworks/base/services/core/java/com/android/server/am/ContentProviderConnection.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private final HashMap<String, ContentProviderRecord> mSingletonByName' frameworks/base/services/core/java/com/android/server/am/ProviderMap.java
+grep -n -F 'private final HashMap<ComponentName, ContentProviderRecord> mSingletonByClass' frameworks/base/services/core/java/com/android/server/am/ProviderMap.java
+grep -n -F 'private final SparseArray<HashMap<String, ContentProviderRecord>> mProvidersByNamePerUser' frameworks/base/services/core/java/com/android/server/am/ProviderMap.java
+grep -n -F 'private final SparseArray<HashMap<ComponentName, ContentProviderRecord>> mProvidersByClassPerUser' frameworks/base/services/core/java/com/android/server/am/ProviderMap.java
+grep -n -F 'ContentProviderRecord record = mSingletonByName.get(name);' frameworks/base/services/core/java/com/android/server/am/ProviderMap.java
+grep -n -F 'return getProvidersByName(userId).get(name);' frameworks/base/services/core/java/com/android/server/am/ProviderMap.java
+grep -n -F 'final ArrayMap<ProviderKey, ProviderClientRecord> mProviderMap' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'final ArrayMap<IBinder, ProviderRefCount> mProviderRefCountMap' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'final ArrayMap<IBinder, ProviderClientRecord> mLocalProviders' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'final ArrayMap<ComponentName, ProviderClientRecord> mLocalProvidersByName' frameworks/base/core/java/android/app/ActivityThread.java
 ```
 
-画出singleton/per-user、authority/class四张索引，以及CPR与client ProcessRecord之间的双向Connection；为多authority、两个user和两个client各举一个key。
+画出一个 Provider class 声明 `a;b`、同时被两个客户端进程使用时的对象图：服务端有几项 class/name 索引、几条 Connection，单个客户端又有几个 ProviderKey 与几个 ProviderRefCount。然后分别让第二个 authority 和第二个客户端加入，说明哪一层增长、哪一层复用。
 
-## 113. macOS只读练习二：追获取与发布
+## 3. 客户端获取：user-aware key 先命中缓存，小锁只包住 AMS 往返
+
+`ApplicationContentResolver` 不把带 `10@` 的 authority 原样交给 `ActivityThread`。它用 `getAuthorityWithoutUserId()` 去掉 user-info，并用 `getUserIdFromAuthority(auth, contextUser)` 得到 userId。于是客户端缓存键是规范 authority 与用户的二元组，同字符串在个人用户和工作资料是两项；没有显式 user-info 时，Context 的 user 决定路由。
+
+`acquireProvider()` 首先调用 `acquireExistingProvider()`。命中后还要检查 Binder `isBinderAlive()`；若已死，ActivityThread 先清除该 Binder 对应的引用聚合及所有 authority cache，再通知 AMS 处理 unstable death，随后返回 miss。Binder 活着且存在 ProviderRefCount 才增加本地 stable/unstable 引用；本地 Provider 没有这份远端引用账，可直接返回。
+
+miss 路径通过 `getGetProviderLock(auth,userId)` 取锁。这张锁表没有清理逻辑，进程见过的 key 会留下一个小对象。锁只包住 `AMS.getContentProvider()` 的 Binder 往返，`installProvider()` 在退出锁后执行；锁内也没有二次缓存检查。因此它只让同 key 的 AMS 请求串行，不保证第二个线程复用第一个线程已经安装的结果。时序可以是：线程 A 从 AMS 返回、释放小锁但尚未 install，线程 B 随即进入 AMS，于是两者都拿到服务端引用；最终客户端 install 通过 Binder identity 决胜，并归还输掉的 Holder connection。
+
+这也解释两个边界。第一，不同 authority 别名使用不同小锁，即使最后映射到同一 Binder，也能并发请求。第二，小锁不覆盖 Provider 本地实例化，因为本地 `attachInfo()/onCreate()` 可能重入 ContentResolver；把大锁跨过这段代码会制造死锁，r48 选择在安装阶段再补偿竞态。
+
+客户端 user key 还有 singleton 可观测差异。AMS 可把跨用户请求路由到 user 0 singleton，Holder 的 `applicationInfo.uid` 也属于 user 0；`installProviderAuthoritiesLocked()` 据此把 authority 缓存在 user 0 key。最初以 user 10 查询的 key 仍可能 miss，后续再次请求时又去 AMS，随后才按 Binder identity 合并引用。这不改变服务端 singleton 身份，却说明“成功获取一次”不必然填充最初请求的客户端 key。
+
+### 练习 2：重放同 key 双线程、别名并发与 singleton user key
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '7037,7455p' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
-sed -n '7683,7760p' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
-sed -n '6770,6845p' frameworks/base/core/java/android/app/ActivityThread.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'final ProviderKey key = new ProviderKey(auth, userId);' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'final IContentProvider provider = acquireExistingProvider(c, auth, userId, stable);' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'synchronized (getGetProviderLock(auth, userId)) {' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'holder = ActivityManager.getService().getContentProvider(' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'holder = installProvider(c, holder, holder.info,' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'mGetProviderLocks.put(key, lock);' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'if (!jBinder.isBinderAlive()) {' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'handleUnstableProviderDiedLocked(jBinder, true);' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'ContentProvider.getAuthorityWithoutUserId(auth),' frameworks/base/core/java/android/app/ContextImpl.java
+grep -n -F 'return ContentProvider.getUserIdFromAuthority(auth, getUserId());' frameworks/base/core/java/android/app/ContextImpl.java
+grep -n -F 'final int userId = UserHandle.getUserId(holder.info.applicationInfo.uid);' frameworks/base/core/java/android/app/ActivityThread.java
 ```
 
-按cache miss、PMS解析、CPR/Connection、start或schedule、onCreate、publish、notify、Holder返回标线程与锁，并分别标出10秒和20秒timeout。
+为线程 A/B 写出“cache miss → A 得到 Holder → B 进入 AMS → A/B 先后 install”的合法序列，标注服务端引用怎样由客户端竞态补偿。再比较 authority `a` 与 `b`、请求user 10但返回user 0 singleton两种情况，说明为什么锁 key、cache key 与 Binder identity 分别解决不同问题。
 
-## 114. macOS只读练习三：手算引用转换
+## 4. AMS 准入与快路：先找记录，再证明调用者有可能访问，最后建立依赖
+
+公开 `getContentProvider()` 先拒绝 isolated caller、拒绝 null `IApplicationThread`，并用 AppOps `checkPackage()` 校验可选 callingPackage 是否属于 Binder UID。进入内部实现后再把 IApplicationThread 映射到 ProcessRecord；找不到记录同样抛 SecurityException。external 获取则要求 `ACCESS_CONTENT_PROVIDERS_EXTERNALLY`，没有 client ProcessRecord，稍后只建立 external handle。
+
+查表有两个容易混淆的 singleton 分支。`ProviderMap.getProviderByName(name,userId)` 自身先查全局 singleton，再查该用户；全局直接命中后不会再次执行 `isValidSingletonCall()`。只有初次查表为 null、显式回退查 user 0 记录时，AMS 才同时验证记录确属 singleton 且此次调用可以共享。无论哪条命中，后续仍需 association、跨用户与权限检查，不能把全局 Map 命中当成访问授权。
+
+`checkContentProviderPermissionLocked()` 是“可能访问”预检，不是具体 URI 的最终 Transport enforcement。它在跨用户时先看 authority 下是否已有任意 URI grant，然后才走 `handleIncomingUser()`；静态侧只要 Provider 顶层 read 或 write 任一权限通过，或者任意 PathPermission 声明的某个权限通过，就允许取得 Binder；最后还可凭 authority 下任意 UriPermission 通过。这里没有具体 URI path、没有本次 CRUD 类型，所以拿到 Binder 不代表某个 query/update 已获准。下一章会进入 ContentProvider.Transport 的逐 URI、逐操作、AppOps 与 attribution 校验。
+
+已有记录只有 `cpr.proc != null && !cpr.proc.killed` 才算 running；这不是 Binder ping。若 running 且 `canRunHere()`，条件精确为 `(multiprocess || processName相同) && Provider uid与调用进程应用uid相同`，AMS 返回 provider/connection 均为空的 Holder，让调用端本地实例化。shared UID 配合 multiprocess 也可能满足；external 因为没有 ProcessRecord，绝不会走本地分支。
+
+远端快路先建立或累加 Connection，再更新 LRU/OOM。一个 client ProcessRecord 对同一 CPR 复用同一 Connection；第一次引用才加入两端列表并启动 association。OOM 更新失败时，AMS 撤掉本次引用；只有该普通客户端已无其他服务端引用、dec返回最后一份时才转冷启动，否则本次直接返回null，external分支也因没有Connection而返回null。只有OOM更新报告成功且 `verifiedAdj` 与新 `setAdj` 不同，才额外读 `/proc/pid/stat` 缩小“进程已被杀但记录尚存”的窗口。即便成功，源码也承认信号仍可能在途，因此返回的 Binder 仍可能很快死亡。
+
+### 练习 3：区分全局 singleton 命中、user 0 回退、可能访问与本地实例化
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '4750,4785p' frameworks/base/core/java/android/app/ActivityThread.java
-sed -n '6850,7065p' frameworks/base/core/java/android/app/ActivityThread.java
-sed -n '6895,6980p' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'enforceNotIsolatedCaller("getContentProvider");' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'if (callingPackage != null && mAppOpsService.checkPackage(callingUid, callingPackage)' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'cpr = mProviderMap.getProviderByName(name, userId);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'cpr = mProviderMap.getProviderByName(name, UserHandle.USER_SYSTEM);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F '&& isValidSingletonCall(r == null ? callingUid : r.uid,' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'if (r != null && cpr.canRunHere(r)) {' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'holder.provider = null;' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'return (info.multiprocess || info.processName.equals(app.processName))' frameworks/base/services/core/java/com/android/server/am/ContentProviderRecord.java
+grep -n -F 'if (checkComponentPermission(cpi.readPermission, callingPid, callingUid,' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'PathPermission[] pps = cpi.pathPermissions;' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'mUgmInternal.checkAuthorityGrants(callingUid, cpi, userId, checkUser)' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'if (success && verifiedAdj != cpr.proc.setAdj' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
 ```
 
-依次执行unstable acquire、stable acquire、release unstable、release stable、500ms内重新stable、再release；分别记录客户端(s,u,pending)和服务端(s,u)，解释临时unstable为何不会杀client。
+为“user 10直接命中全局singleton”“user 10查不到后回退user 0”“同UID multiprocess本地运行”“只有某条PathPermission写权限”四例标出查表、singleton验证、Connection与最终CRUD权限的结果。尤其说明为何最后一例可以拿 Binder，却未证明任意query都能成功。
 
-## 115. macOS只读练习四：审计死亡与ANR
+## 5. 冷启动：解析 ProviderInfo、选择一代 CPR、登记 launching demand，再启动或复用进程
+
+快路失效后，AMS 用 PackageManager 按请求user解析 ProviderInfo，并携带 URI permission patterns。它重新计算 singleton；合法 singleton 改到 user 0，再把 ApplicationInfo转换到最终user。association、可能访问、system-ready、system provider安装状态与目标user运行状态都在启动前收束。这里才是“由声明创建记录”的路径，而不是简单把旧的 name Map 项当真。
+
+随后按 ComponentName 查 class Map。没有记录时先处理运行时权限review，取得该user的 ApplicationInfo，构造新 CPR。若刚才发现旧宿主被AMS标死，且 class Map仍指向那一代 CPR，代码复制一份新的 CPR，避免新客户端挂到会在旧进程清理中被连带杀死的记录上。它不是同步等待旧进程死亡；ProcessList 的进程代际协调可能另有短暂等待，但 ContentProvider 获取代码本身继续建立新一代需求。
+
+这里会第二次检查 `canRunHere()`。若满足，本地 Holder 立即返回，发生在远端 ProviderMap name/class 写入和 launching登记之前。因此不能笼统说“新 CPR 总会先写 class Map”；一个仅供调用进程本地实例化的 multiprocess Provider 可以没有这次服务端发布状态。另一方面，attach 时的 `generateApplicationProvidersLocked()` 是宿主进程 eager Provider 列表路径，会按 class 预建记录，两条路径也不能混为一次动作。
+
+远端路径先检查 CPR 是否已在 `mLaunchingProviders`。若不是，则清 package stopped 状态并寻找目标 ProcessRecord：进程已 attach、thread非空且未 killed 时，把 CPR放入 `proc.pubProviders` 后调用 `scheduleInstallProvider()`；只有该Provider类名尚不在 pubProviders 才调度。Binder 调度异常被忽略，CPR仍会进入 launching。若目标进程不存在，就以 content-provider HostingRecord 启动进程；启动失败直接返回 null。
+
+最后给 CPR 写 `launchingApp` 并加入 `mLaunchingProviders`。对远端新 class，AMS才写 class Map；无论是否firstClass，都把**本次请求的 authority**写 name Map，建立/累加 Connection，并在退出AMS大锁前设 `conn.waiting=true`。之后还会给调用UID授予对Provider appId的隐式包可见性。这些状态都早于 Binder publish。
+
+已有进程的安装路径有一个安静失败窗口：`scheduleInstallProvider()` 没有本段专属 publish watchdog；而且如果 class name 已在 `proc.pubProviders`，后续请求不会再次调度。一次预登记后安装失败，可能只剩每次 get 自己的20秒等待来暴露问题。
+
+### 练习 4：验证冷解析、第二次本地分支、进程复用与 launching 建账顺序
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '14655,14735p' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
-sed -n '7790,7880p' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
-sed -n '80,155p' frameworks/base/core/java/android/content/ContentProviderClient.java
-sed -n '620,705p' frameworks/base/core/java/android/content/ContentProviderClient.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'resolveContentProvider(name,' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F '&& isValidSingletonCall(r == null ? callingUid : r.uid,' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'cpr = mProviderMap.getProviderByClass(comp, userId);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'cpr = new ContentProviderRecord(this, cpi, ai, comp, singleton);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'cpr = new ContentProviderRecord(cpr);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'return cpr.newHolder(null);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'if (!proc.pubProviders.containsKey(cpi.name)) {' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'proc.thread.scheduleInstallProvider(cpi);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'new HostingRecord("content provider",' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'cpr.launchingApp = proc;' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'mLaunchingProviders.add(cpr);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'conn.waiting = true;' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
 ```
 
-比较stable client、unstable client、waiting client和external handle在宿主死亡时的结果；再画setDetectNotResponding从Handler Runnable到mAnrHelper的权限与对象定位链。
+按源码为三种请求排序：同进程multiprocess、本来已有已attach宿主、必须fork新宿主。分别标注何时有class Map、name Map、pubProviders、mLaunchingProviders、Connection与Binder；解释 `scheduleInstallProvider()` 抛 RemoteException 后哪些状态仍然存在。
 
-## 116. 易混点一：发布记录不等于当前Binder活着
+## 6. 三只时钟：fork 到 attach、attach 到 publish、单次 get 等 ready
 
-ProviderMap可先放正在launching的CPR，也可能短暂保留尚未完成死亡清理的旧record；必须结合provider、proc、killed、launchingApp和对象代际判断，不能只看authority有条目。
+r48 这里至少有三只不能相加成一个“Provider启动超时”的时钟：
 
-## 117. 易混点二：stable是依赖合同而非永久驻留
+| 时钟 | 起点 → 终点 | 常量 | 超时动作 |
+|---|---|---|---|
+| 进程启动 | fork/start → `attachApplication` | `PROC_START_TIMEOUT=10s`，wrapper为1200s | 按进程启动失败清理 |
+| Provider发布 | 已attach且该进程仍承载launching Provider → publish | `CONTENT_PROVIDER_PUBLISH_TIMEOUT=10s` | 对宿主走 publish timeout / 进程问题处置 |
+| 当前获取 | get进入等待 → CPR出现Binder | `CONTENT_PROVIDER_READY_TIMEOUT=20s` | 当前调用记录严重日志并返回null |
 
-它会提升宿主重要性并在异常死亡时连带处理客户端，但不会阻止显式force-stop、崩溃、权限失败或业务异常；release归零后宿主仍可按内存策略回收。
+第二只时钟只在 attach 阶段发现 `checkAppInLaunchingProvidersLocked(app)` 时安排。因此“把Provider安装到已经attach的进程”没有同等的10秒 publish timer；它主要由第三只时钟让请求方结束等待。第一只时钟也不是 Provider 自己的10秒，它监督进程能否 attach；带wrapper的调试进程甚至是1200秒。
 
-## 118. r48实现边界汇总
+单次get在退出AMS锁后同步 `synchronized(cpr)` 等待。每轮用绝对deadline减当前uptime，再调用 `cpr.wait(wait)`。Java 的 `wait(0)` 意味着无限等待；而实现一旦被任意唤醒、Binder仍为空，就直接把 `timedOut` 设true并break，并没有重新核对deadline后持续循环。因此源码形状虽有 while，却不具备严格的“抗虚假唤醒deadline循环”语义。正常publish会写Binder后notify，通常不触发该边界。
 
-ProviderMap miss可建空user map；本地安装竞态的落败实例可能已onCreate；noReleaseNeeded远端用1000/1000哨兵；external错误token可能下溢且death未立刻重算OOM；部分publish可取消进程级timeout；publish identity恢复缺finally。它们应作为源码审计线索，不夸大为已验证漏洞。
+更重要的是20秒超时只返回null。它不调用 `decProviderCountLocked()`，不删除 name/class Map，不撤销 mLaunchingProviders，不撤销隐式包可见性，也不归还 external handle。普通调用者没拿到 Holder，就没有 connection capability 可在稍后 release；该服务端引用可能一直留到进程死亡或其他清理。若 Provider更晚发布，这条未交付的 stable Connection仍会成为将来Provider死亡时的依赖处置依据。
 
-## 119. 复读纠偏记录
+`waiting` 也不是完美的“此刻线程在wait”指示。远端冷路退出AMS锁前已把它设true；只有实际进入 `try/finally` 的 wait 才在finally清false。若publish恰在拿到CPR锁前完成，while一次都不进，成功返回的Connection仍可能保留 `WAITING` 标记。这会影响后续启动失败清理如何跳过连接，诊断时应把它视为实现状态而非精确线程采样。
 
-复读后修正十点：get阶段只做可能访问检查；Provider早于Application.onCreate；onCreate返回值未决定publish；同组件多authority共用Binder；客户端计数与服务端计数粒度不同；最后stable先转临时unstable；1秒retain不同于OOM recent-provider；stable宿主死会杀依赖client；unstable需业务重取；ANR检测是特权显式能力而非所有CRUD默认超时。
+### 练习 5：定位三只时钟并推演 ready timeout 的残留
 
-## 120. 本章小结与下一章
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'static final int PROC_START_TIMEOUT = 10*1000;' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'static final int PROC_START_TIMEOUT_WITH_WRAPPER = 1200*1000;' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'public static final int CONTENT_PROVIDER_PUBLISH_TIMEOUT_MILLIS = 10 * 1000;' frameworks/base/core/java/android/content/ContentResolver.java
+grep -n -F 'public static final int CONTENT_PROVIDER_READY_TIMEOUT_MILLIS =' frameworks/base/core/java/android/content/ContentResolver.java
+grep -n -F 'if (providers != null && checkAppInLaunchingProvidersLocked(app)) {' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'mHandler.sendMessageDelayed(msg,' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'SystemClock.uptimeMillis() + ContentResolver.CONTENT_PROVIDER_READY_TIMEOUT_MILLIS;' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'final long wait = Math.max(0L, timeout - SystemClock.uptimeMillis());' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'cpr.wait(wait);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'timedOut = true;' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'return null;' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+```
 
-Android 11把Provider运行依赖分成三层：ActivityThread缓存与本地聚合、AMS ProviderMap/Connection全局账、宿主ActivityThread实例化与发布；stable/unstable、延迟释放、OOM传播和死亡清理共同平衡一致性、性能与可恢复性。下一章继续深入ContentProvider Transport的read/write权限、PathPermission、URI grant、calling package/attribution、AppOps、跨用户与CRUD/Bulk接口执行链。
+画出“fork第0秒、attach第8秒、publish第15秒”和“已有进程第0秒scheduleInstall、永不publish”两条时间线。再让客户端在第20秒超时、第25秒宿主发布，列出 CPR、Map、Connection、waiting、客户端Holder五项状态，说明为什么“调用返回null”不等于需求已回滚。
+
+## 7. 宿主 attach 与本地安装：Provider.onCreate 早于 Application.onCreate，也早于服务端 publish
+
+新进程 attach 后，AMS 取消进程启动timeout，调用 `generateApplicationProvidersLocked()` 查询该 processName/uid 的全部 Provider。PackageManager 对列表按 `initOrder` 降序排列；AMS为每个Provider按class查建 CPR，放进 `app.pubProviders`，并把列表送进 `bindApplication`。这条 eager 列表会包含同一宿主的其他Provider，不只最初触发进程启动的那一项。
+
+ActivityThread 创建 Application 对象后，在非restricted backup模式先执行 `installContentProviders(app,data.providers)`，之后才调用 instrumentation 和 `callApplicationOnCreate(app)`。每个Provider安装会选择合适Context与split classloader，经AppComponentFactory实例化，取本地Transport Binder，调用 `localProvider.attachInfo(c,info)`；`attachInfo()` 内部再进入 Provider 的 `onCreate()`，其boolean返回值不会决定是否发布。Provider因此可以在Application.onCreate前初始化和对外可见，Provider.onCreate若依赖Application自定义初始化必须自己处理顺序。
+
+每个本地实例在 `mProviderMap` 锁外构造并运行 `attachInfo/onCreate`，随后才进锁按 ComponentName与本地Binder登记。并发安装同一 class 时，输掉竞态的实例已经执行过构造与onCreate副作用，最后只是改用 `mLocalProvidersByName` 中的胜者；框架没有对败者调用统一shutdown。这是解释“onCreate日志出现两次但最终只有一个路由对象”的关键边界。
+
+安装循环把成功Holder加入results，最后一次 Binder调用批量publish。若某个实例化异常未被Instrumentation处理，进程会因RuntimeException中断；若Instrumentation接住异常，install返回null，该项不进入results，其他项仍可继续。`Application.onCreate()` 自己随后崩溃时，Provider可能已经publish过，于是其他进程短暂获得Binder后再经历宿主死亡。
+
+`noReleaseNeeded` 在本地安装中为true。ActivityThread仍可能为远端、来自system进程且“不需release”的 Binder创建一个 `ProviderRefCount(1000,1000)` 哨兵；不能把这种状态写成“完全没有ProviderRefCount”。真正本地Provider走local maps，不依赖普通远端release协议。
+
+### 练习 6：验证 attach、initOrder、Provider.onCreate 与 Application.onCreate 的先后关系
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'List<ProviderInfo> providers = normalMode ? generateApplicationProvidersLocked(app) : null;' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F '.queryContentProviders(app.processName, app.uid,' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'app.pubProviders.put(cpi.name, cpr);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'final int v1 = p1.initOrder;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'app = data.info.makeApplication(data.restrictedBackupMode, null);' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'installContentProviders(app, data.providers);' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'mInstrumentation.callApplicationOnCreate(app);' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F '.instantiateProvider(cl, info.name);' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'localProvider.attachInfo(c, info);' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'ProviderClientRecord pr = mLocalProvidersByName.get(cname);' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'mLocalProvidersByName.put(cname, pr);' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'publishContentProviders(' frameworks/base/core/java/android/app/ActivityThread.java
+```
+
+给两个Provider设置不同initOrder，其中一个onCreate成功、另一个异常被Instrumentation接住，再让Application.onCreate抛异常。写出哪些本地map、publish结果与外部可见窗口可能存在；再加入同class并发安装，指出败者副作用为什么不会由Map竞态补偿消除。
+
+## 8. publish 完成点：信任服务端记录的身份，写全别名，设置 Binder 后唤醒等待者
+
+`publishContentProviders()` 对null列表直接返回，甚至早于isolated与caller校验；空列表则会完成这些校验但不改变Provider状态。对每个非空Holder，AMS要求 `src.info/src.provider` 非空，再只用 `src.info.name` 到发布进程的 `r.pubProviders` 找目标CPR。找不到就忽略该项。
+
+一旦找到 `dst`，真正用于Map身份的是服务端保存的 `dst.info`：按它的package/name写class Map，并拆分它的authority写入所有name Map。上传Holder中的其他ProviderInfo字段没有逐项与dst比对；Binder实现也没有在此验证“确由该Provider class构造”。安全边界依赖发布者已经被绑定到正确ProcessRecord、且name必须命中其pubProviders白名单，而不是信任客户端重建整份ProviderInfo。
+
+Map写入先于 `dst.provider=src.provider`，但二者都发生在AMS大锁内，新get无法在中间观察到半步状态。随后AMS从 `mLaunchingProviders` 删除该CPR；如果删到至少一项，就按**进程**移除 `CONTENT_PROVIDER_PUBLISH_TIMEOUT_MSG`。然后在 `synchronized(dst)` 内写Binder、`setProcess(r)`并`notifyAll()`，清零restart count，更新OOM与usage stats。这一小段才是等待者看到 ready 的完成点。
+
+同一进程有多个launching CPR时，部分发布会暴露一个进程级锐角：任一CPR发布成功就移除该进程唯一的publish timeout message，即使兄弟CPR仍在mLaunchingProviders。兄弟请求仍有各自20秒ready wait，但失去attach后的10秒进程级监督。批量循环中间没有事务回滚，先发布项已经可用，后续无效或异常项不会撤回它。
+
+publish 也没有在写Map前确认“当前class/name Map仍精确指向dst”，不像死亡清理那样做对象identity保护。结合进程代际竞态，晚到旧发布是否可能重写新Map，是审计时应显式检查的缝隙，不能用“Map已是新记录所以旧publish自然被拒”作假设。另一个实现边界是 clearCallingIdentity 的恢复没有包在finally；正常路径会恢复，运行期异常则不能用统一finally语义描述。
+
+### 练习 7：逐行确定 publish 的身份、Map、launching、唤醒与 timeout 顺序
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'if (providers == null) {' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'ContentProviderRecord dst = r.pubProviders.get(src.info.name);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'ComponentName comp = new ComponentName(dst.info.packageName, dst.info.name);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'String names[] = dst.info.authority.split(";");' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'mProviderMap.putProviderByName(names[j], dst);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'if (mLaunchingProviders.get(j) == dst) {' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'mHandler.removeMessages(CONTENT_PROVIDER_PUBLISH_TIMEOUT_MSG, r);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'dst.provider = src.provider;' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'dst.setProcess(r);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'dst.notifyAll();' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'dst.mRestartCount = 0;' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'updateOomAdjLocked(r, true, OomAdjuster.OOM_ADJ_REASON_GET_PROVIDER);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+```
+
+让进程P有CPR-A与CPR-B都在launching，只发布A；列出两项的name/class map、provider、launching与等待计时器状态。再构造src.info.name命中但src.info.authority不同的Holder，指出哪些上传字段决定匹配、哪些服务端字段决定最终Map。
+
+## 9. 客户端安装决胜：authority 映射按 Provider UID 建 key，Binder identity 聚合引用
+
+远端Holder回到ActivityThread后，`installProvider()` 先看Binder identity。若该Binder已有ProviderRefCount，说明另一次获取或另一个authority已经安装成功：本次若需要release，就增加胜者的本地引用，再调用AMS `removeContentProvider(holder.connection,stable)` 归还这次输掉的服务端引用。这样最终使用同一Binder，却不会无故遗失第二次逻辑acquire。
+
+若Binder尚未出现，`installProviderAuthoritiesLocked()` 把ProviderInfo中分号分隔的所有authority映射到新的ProviderClientRecord。每个key的user来自 Holder Provider应用UID。authority key已被占用时只记录警告，不覆盖旧记录；随后仍以这个新Binder创建ProviderRefCount。因此极端别名冲突时，Binder ref map与authority map并不保证一一可达，诊断必须同时看两者。
+
+普通远端ProviderRefCount初值是本次获取类型对应的 `1/0` 或 `0/1`。`noReleaseNeeded` 远端则使用 `1000/1000` 哨兵并仍放入ref map；本地Provider走 `mLocalProvidersByName` 与 `mLocalProviders`，Holder被改成noReleaseNeeded，也没有普通Connection release生命周期。
+
+服务端计数与客户端Java对象数也不是同一粒度。ActivityThread把同一进程、同一Binder的多个ContentResolver操作或ContentProviderClient聚合到ProviderRefCount；只在某类本地计数发生0↔1转换时通知AMS。AMS则按“同一client ProcessRecord→同一CPR”复用Connection。稳态服务端stable/unstable更像每类是否存在的聚合位，但跨authority竞态补偿、隐藏接口或并发过渡可让计数大于1，不能把它声明成严格boolean。
+
+安装决胜还有一个本地路径差异：`canRunHere()` 返回的Holder没有Binder，ActivityThread会自己instantiate并运行onCreate，然后按ComponentName决胜。即使服务端另一进程已经发布了同一multiprocess Provider，只要当前caller满足canRunHere，它仍可能再有一份本地实例；“全系统每class唯一”从来不是multiprocess契约。
+
+## 10. 引用状态机：最后一份 stable 先转成 unstable，一秒后才真正移除
+
+对普通远端Provider，本地stable与unstable引用分别计数。第一次整体获取时，服务端 `incProviderCountLocked()` 已经建立对应的stable或unstable计数，客户端随后只是以 `1/0` 或 `0/1` 创建新ProviderRefCount，不再补发ref调用。已有PRC后，某类本地计数从0→1才通过 `refContentProvider()` 增加服务端该类计数；同类继续增加只改本地账。释放到某类0时才通知服务端；但最后一份总引用采用延迟移除协议，避免短促连续CRUD让Provider缓存抖动。
+
+若最后一份是stable且没有unstable，本地先向AMS发送 `stable -1, unstable +1`，在服务端保留一份临时unstable，然后设置 `removePending`，向主线程Handler延迟一秒发送REMOVE_PROVIDER。若最后一份本来就是unstable，则不先把服务端减到0，只安排相同消息。`refContentProvider()` 明确禁止任何计数变负，也禁止在该入口把总数降到0；真正归零必须由稍后的 `removeContentProvider(connection,false)` 完成。
+
+一秒窗口内重新acquire有两条“抢救”：stable重获把临时unstable转换回stable，发送 `+1/-1`；unstable重获只取消pending，因为那份临时unstable本来仍在服务端。Handler消息可能已经在队列中，`completeRemoveProvider()`先检查removePending，输掉竞态就退出；若确实移除，则按Binder删ref map和全部authority cache，再在锁外让AMS删除服务端Connection。
+
+这固定一秒只属于客户端缓存缓冲。服务端最后Connection从两端表移除时，如果client足够重要，会给宿主写 `lastProviderTime`；OomAdjuster再用可配置、默认20秒的 `content_provider_retain_time` 把宿主当recent-provider保护一段时间。两只计时器起点、对象和作用完全不同。
+
+`refContentProvider()` 在Connection已标dead时仍会提交合法的计数变更，只用返回false报告死亡；ActivityThread的调用处忽略这个boolean。`removeContentProvider()` 又是另一入口，直接走dec并允许最后归零；它没有ref入口相同的负数预检。因此账坏时不能只根据一次返回值断言客户端已经修复或服务端拒绝了修改。
+
+## 11. ContentResolver 调用：query 先用 unstable 探路，再把 stable 租约交给 Cursor
+
+普通 `ContentResolver.query()` 先acquire unstable Provider，并为CancellationSignal向该Provider创建远端transport。query若抛 `DeadObjectException`，客户端清死Binder缓存并通知AMS，然后获取stable Provider重试**一次**；第二次仍失败会落入RemoteException处理，不是无限重启。
+
+得到非空Cursor后，ContentResolver先调用 `getCount()`，按源码意图强制/验证Cursor执行并尽早暴露异常；跨进程BulkCursor在服务端构造descriptor时可能已经取过count，所以不能把这一步一律解释成新增一次远端取数。若重试时已持stable，就沿用它；否则再acquire一次stable。随后用 `CursorWrapperInner` 同时持有Cursor与stable Provider，把局部stable变量清空，finally只释放unstable。调用者close Cursor时，wrapper以AtomicBoolean保证只释放一次stable。
+
+这带来一个窄边界：成功取得qCursor后，额外stable acquire理论上仍可能返回null；构造wrapper并不拒绝null Provider。Cursor仍会返回调用者，却没有预期的stable宿主保护，close时release(null)只返回false。正常系统中同一活Binder应快速命中，问题主要出现在死亡竞态。
+
+文件打开走相似协议。openAsset/openTyped先unstable调用，死亡后stable重试一次；成功后用 `ParcelFileDescriptorInner` 持有stable引用，直到FD close的资源释放回调。CRUD如update、insert、delete通常直接stable acquire，在同步Binder调用finally中立即release；因此“ContentResolver总是先unstable”“所有stable都绑定Cursor”都不成立。
+
+`ContentProviderClient` 又不同：创建client本身已经取得stable或unstable租约，调用者合同要求所有方法复用它直到client close。它返回的CursorWrapper只负责Cursor CloseGuard，不额外acquire/transfer Provider引用，文件描述符也原样返回。文档要求client在仍使用返回数据时保持打开；把ContentResolver.query的“Cursor自己续租”经验套到ContentProviderClient，会过早释放宿主保护。实现中的 `mClosed` 只在close路径判断，CRUD/query入口并不据此拒绝调用，所以close后仍可能发出Binder事务，却已经没有可靠租约；本地Provider第一次deprecated `release()`也可能返回false，AtomicBoolean仍已完成关闭。
+
+### 练习 8：追踪 query、Cursor、文件描述符与 ContentProviderClient 的租约所有者
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'IContentProvider unstableProvider = acquireUnstableProvider(uri);' frameworks/base/core/java/android/content/ContentResolver.java
+grep -n -F 'remoteCancellationSignal = unstableProvider.createCancellationSignal();' frameworks/base/core/java/android/content/ContentResolver.java
+grep -n -F 'unstableProviderDied(unstableProvider);' frameworks/base/core/java/android/content/ContentResolver.java
+grep -n -F 'stableProvider = acquireProvider(uri);' frameworks/base/core/java/android/content/ContentResolver.java
+grep -n -F 'qCursor.getCount();' frameworks/base/core/java/android/content/ContentResolver.java
+grep -n -F 'final CursorWrapperInner wrapper = new CursorWrapperInner(qCursor, provider);' frameworks/base/core/java/android/content/ContentResolver.java
+grep -n -F 'ContentResolver.this.releaseProvider(mContentProvider);' frameworks/base/core/java/android/content/ContentResolver.java
+grep -n -F 'ParcelFileDescriptor pfd = new ParcelFileDescriptorInner(' frameworks/base/core/java/android/content/ContentResolver.java
+grep -n -F 'return new ContentProviderClient(this, provider, name, true);' frameworks/base/core/java/android/content/ContentResolver.java
+grep -n -F 'return new ContentProviderClient(this, provider, uri.getAuthority(), false);' frameworks/base/core/java/android/content/ContentResolver.java
+grep -n -F 'return new CursorWrapperInner(cursor);' frameworks/base/core/java/android/content/ContentProviderClient.java
+grep -n -F 'if (mClosed.compareAndSet(false, true)) {' frameworks/base/core/java/android/content/ContentProviderClient.java
+```
+
+分别画出普通query成功、unstable死亡后重试、openTyped成功、stable ContentProviderClient query四条租约时间线。标出unstable何时释放、stable由谁持有、Cursor/FD/client中谁的close才是最终完成点，并说明stable重获为null的Cursor锐角。
+
+## 12. 一次重试的取消陷阱：旧 Provider 创建的 transport 不属于新 Provider
+
+ContentResolver在第一次unstable调用前执行 `unstableProvider.createCancellationSignal()`。这个Binder RPC让旧Provider进程创建一个 `CancellationSignal.Transport`；回到客户端后持有的是它的远端Binder代理。正常调用回到同一个Provider进程时，Binder驱动能把本地Binder对象还原为Transport实例，`CancellationSignal.fromTransport()`取出实际CancellationSignal。
+
+DeadObject后，query/open代码获取新Provider，却复用原来的 `remoteCancellationSignal`。这个对象仍指向旧进程创建的Binder；传到新Provider时只是代理，不是新进程本地的 `Transport` 实例。r48 的 `fromTransport()`只在 `transport instanceof Transport` 时返回对象，否则返回null。因此重试本身可能不可合作取消；ContentResolver随后在finally执行 `cancellationSignal.setRemote(null)`，只能解除本地关联，不能把旧transport变成新宿主的transport。
+
+这不是所有ContentProviderClient调用的普遍情况。ContentProviderClient不自动重新获取Provider；unstable client捕获DeadObject后通知AMS并重新抛出，调用者必须close失效client、另行acquire并发起新操作。新client的新调用会向新Provider创建新的取消transport。stable client死亡也重抛，但不走unstableProviderDied通知。另一个持有边界是CPC的query/refresh/open等路径会给调用者CancellationSignal设置remote，却不像ContentResolver包装路径那样在finally清空；方法返回不等于自动cancel，旧transport可继续挂在Signal上直到后续替换或对象释放。
+
+还要区分“取消”“等待ready timeout”和“ANR探测”。CancellationSignal只在调用真正进入Provider且实现合作检查时终止工作；20秒ready发生在拿到Binder之前，用户传给CRUD的CancellationSignal不能直接中断AMS的CPR等待；ContentProviderClient的ANR Runnable则只是另一路定时上报，不会调用CancellationSignal，也不取消当前Binder事务。
+
+因此可恢复调用的稳妥模型是：一次Provider代际配一份远端取消transport；Binder代际改变后重新创建操作上下文。若要审计r48，测试应在旧Provider创建transport后强杀旧宿主、让新宿主接收同一代理，再观察Provider侧CancellationSignal为null，而不是只验证客户端对象已经cancel。
+
+## 13. OOM 与 external handle：stable/unstable 同样传播重要性，外部需求是另一种能力
+
+OomAdjuster遍历宿主进程的 `pubProviders`，再遍历每个CPR的connections，读取client当前adj/procState并向宿主传播。循环没有读取 `stableCount`、`unstableCount` 或 `dead`；只要Connection仍在列表，两类引用对宿主OOM/LRU保护相同。stable/unstable的强弱发生在死亡协议，不是“stable把宿主提得更高”。
+
+已有已发布Provider的get会立即updateOomAdj；启动路径要等publish后再更新。LRU提升也有限定：只有该client→CPR Connection总计数变成1，且client已有setAdj足够重要时才把宿主上提LRU。最后Connection从重要client移除后，服务端写lastProviderTime，默认20秒recent-provider保护防止抖动；client进程直接死亡的批量清理不走这个dec路径，所以不建立同样的recent时间点。
+
+没有framework ProcessRecord的使用者走external handle。`incProviderCountLocked(r==null)` 只向CPR登记token或匿名计数并返回null Connection，哪怕调用参数stable=true。它会让OomAdjuster把宿主至少提高到foreground adj / important-foreground procState，却没有“Provider死则杀external客户端”语义，也无法通过connection定位ANR客户端。
+
+非空token首次登记会linkToDeath，同token多次获取只增加acquisition count；token死亡一次删除整项。r48有几处账和诊断边界：linkToDeath失败仍保留handle；binderDied删除handle却不立即调用updateOomAdj；同token计数大于1时显式remove正确减一但返回false，AMS会误记“没有external reference”；传入不匹配token而其他token仍存在时，会走匿名计数递减，甚至降为负数。
+
+匿名external要求调用方显式配对。同步 `getProviderMimeType()` 会在finally归还；异步版本只在远端callback里归还，若oneway调用当场RemoteException或Provider永不callback，该方法不会归还匿名计数；宿主若仍活，它继续构成external OOM边，否则只是旧CPR上的残留账。普通已发布Provider死亡也不会仅因还存在external handle自动重启；handle影响OOM与launching失败是否仍有需求，不是永久重启订阅。
+
+## 14. Provider 与 client 死亡：stable 连带处置、unstable 通知、launching 才可能重启
+
+已发布Provider宿主死亡时，AMS按对象identity从class/name Map摘除旧CPR，避免误删已经替换的新一代；再遍历旧CPR的Connection并置 `dead=true`。若某连接stableCount大于0，非persistent、thread存在、pid有效且非system_server的客户端进程会以 dependency died 原因被kill。stable优先，所以同一Connection同时有stable/unstable时仍走连带处置；这一分支不当场从双向表移除Connection，persistent等免杀客户端因而可能暂时保留dead连接。
+
+没有stable、client thread仍存在且旧Provider Binder非空时，AMS向客户端发 `unstableProviderDied(oldBinder)`，然后立即从CPR与client的双向列表移除Connection；条件不满足的连接由其他进程清理路径收束。ActivityThread收到后按Binder删ProviderRefCount与所有authority cache；客户端主动在调用中先发现DeadObject时也会做相同本地清理，再调用AMS `unstableProviderDied(connection)`，AMS先ping当前Binder，确认已死且仍对应同一宿主后进入appDied。两条路径共同缩小“客户端知道死、服务端尚不知道”的窗口。
+
+启动未完成时 `cpr.provider==null`，规则不同。若仍允许重启，waiting Connection会被直接跳过：不置dead、不kill、不通知，继续等同一CPR下一次宿主。若已终局清理，stable waiter仍可能触发连带kill；unstable waiter因为Provider Binder为空，既没有回调也不会进入立即摘连接分支，get被notify后返回null，Connection可能留到client死亡。
+
+自动重启只属于仍在 `mLaunchingProviders`、普通崩溃清理传入 `alwaysBad=false` 且还有Connection或external handle的需求。这个分支以 `MAX_RETRY_COUNT=3` 把初次尝试后的重启封顶为三次；process-start timeout与10秒publish timeout传 `alwaysBad=true`，第一次超时就终局清理，不享受这组重试。成功publish会把计数清零。已经发布后才死亡的普通Provider，不会只因旧Connection或handle自动拉起；下一次显式acquire才重新形成启动需求。
+
+客户端进程死亡则反向遍历 `app.conProviders`，从各CPR连接表摘除并清空，无需等待逐个release，也不区分stable/unstable。该路径不经过最后引用的dec逻辑，不设置lastProviderTime；常规进程死亡清理随后会全局重算OOM，active instrumentation等分支可抑制这次重算。Provider死亡不会顺带撤销上一章的URI grants，两套生命周期要由各自owner、包清理或授权API收束。
+
+20秒ready timeout使死亡语义更尖锐：超时没有减Connection，调用者也没有Holder可释放；更晚publish后，该stable Connection可能在宿主再死时参与连带kill。诊断“客户端从未成功拿到Provider”不能据此推导“服务端没有把它当依赖”。
+
+## 15. ContentProviderClient ANR 探测：定时上报宿主，不取消调用，也不是通用 CRUD timeout
+
+隐藏/System API `setDetectNotResponding(timeout)` 在timeout大于0时创建每个client自己的Runnable，并共享一个主Looper上的async静态Handler；同时对Provider Binder调用 `Binder.allowBlocking()`。每次远端方法前 `postDelayed`，finally中的afterRemote移除同一个Runnable。设为0或close会把字段置null并恢复defaultBlocking；client的AtomicBoolean保证租约只释放一次，finalize仅是遗忘close时的兜底。
+
+Runnable到期调用 `ActivityThread.appNotRespondingViaProvider(providerBinder)`，ActivityThread用Binder找到ProviderRefCount，再把Holder.connection交给AMS。AMS在这里才运行时强制 `REMOVE_TASKS`，找到Connection关联的宿主ProcessRecord，然后交给AnrHelper。setter上的权限annotation不是本地runtime enforcement；没有权限的隐藏API调用者可能成功配置，直到超时回调才收到SecurityException。
+
+这条链只**报告**“ContentProvider not responding”。它不取消Binder事务、不保证立刻kill，也不向Provider方法注入deadline。ContentResolver里3秒的常量只服务特定异步getType/canonicalize路径，不能推广为query/update的统一超时。若Provider是本地实例而没有PRC，或者引用已从client map移除，ActivityThread可能没有connection可上报；远端noRelease Provider仍有1000/1000的PRC与普通Holder.connection，不能归入该类。external MIME路径的Holder.connection恒为null，AMS也只能记录null。
+
+ContentProviderClient公开文档说明实例不保证线程安全。r48实现进一步说明为什么不应共享并发调用：同一个client的多个调用共用同一个Runnable，其中一个较早完成时 `removeCallbacks` 会移除另一调用的watchdog；close把mAnrRunnable置null，却没有显式移除此前已经排队的旧Runnable，阻塞调用期间close可能留下迟到上报。不同client又可能共享同一Binder代理，allowBlocking/defaultBlocking切换也会互相影响。
+
+watchdog本身还依赖主Looper执行。若受监督的同步Provider调用恰好就在主线程阻塞，Runnable虽然到期，却无法在同一被阻塞Looper上运行；调用返回后的finally又会removeCallbacks。async Handler只能绕过同步屏障，不能让一个阻塞中的Looper并发执行。因此它适合监督其他线程的阻塞调用，不能被当成主线程Provider调用的可靠deadline。把client限定到单线程、成对close，并让监督Looper保持可调度，才符合这段实现的真实前提。
+
+### 练习 9：验证 ANR 定时、权限执行点、connection 路由与并发边界
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F '@RequiresPermission(android.Manifest.permission.REMOVE_TASKS)' frameworks/base/core/java/android/content/ContentProviderClient.java
+grep -n -F 'mAnrRunnable = new NotRespondingRunnable();' frameworks/base/core/java/android/content/ContentProviderClient.java
+grep -n -F 'sAnrHandler = new Handler(Looper.getMainLooper(), null, true' frameworks/base/core/java/android/content/ContentProviderClient.java
+grep -n -F 'sAnrHandler.postDelayed(mAnrRunnable, mAnrTimeout);' frameworks/base/core/java/android/content/ContentProviderClient.java
+grep -n -F 'sAnrHandler.removeCallbacks(mAnrRunnable);' frameworks/base/core/java/android/content/ContentProviderClient.java
+grep -n -F 'Binder.allowBlocking(mContentProvider.asBinder());' frameworks/base/core/java/android/content/ContentProviderClient.java
+grep -n -F 'Binder.defaultBlocking(mContentProvider.asBinder());' frameworks/base/core/java/android/content/ContentProviderClient.java
+grep -n -F 'mContentResolver.appNotRespondingViaProvider(mContentProvider);' frameworks/base/core/java/android/content/ContentProviderClient.java
+grep -n -F 'ProviderRefCount prc = mProviderRefCountMap.get(provider);' frameworks/base/core/java/android/app/ActivityThread.java
+grep -n -F 'enforceCallingPermission(REMOVE_TASKS, "appNotRespondingViaProvider()");' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'final ProcessRecord host = conn.provider.proc;' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'mAnrHelper.appNotResponding(host, "ContentProvider not responding");' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+```
+
+用同一ContentProviderClient并发发起A/B两次长调用：A先post、B后post、A先完成，逐步写Handler中Runnable数量与B是否仍受监督。再比较本地Provider、普通远端Connection、external MIME三种情况，指出timeout发生时哪条链能定位宿主、哪条只能静默或记日志。
+
+## 16. 诊断矩阵：把“找不到、等不到、拿到后死亡、调用卡住”拆成四类证据
+
+ContentProvider问题最容易被一条“Failed to find provider”或“ANR”概括过头。更可靠的排查矩阵是：
+
+| 现象 | 首先确认 | 能证明 | 仍不能证明 |
+|---|---|---|---|
+| AMS立即返回null/拒绝 | ProviderInfo、user、association、possible-access、system/user状态 | 请求在启动前哪个门结束 | 具体URI的Transport权限结果 |
+| 等待ready超时 | CPR的class/name Map、launchingApp、mLaunchingProviders、conn WAITING | Binder在本次等待内未发布 | Connection、Map、隐式可见性已回滚 |
+| Holder返回后DeadObject | 客户端authority cache、Binder ref、服务端CPR代际与death路径 | 某一Binder代际已死 | 下一次acquire一定重启或旧grant已撤销 |
+| Provider调用过慢 | CPC watchdog是否配置、connection能否定位host、调用线程与CancellationSignal | 是否触发上报/合作取消 | Binder事务已取消或宿主必然被kill |
+
+推荐按五个问题收束现场：
+
+1. authority携带的user-info是否被规范到预期 `(auth,user)`，singleton最终落在哪个用户key；
+2. ProviderMap中的CPR是已发布、launching、旧代际残留，还是仅class eager登记；
+3. client到CPR是普通Connection、local instantiate还是external handle，谁有能力释放；
+4. 当前看到的是10秒进程attach、10秒attach后publish、20秒单次ready、一秒客户端retain还是20秒服务端recent保护；
+5. stable/unstable差异发生在死亡处置还是只被误当成OOM等级，Cursor/FD/client究竟谁持有最后租约。
+
+这五问能解释几类看似矛盾的日志：客户端得到null而dumpsys仍有Connection；同authority重复进入AMS但最终复用同一Binder；Provider.onCreate已打印而Application.onCreate尚未执行；一个Provider发布后同进程兄弟仍在launching却没有publish timer；unstable调用可重获新Binder但复用旧取消transport；没有成功Holder的stable waiter仍可能在稍后宿主死亡时成为依赖。
+
+本文的终点是“Transport Binder已经由一代Provider发布，并由明确租约托住或释放”。它还没有回答一次query/update/open在Provider进程内怎样验证具体URI、calling package与attribution，怎样组合read/write permission、PathPermission、URI grant和AppOps，也没有进入bulk操作的逐项边界。下一章将继续到 **Android ContentProvider Transport：读写权限、PathPermission、URI grant、calling package/attribution、AppOps、跨用户与CRUD/Bulk执行链**。

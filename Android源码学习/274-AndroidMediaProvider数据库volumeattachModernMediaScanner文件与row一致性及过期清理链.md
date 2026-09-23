@@ -1,562 +1,452 @@
 # 274 Android MediaProvider数据库、volume attach、ModernMediaScanner、文件与row一致性及过期清理链
 
-## 1. 本章目标
+## 1. 先看结论：一致性不是一个瞬间，而是五个可分别失败的完成点
 
-第273章解释了App与FUSE怎样进入MediaProvider，本章继续研究“文件已经存在”和“MediaStore能查到一行”为什么不是同一件事。我们会从数据库初始化、卷attach、扫描器遍历与批处理一路追到row回收、pending/trashed到期删除和卸载卷的历史索引保留。
+本文以 Android 11 `android-11.0.0_r48` 为边界：`frameworks/base` 位于 `1d9b9ab57d844b18b3b1b4297725141e7788109b`，`packages/providers/MediaProvider` 位于 `47c141d93e93b25cc85c36f3579fda25a1695952`。这一版的 MediaProvider 不能用“磁盘和数据库最终总会一样”概括；更准确的模型是五个依次推进、却没有共同原子提交的完成点：
 
-## 2. Android 11版本边界
+1. **卷可见**：`StorageManager` 报告卷处于 mounted 或 mounted-read-only，缓存能解析卷名、根目录和扫描路径。
+2. **卷已 attach**：具体卷名进入 `mAttachedVolumeNames`，对应 URI 才能路由到数据库 helper。
+3. **文件已遍历**：扫描器访问目录树，判断隐藏性、MIME、媒体类型和是否需要更新。
+4. **row 已提交**：批量 `insert`/`update`/`delete` 真正经过 MediaProvider 和 SQLite；排队计数不等于提交计数。
+5. **旧 row 已对账**：扫描快照之外的候选行经过 generation、pending 等条件过滤后被清理；这一步只要求删除数据库行，不要求删除磁盘文件。
 
-本文只依据本地`android-11.0.0_r48`。后续Android版本的MediaProvider数据库结构、扫描规则和后台维护可能变化；这里出现的7天pending、30天trash、32条batch以及24小时idle job都应理解为r48实现，而不是永恒API契约。
+日常维护又在这些完成点之上运行：它重新扫描当前卷、核对缩略图、清 owner、删除到期项、遗忘长期不再出现的卷，最后才记录指标。任何一个广播、返回值或计数都只覆盖其中一段。
 
-## 3. 先建立正确心智模型
+| 观察 | 能证明什么 | 不能证明什么 |
+|---|---|---|
+| `attachVolume()` 返回 | 卷名已进入 attached 集合，通知已发出 | 默认目录、缩略图 UUID、Documents roots 已完成 |
+| `MEDIA_SCANNER_FINISHED` | external 扫描的外层 `finally` 已执行 | 所有路径扫描成功、scanner 状态已清空 |
+| scan 指标中的 insert/update/delete | 操作曾加入 pending 队列 | 每项都成功提交 |
+| reconcile 的 `PARAM_DELETE_DATA=false` | 不走普通物理文件删除分支 | 没有通知、授权撤销或缩略图失效副作用 |
+| idle 的 expired 数 | 查询游标命中的候选行数 | 同样数量的磁盘文件已删除 |
 
-真实文件系统负责字节、目录项和mtime，MediaStore的SQLite负责可查询索引、媒体元数据、owner与状态列。扫描器是二者之间的“对账器”，ContentProvider/FUSE写入链则尽量在操作当下同步两边；任何崩溃、拔盘或绕过写入都会留下短暂甚至持久差异。
+## 2. 数据库不是“一卷一库”：两个helper、共享external.db与事务epoch
 
-## 4. “数据库是真相”只对查询成立
+`MediaProvider.onCreate()` 构造一个 `ModernMediaScanner`，随后只构造 `internal.db` 和 `external.db` 两个 `DatabaseHelper`。所有具体外部卷的 row 都进入同一个 `external.db`，由 `volume_name` 区分。`isMediaDatabaseName()` 仍接受 `external-*.db`，这是兼容或迁移识别范围，不能反推当前 attach 会为每个卷新建数据库。
 
-App通过MediaStore查询时，看到的是经过权限和volume过滤的数据库结果；但文件最终能否打开还取决于磁盘对象与FUSE政策。反过来，一个刚被其他程序写入磁盘的文件，在扫描完成前也可能没有row，因而不会出现在collection查询中。
+`files` 是宽表，`_data` 使用 `UNIQUE COLLATE NOCASE`；目录也能拥有 row，只是目录的 MIME 为 `null`。因此 `getItemCount()` 明确只统计 `mime_type IS NOT NULL` 的真实媒体项，而不是简单统计整张表。
 
-## 5. 本章源码地图
+`DatabaseHelper` 故意禁用普通的 `getReadableDatabase()` 与 `getWritableDatabase()` 调用。业务操作必须经过 `runWithTransaction()` 或 `runWithoutTransaction()`，这样 schema 读锁、SQLite 事务和提交后的通知任务才处在同一套纪律中。WAL 打开并不取消这套锁语义。
 
-```text
-packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
-packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
-packages/providers/MediaProvider/src/com/android/providers/media/MediaService.java
-packages/providers/MediaProvider/src/com/android/providers/media/IdleService.java
-packages/providers/MediaProvider/src/com/android/providers/media/scan/MediaScanner.java
-packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
-packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
-packages/providers/MediaProvider/src/com/android/providers/media/util/SQLiteQueryBuilder.java
-packages/providers/MediaProvider/apex/framework/java/android/provider/MediaStore.java
-```
+最容易误读的是 generation：`beginTransactionInternal()` 在 SQLite 事务开始后立即把 `local_metadata.generation` 加一。事务若回滚，这次加一也回滚；事务若成功，即使没有 row 改动，generation 仍可能前进。`runWithTransaction()` 在同一线程已有事务时直接复用它，所以一组嵌套 helper 调用共用同一个 epoch；直接再次 `beginTransaction()` 才会抛异常。它是“成功事务序号”，不是 row 数、文件数或扫描次数。
 
-## 6. 本章的五个问题
+### 练习 1：证明数据库拓扑与generation的真实粒度
 
-第一，internal.db与external.db怎样分工；第二，卷挂载怎样成为可查询状态；第三，ModernMediaScanner怎样判断insert、update、skip或delete；第四，扫描期间的新写入怎样避免误删；第五，pending、trash、owner、缩略图和旧卷如何在idle maintenance中维护。
-
-## 7. 关键名词：具体卷与合成卷
-
-`internal`是系统内置媒体资源；`external_primary`以及UUID样式名称代表具体外部卷；`external`是聚合视图名称。调用`content://media/external/...`时，许多写入场景会解析到primary，查询则可展开为当前挂载外部卷的合成视图，不能把二者当同一个物理卷。
-
-## 8. 关键名词：attach不等于mount
-
-mount是StorageManager/vold层的文件系统状态；attach是MediaProvider把卷名加入自身可服务集合。卷可以已经由内核挂载，但MediaProvider尚未attach；此时`getDatabaseForUri()`仍会抛VolumeNotFoundException。
-
-## 9. 关键名词：scan不等于import
-
-扫描既可能插入新row，也可能更新已有row、跳过未变化文件、删除磁盘上已不存在的row并解析playlist。它不是单向“把新文件导入数据库”，而是限定目录范围内的双向对账。
-
-## 10. 总体状态流
-
-```mermaid
-flowchart TD
-    VOL["StorageVolume mounted"] --> CACHE["updateVolumes刷新卷与路径缓存"]
-    CACHE --> ATTACH["attachVolume加入attached集合"]
-    ATTACH --> PREP["默认目录/缩略图UUID/Docs ready"]
-    ATTACH --> SERVICE["MediaService扫描卷"]
-    SERVICE --> WALK["ModernMediaScanner遍历磁盘"]
-    WALK --> UPSERT["insert/update files row"]
-    WALK --> RECON["reconcile未知row"]
-    RECON --> ROWDEL["只删row PARAM_DELETE_DATA=false"]
-    IDLE["IdleService 24h条件任务"] --> SERVICE
-    IDLE --> EXPIRE["过期文件/缩略图/owner/旧卷维护"]
-    DETACH["volume detach"] --> CANCEL["取消扫描并移出attached"]
-```
-
-## 11. onCreate先构造扫描器
-
-MediaProvider启动时先创建`ModernMediaScanner(context)`，随后构造两套DatabaseHelper。扫描器通过本地ContentProviderClient回到同一个MediaProvider，因此仍复用正常的insert、update、delete、权限旁路和通知机制，而不是直接任意改SQLite。
-
-## 12. 只有两份主数据库
-
-`internal.db`对应internal volume，`external.db`承载所有具体外部卷。看到SD卡、USB盘和primary时，不要推断r48会为每个卷新建一份现代数据库；它们主要依靠files表的`volume_name`列分区。
-
-## 13. 外置卷共库的意义
-
-共库让`external`合成视图可以跨当前挂载卷查询，也便于保留近期拔出卷的索引。代价是所有外部查询必须正确加入volume过滤，否则会把已经弹出的卷的旧row泄露给调用者。
-
-## 14. DatabaseHelper不是普通SQLiteOpenHelper用法
-
-它重写公开的`getReadableDatabase()`和`getWritableDatabase()`并直接抛异常，要求内部调用走`runWithTransaction()`或`runWithoutTransaction()`。原因是schema变更需要读写锁协调SQLite连接，避免一条连接改schema、另一条等待transaction造成死锁。
-
-## 15. WAL与schema读写锁
-
-构造器启用write-ahead logging。一般数据库操作拿schema read lock，升级和重建view拿write lock；这不是用来替代SQLite事务，而是在连接池与schema更新之间再加一层进程内秩序。
-
-## 16. files表是一张宽表
-
-`files`同时保存路径、大小、mtime、MIME、media_type、音视频图片元数据、owner、pending、trashed、favorite、relative_path、volume_name和generation等。audio、video、images、downloads主要是这张表上的view，不是彼此完全独立的数据副本。
-
-## 17. _data具有NOCASE唯一性
-
-schema中`_data TEXT UNIQUE COLLATE NOCASE`，同一数据库不能保存仅大小写不同的重复路径row。这会把外部文件系统的命名语义与SQLite的NOCASE约束连接起来，插入冲突在target R与旧target上的异常兼容行为也可能不同。
-
-## 18. 目录也有row
-
-ModernMediaScanner会把目录作为普通访问节点扫描，写入`FORMAT_ASSOCIATION`且MIME为空。目录row帮助维护parent关系；DatabaseHelper统计媒体item时用`mime_type IS NOT NULL`排除这些目录，所以“files表行数”不等于“媒体数量”。
-
-## 19. view按media_type投影
-
-audio、video、images和downloads view从files筛出对应media_type或download标志，再应用列投影。查询某个collection只是换了视图与权限，不意味着磁盘上存在四套索引。
-
-## 20. volume过滤写进view
-
-DatabaseHelper维护`mFilterVolumeNames`。集合变化时，它在schema write lock和事务中重建最新views，把当前可见卷名嵌入SQL；因此拔盘后可隐藏旧row，而无需立刻抹掉其全部元数据。
-
-## 21. 初始外部过滤值
-
-external helper构造时先把`external_primary`作为默认过滤值，之后`updateVolumes()`异步用当前外部卷集合刷新。初始化窗口与测试环境因此可能先看到默认值，正式状态以刷新后的集合为准。
-
-## 22. attached集合是第一道门
-
-`getDatabaseForUri()`先把`external`解析为`external_primary`，再确认卷名位于`mAttachedVolumeNames`。只有通过后才选择internal或external helper；共用external.db不代表任意历史volume_name都随时可操作。
-
-## 23. 为什么历史row仍不能直接访问
-
-一个SD卡的row可能仍在external.db，但detach后具体卷名不在attached集合，查询入口会先失败；合成view也只包含当前filter volume names。保留数据与对外可访问是两个独立维度。
-
-## 24. attachVolume只允许本进程
-
-方法检查calling identity的pid必须等于MediaProvider自己的pid，外部App不能用`content://media/.../volumes`任意打开数据库。随后还用`MediaStore.checkArgumentVolumeName()`拒绝不合法卷名。
-
-## 25. validate参数的作用
-
-validate为true且非internal时，会调用`getVolumePath()`确认卷当前存在；MediaService主动扫描时使用true。ExternalStorageService接收系统卷状态时使用false，因为StorageManager已经给出了可信状态，且路径缓存可能正处在更新窗口。
-
-## 26. attach先加入集合
-
-通过检查后，卷名在同步块内加入`mAttachedVolumeNames`，然后对具体volume URI发送notifyChange。若是外部具体卷，还会同时通知`external`合成URI，使观察聚合collection的客户端重新查询。
-
-## 27. attach不创建新external数据库
-
-代码选择helper时仍是internal→mInternalDatabase，其他→mExternalDatabase。attach的主要效果是开放路由、通知观察者和安排卷级准备工作，不是执行SQL `ATTACH DATABASE`。
-
-## 28. 外部卷准备放到前台执行器
-
-非internal卷的默认目录与缩略图检查通过ForegroundThread executor异步执行。attach返回不意味着这些准备动作已经全部完成，但attached门已经开放；这解释了生命周期与卷准备之间的短暂并发窗口。
-
-## 29. 默认目录只主动创建一次
-
-`ensureDefaultFolders()`仅针对primary等卷按SharedPreferences key判断，遍历系统默认目录，不存在才`mkdirs()`并插入目录row。标记提交后，即使用户手动删除目录，也不会每次挂载都强行重建。
-
-## 30. 非primary使用卷专属key
-
-primary用`created_default_folders`，其他卷的key附加MediaStore volume name。这样一个卷完成初始化不会错误阻止另一张SD卡创建默认目录。
-
-## 31. 缩略图数据库UUID配对
-
-MediaProvider从数据库取得或创建UUID，并与缩略图目录中的标记文件比较。标记缺失时写入当前UUID；若磁盘UUID与数据库不同，就遍历删除缩略图，防止重建数据库后旧文件名碰巧对应新的row id。
-
-## 32. MediaDocumentsProvider ready信号
-
-默认目录和缩略图事务完成后调用`MediaDocumentsProvider.onMediaStoreReady()`。注释强调数据库已能回答查询，DocumentsProvider此时再服务可降低ANR风险；它不是卷attach的前置授权判断。
-
-## 33. updateVolumes刷新四组缓存
-
-它清空并重建外部卷名、volumeName→路径、volumeName→扫描路径、volume root→StorageVolume id四类缓存。StorageVolume callback与ExternalStorageService的volume state回调都会触发刷新。
-
-## 34. 哪些状态算当前外部卷
-
-`MediaStore.getExternalVolumeNames()`遍历StorageManager volumes，只纳入`MEDIA_MOUNTED`与`MEDIA_MOUNTED_READ_ONLY`且volume name非空的项。只读卷可以参与查询与扫描，但具体写入仍可能在文件系统层失败。
-
-## 35. external是合成名字
-
-`FileUtils.getVolumeScanPaths(external)`会展开所有当前具体外部卷；而`getVolumePath(external)`直接抛FileNotFoundException，因为合成视图没有单一挂载根。凡是需要真实路径的代码必须先解析到具体卷。
-
-## 36. scan path有边界
-
-internal扫描`Environment.getInternalMediaDirectories()`；具体external扫描该StorageVolume根；合成external展开各根。MediaProvider对传入`_data`还会canonicalize并确认落在目标卷允许扫描路径下，不能靠伪造volume URI写到另一个根。
-
-## 37. MediaService是扫描编排器
-
-它是JobIntentService，处理MEDIA_MOUNTED、MEDIA_SCANNER_SCAN_FILE、locale与package事件。真正的目录遍历仍委托给MediaProvider中的scanner，服务本身负责规范化路径、attach、广播和扫描状态标记。
-
-## 38. 外部卷扫描前先扫internal
-
-`onScanVolume()`若目标不是internal，先扫描internal并调用`RingtoneManager.ensureDefaultRingtones()`。这样系统铃声尽快可用，不必等潜在很久的整张外置盘扫描结束。
-
-## 39. 扫描根先canonicalize
-
-来自Intent的文件URI先构造File并调用`getCanonicalFile()`，再根据真实路径求volume name。这样`..`或符号路径别名不会轻易把扫描范围与卷判断分离。
-
-## 40. 扫描开始与结束标记
-
-MediaService向MediaStore的media_scanner URI插入volume name，MediaProvider记录`mMediaScannerVolume`和helper的scan start time；完成后删除该URI并记录stop time。这个特殊URI是扫描状态控制面，不是普通媒体row。
-
-## 41. 广播包住整个外部扫描
-
-外部卷发送MEDIA_SCANNER_STARTED，finally中发送MEDIA_SCANNER_FINISHED。broadcast URI在扫描前一次解析，因此即使中途拔盘，结束广播仍可引用原卷；异常不会跳过finally。
-
-## 42. ModernMediaScanner的定位
-
-源码称它是用纯managed code重写的legacy scanner，目标是bug-compatible、更易测试维护。元数据原则是先填文件属性，再由MediaMetadataRetriever、ExifInterface、XmpInterface按更高信任度覆盖有效字段。
-
-## 43. 每次扫描创建Scan对象
-
-Scan持有本地ContentProviderClient、root、reason、volumeName、files URI、CancellationSignal、ownerPackage以及统计数据。try-with-resources确保pending操作被检查、目录锁释放、client关闭。
-
-## 44. volume级CancellationSignal
-
-scanner以volumeName缓存CancellationSignal，同卷扫描共享它。detach会从map移除并cancel当前signal，遍历、查询和清理阶段多处调用`throwIfCanceled()`，让拔盘尽快终止工作。
-
-## 45. detach不是等待扫描自然结束
-
-MediaProvider先调用`mMediaScanner.onDetachVolume(volume)`发取消，再从attached集合移除并通知具体卷和external观察者。扫描线程捕获OperationCanceledException并安静返回，避免把正常拔盘当致命错误。
-
-## 46. 构造时抓取start generation
-
-Scan通过`MediaStore.getGeneration()`记录`mStartGeneration`。后面清理row时，只考虑`generation_added <= startGeneration`，保护扫描开始后由并发操作新插入、但尚未被本次遍历看到的row。
-
-## 47. 单文件与目录扫描不同
-
-`mSingleFile = mRoot.isFile()`。单文件扫描会锁住父目录，若正好扫描并识别到一个既有或新row，可跳过全范围reconcile；目录扫描则完成walk后必须对扫描范围内数据库row做对账。
-
-## 48. 扫描的三阶段
-
-第一阶段`walkFileTree()`收集并upsert；第二阶段`reconcileAndClean()`找磁盘未见的旧row；第三阶段`resolvePlaylists()`处理本次generation之后更新的playlist。顺序确保playlist解析能看到先写入的媒体row。
-
-## 49. 扫描与对账时序图
-
-```mermaid
-sequenceDiagram
-    participant S as "Scan"
-    participant FS as "Filesystem"
-    participant MP as "MediaProvider"
-    participant DB as "external.db/files"
-    S->>MP: getGeneration(volume)
-    MP-->>S: startGeneration
-    S->>FS: Files.walkFileTree(root)
-    loop 每个目录/文件
-        S->>MP: query _data含pending/trashed
-        MP-->>S: existing id/mtime/size/type
-        S->>S: unchanged则记录id并跳过
-        S->>MP: batch insert或update
-        MP->>DB: 写row并标generation
-    end
-    S->>MP: 查询root下generation_added<=start
-    MP-->>S: 已存在row ids
-    S->>S: scannedIds中没有则unknown
-    S->>MP: delete row且PARAM_DELETE_DATA=false
-    S->>MP: resolve changed playlists
-```
-
-## 50. 路径是否可扫描先看父链
-
-单文件扫描检查父目录，目录扫描检查root；`shouldScanPathAndIsPathHidden()`一路向上。任何父路径命中固定不可扫描模式便返回false；否则累计“是否位于隐藏目录”状态，用来把媒体类型降为NONE。
-
-## 51. 固定可见根会删除异常.nomedia
-
-存储根等`PATTERN_VISIBLE`路径必须可见，扫描器会删除该处非标准`.nomedia`。这是防止一个根级标记隐藏整卷，而不是说所有子目录的`.nomedia`都被忽略。
-
-## 52. 固定不可扫描目录
-
-Android/data、Android/obb以及Movies/Music/Pictures下的`.thumbnails`目录命中`PATTERN_INVISIBLE`，扫描器尝试创建`.nomedia`并跳过子树。创建标记是为了SD卡拿到旧设备时，旧scanner也能识别不可扫描区域。
-
-## 53. 普通.nomedia的准确语义
-
-r48的`shouldScanDirectory()`并未因任意目录存在`.nomedia`就返回false；隐藏状态由`FileUtils.isDirectoryHidden()`沿父链累计。目录仍可能被遍历，但其中普通媒体会被标成`MEDIA_TYPE_NONE`，这与“完全不读文件树”不同。
-
-## 54. 每个目录有独占锁
-
-scanner以Path→DirectoryLock引用计数表协调并发扫描。preVisitDirectory获取锁，postVisitDirectory先flush本目录pending操作再释放；单文件扫描则显式锁父目录，避免两个重叠扫描互相误判unknown row。
-
-## 55. 锁不是全卷串行化
-
-只要目录不重叠，不同扫描仍可并行；重叠路径在对应目录上排队。close还会快照并释放异常路径中遗留的锁，防止一次扫描失败永久堵住后来任务。
-
-## 56. visitFile先解析类型
-
-目录的MIME为null；文件由MimeUtils根据路径解析。DRM MIME会交给DrmManagerClient求原始类型，然后结合隐藏状态和路径得到media_type；专辑封面样式图片也会降为MEDIA_TYPE_NONE，避免进入用户图片collection。
-
-## 57. “未变化”由四项共同决定
-
-scanner按`_data=?`查询既有row，并显式包含pending、trashed、favorite。只有mtime、size、MIME、media_type都相同且不是FUSE pending，普通文件才跳过；目录无条件可跳过内容元数据提取，但其id仍被记为已扫描。
-
-## 58. 为什么先记录scanned id
-
-即便文件未变化而跳过，也必须把existingId加入`mScannedIds`。否则后面的reconcile只看到“没有产生update”，就会把这个完全正常的row当成unknown并删除。
-
-## 59. FUSE pending强制重扫
-
-如果row的IS_PENDING非0，但真实文件名并不匹配`.pending-时间-原名`，scanner判定它是FUSE创建的pending。即使mtime/size未变化，也不能走unchanged快路，必须更新row并把pending发布为普通状态。
-
-## 60. scanner识别隐藏状态而非删除内容
-
-文件隐藏或位于隐藏父目录时，media_type改为NONE，但row仍可存在files表。MediaStore图片/音视频view不再展示它，文件字节也不会仅因隐藏就被scanner删除。
-
-## 61. upsert其实是insert或定点update
-
-源码虽称newUpsert，但r48还没有使用SQLite UPSERT：existingId为-1构造insert，否则构造带具体id、expectedCount=1的update。两者都允许单项exception，避免一个坏文件拖垮整批扫描。
-
-## 62. generic values先清旧字段
-
-`withGenericValues()`不只写_data、size、mtime和title，还先把date taken、宽高、文档id、方向、音频标签等大量字段设null或默认值。这样文件内容改成不含某元数据时，旧扫描值不会幽灵般残留。
-
-## 63. 元数据覆盖顺序
-
-基础值来自BasicFileAttributes与文件名；音视频使用MediaMetadataRetriever；图片使用ExifInterface；容器还能解析XMP并写入脱敏后的XMP。只有Optional有效值才覆盖，空串、-1和纯空白会被忽略。
-
-## 64. 图片元数据
-
-image扫描读取宽高、resolution、date taken、orientation、description、exposure、f-number、ISO与scene capture type。读取异常只记录trouble，仍返回带基础字段的operation，因此“EXIF坏了”不必然导致整张图片没有row。
-
-## 65. 音视频元数据
-
-audio初始化UNKNOWN artist与父目录album，再根据Ringtones、Notifications、Alarms、Podcasts、Audiobooks、Music路径设置用途；video还清空并重建color standard/transfer/range。Retriever失败时同样保留通用索引。
-
-## 66. owner只写给新文件
-
-调用`scanFile(file, reason, ownerPackage)`时，只有新insert、非目录且ownerPackage非null才附加OWNER_PACKAGE_NAME。更新既有row不会因为一次扫描请求随意夺走原owner，目录也不设置调用方owner。
-
-## 67. DRM的特殊补丁
-
-DRM文件先求原始MIME，且operation最终强制`IS_DRM=1`，因为更低层metadata stack可能没有正确设置。这里展示scanner不仅搬运属性，还承担兼容修正。
-
-## 68. batch阈值是超过32
-
-`BATCH_SIZE=32`，`maybeApplyPending()`在pending size大于32时提交，所以常见一批可达到33项，而不是严格每32项提交。离开目录前和walk结束后还会强制apply。
-
-## 69. batch通过MediaProvider写回
-
-scanner调用`ContentResolver.applyBatch(media, operations)`，结果URI中的id加入scannedIds。它没有直接调用db.insert，因此路径派生、generation、trigger、通知与其他MediaProvider规则仍生效。
-
-## 70. 单项失败不会中止整批意图
-
-operation使用`withExceptionAllowed(true)`，result可携带exception；scanner记录警告后继续处理其他结果。整批RemoteException或OperationApplicationException也只记录，但pending最终会清空，这意味着失败项要靠后续扫描再修复。
-
-## 71. first result如何选择URI
-
-扫描保存第一个遇到的id，结束后再查询其media_type，返回audio、video、image、playlist的具体collection URI；无法分类时返回files URI。返回URI类型是扫描后数据库分类结果，不只由扩展名直接拼出。
-
-## 72. reconcile先快照scannedIds
-
-walk完成后把LongArray转数组排序，后续用binarySearch判断数据库id是否在本次遍历见过。这个集合同时包含未变化existing row和成功insert返回的row，因而覆盖skip与write两条路径。
-
-## 73. reconcile只看root范围
-
-SQL要求`_data LIKE root/% OR _data LIKE root`，并用escapeForLike处理路径中的通配字符。扫描一个子目录只对账这个子树，不会把同卷其他目录row误删。
-
-## 74. abstract playlist被排除
-
-没有磁盘文件的MTP abstract AV playlist不参加“磁盘没见到就删row”判断。它本来就是纯数据库抽象对象，若套用普通文件一致性规则会被错误回收。
-
-## 75. pending默认排除、trash包含
-
-对账查询设置MATCH_PENDING_EXCLUDE、MATCH_TRASHED_INCLUDE、MATCH_FAVORITE_INCLUDE。普通pending可能正处在未发布写入期，不应因扫描没看到而清掉；trashed实体仍对应磁盘上的隐藏重命名文件，需要参与一致性核对。
-
-## 76. generation保护并发新row
-
-查询额外要求`generation_added <= mStartGeneration`。扫描开始后另一个App新插入row，即使文件尚未出现在当前walk结果，也不会被本次clean判为unknown；这是比“加一把全卷大锁”更细的并发保护。
-
-## 77. generation不保护所有竞争
-
-它主要保护扫描启动后的新insert。已经存在的row若在扫描期间被移动、删除或更改，仍需目录锁、MediaProvider同步更新和下一轮扫描共同收敛；generation不是文件系统事务日志。
-
-## 78. 查询与删除分两阶段
-
-scanner先完整收集unknownIds，再逐个构造delete operation。注释说明这样分页查询时，删除不会让当前Cursor窗口与排序发生漂移；稳定快照比边查边删更容易推理。
-
-## 79. clean只删数据库row
-
-删除URI附加`PARAM_DELETE_DATA=false`。因此对账发现“数据库有、扫描未见”时，只移除索引，不尝试再删除磁盘文件；既然walk没看见它，贸然对路径执行unlink既无必要也可能误伤竞争中新建的对象。
-
-## 80. 文件存在但未被扫描的窗口
-
-直接路径写入后，FUSE通常触发scan，但进程崩溃或特殊旁路可能留下“有文件无row”。下一次需求扫描、卷扫描或idle full scan会插入；在此前MediaStore collection查询可能看不到它。
-
-## 81. row存在但文件消失的窗口
-
-App绕过Provider删除、拔盘异常或I/O失败可能留下“有row无文件”。目录扫描的reconcile会删row；单个open也可能因文件不存在失败，不能因为query返回一行就假定字节仍可读取。
-
-## 82. Provider删除与scanner clean不同
-
-普通MediaProvider delete默认先`deleteIfAllowed()`删除数据文件，再删row；scanner clean显式关闭delete data。二者都调用delete API，却用query parameter表达完全不同的意图。
-
-## 83. FUSE删除后的兼容缓存
-
-第273章看到FUSE路径删除会同步删row；若App随后又按URI删同一row，MediaProvider可从UID缓存的deleted row id识别并静默返回0，避免旧App因“已经删掉”反而收到SecurityException。
-
-## 84. pending的两种物理表示
-
-通过普通MediaStore insert设置IS_PENDING时，`computeDataFromValues()`常把文件名变为`.pending-到期秒-显示名`；FUSE按真实路径创建时可留下正常文件名但row为pending。scanner正是通过文件名pattern区分二者。
-
-## 85. computeDateExpires不信任外部值
-
-外部修改的ContentValues先移除DATE_EXPIRES，调用方不能任意把自动清理时间设到遥远未来。只有操作实际改变IS_PENDING或IS_TRASHED时，MediaProvider才根据系统当前时间计算或清空expires。
-
-## 86. pending默认保留7天
-
-FileUtils的`DEFAULT_DURATION_PENDING`为7天。其语义是给生产者一个完成写入并发布的窗口；pending不是永久私有仓库，长期不发布的内容会进入idle到期删除候选。
-
-## 87. trash默认保留30天
-
-`DEFAULT_DURATION_TRASHED`为30天。置trash时路径可改写为`.trashed-到期秒-显示名`并记录IS_TRASHED与DATE_EXPIRES；恢复时状态清零、expires置null并恢复显示名对应路径。
-
-## 88. 文件名pattern反推状态
-
-`PATTERN_EXPIRES_FILE`匹配`.pending|trashed-数字-原名`。`computeValuesFromData()`能由_data反推volume、relative path、display name、pending/trashed与expires，使磁盘重命名和数据库状态在再次扫描时重新对齐。
-
-## 89. FUSE pending为何不改名
-
-`computeDataFromValues(values, isForFuse)`在isForFuse且pending时不把真实路径改成`.pending-*`，因为文件已经按路径创建；FileUtils还保留TODO，说明扫描发生在create之后，不能简单在每次由DATA计算时都清pending。
-
-## 90. 发布FUSE文件依赖扫描
-
-ModernMediaScanner查询row时若发现“pending=1但文件名不是expires pattern”，就认定pending来自FUSE并强制重扫。MediaProvider处理scanner update时允许将该pending归零，最终让文件进入普通collection可见状态。
-
-## 91. trash不是只改一个布尔值
-
-状态、到期时间、display name、_data真实路径可能联动，实际rename失败也会影响操作结果。读源码时必须同时看`computeDateExpires()`、`computeDataFromValues()`和Provider update/rename链，不能只看IS_TRASHED列。
-
-## 92. 默认查询隐藏状态项
-
-普通查询通常排除他人pending与trashed，owner/FUSE/system路径可通过MATCH参数选择包含。扫描器为了对账显式指定include/exclude，说明这些参数既是UI可见性政策，也是内部一致性工具。
-
-## 93. IdleService怎样调度
-
-MediaReceiver安排job id -200，周期24小时，同时要求充电和设备idle。JobService启动新线程调用MediaProvider.onIdleMaintenance；停止job时cancel CancellationSignal并返回false，不请求系统自动重试。
-
-## 94. idle首先全扫当前外部卷
-
-维护遍历`getExternalVolumeNames()`，每卷调用MediaService的REASON_IDLE扫描；这又会先保证internal与默认铃声。它让长期绕过Provider产生的文件/row差异有周期性收敛机会。
-
-## 95. idle不是精确24小时闹钟
-
-JobScheduler的periodic、charging和device idle都是调度条件，实际运行可延后。7天或30天表示计算出的expires，真正删除要等某次符合条件的maintenance，不能承诺到秒清理。
-
-## 96. 缩略图清理
-
-`pruneThumbnails()`先收集files所有已知id并排序，再遍历当前卷缩略图目录。除数据库UUID标记外，文件名能解析为已知id就保留，否则删除并invalidate；无效名字也会被视为stale。
-
-## 97. 卸载包只清owner
-
-package fully removed或data cleared触发`onPackageOrphaned()`，把匹配OWNER_PACKAGE_NAME的row更新为null，不删除用户媒体文件。idle还会遍历数据库owner，发现包既未安装也不在installer session中时做同样孤儿化。
-
-## 98. installer session为何算已知
-
-备份恢复或安装进行中时，包可能暂时查不到PackageInfo，但PackageInstaller已有session。把这种owner立即清空会破坏恢复语义，所以`isPackageKnown()`把两种来源都视为存在。
-
-## 99. 到期删除只看最近一周窗口
-
-idle用`DATE_EXPIRES BETWEEN now-7days AND now`查询。注释说这是防御系统时钟剧烈变化；它不是简单的`DATE_EXPIRES <= now`，因此极老的过期row不会在这条查询中无条件批量扫掉。
-
-## 100. 到期删除会删真实内容
-
-查询得到volume_name与id后，调用普通`delete(Files.getContentUri(volume,id))`，没有设置PARAM_DELETE_DATA=false。因此pending/trash过期维护与scanner unknown clean不同：前者意图删除文件和row，后者只修数据库索引。
-
-## 101. maintenance事务的重入边界
-
-到期遍历包在`mExternalDatabase.runWithTransaction()`中，而内部delete再取同一helper时，DatabaseHelper检测thread-local transaction已存在便直接复用，避免嵌套transaction。通知与后台任务统一等外层成功后分阶段发出。
-
-## 102. idle维护全景
-
-```mermaid
-flowchart LR
-    JOB["24h + charging + idle"] --> SCAN["扫描当前所有外部卷"]
-    SCAN --> THUMBID["校验数据库/磁盘缩略图UUID"]
-    THUMBID --> PRUNE["删除无对应row的缩略图"]
-    PRUNE --> OWNER["未知package的owner置NULL"]
-    OWNER --> EXP["删除最近一周内到期内容"]
-    EXP --> RECENT["比较known volume与recent volume"]
-    RECENT --> STALE["删除不再recent的volume rows"]
-    STALE --> CACHE["清目录cache并记录metrics"]
-```
-
-## 103. recent volume保留策略
-
-MediaStore从StorageManager的recent storage volumes取得近期卷名。external.db中已知volume减去recent集合得到真正stale卷，再按volume_name批量删row；暂时拔出的常用SD卡仍可保留索引，永久消失的旧卷最终被遗忘。
-
-## 104. current与recent不要混同
-
-current external names用于view过滤、扫描与对外访问；recent names用于决定历史索引是否值得保留。一个卷可以“不current但recent”，此时row保留却不可通过attached/current视图正常访问。
-
-## 105. maintenance最后清目录cache
-
-所有维护完成后清空`mDirectoryCache`，重新计算真实媒体item count并记录duration、stale thumbnails和expired count。缓存失效是收尾动作，不是证明磁盘与数据库绝对一致的事务提交点。
-
-## 106. generation每个事务先加一
-
-DatabaseHelper开始transaction时执行`UPDATE local_metadata SET generation=generation+1`。因此generation是单调事务代际，不是精确“变更row数”；事务可能一次写多row，也可能因内部使用产生跳号。
-
-## 107. insert与update如何盖章
-
-定制SQLiteQueryBuilder会移除调用方伪造的generation列：insert把generation_added和generation_modified都设为当前local generation；update只更新generation_modified。App不能自己倒填代际来逃避scanner并发保护。
-
-## 108. generation比mtime可靠但仍需version
-
-MediaStore文档建议增量同步先比较`getVersion(volume)`，版本由数据库schema version与数据库UUID组成；version改变说明generation可能重置，应全量同步。版本不变时，再用generation_added/modified做算术比较，比受系统时钟和File.setLastModified影响的时间列稳健。
-
-## 109. trigger负责副作用而非generation
-
-files insert/update/delete triggers调用DatabaseHelper注册的`_INSERT/_UPDATE/_DELETE`自定义函数，收集通知、owner变化、路径等副作用；generation值由定制SQL builder写入。把trigger误认为代际来源会读错责任边界。
-
-## 110. 一致性的五层防线
-
-即时Provider/FUSE操作尽量同时改文件与row；目录锁约束重叠扫描；generation保护并发新insert；reconcile修复扫描范围内孤儿row；idle full scan与维护处理长期遗漏。它追求最终收敛，而不是把Linux VFS与SQLite变成一个原子数据库。
-
-## 111. 阅读完成检查
-
-你应能解释为什么只有两份数据库、external view怎样过滤当前卷、attach为何不是SQL ATTACH、scanner何时skip/update/delete、generation为何能防误删新row，以及pending到期删除和scanner clean为什么一个删文件、一个只删row。
-
-## 112. macOS只读练习一：画出卷与数据库映射
+在源码根目录运行；也可把源码根目录作为第一个参数，从任意目录运行。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '300,420p' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
-sed -n '7340,7465p' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
-sed -n '88,230p' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'mMediaScanner = new ModernMediaScanner(context);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'mInternalDatabase = new DatabaseHelper(context, INTERNAL_DATABASE_NAME,' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'mExternalDatabase = new DatabaseHelper(context, EXTERNAL_DATABASE_NAME,' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'static final String INTERNAL_DATABASE_NAME = "internal.db";' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'static final String EXTERNAL_DATABASE_NAME = "external.db";' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'if (name.startsWith("external-") && name.endsWith(".db")) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'public SQLiteDatabase getReadableDatabase() {' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'public SQLiteDatabase getWritableDatabase() {' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'setWriteAheadLoggingEnabled(true);' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F '_data TEXT UNIQUE COLLATE NOCASE' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'SELECT COUNT(_id) FROM files WHERE ' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'db.execSQL("UPDATE local_metadata SET generation=generation+1;");' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'if (mTransactionState.get() != null) {' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'return op.apply(db);' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
 ```
 
-写出internal、external_primary、一个UUID卷和external合成名分别经过哪个helper、attached门与view filter；特别标注“共用external.db”不等于“卸载后仍可访问”。
+读完应能回答：两个具体 SD 卡是否共享 generation？答案是共享，因为它们都路由到同一个 external helper；一次成功的只读式 `runWithTransaction()` 是否可能让 generation 前进？答案也是可能。
 
-## 113. macOS只读练习二：手推一次目录扫描
+## 3. 卷名同时参与路由与过滤，但两条链不是同一件事
+
+`external_primary`、UUID 形式的卷名是**具体卷**；`external` 是合成卷，代表当前外部卷的合并视图。数据库路由先把合成 `external` 解析成 `external_primary`，再检查这个具体名是否 attached，最后选择 internal 或 external helper。于是合成 external 查询仍以 primary attached 为入口条件。
+
+查询行集则走另一条链：`getQueryBuilder()` 遇到合成 external，会把 `includeVolumes` 展开为当前缓存中的所有外部卷名；具体卷则只绑定自身。Images、Video、Audio media、Files、Downloads 等普通集合在运行时追加 `volume_name IN (...)`。
+
+不要把这个事实泛化成“所有 SQL view 都内置卷过滤”。常规 media view 本身没有当前卷谓词；只有 `audio_artists`、`audio_albums`、`audio_genres` 这类聚合 view 把 `mFilterVolumeNames` 烘焙进定义。`updateVolumes()` 先同步刷新静态卷名、路径、扫描路径和 path-to-id 缓存，再把聚合 view 的重建异步投递给 `ForegroundThread`。因此普通 row 查询可能已经看到新缓存，而聚合 view 仍在等待重建。
+
+`MediaStore.getExternalVolumeNames()` 只收集 mounted 与 mounted-read-only 且具有 MediaStore 卷名的卷。它回答“当前卷”，不是 attached 集合，也不是 recent 历史集合。
+
+### 练习 2：沿着external同时追路由门和行集过滤
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '250,470p' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
-sed -n '510,755p' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private static @NonNull String resolveVolumeName(@NonNull Uri uri) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'return MediaStore.VOLUME_EXTERNAL_PRIMARY;' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (!mAttachedVolumeNames.contains(volumeName)) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'return mExternalDatabase;' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'includeVolumes = bindList(getExternalVolumeNames().toArray());' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'appendWhereStandalone(qb, FileColumns.VOLUME_NAME + " IN " + includeVolumes);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'mExternalDatabase.setFilterVolumeNames(getExternalVolumeNames());' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'filterVolumeNames = bindList(mFilterVolumeNames.toArray());' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'WHERE is_music=1 AND volume_name IN ' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'WHERE volume_name IN ' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'case Environment.MEDIA_MOUNTED_READ_ONLY: {' packages/providers/MediaProvider/apex/framework/java/android/provider/MediaStore.java
+grep -n -F 'res.add(volumeName);' packages/providers/MediaProvider/apex/framework/java/android/provider/MediaStore.java
 ```
 
-假设root下有未变化图片A、新图片B、数据库有但磁盘消失的C、扫描启动后并发插入的D：逐个写出scannedIds、unknownIds和最终操作，并解释generation clause怎样保护D。
+排障时应把四种状态分别记录：StorageManager 当前卷缓存、attached 集合、运行时 query filter、聚合 view filter。它们通常趋同，却不由一个同步临界区一次性切换。
 
-## 114. macOS只读练习三：比较pending与trash
+## 4. attach先开路由门，再异步准备目录、缩略图与Documents roots
+
+进程启动时，MediaProvider 注册 `StorageVolumeCallback`，调用 `updateVolumes()`，然后 attach internal 和当时所有当前外部卷。后续状态变化先触发缓存刷新；真正的 attach 也可由 `MediaService` 在卷扫描前调用。
+
+`attachVolume()` 只允许本进程身份调用，校验卷名；`validate=true` 时还要能解析物理路径。它先把卷名加入 `mAttachedVolumeNames`，再通知具体卷 URI；外部卷还通知合成 external URI。到这里方法就已经拥有可返回的 URI。
+
+这里也没有“已经 attach 就直接返回”的幂等快路：`ArraySet.add()` 的返回值被忽略，重复调用仍会重复 notify；重复 external attach 还会再次投递后续准备任务。
+
+外部卷的后续准备被投递到前台执行器：在 external 数据库事务中调用 `ensureDefaultFolders()` 和 `ensureThumbnailsValid()`，事务结束后再调用 `MediaDocumentsProvider.onMediaStoreReady()`。所以 attach 返回不是这些工作的屏障。
+
+默认目录只在偏好键未置位时主动创建：primary 使用 `created_default_folders`，其他卷使用带卷名的键。用户日后手动删除目录，不会因为同一键仍在就每次 attach 都重建。实现没有检查 `mkdirs()` 的返回值，目录已存在时也不会在这一步补 row，最后仍可能提交偏好键；因此这是 best-effort 初始化，后续扫描仍承担收敛职责。缩略图则用数据库文件 `user.uuid` xattr 与卷上 `.database_uuid` 配对；所有具体外部卷共享 external.db 的 UUID。缺少标记时写入当前 UUID，不匹配时尝试清空缩略图树再改写标记。
+
+Documents 的 ready 更要收窄理解：Android 11 这里是一个进程级静态布尔值，传入的 `volumeName` 并未形成逐卷 readiness；它表示底层 provider 已经可以回答 roots，既不表示该卷扫描完成，也不表示所有卷准备完成。
+
+MediaService 在 attach 返回后就能继续写 scanner 状态并遍历目录，不等待这项异步准备；detach 也不会撤销已经排队或正在运行的准备任务。detach 自身的顺序是：通知扫描器取消该卷当前 signal，移除 attached 名，再通知具体卷与合成 external。它不关闭共享 external.db，也不在这里刷新四组 volume 缓存或重建聚合 view；这些由独立的 volume-state/update 链推进，`updateVolumes()` 本身也不会替代 attach/detach。
+
+### 练习 3：给attach、异步准备和detach分别找完成点
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '840,875p' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
-sed -n '1040,1165p' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
-sed -n '570,615p' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'mStorageManager.registerStorageVolumeCallback(context.getMainExecutor(),' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'updateVolumes();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'attachVolume(MediaStore.VOLUME_INTERNAL, /* validate */ false);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'public Uri attachVolume(String volume, boolean validate) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'mCallingIdentity.get().pid != android.os.Process.myPid()' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'getVolumePath(volume);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'mAttachedVolumeNames.add(volume);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'resolver.notifyChange(getBaseContentUri(MediaStore.VOLUME_EXTERNAL), null);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'ForegroundThread.getExecutor().execute(() -> {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'ensureDefaultFolders(volume, db);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'ensureThumbnailsValid(volume, db);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'MediaDocumentsProvider.onMediaStoreReady(getContext(), volume);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'key = "created_default_folders_" + vol.getMediaStoreVolumeName();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'else if (!Objects.equals(uuidFromDatabase, uuidFromDisk.get())) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'mMediaScanner.onDetachVolume(volume);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'mAttachedVolumeNames.remove(volume);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'private static volatile boolean sMediaStoreReady = false;' packages/providers/MediaProvider/src/com/android/providers/media/MediaDocumentsProvider.java
+grep -n -F 'sMediaStoreReady = true;' packages/providers/MediaProvider/src/com/android/providers/media/MediaDocumentsProvider.java
 ```
 
-分别列出普通MediaStore pending、FUSE pending和trashed文件的真实文件名、row状态、默认到期时间与scanner行为；说明为什么FUSE pending必须绕开unchanged fast path。
+## 5. MediaService编排扫描；状态URI与广播都不是成功事务
 
-## 115. macOS只读练习四：审计idle清理
+`MediaService` 是 `JobIntentService`，处理按需单文件扫描和卷挂载扫描。外部卷扫描在发 STARTED 广播前，先递归扫描 internal，再确保默认铃声；因此广播并不包住全部准备工作。它还提前解析一次 broadcast URI，以便卷在中途弹出时仍能发对应事件。
+
+随后服务取得本地 MediaProvider、以 `validate=true` attach 目标卷，向 `media_scanner` URI insert 当前卷名。这个 URI 没有写一张持久表：MediaProvider 只是把名称放进单个 `mMediaScannerVolume` 字段、记录 helper 的 start time；query 返回的是 `MatrixCursor`。正常路径遍历每个 scan path 后 delete 这个 URI，MediaProvider 才记录 stop time 并清空字段。
+
+这个状态入口没有 per-scan token、卷名匹配或引用计数，只是单槽 best-effort 活动指示。若两个调用重叠，B 的 insert 会覆盖 A；A 随后的 delete 会按槽中当前卷记录 stop 并清掉 B，B 尚在工作时 query 就可能返回 null，B 最后的 delete 再返回 0。共享 external helper 上的 start/stop time 也不是逐卷并发账本。
+
+异常边界决定了不能把它叫作事务：`resolver.delete(scanUri, ...)` 位于 `try` 正常路径，不在 `finally`。扫描、批处理之后若抛出未被内部吞掉的异常，状态字段可能残留；外层 `finally` 仍会发 external 的 FINISHED 广播。甚至 attach、状态 insert 或 STARTED 发送阶段的异常，只要已经进入这一层 `try`，也会走 FINISHED。FINISHED 因而表示编排作用域退出，不表示扫描成功。
+
+按需 `ACTION_MEDIA_SCANNER_SCAN_FILE` 更短：canonicalize 文件后直接调用 `provider.scanFile()`，不走卷状态 URI，也没有卷 STARTED/FINISHED 广播。
+
+### 练习 4：制造“FINISHED已发、scanner状态未清”的反例
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '1,105p' packages/providers/MediaProvider/src/com/android/providers/media/IdleService.java
-sed -n '950,1075p' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
-sed -n '3670,3730p' packages/providers/MediaProvider/apex/framework/java/android/provider/MediaStore.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'public class MediaService extends JobIntentService {' packages/providers/MediaProvider/src/com/android/providers/media/MediaService.java
+grep -n -F 'case Intent.ACTION_MEDIA_SCANNER_SCAN_FILE: {' packages/providers/MediaProvider/src/com/android/providers/media/MediaService.java
+grep -n -F 'case Intent.ACTION_MEDIA_MOUNTED: {' packages/providers/MediaProvider/src/com/android/providers/media/MediaService.java
+grep -n -F 'onScanVolume(context, MediaStore.VOLUME_INTERNAL, reason);' packages/providers/MediaProvider/src/com/android/providers/media/MediaService.java
+grep -n -F 'RingtoneManager.ensureDefaultRingtones(context);' packages/providers/MediaProvider/src/com/android/providers/media/MediaService.java
+grep -n -F 'provider.attachVolume(volumeName, /* validate */ true);' packages/providers/MediaProvider/src/com/android/providers/media/MediaService.java
+grep -n -F 'values.put(MediaStore.MEDIA_SCANNER_VOLUME, volumeName);' packages/providers/MediaProvider/src/com/android/providers/media/MediaService.java
+grep -n -F 'Uri scanUri = resolver.insert(MediaStore.getMediaScannerUri(), values);' packages/providers/MediaProvider/src/com/android/providers/media/MediaService.java
+grep -n -F 'new Intent(Intent.ACTION_MEDIA_SCANNER_STARTED, broadcastUri)' packages/providers/MediaProvider/src/com/android/providers/media/MediaService.java
+grep -n -F 'for (File dir : FileUtils.getVolumeScanPaths(context, volumeName)) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaService.java
+grep -n -F 'resolver.delete(scanUri, null, null);' packages/providers/MediaProvider/src/com/android/providers/media/MediaService.java
+grep -n -F 'new Intent(Intent.ACTION_MEDIA_SCANNER_FINISHED, broadcastUri)' packages/providers/MediaProvider/src/com/android/providers/media/MediaService.java
+grep -n -F 'mMediaScannerVolume = initialValues.getAsString(MediaStore.MEDIA_SCANNER_VOLUME);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'helper.mScanStartTime = SystemClock.elapsedRealtime();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'helper.mScanStopTime = SystemClock.elapsedRealtime();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'mMediaScannerVolume = null;' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'c.addRow(new String[] {mMediaScannerVolume});' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'return provider.scanFile(file, REASON_DEMAND);' packages/providers/MediaProvider/src/com/android/providers/media/MediaService.java
 ```
 
-按顺序记录full scan、thumbnail、owner、expires、recent volume与cache步骤；比较`DATE_EXPIRES BETWEEN now-7d AND now`和直觉中的`<=now`，再区分current与recent volume集合。
+## 6. 一个Scan抓取起始快照；取消与目录锁都只是协作式边界
 
-## 116. 易混点一：不是每卷一库
+每次 API 调用创建一个 `Scan` 对象，持有本地 provider client、root、卷名、Files URI、owner、`mStartGeneration` 与 `mSingleFile`。后者来自 `mRoot.isFile()`，不是来自“调用的方法名”：把目录传给 `scanFile()` 仍会采用目录扫描语义。只有 `mSingleFile && mScannedIds.size() == 1` 才跳过 reconcile。
 
-r48现代MediaProvider只有internal.db与external.db主helper，多个外部具体卷靠volume_name共享external.db。源码里兼容识别`external-*.db`名称不等于当前attach会为每个卷创建独立库。
+同一卷的多个 Scan 从 `mSignals` 取得同一个 `CancellationSignal`。正常扫描结束不会把它移除；detach 才 remove 并 cancel 当时的 signal。若 detach 发生在 Scan 构造之前，它不是一个会永久拒绝未来扫描的闩锁。扫描在遍历、查询和主要阶段显式检查 signal，但 metadata retriever、Exif 解析、`applyBatch()` 等内部过程没有逐项取消点；detach 只是请求尽快停止，不会 join 到扫描线程退出。
 
-## 117. 易混点二：mount、cache、attach、filter四态不同
+scanner 的公开 `scanDirectory()`/`scanFile()` 会吞掉 `OperationCanceledException`，分别安静返回或返回 null。对卷编排而言，这次取消可能因此表现成一次正常方法返回，最后 MediaService 仍可能清状态并发 FINISHED。更微妙的是 detach 先从 map 移除旧 signal 再 cancel；若编排还有后续 scan path，新建 Scan 会取得 fresh signal，不会继承旧 signal 的 canceled 状态，能否继续则再受 attached gate 与后续访问约束。取消既不是持久闩锁，“流程正常收尾”也不等于目录完整扫描。
 
-StorageManager mounted决定系统卷存在；MediaProvider cache保存卷路径；attached集合决定URI能否路由；database view filter决定合成查询显示哪些row。正常生命周期让它们快速收敛，但调试并发问题时必须逐层核对。
+并发控制按**精确目录 Path** 建立引用计数锁。单文件扫描锁 parent；目录遍历在 `preVisitDirectory()` 加锁，在 `postVisitDirectory()` 先 flush 该目录相关 pending，再解锁。它不会把整卷串行化，也不覆盖之后的 reconcile 与 playlist 阶段。
 
-## 118. 易混点三：pending与trash不是虚拟文件夹
+还有一个异常清理陷阱：`Scan.close()` 先检查 pending 是否为空；若非空会立即抛异常，后面的遗留锁释放与 client close 根本不会执行。只有 pending 已排空时，close 才能补释放异常路径遗留的锁。不能把 `try-with-resources` 写成无条件清理保证。
 
-它们首先是row状态，也可能编码到隐藏文件名；FUSE pending又可能保持普通真实文件名。扫描、查询和idle用不同规则处理，不能只凭路径前缀判断所有情况。
+### 练习 5：标出取消、锁和close都没有覆盖的区间
 
-## 119. 复读纠偏记录
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'try (Scan scan = new Scan(file, reason, /*ownerPackage*/ null)) {' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'public void onDetachVolume(String volumeName) {' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'final CancellationSignal signal = mSignals.remove(volumeName);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'signal.cancel();' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'mSignal = getOrCreateSignal(mVolumeName);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'mStartGeneration = MediaStore.getGeneration(mResolver, mVolumeName);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'mSingleFile = mRoot.isFile();' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'if (mSingleFile && mScannedIds.size() == 1) {' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'acquireDirectoryLock(mRoot.getParentFile().toPath());' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'lock = mDirectoryLocks.get(dir);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'applyPending();' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'releaseDirectoryLock(dir);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'if (!mPending.isEmpty()) {' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'for (Path dir : new ArraySet<>(mAcquiredDirectoryLocks)) {' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'mClient.close();' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+```
 
-复读后修正九点：attach不是SQLite ATTACH；多个外卷共用external.db；历史row由attached门和view filter共同隐藏；普通`.nomedia`在r48主要造成hidden/media_type NONE而非一律skip subtree；batch条件是size>32；scanner clean显式只删row；expired maintenance会删真实文件且只查最近一周到期窗；generation是事务代际而非row计数；current volume与recent volume承担访问过滤和历史保留两种责任。
+## 7. 路径策略分“跳过子树”和“隐藏媒体”，普通.nomedia不等于不遍历
 
-## 120. 本章小结与下一章
+扫描开始先沿 root 的父链调用 `shouldScanPathAndIsPathHidden()`，同时计算“可扫描”和“祖先是否隐藏”。两组正则提供硬边界：存储根及 sandbox 根是强制可见点，会尝试删除异常 `.nomedia`；`Android/data`、`Android/obb` 以及 Movies/Music/Pictures 下的 `.thumbnails` 是强制不可扫描点，会尝试创建 `.nomedia` 并 `SKIP_SUBTREE`。
 
-MediaProvider以两份数据库索引多卷，用attached与动态view把当前挂载状态投影给调用者；ModernMediaScanner通过属性比较、批量upsert、scanned id和start generation完成限定范围对账；IdleService再周期性扫描并维护缩略图、owner、过期内容与旧卷。下一章继续深入MediaProvider的insert/update/delete、路径放置、rename事务、文件I/O与通知分发链。
+普通目录中的 `.nomedia` 走另一套语义。`FileUtils.isDirectoryHidden()` 把点目录或含 `.nomedia` 的目录标成 hidden；遍历仍会进入它，`mHiddenDirCount` 随层级增减，文件被归类为 `MEDIA_TYPE_NONE`。`.nomedia` 文件自身被 `scanItem()` 忽略，但其他文件仍可留在 `files` 表中。顶层默认媒体目录和 `DCIM/Camera` 又是强制可见例外，会删除其中的 `.nomedia`。
+
+目录本身也经过 `visitFile()`，以 MIME `null` 建立 parent row。之后遇到现有目录 row 时，无论 mtime/size 是否变化，代码都会在记下 scanned id 后跳过 metadata update。这解释了为什么“目录存在于 files 表”和“目录是一条媒体项”不是同一句话。
+
+## 8. 单文件决策先记seen，再决定skip或upsert
+
+`visitFile()` 先区分目录与文件、解析 MIME；DRM MIME 会向 `DrmManagerClient` 询问原始类型。媒体类型同时受路径、MIME 和 `mHiddenDirCount` 影响。随后用精确 `_data=?` 查询现有 row，并显式包含 pending、trashed、favorite，避免默认过滤让已存在项看起来像新文件。
+
+如果找到 row，扫描器会**先**把 id 放进 `mScannedIds` 并可能设为 first result，再比较 mtime、size、MIME（忽略大小写）和 media type。四项相同且不是 FUSE pending 才算 unchanged；目录则直接跳过。这个顺序意味着后续 update 即使失败，旧 id 仍被当作本次见过，不会在同次 reconcile 中删除。mtime 也并非所有根都直接取文件属性：位于 `Environment.getStorageDirectory()` 之外的只读分区使用 `Build.TIME`。
+
+FUSE pending 的识别是组合条件：物理文件名不匹配 `.pending|trashed-时间戳-原名`，同时 DB 的 `is_pending` 非零。它会强制走 update，但是否发布还取决于调用线程：常规 MediaService、idle 或 Binder 需求扫描经过 `computeValuesFromData(..., false)`，会把没有隐藏命名模式的 pending 清零；FUSE 目录 rename 后也会同步触发扫描，此时 `isFuseThread()` 仍可为 true，显式 pending 会保留。只有非 FUSE 路径的 update 真正提交成功，才能说完成发布。
+
+新项走 insert，旧项走带 `_id` 的 update。只有“新建、非目录、调用方提供 owner”才补 `OWNER_PACKAGE_NAME`；DRM 再强制写 `IS_DRM=1`。generic 层先把一批常见字段清空；audio/video 再走 retriever 与 XMP，image 则走 Exif 与 XMP。这能降低旧 metadata 残留，却不是清空整张宽表的证明：例如部分图片专有字段和 TRACK 只在 Optional 有值时覆盖，缺失时仍需逐列审计。
+
+### 练习 6：用一个隐藏FUSE pending文件手推visitFile
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private static final Pattern PATTERN_VISIBLE = Pattern.compile(' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'private static final Pattern PATTERN_INVISIBLE = Pattern.compile(' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'nomedia.delete();' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'nomedia.createNewFile();' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'isPathHidden = isPathHidden || FileUtils.isDirectoryHidden(dir);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'if (attrs.isDirectory()) {' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'actualMimeType = mDrmClient.getOriginalMimeType(realFile.getPath());' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F '/*isHidden*/ mHiddenDirCount > 0);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'queryArgs.putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'mScannedIds.add(existingId);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'final boolean sameTime = (lastModifiedTime(realFile, attrs) == dateModified);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F '&& !isPendingFromFuse;' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'op = scanItem(existingId, realFile, attrs, actualMimeType, actualMediaType,' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'if (op.build().isInsert() && !attrs.isDirectory() && mOwnerPackage != null) {' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'op.withValue(MediaColumns.IS_DRM, 1);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'op.withValue(MediaColumns.DATE_TAKEN, null);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'final ExifInterface exif = new ExifInterface(is);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'withRetrieverValues(op, mmr, mimeType);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'if (FileUtils.contains(Environment.getStorageDirectory(), file)) {' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'if (PATTERN_EXPIRES_FILE.matcher(name).matches()) {' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'FileUtils.computeValuesFromData(values, isFuseThread());' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+```
+
+## 9. batch是吞吐边界，不是“全批成功”边界
+
+`BATCH_SIZE` 为 32，但 flush 条件是 `mPending.size() > BATCH_SIZE`，所以自然积累的一批通常能到 33。`addPending()` 在执行前就增加 insert/update/delete 指标，指标描述排队意图，不是数据库确认结果。
+
+扫描 upsert 由 `newUpsert()` 创建，并设置 `withExceptionAllowed(true)`。因此 applyBatch 返回后可以逐项查看 `ContentProviderResult.exception`；只有带成功 `result.uri` 的 insert 才把新 id 加入 scanned IDs。既有 row 的 id 早在 update 排队前已加入，不能用 scanned IDs 反推 update 成功。
+
+reconcile 的 delete 则没有设置 `withExceptionAllowed(true)`。某个 clean delete 失败可能让整个 provider batch 事务回滚并抛 `OperationApplicationException`；外层只记录错误，`finally` 仍无条件清空 pending。upsert 的单项容错不能推广给 clean delete。
+
+`mFirstId` 同样不是提交收据：既有 row 在比较阶段即可占据它；成功 insert 的 URI 也可设置它。`getFirstResult()` 再查询 media type，映射为 audio/video/image/playlist URI，最坏返回 generic Files URI。若业务需要证明内容已落库，应在 scan 返回后重新 query 所需字段，而不是只检查非空 URI。
+
+## 10. reconcile用start generation保护新row，但不封住所有并发竞争
+
+目录扫描完成后，扫描器先复制并排序 `mScannedIds`，再查询 root 本身及其子路径。候选排除没有磁盘文件的 abstract playlist，默认排除 pending，同时包含 trashed 与 favorite；最关键的条件是 `generation_added <= mStartGeneration`。
+
+这个 generation 条件只保护“扫描开始后新插入的 row”：它们的 `generation_added` 更大，不会因未出现在本次目录快照而被清理。它不保护扫描开始前已有、期间被 update 或 move 的 row，因为 update 只改 `generation_modified`；也不是文件系统事务日志。目录锁此时已经释放，更不能替代并发协议。
+
+查询 unknown IDs 与删除分成两阶段，使分页或游标不会被边查边删扰动。两阶段之间不会重新 `stat`：若一个旧 row 对应的文件恰在 query 后重新出现，row 仍可能被删，留给下一次 scan 再补。`visitFileFailed()` 也只是记录错误并继续，所以瞬时不可访问的文件没有进入 seen 集合时，后续对账可能清掉它的 row。
+
+clean URI追加 `PARAM_DELETE_DATA=false`，因此 MediaProvider 跳过普通物理文件删除分支，只删除 row；但 files delete trigger/listener 仍可安排通知、URI 授权撤销和缩略图失效。所谓“row-only”只限定 unlink，不等于零副作用。
+
+playlist 解析最后按整个卷查询 `generation_modified > mStartGeneration`，没有 root 谓词。它可能处理本次 root 之外、由并发事务修改的 playlist，不能称为“只解析这次遍历到的播放列表”。
+
+### 练习 7：分别证明seen、committed与cleaned
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private static final int BATCH_SIZE = 32;' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'if (mPending.size() > BATCH_SIZE) {' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'if (op.isInsert()) mInsertCount++;' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'ContentProviderResult[] results = mResolver.applyBatch(AUTHORITY, mPending);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'if (result.exception != null) {' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'if (uri != null) {' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'catch (RemoteException | OperationApplicationException e) {' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'mPending.clear();' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'final long[] scannedIds = mScannedIds.toArray();' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'final String generationClause = FileColumns.GENERATION_ADDED + " <= "' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'queryArgs.putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_EXCLUDE);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'queryArgs.putInt(MediaStore.QUERY_ARG_MATCH_TRASHED, MediaStore.MATCH_INCLUDE);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'if (Arrays.binarySearch(scannedIds, id) < 0) {' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F '.appendQueryParameter(MediaStore.PARAM_DELETE_DATA, "false")' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'addPending(ContentProviderOperation.newDelete(uri).build());' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'FileColumns.GENERATION_MODIFIED + " > " + mStartGeneration);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F '.withExceptionAllowed(true);' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'public FileVisitResult visitFileFailed(Path file, IOException exc)' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'helper.beginTransaction();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (!op.isExceptionAllowed()) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'helper.setTransactionSuccessful();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (deleteparam == null || ! deleteparam.equals("false")) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+```
+
+## 11. 用四格矩阵看文件与row，而不是假设单一真相源
+
+MediaStore 查询以数据库为索引真相，文件 I/O 以磁盘为字节真相。扫描和维护只是在两个真相之间不断缩短窗口：
+
+| 磁盘文件 | 数据库row | 典型原因 | 后续动作与边界 |
+|---|---|---|---|
+| 有 | 有 | 正常、隐藏、pending、trashed，或 metadata 已陈旧 | scan 可能 skip 或 update；隐藏项可仍在 `files` |
+| 有 | 无 | 文件刚由路径创建、insert/batch 失败、普通 delete 的 unlink 失败后 row 已删 | 后续 scan 尝试 insert；FINISHED 不能证明已经补齐 |
+| 无 | 有 | 外部删除、卷离线留下历史索引、扫描期间竞争 | reconcile 可 clean row；pending、新 generation 或 recent volume 策略会延后处理 |
+| 无 | 无 | 从未索引或已完成删除 | 对当前查询是稳定终态，但不代表所有通知消费者已处理 |
+
+普通 MediaProvider delete 的实际顺序也不是强一致事务：先通过 `deleteIfAllowed()` 尝试 `file.delete()` 并失效 FUSE dentry，再删数据库 row。`deleteIfAllowed()` 吞掉异常，`deleteAndInvalidate()` 又忽略 `File.delete()` 的 boolean 返回值；所以 row 可以成功消失而字节仍留在磁盘。反方向上，scanner clean 明确跳过物理删除，却仍删 row。
+
+受管 FUSE create 的常规顺序则是 row 在前：native 先调用 `InsertFile()`，Provider 插入 `IS_PENDING=1` 的 row，之后才真正 `open()` lower 文件；open 失败会回调删除先前 row。创建成功后的 `OnFileCreated()` 在 Java 侧只异步更新 quota 类型，`pf_release()` 也只关闭句柄，没有自动启动 metadata scan。于是“FUSE close 后媒体必已发布”不是成立的完成点；显式需求扫描、卷扫描或 idle 扫描仍承担 metadata 与 pending 的后续收敛。
+
+判断一致性应至少分别观测：目标路径是否存在、精确 `_data` row 是否存在、row 的 pending/trashed/generation 状态、扫描状态字段是否清空，以及相关通知是否已经派发。单看广播或 Metrics 会把“尝试”误当成“完成”。
+
+## 12. pending与trash把生命周期编码进row，也可能编码进物理文件名
+
+`PATTERN_EXPIRES_FILE` 识别 `.<pending|trashed>-<秒级过期时间>-<原名>`。Provider API 创建 pending 时默认保留 7 天，trash 默认 30 天。`computeDateExpires()` 先移除调用者提供的 `DATE_EXPIRES`，仅当本次 values 明确包含 pending 或 trashed 标志时，才按系统时钟重新计算或清空；外部调用者不能任意指定过期点。
+
+非 FUSE 的 pending 会把 `_data` 改成隐藏 pending 名；trash 无论该布尔参数如何都会选择隐藏 trashed 名。虽然这些名字以点开头，`isFileHidden()` 会对 expiration pattern 特判为非隐藏，真正的可见性仍由 pending/trashed query 条件控制。FUSE 通过 filepath 建 pending 时则不改物理名，所以数据库状态与文件名暂时不对称。反向的 `computeValuesFromData()` 能从隐藏名恢复 volume、relative path、display name、状态和过期时间；普通非隐藏名在非 FUSE 路径会清 pending/trashed/expiry，而 FUSE 路径故意保留显式 pending。
+
+这正是 scanner 强制重扫 FUSE pending 的原因：文件名没有 expiration pattern，但 row pending 非零时不能按“mtime 与 size 没变”跳过。常规服务、idle 或 Binder 需求扫描在非 FUSE 线程成功提交 update 时，普通反推路径会清掉 pending，发布原名文件；由 FUSE rename 同步触发的扫描仍可保留 pending，batch 失败也不会完成发布。
+
+过期清理只选择 `DATE_EXPIRES BETWEEN now-7days AND now`。它是防系统时钟巨幅跳变的窗口，不是“所有小于 now 的记录”；早于窗口的异常旧值不会被这条查询命中。普通非 FUSE 的集合查询默认排除 pending/trashed，但 item URI、FUSE 路径查询和显式 `QUERY_ARG_MATCH_*` 都有例外；因此“某次应用查询查不到”不等于 row 或文件不存在。
+
+### 练习 8：比较Provider pending、FUSE pending与trash的物理名
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'public static final Pattern PATTERN_EXPIRES_FILE = Pattern.compile(' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'public static final long DEFAULT_DURATION_PENDING = 7 * DateUtils.DAY_IN_MILLIS;' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'public static final long DEFAULT_DURATION_TRASHED = 30 * DateUtils.DAY_IN_MILLIS;' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'values.remove(MediaColumns.DATE_EXPIRES);' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F '(System.currentTimeMillis() + DEFAULT_DURATION_PENDING) / 1000);' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F '(System.currentTimeMillis() + DEFAULT_DURATION_TRASHED) / 1000);' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'public static void computeValuesFromData(@NonNull ContentValues values, boolean isForFuse) {' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'if (isForFuse) {' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'values.put(MediaColumns.IS_PENDING, 0);' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'public static void computeDataFromValues(@NonNull ContentValues values,' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'if (!isForFuse && getAsBoolean(values, MediaColumns.IS_PENDING, false)) {' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F '} else if (getAsBoolean(values, MediaColumns.IS_TRASHED, false)) {' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'final Matcher matcher = FileUtils.PATTERN_EXPIRES_FILE.matcher(realFile.getName());' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'boolean isPendingFromFuse = !matcher.matches();' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'isPendingFromFuse &= c.getInt(5) != 0;' packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
+grep -n -F 'scanRenamedDirectoryForFuse(oldPath, newPath);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'return FuseDaemon.native_is_fuse_thread();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'int mp_return_code = fuse->mp->InsertFile(child_path.c_str(), req->ctx.uid);' packages/providers/MediaProvider/jni/FuseDaemon.cpp
+grep -n -F 'values.put(FileColumns.IS_PENDING, 1);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'fuse->mp->OnFileCreated(child_path);' packages/providers/MediaProvider/jni/FuseDaemon.cpp
+grep -n -F 'public void onFileCreatedForFuse(String path) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'fuse->fadviser.Close(h->fd);' packages/providers/MediaProvider/jni/FuseDaemon.cpp
+grep -n -F 'FileColumns.DATE_EXPIRES + " BETWEEN " + from + " AND " + to' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+```
+
+## 13. IdleService的24小时只是调度约束，维护本体有固定先后顺序
+
+开机接收器会安排 `IdleService`；任务 ID 为 `-200`，只有不存在 pending job 时才创建。JobInfo 的 period 是 24 小时，同时要求充电和设备 idle，所以它不是墙钟上的精确每日闹钟。`onStartJob()` 新建线程运行维护；`onStopJob()` cancel signal 并返回 false，表示本次停止后不要求自动 reschedule。
+
+`onIdleMaintenance()` 的源码顺序不可随意改写：
+
+1. trim 持久日志；
+2. 对每个**当前外部卷**调用 `MediaService.onScanVolume(REASON_IDLE)`，随后核对该卷缩略图 UUID；每个 external 扫描又会先递归扫描 internal；
+3. prune 当前卷上的 stale thumbnails；
+4. 找出未知 owner package 并把 owner 置空；
+5. 查询最近一周内到期的 row，逐个走普通 delete；
+6. 用 known volume 减 recent volume，raw delete 长期陈旧卷的 row；
+7. 清 directory cache；
+8. 统计 MIME 非空的媒体项并记录 maintenance metrics。
+
+扫描阶段只捕获 `IOException`，其他运行时异常可以中断后续维护。取消检查位于每卷扫描前、带 signal 的数据库查询及每个缩略图目录前，并非每个 mutation 前都有检查；取消后已完成的早期事务不会自动回滚。
+
+IdleService 的 job signal 也没有传给 `MediaService.onScanVolume()` 或 `ModernMediaScanner`；它与 detach 取消的按卷 scanner signal 是两套对象。因此 `onStopJob()` 发生在某卷扫描期间时，不能靠 job signal 打断这次扫描，只能等扫描返回后在下一个 maintenance 检查点生效。worker 又只捕获 `OperationCanceledException`，而 `jobFinished(params, false)` 不在 `finally`：其他运行时异常不但截断后续阶段，还会绕过这次 JobScheduler 完成回执。
+
+### 练习 9：按源码顺序审计一次idle维护
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private static final int IDLE_JOB_ID = -200;' packages/providers/MediaProvider/src/com/android/providers/media/IdleService.java
+grep -n -F 'new Thread(() -> {' packages/providers/MediaProvider/src/com/android/providers/media/IdleService.java
+grep -n -F 'jobFinished(params, false);' packages/providers/MediaProvider/src/com/android/providers/media/IdleService.java
+grep -n -F 'mSignal.cancel();' packages/providers/MediaProvider/src/com/android/providers/media/IdleService.java
+grep -n -F 'return false;' packages/providers/MediaProvider/src/com/android/providers/media/IdleService.java
+grep -n -F 'if (scheduler.getPendingJob(IDLE_JOB_ID) == null) {' packages/providers/MediaProvider/src/com/android/providers/media/IdleService.java
+grep -n -F '.setPeriodic(TimeUnit.HOURS.toMillis(24))' packages/providers/MediaProvider/src/com/android/providers/media/IdleService.java
+grep -n -F '.setRequiresCharging(true)' packages/providers/MediaProvider/src/com/android/providers/media/IdleService.java
+grep -n -F '.setRequiresDeviceIdle(true)' packages/providers/MediaProvider/src/com/android/providers/media/IdleService.java
+grep -n -F 'Logging.trimPersistent();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'for (String volumeName : getExternalVolumeNames()) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'MediaService.onScanVolume(getContext(), volumeName, REASON_IDLE);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'return pruneThumbnails(db, signal);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (!isPackageKnown(packageName)) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'delete(Files.getContentUri(volumeName, id), null, null);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F '.getRecentExternalVolumeNames(getContext());' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'staleVolumeNames.removeAll(recentVolumeNames);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'final int num = db.delete("files", FileColumns.VOLUME_NAME + "=?",' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'mDirectoryCache.clear();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'return DatabaseHelper.getItemCount(db);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'pm.getPackageInfo(packageName, PackageManager.MATCH_UNINSTALLED_PACKAGES);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'for (SessionInfo si : pm.getPackageInstaller().getAllSessions()) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'file.delete();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'return c.getCount();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+```
+
+## 14. thumbnail、owner、expiry与recent volume各清不同对象
+
+thumbnail prune 先取 external.db 中所有已知 `_id`，再遍历当前卷的缩略图目录。文件名能解析为已知 id 就保留，否则调用 `deleteAndInvalidate()` 并把 `prunedCount` 加一。由于底层忽略 `File.delete()` 的 boolean，这个数字是尝试处理的 stale 候选数，不是已成功 unlink 的证明；legacy thumbnail 表另用 SQL 清孤儿 row。
+
+owner 清理也不删文件或 row。一个包只要能以 `MATCH_UNINSTALLED_PACKAGES` 查到，或仍出现在任意 `PackageInstaller` session 中，就算 known；否则 `onPackageOrphaned()` 仅把该包所有 row 的 `owner_package_name` 置为 null。
+
+expiry 查询直接扫共享 external.db，可能命中当前未 attached 卷的历史 row。随后普通 `delete(Files.getContentUri(volumeName,id))` 又必须通过 attached gate；这种候选可能抛 volume 异常并中断所在事务和后续维护。所有候选又处在同一个 external helper 事务里，嵌套 delete 复用它：若前几项已成功 unlink，后面的 detached-volume 或 SQLite 异常令外层事务回滚，早先 row 可以恢复，已经删除的文件却无法恢复，反而形成“无文件、有 row”。即使整体返回，`expiredMedia` 也是 cursor count，物理删除失败仍可能伴随 row 删除，不能把日志里的 Deleted N 当成 N 个字节对象已消失。
+
+stale volume 清理使用另一套保留线：`getRecentStorageVolumes()` 的契约包含“当前和最近可用”的卷，并带 real-state、invisible、recent flags。代码计算 `known - recent`，对结果直接执行 `db.delete("files", volume_name=?)`；卷本就不可用，所以这里只删历史 row，不碰文件。current 是当前扫描集合，recent 是历史保留集合，两者不可互换。
+
+## 15. generation适合增量水位，但必须与version和删除检测配套
+
+自定义 `SQLiteQueryBuilder` 会移除调用者提供的 `generation_added`、`generation_modified`。insert 把两列都写成当前 generation；update 只改 `generation_modified`；delete 没有 row 可盖章，但包裹它的成功事务仍会推进全局 generation。files trigger 调用 `_INSERT/_UPDATE/_DELETE` listener 安排通知、授权和缩略图等副作用，不负责 generation 赋值。
+
+还要识别绕过自定义 builder 的内部维护：例如 orphan owner 使用原生 `db.update()`，事务 generation 会前进，却不会给受影响 row 重写 `generation_modified`；stale-volume raw delete 也没有 tombstone。于是“水位前进”与“能从 generation 列拉到每个变化”并不等价。
+
+`MediaStore.getVersion(volume)` 在 provider 内返回 `db.getVersion() + ":" + DatabaseHelper.getOrCreateUuid(db)`。数据库被删除、重建或 UUID 改变时，version 能迫使客户端全量同步。对多个外部卷而言，version 和 current generation 都来自同一个 external.db，是**数据库级**而非逐卷计数；其他卷的事务甚至无 row 改动的成功事务，都可让某个具体卷观察到水位前进而查不到 delta。
+
+稳健的增量同步可保存 `(version, generation)`：下次先比较 version，改变则全量重建；未变时要在**查询前**采样 `highWater=getGeneration()`，再按目标具体卷拉取 `old < generation_added|modified <= highWater`，成功处理后只保存这个预采样 highWater，并再次核对 version。不能在查询结束后才读取并保存最新 generation，否则夹在 query 与末次取水位之间的提交会被跨过去。generation 比 wall-clock 字段稳健，但它没有 delete tombstone，单靠这两列发现不了已删除 id；删除仍需 observer、周期性全量集合对账或业务自己的 tombstone 机制。
+
+对扫描器而言，start generation 也只是并发插入保护线。出现空 delta、跳号或多个 row 共用同一 generation 都是合法现象；把它解释成连续 row 序号会制造错误恢复逻辑。
+
+## 16. 用完成点矩阵收束排障，并把下一章边界留给写入事务
+
+遇到“相册没出现”“文件删不掉”“扫描明明结束却状态异常”，按下面顺序定位：
+
+| 问题 | 直接证据 | 常见误判 |
+|---|---|---|
+| 卷是否可解析 | current volume 名、path 与 scan paths 缓存 | mounted 就必然 attached |
+| URI 是否可路由 | `mAttachedVolumeNames` 与具体卷名 | external 合成名本身是一块物理卷 |
+| 是否真正遍历 | root、隐藏父链、不可扫描 pattern、取消点 | `.nomedia` 总会跳过整棵子树 |
+| row 是否写成 | 精确 `_data` query、result exception、generation 字段 | pending 队列计数就是成功数 |
+| 旧 row 是否对账 | root predicate、scanned IDs、start generation、pending 条件 | generation 能封住所有 rename/update 竞争 |
+| 文件是否真删除 | 删除后重新 `stat` 路径 | row 消失或 expired 日志即可证明 unlink |
+| 维护是否走到底 | 每一阶段的最后证据与异常日志 | 24 小时 period 等于每天固定时刻完整执行 |
+
+整条链可以压成一句话：**StorageManager 给出当前卷，attach 打开数据库路由，scanner 把文件事实转成 row 操作，reconcile 清理旧索引，idle 再按不同保留线修剪派生物与历史状态；这些步骤通过 generation、锁、取消和通知相互约束，却没有跨文件系统与 SQLite 的总事务。**
+
+下一章进入 MediaProvider 的写路径：`insert/update/delete` 如何计算放置路径，rename 怎样协调文件与数据库事务，文件 I/O 的失败窗口在哪里，以及 files trigger 最终如何把变化分发为通知。

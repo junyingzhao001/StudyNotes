@@ -1,602 +1,453 @@
-# 263 Android运行时权限请求UI、grant/revoke、AppOps同步、一次性权限与自动撤销链
+# Android运行时权限请求：UI决策、grant/revoke、AppOps、一次性会话与自动撤销链
 
-## 1. 本章目标
+## 1. requestPermissions是一条多账本协议，不是一次grant调用
 
-第262章讲的是安装或更新后，PermissionManager怎样重建权限状态。本章转入应用运行期间：App调用`requestPermissions()`以后，系统权限界面怎样确认真正的调用包；用户点击“仅在使用中允许”“仅限这一次”或“拒绝”后，谁修改grant、flags和AppOps；一次性权限何时真正失效；长期不用App的权限又怎样被自动撤销。
+本文以 AOSP android-11.0.0_r48 为边界。第262章解释安装或更新后怎样重建权限状态；本章只看应用已经安装之后，用户发起权限请求、系统界面作出决定、system_server 改状态，以及两种自动撤销怎样结束授权。
 
-## 2. 本章源码版本与边界
+一句话答案是：Activity.requestPermissions 只启动受信任的 PermissionController 界面；界面依据原始调用包和当前模型作决定，再通过有特权的 Binder 调用分别修改 runtime grant、permission flags 和 AppOps。PMS 的返回、应用回调、AppOps 收敛、进程终止、XML 落盘、一次性会话结束和长期不用扫描，是彼此不同的完成点。
 
-本文只解释本地`android-11.0.0_r48`。Android 12以后权限界面、近似位置、自动重置兼容范围和后台限制继续演进，因此不能把新版本现象倒推到这里。练习全部是在macOS上只读搜索源码，不要求编译AOSP，也不要求连接设备。
+需要同时盯住六本账：
 
-## 3. 先记住总模型
+| 账本 | 典型状态 | 直接回答的问题 |
+| --- | --- | --- |
+| runtime permission | granted / denied | 包在该用户下是否持有权限位 |
+| permission flags | USER_SET、USER_FIXED、ONE_TIME、AUTO_REVOKED 等 | 这次状态为什么形成、以后能否再问 |
+| raw AppOps | ALLOWED、FOREGROUND、IGNORED、DEFAULT | UID 或 package 当前保存的 op 模式 |
+| effective AppOps | 由 raw mode、UID state、capability 等求值 | 此刻一次具体访问是否放行 |
+| 会话与扫描状态 | one-time listener、alarm、periodic job | 未来由谁触发撤销 |
+| 持久化文件 | packages.xml、runtime-permissions.xml、appops.xml | 重启后能恢复到什么状态 |
 
-一次运行时权限变化至少涉及四本账：
+主源码集中在 Activity.java、PackageManager.java、GrantPermissionsActivity.java、AppPermissionGroup.java、PermissionManagerService.java、PermissionPolicyService.java、AppOpsService.java、OneTimePermissionUserManager.java、PermissionControllerServiceImpl.java 和 AutoRevokePermissions.kt。阅读时若把其中任何一次方法返回当成“六本账都完成”，后面的时序都会判断错。
 
-```text
-Manifest请求：应用声明想要哪些权限
-Permission grant：某用户下，该包/UID是否获得权限
-Permission flags：USER_SET、USER_FIXED、ONE_TIME、AUTO_REVOKED等原因和策略
-AppOps mode：实际访问某类受控资源时是ALLOWED、FOREGROUND还是IGNORED
-```
+## 2. Activity入口只为直接请求建立实例级闸门
 
-只看到`PERMISSION_GRANTED`，并不等于已经理解完整状态。
+直接调用 Activity.requestPermissions 时，负 requestCode 立即抛异常；permissions 的 null 或空数组由 PackageManager.buildRequestPermissionsIntent 拒绝。通过输入校验后，Activity 检查 mHasCurrentPermissionsRequest：同一个 Activity 实例已有一组直接请求时，新请求收到空数组回调，不再启动界面。
 
-## 4. 五个参与者
+这个布尔值在发起后置 true，在权限专用结果分发前清 false，并随 Activity 的实例状态保存和恢复。因此它能覆盖旋转重建，却不是进程级、UID 级或系统级互斥锁。
 
-调用端通常是App进程中的`Activity`；权限弹窗运行在独立的系统`PermissionController`应用；真正的permission grant保存在`system_server`内的`PermissionManagerService`；权限与AppOps的持续对齐由`PermissionPolicyService`完成；UID重要性则由ActivityManager提供给一次性权限计时器。
+还要保留一个 r48 特例：平台 android.app.Fragment 的 HostCallbacks 路径自行拼接 who 并直接 startActivityForResult，既不读取也不写入 mHasCurrentPermissionsRequest。同一 Activity 中，“直接 Activity 请求串行”并不能推出“所有 Fragment 请求也串行”；并发结果仍靠不同 who 和 requestCode 路由。
 
-## 5. 本章源码地图
-
-```text
-frameworks/base/core/java/android/app/Activity.java
-frameworks/base/core/java/android/content/pm/PackageManager.java
-frameworks/base/core/java/android/app/ApplicationPackageManager.java
-frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
-frameworks/base/services/core/java/com/android/server/pm/permission/OneTimePermissionUserManager.java
-frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
-packages/apps/PermissionController/AndroidManifest.xml
-packages/apps/PermissionController/.../ui/GrantPermissionsActivity.java
-packages/apps/PermissionController/.../model/AppPermissionGroup.java
-packages/apps/PermissionController/.../utils/KotlinUtils.kt
-packages/apps/PermissionController/.../service/AutoRevokePermissions.kt
-```
-
-## 6. 先分开“请求”和“授予”
-
-`Activity.requestPermissions()`没有直接调用`grantRuntimePermission()`。它启动系统权限Activity，让用户作决定；只有PermissionController处理结果时，才通过PackageManager/Binder请求system_server改变状态。这种分层使普通App没有机会伪造“用户已经点击允许”。
-
-## 7. 先分开“一次性撤销”和“长期不用自动撤销”
-
-一次性权限从用户点击“仅限这一次”开始，依据当前UID的重要性和连续不活跃时间结束，通常是分钟级会话。自动撤销则由周期Job扫描长期未使用应用，Android 11默认门槛是90天、检查频率15天。它们共用部分撤销工具，但触发器和标志完全不同。
-
-## 8. 先分开permission与AppOp
-
-permission决定身份是否具备某项能力；AppOp是运行时访问开关。以前台/后台位置为例，前台权限已授而后台权限未授时，permission相关AppOp应是`MODE_FOREGROUND`，不是简单的全允许或全拒绝。
-
-## 9. 一张总览图
-
-请求UI、状态写入、AppOps同步和两种自动撤销是相连但不同的链：
-
-```mermaid
-flowchart TD
-    APP["App Activity.requestPermissions"] --> INTENT["显式指向PermissionController的请求Intent"]
-    INTENT --> UI["GrantPermissionsActivity校验调用包并展示分组UI"]
-    UI --> CHOICE{"用户选择"}
-    CHOICE -->|允许/仅前台/一次| PC["AppPermissionGroup或KotlinUtils"]
-    CHOICE -->|拒绝/不再询问| PC
-    PC --> BINDER["PackageManager Binder调用"]
-    BINDER --> PMS["PermissionManagerService更新grant与flags"]
-    PMS --> LISTENER["运行时权限状态变化监听器"]
-    LISTENER --> POLICY["PermissionPolicyService按shared UID同步AppOps"]
-    PC --> RESULT["重新checkPermission生成结果数组"]
-    RESULT --> APP
-    PC --> OT["ONE_TIME会话跟踪UID重要性"]
-    OT -->|超时| PC
-    JOB["AutoRevokeService周期扫描长期未用App"] --> PC
-```
-
-## 10. `requestPermissions()`的第一个校验
-
-`requestCode`必须大于等于0，否则`Activity`直接抛`IllegalArgumentException`。这个编号只用于把异步结果路由回当前Activity或Fragment，不参与权限裁决。
-
-## 11. 同一Activity同一时刻只允许一组请求
-
-`Activity`用`mHasCurrentPermissionsRequest`记录是否已有请求。若再次调用，它不会再弹第二个权限窗口，而是立刻给新请求回调两个空数组，源码注释把这定义为cancellation。
-
-```java
-if (mHasCurrentPermissionsRequest) {
-    onRequestPermissionsResult(requestCode, new String[0], new int[0]);
-    return;
-}
-```
-
-## 12. 这个限制不是进程全局锁
-
-字段属于Activity实例，并非整个包或整个UID的全局互斥量。多个Activity的并发行为还会受任务栈、系统UI及权限控制器自身调度约束，不能把这一个boolean解释成系统范围“同时只能有一个权限请求”。
-
-## 13. 请求Intent怎样构造
-
-`PackageManager.buildRequestPermissionsIntent()`拒绝null或空数组，构造`ACTION_REQUEST_PERMISSIONS`，把权限名放入`EXTRA_REQUEST_PERMISSIONS_NAMES`，最后调用`setPackage(getPermissionControllerPackageName())`。
-
-## 14. 为什么必须显式指定PermissionController包
-
-若只发隐式Intent，其他App可能注册同action并伪造权限界面。指定系统选定的PermissionController包后，不经过普通应用选择器，也不会让任意第三方Activity接管这条安全交互链。
-
-## 15. `startActivityForResult()`的特殊who前缀
-
-Activity不是用普通who启动，而是传`@android:requestPermissions:`前缀。结果回来时`dispatchActivityResult()`识别此前缀，再把结果送给Activity或对应Fragment的权限回调，而不是普通`onActivityResult()`。
-
-## 16. 请求状态跨重建保存
-
-`mHasCurrentPermissionsRequest`会写入Activity instance state并恢复。这避免旋转屏幕或配置变化后，原权限窗口尚未结束，重建的Activity却误以为可以立刻发第二组请求。
-
-## 17. PermissionController如何声明入口
-
-`AndroidManifest.xml`中的`GrantPermissionsActivity`注册`android.content.pm.action.REQUEST_PERMISSIONS`，使用防触摸欺骗主题，排除最近任务，并对instant app可见。它是权限交互UI，不是PMS本身。
-
-## 18. 防覆盖攻击的系统窗口标志
-
-`GrantPermissionsActivity.onCreate()`首先给窗口加`SYSTEM_FLAG_HIDE_NON_SYSTEM_OVERLAY_WINDOWS`。目标是显示敏感选择时隐藏非系统overlay，降低悬浮窗视觉诱导风险；它与View层的obscured touch过滤属于相邻但不同的防线。
-
-## 19. 为什么缓存`getCallingPackage()`
-
-源码说明calling package只能在`onCreate`等有效时机读取，因此立刻保存到`mCallingPackage`。后续展示应用名、读取Manifest、grant/revoke和构造结果都围绕这个系统提供的调用方，而不是相信Intent里自报的包名。
-
-## 20. 触摸窗口外不会取消
-
-`setFinishOnTouchOutside(false)`使用户不能靠点弹窗外侧模糊地结束流程。系统仍可能因进程、配置、任务或其他中断结束Activity，因此调用端仍必须处理空结果和拒绝结果。
-
-## 21. 权限数组为空怎么办
-
-若Intent没有权限名，控制器把它规范成长度0数组，设置结果并结束。正常SDK入口会更早拒绝空数组，但服务端组件仍做防御性处理，因为组件入口不能假设所有调用都来自标准Java API。
-
-## 22. 控制器重新读取调用包Manifest
-
-它用`GET_PERMISSIONS`读取真正调用包的`PackageInfo`。找不到包、没有`requestedPermissions`或请求表为空时直接结束。传入一个字符串并不证明应用Manifest真的请求过对应权限。
-
-## 23. pre-M应用不能走现代请求UI
-
-若调用包`targetSdkVersion < M`，控制器把请求数组改成空数组并结束。旧应用的危险权限兼容依赖安装/审查和AppOps机制，不允许用现代API临时弹出运行时授权窗口。
-
-## 24. 调用UID从PackageInfo取得
-
-控制器取`callingPackageInfo.applicationInfo.uid`并由它得到`UserHandle`。运行时权限按用户存储，因此包名相同但处于不同Android用户时，授权状态并不共用。
-
-## 25. UI实现会按设备形态选择
-
-手机、电视、Wear与Automotive使用不同的`GrantPermissionsViewHandler`。视图布局和交互细节可以不同，但最终仍汇入同一个结果处理模型；不要把手机按钮布局误当成权限服务协议本身。
-
-## 26. 为什么权限按group展示
-
-控制器把请求权限映射到`AppPermissionGroup`和`GroupState`，按组逐步展示。用户看到“位置”或“相机”这样的组，而底层结果数组仍按原始permission name逐项返回。
-
-## 27. group不是grant存储的最小键
-
-底层状态仍按单个权限名记录。group主要承担UI、前景/背景关联和批量策略。一个group的UI选择可以影响多项permission，但不能因此说PMS只存一个“组授权boolean”。
-
-## 28. 前景与背景是两个状态层
-
-具有background permission的组会区分foreground和background `GroupState`。用户选“仅在使用中允许”时，foreground被授予、background被撤销；选“始终允许”才可能两边都授予。
-
-## 29. “仅限这一次”的组合
-
-Android 11把一次性选择处理为：授予foreground权限，标记一次性；同时不授予background权限。`AppPermissionGroup.setOneTime()`也明确跳过background permission。
-
-## 30. 五类关键UI结果
-
-源码关键常量包括`GRANTED_ALWAYS`、`GRANTED_FOREGROUND_ONLY`、`GRANTED_ONE_TIME`、`DENIED`和`DENIED_DO_NOT_ASK_AGAIN`。按钮文字可能因设备和权限组不同，但最终语义可归入这些状态。
-
-## 31. “始终允许”怎样落地
-
-若同时存在foreground与background state，控制器分别以`granted=true, isOneTime=false`处理两者。后台位置等权限是否允许在当前页面直接选择，还受目标SDK和专门UI流程影响，不能仅凭这个switch推导所有按钮必然可见。
-
-## 32. “仅在使用中”怎样落地
-
-foreground调用grant路径，background调用revoke路径。最后AppOps同步会把有关op变成`MODE_FOREGROUND`，这正是“权限有一部分被授予，但访问只在前台有效”的运行时表达。
-
-## 33. “拒绝”和“不再询问”的差别
-
-两者都会撤销grant；后者把`doNotAskAgain=true`传给组模型，最终影响`USER_FIXED`。普通拒绝通常是`USER_SET`而非`USER_FIXED`，系统是否还展示下一次请求由flags、请求历史及UI策略共同决定。
-
-## 34. `USER_FIXED`不是permission denied本身
-
-未授予是grant状态；`USER_FIXED`说明拒绝被用户固定，常对应“不再询问”。把二者混成一个boolean，会无法解释“当前拒绝但仍可再次弹窗”和“当前拒绝且不再弹窗”的区别。
-
-## 35. 一次性选择先写模型再grant
-
-`onPermissionGrantResultSingleState()`先`setOneTime(true)`，再`grantRuntimePermissions(...)`。`AppPermissionGroup`延迟并持久化组合变化，使grant和ONE_TIME标志最终作为同一次用户决策被处理。
-
-## 36. 普通允许会清除一次性状态
-
-当用户改成普通允许时，控制器调用`setOneTime(false)`。否则旧的一次性flag可能让一个本应长期保留的grant仍被计时器自动撤销。
-
-## 37. 拒绝也会清ONE_TIME
-
-revoke后再`setOneTime(false)`，表示当前是明确拒绝，而不是等待一次性会话超时。一次性会话和拒绝原因不能同时模糊存在。
-
-## 38. `AppPermissionGroup`是什么
-
-它是PermissionController侧对一个应用权限组的可变模型，汇总每项权限的grant、flags、AppOp、前后台关系和目标SDK，并通过PackageManager API持久化。它不是system_server中的权威权限表。
-
-## 39. 为什么UI层会主动操作AppOps
-
-旧模型的`persistChanges()`不仅grant/revoke permission，也调用`allowAppOp()`或`disallowAppOp()`。这样用户点击后能快速形成一致状态；与此同时system_server的`PermissionPolicyService`还会监听并再次按全局规则收敛。
-
-## 40. 两次同步不等于重复授权
-
-PermissionController的直接AppOp调整和PermissionPolicyService的监听同步承担不同角色。前者服务当前用户操作，后者处理包变化、shared UID、restriction以及外部AppOp变化后的全局一致性；设置函数会比较旧mode，避免无条件重复写。
-
-## 41. 现代App的grant调用
-
-`KotlinUtils.grantRuntimePermission()`确认不是system-fixed、instant/runtime-only条件允许且目标支持runtime后，调用：
-
-```kotlin
-app.packageManager.grantRuntimePermission(
-    group.packageInfo.packageName, perm.name, user)
-```
-
-真正安全校验仍在system_server。
-
-## 42. 现代App的revoke调用
-
-已授予且目标支持runtime时，控制器调用`PackageManager.revokeRuntimePermission()`。随后还会把关联AppOp设为不允许；撤销能力可能使进程仍持有已打开资源，所以相关路径会考虑终止UID。
-
-## 43. legacy App为何主要改AppOp
-
-targetSdk低于M的应用不理解运行时grant变化。控制器对可映射AppOp的旧应用通过AppOp模拟关闭，并设`REVOKED_COMPAT`；为了让旧进程重新观察状态，AppOp改变时可能kill UID。
-
-## 44. grant时flags怎样更新
-
-轻量模型会清`REVOKED_COMPAT`和`REVIEW_REQUIRED`，清`USER_FIXED`，设`USER_SET`，并清`ONE_TIME`和`AUTO_REVOKED`。若上层要授一次性权限，旧组模型会在组合持久化时把ONE_TIME重新带入最终flags。
-
-## 45. revoke时flags怎样更新
-
-`userFixed`决定是否设置`USER_FIXED`。普通主动拒绝设置`USER_SET`并清ONE_TIME；轻量工具中的`oneTime=true`分支则清USER_SET、设ONE_TIME。无论哪种交互变化，都会清旧`AUTO_REVOKED`，避免把用户新决定误标成长期未用自动处理。
-
-## 46. flags更新使用mask
-
-`updatePermissionFlags()`只修改PermissionController负责的位，不应覆盖`SYSTEM_FIXED`、`POLICY_FIXED`等不属于此次用户选择的位。读源码时必须同时看mask和values，不能只看传入的flags值。
-
-## 47. system-fixed为何不能碰
-
-若权限由系统固定，控制器的轻量grant/revoke直接返回原状态。UI层不是最高策略权威，不能覆盖系统映像或核心安全策略已经固定的决定。
-
-## 48. policy-fixed也要在服务端检查
-
-PermissionManagerService会检查调用者是否具备覆盖策略固定权限的特权。客户端或PermissionController侧的预检查只是减少无效调用，Binder服务端仍必须以调用身份、用户和flags重新裁决。
-
-## 49. grant的Binder路径有版本性不对称
-
-Android 11中`ApplicationPackageManager.grantRuntimePermission()`仍调用`IPackageManager.grantRuntimePermission()`；`PackageManagerService`为兼容再转给PermissionManager服务AIDL。源码注释说这个便利入口尚未清理。
-
-## 50. revoke已直接走PermissionManager Binder
-
-同一类里revoke调用`mPermissionManager.revokeRuntimePermission(...)`。因此不要仅凭Java API同属PackageManager，就假设grant与revoke在r48的Binder第一跳完全相同；最终权威逻辑都进入PermissionManagerService。
-
-## 51. 服务端grant的关键校验
-
-PMS检查目标用户存在、跨用户权限、调用者是否能grant、包是否对调用者可见、permission是否存在且被Manifest请求、类型是否runtime/development、fixed/restricted/instant/targetSdk条件等。UI传来的包名和permission名都不是无条件可信输入。
-
-## 52. 服务端revoke为何可能kill进程
-
-权限被撤回后，运行进程可能仍持有基于旧授权取得的资源或Binder句柄。PMS在状态更新与持久化后通过回调安排kill；PermissionController也可能因legacy AppOp变化kill UID。两条路径的原因相近，但触发层次不同。
-
-## 53. grant结果不是按钮文本
-
-权限UI结束时，不是直接把“用户刚才点击的枚举”塞给App。控制器对最初请求数组逐项调用`PackageManager.checkPermission(permission, callingPackage)`，以最终系统状态生成`grantResults`。
-
-## 54. 为什么要重新check
-
-一组选择可能受system-fixed、policy-fixed、restricted、前后台依赖或无效permission影响。用最终权威状态回报，可以避免按钮意图与实际落盘结果不一致。
-
-## 55. 请求与回调完整时序
-
-```mermaid
-sequenceDiagram
-    participant A as "App Activity"
-    participant ATMS as "Activity任务/结果路由"
-    participant PC as "PermissionController UI"
-    participant PM as "PackageManager Binder"
-    participant PMS as "PermissionManagerService"
-    participant PPS as "PermissionPolicyService"
-    A->>A: requestPermissions(names, requestCode)
-    A->>ATMS: startActivityForResult(特殊who, 显式Intent)
-    ATMS->>PC: 启动GrantPermissionsActivity并保留真实callingPackage
-    PC->>PC: 校验Manifest/targetSdk并逐组展示
-    PC->>PM: grant/revoke + updatePermissionFlags
-    PM->>PMS: 服务端鉴权并修改每用户状态
-    PMS-->>PPS: runtime permission state changed
-    PPS->>PPS: shared UID整体计算并同步AppOps
-    PC->>PM: checkPermission逐项读取最终结果
-    PC-->>ATMS: names + grantResults
-    ATMS-->>A: onRequestPermissionsResult
-```
-
-## 56. `RESULT_OK`不是“全部允许”
-
-PermissionController正常完成流程时调用`setResultAndFinish()`并设置`RESULT_OK`，但数组中仍可混有`PERMISSION_DENIED`。Activity的权限专用回调关注逐项`grantResults`，不要把Activity result code当作授权结论。
-
-## 57. `RESULT_CANCELED`也不是逐项拒绝码
-
-`finish()`会在尚未设置结果时以`RESULT_CANCELED`构造结果，但仍可能携带当前逐项check结果。若PermissionController进程崩溃或返回data为null，Activity才以两个空数组作best effort回调。
-
-## 58. 原请求顺序得到保留
-
-结果Intent中的names使用`mRequestedPermissions`，grantResults按相同索引逐个check。调用端应按名字或相同索引解释，不能按权限组UI顺序自行重排。
-
-## 59. `checkPermission()`只告诉grant视图
-
-回调中`PERMISSION_GRANTED`并不直接告诉调用端该访问是永久、一次性还是只限前台。应用若要理解产品语义，还要结合自身生命周期、API行为和系统再次撤销后的检查，不能缓存这一次回调永远有效。
-
-## 60. 为什么权限变化后还需要PermissionPolicyService
-
-一些runtime permission有对应AppOp；两个permission还可能共享switch op；soft restricted权限可能有extra op；shared UID又让多个包共同影响同一UID mode。单次UI操作无法覆盖所有后续包更新与策略变化，因此system_server维护持续同步器。
-
-## 61. PermissionPolicyService启动时注册三类观察
-
-它观察包added/changed/removed，注册runtime permission state changed listener，还对危险权限对应switch op及部分extra AppOp注册mode watcher。无论permission侧还是AppOp侧先变，都能触发重新收敛。
-
-## 62. 为什么AppOp变化也反向触发同步
-
-若其他系统组件直接改了相关AppOp，permission与op可能不一致。`mAppOpsCallback.opChanged()`安排包级同步，并检查该UID是否还请求AppOp型permission，让策略重新建立可解释状态。
-
-## 63. 异步同步怎样去重
-
-`mIsPackageSyncsScheduled`以`Pair<packageName,userId>`记待执行任务。同一包同一用户已有同步消息时不重复排队，最终在`FgThread`上执行后移除标记。
-
-## 64. 为什么不同用户不能共用一次同步
-
-runtime grant和flags按用户记录，包在用户0和用户10的授权可不同。去重键必须包含userId，用户上下文中的PackageManager查询也必须对应目标用户。
-
-## 65. shared UID必须整体同步
-
-源码注释强调：共享UID的所有包必须一起同步。包级入口先加入目标包，再通过`getSharedUserPackagesForPackage()`把同UID包加入同步器，因为最终AppOp UID mode会共同作用于它们。
-
-## 66. 为什么只同步当前包会出错
-
-假设A和B共享UID，A请求并获位置权限，B不请求。若B更新时只看B，就可能把UID位置op改成IGNORED，连A一起失效；反过来只看A也可能给不应独立获得能力的共享身份留下更宽状态。
-
-## 67. 同步器先收集、后写AppOps
-
-`addPackage()`在持有包锁的调用上下文中只读取包和permission事实、把待变更项放入四个列表；`syncPackages()`随后才调用AppOps。源码特别警告持包锁时不要回调AppOps，避免锁顺序和重入问题。
-
-## 68. 哪些包被跳过
-
-取不到PackageInfo/AndroidPackage、没有ApplicationInfo或requestedPermissions的包直接返回。root UID和system UID也被跳过，因为它们总能通过permission检查，修改其AppOps可能破坏兼容性。
-
-## 69. permission怎样映射到op
-
-同步器先用`permissionToOpCode()`，再取`opToSwitch()`。例如细粒度与粗粒度位置可能共享控制op，因此最终不能机械地“一项permission写一个独立mode”。
-
-## 70. `REVIEW_REQUIRED`为何暂不改op
-
-若permission flags仍有`FLAG_PERMISSION_REVIEW_REQUIRED`，`addPermissionAppOp()`直接返回。旧应用等待用户审查时有专门兼容流程，此处不应提前把AppOp硬收敛成普通现代状态。
-
-## 71. 无AppOp的permission怎么办
-
-若映射结果是`OP_NONE`，同步器不处理。background permission本身通常没有独立AppOp，它通过foreground permission的`backgroundPermission`关联决定同一个op应为ALLOWED还是FOREGROUND。
-
-## 72. `shouldGrantAppOp()`第一关
-
-它先调用`checkPermission(permissionName, packageName)`。未grant就返回false，最终候选mode为IGNORED。注意这是包视图的permission检查，写入时则主要使用UID mode。
-
-## 73. `REVOKED_COMPAT`第二关
-
-即使旧应用permission表面上仍是granted，只要flags含`REVOKED_COMPAT`，AppOp就不应放行。这正是legacy运行时撤销借AppOps实现的关键。
-
-## 74. restricted permission第三关
-
-hard restricted且`APPLY_RESTRICTION`生效时不授AppOp；soft restricted则交给`SoftRestrictedPermissionPolicy.mayGrantPermission()`。因此permission grant与资源实际可用之间可能存在策略层差异。
-
-## 75. 前后台如何变成三态
-
-foreground permission未grant时是`MODE_IGNORED`；foreground已grant但关联background未grant时是`MODE_FOREGROUND`；前后台都满足时是`MODE_ALLOWED`。
-
-## 76. 最宽模式优先原则
-
-`syncPackages()`按allow、foreground、ignore、ignore-if-not-allowed顺序处理，并用`uid+op`去重。若多个permission或shared UID包对同一op给出不同候选，先写的更宽模式获胜：`ALLOWED > FOREGROUND > IGNORED`。
-
-## 77. 这不是简单的最后写入获胜
-
-若按包遍历顺序直接写，结果会依赖包名或集合顺序。先分桶再按权限宽度处理，使共享op的结果由安全模型决定，而不是偶然的遍历顺序决定。
-
-## 78. 为什么主要写UID mode
-
-runtime permission本身按UID身份生效，shared UID尤其要求同一mode。同步器用`setUidModeFromPermissionPolicy()`写入；若既有package-specific mode压住了目标值，还把该package mode重置为op默认值。
-
-## 79. 什么叫package mode干扰
-
-AppOps可同时有UID级和包级覆盖。同步器写UID mode后会重新读取raw mode；若仍不是目标mode，说明包级值在干扰，于是把package mode恢复默认，让权限策略的UID决定重新生效。
-
-## 80. 未再请求的AppOp permission怎样清理
-
-包改变或移除后，服务汇总该UID所有包的requestedPermissions。某个`PROTECTION_FLAG_APPOP`权限已无人请求时，把相关UID和package mode恢复为该op默认值，防止Manifest已删但旧开关残留。
-
-## 81. AppOps同步不是permission授予器
-
-PermissionPolicyService以permission状态计算AppOp，不会因为一个op偶然是ALLOWED就无条件grant危险权限。它的主方向是“已有permission/flags/策略 → 合理AppOp”，AppOp watcher只负责发现漂移并重新同步。
-
-## 82. AppOp mode改变为何可能回调自己
-
-服务把自己的`mAppOpsCallback`传给内部set接口，并且任务有去重及旧值比较。读这类双向观察代码时应寻找收敛条件，而不是把“监听变化又写变化”直接判成无限循环。
-
-## 83. 一次性权限的三个组成部分
-
-一次性权限不是只有`FLAG_PERMISSION_ONE_TIME`：还需要permission当前确实granted、PermissionController启动会话，以及system_server持续观察该包UID的重要性。缺任一部分都不能完整实现自动失效。
-
-## 84. 一次性会话在哪里启动
-
-`AppPermissionGroup.persistChanges()`发现组是one-time且runtime permission已grant时，调用`PermissionManager.startOneTimePermissionSession()`；若包已无任何一次性权限，则调用stop。计时器不在权限弹窗Activity里运行。
-
-## 85. 一次性权限状态机
-
-默认reset阈值是`IMPORTANCE_FOREGROUND`，keep-alive阈值是`IMPORTANCE_FOREGROUND_SERVICE`。ActivityManager importance数值越小表示越重要：
-
-```mermaid
-stateDiagram-v2
-    [*] --> Active: "授予ONE_TIME并启动UID会话"
-    Active --> Active: "importance <= FOREGROUND\n计时器清零"
-    Active --> Timing: "importance > FOREGROUND\n开始累计不活跃时间"
-    Timing --> Active: "重新回到FOREGROUND或更重要\n计时器清零"
-    Timing --> Grace: "计时已到但仍是前台服务级\n会话暂时保留"
-    Timing --> Expired: "计时已到且importance > FOREGROUND_SERVICE"
-    Grace --> Active: "回到FOREGROUND或更重要"
-    Grace --> Expired: "跌出FOREGROUND_SERVICE"
-    Active --> GoneDelay: "UID gone"
-    Timing --> GoneDelay: "UID gone"
-    GoneDelay --> Active: "短延迟内进程恢复"
-    GoneDelay --> Expired: "默认5秒后仍gone"
-    Expired --> Controller: "通知PermissionController撤销"
-```
-
-## 86. 默认超时是一分钟但不是固定寿命
-
-PermissionController的`Utils.ONE_TIME_PERMISSIONS_TIMEOUT_MILLIS`默认是60秒，可由DeviceConfig的`one_time_permissions_timeout_millis`覆盖。它表示连续处于计时条件的时长，不是从点击按钮开始无论如何60秒后撤销。
-
-## 87. 前台时为什么不计时
-
-当importance小于等于`IMPORTANCE_FOREGROUND`时，`mTimerStart`被设回inactive。用户持续使用App时，一次性权限保持；离开前台后才从新的时间点重新累计。
-
-## 88. 前台服务为何形成中间态
-
-importance处于foreground与foreground-service之间时，timer可以开始，但alarm暂不设置；若超时后仍有前台服务，会话继续保留。之后一旦重要性跌出keep-alive阈值，按已累计时间可能立刻到期。
-
-## 89. UID消失为何等5秒
-
-进程升级、崩溃恢复或快速重启会短暂表现为gone。`one_time_permissions_killed_delay_millis`默认5000ms；延迟后若importance仍比`IMPORTANCE_CACHED`更差才结束会话，减少瞬时重启导致的误撤销。
-
-## 90. 计时器使用哪种时钟
-
-r48把`mTimerStart`记为`System.currentTimeMillis()`，并用`AlarmManager.RTC_WAKEUP`在`timerStart + timeout`设置精确alarm。这是Android 11当前实现事实，不要擅自改写成`elapsedRealtime`模型。
-
-## 91. 同一个UID只保存一个监听器
-
-`OneTimePermissionUserManager`用`SparseArray`按UID索引`PackageInactivityListener`。如果已有活动会话，新start既不新建也不更新现有timeout和阈值；源码Javadoc明确写出这一点。
-
-## 92. shared UID下要谨慎理解包名
-
-监听生命周期按UID，而回调保存创建监听器时的packageName。共享UID包会共享重要性事实，第二个同UID会话又会被忽略，因此不能把一次性权限会话想成严格的“每包独立秒表”。这是r48数据结构直接带来的边界。
-
-## 93. 谁有权启动会话
-
-PermissionManagerService要求调用者持有`MANAGE_ONE_TIME_PERMISSION_SESSIONS`，清除Binder calling identity后再取得每用户manager。普通App不能自行把任意包注册成一次性会话，也不能擅自停止别人的会话。
-
-## 94. 用户维度如何隔离
-
-PMS为每个userId维护一个`OneTimePermissionUserManager`，并用该用户Context查package UID。相同包名在不同Android用户中有各自会话和权限状态。
-
-## 95. 卸载时怎样清监听器
-
-manager注册`ACTION_UID_REMOVED`接收器，找到对应UID listener后cancel并从Map删除。cancel同时移除三个importance listener和alarm，避免卸载后继续回调不存在的包。
-
-## 96. 超时者不直接改permission
-
-`onPackageInactiveLocked()`结束监听后调用`PermissionControllerManager.notifyOneTimePermissionSessionTimeout(packageName)`。system_server计时模块只判定会话结束，把具体权限组撤销交还PermissionController。
-
-## 97. PermissionController超时回调做什么
-
-它重新读取包的requestedPermissions，创建`AppPermissionGroup`，收集仍标记one-time的组。若组当前仍grant就撤销，随后`setUserSet(false)`并以“一次性权限已撤销”原因持久化。
-
-## 98. 为什么超时后清USER_SET
-
-一次性授权结束不是用户此刻点了“拒绝”。清USER_SET能区分会话自然到期与显式拒绝，使以后请求UI和统计可以按正确来源解释。
-
-## 99. 自动撤销由谁调度
-
-PermissionController的`AutoRevokeOnBootReceiver`在启动广播后用JobScheduler安排`AutoRevokeService`周期任务。Android 11默认检查频率15天，可由DeviceConfig `auto_revoke_check_frequency_millis`覆盖。
-
-## 100. 哪些设备和用户不自行调度
-
-Automotive设备直接不安排自动撤销。若当前用户是profile也不自行安排，注释称由primary user处理；后续扫描仍逐用户检查解锁状态和豁免条件。
-
-## 101. 为什么设置`SKIP_NEXT_RUN`
-
-调度周期Job时系统可能很快执行一次。接收器先把进程内静态`SKIP_NEXT_RUN=true`，第一次`onStartJob()`只清标记并结束，避免刚建立基准时间就立刻做完整扫描。它不是持久化数据库字段。
-
-## 102. “90天未使用”怎样计算
-
-默认unused threshold为90天，可由`auto_revoke_unused_threshold_millis`覆盖。候选最后可见时间取以下事实的最大值：同UID所有包的`UsageStats.lastTimeVisible`、目标包firstInstallTime、PermissionController保存的firstBootTime；跨profile包还取其他用户同包最后可见时间。
-
-## 103. 为什么同UID所有包要合并使用时间
-
-权限和进程身份可能由shared UID共同承担。若共享UID中的B昨天被使用，不能因为A自己90天没显示就按A单包视图撤掉共享身份能力，因此源码对`uidPackages`取最大lastTimeVisible。
-
-## 104. firstInstallTime和firstBootTime的保护
-
-刚安装的App即使没有UsageStats，也必须至少等阈值；PermissionController第一次初始化并持久化的`first_boot_time`也作为下界，防止系统更新或该组件首次启用后，因历史统计不足立刻大批撤销。它是组件偏好中的基准，不是每次开机都会重置的时间。
-
-## 105. 缺失UsageStats的用户怎样处理
-
-若某用户不在`UsageStatsLiveData`结果中，代码把该用户从候选Map移除，而不是把“没有统计”当成“从未使用”。这是保守策略：证据不足时不自动撤销。
-
-## 106. 永久豁免有哪些
-
-实现会豁免承载输入法、通知监听、无障碍、壁纸、语音交互、注意力、文本分类、打印、Dream、网络推荐、Autofill、设备管理等受绑定权限保护服务的包；carrier privileged包也豁免；disabled user或work profile在该检查中同样返回永久豁免。
-
-## 107. 用户可覆盖豁免怎样表示
-
-它读取`OPSTR_AUTO_REVOKE_PERMISSIONS_IF_UNUSED`。mode为DEFAULT时，targetSdk小于等于Q的包默认豁免，除非teamfood允许pre-R；显式`MODE_ALLOWED`表示允许自动撤销，其他非默认mode表示用户或installer豁免。
-
-## 108. 不是所有已授权限都会撤
-
-每个组还要满足：非前台/后台fixed、存在真正可用且不在特定豁免列表中的grant、不是default grant、不是role grant、属于user sensitive。普通normal权限和固定策略权限不在这一批量撤销范围。
-
-r48这里还有一个很窄但容易读错的细节：`EXEMPT_PERMISSIONS`里的`ACTIVITY_RECOGNITION`只在判断“本组是否存在可触发撤销的grant”时被排除；一旦同组因其他permission满足条件，后面构造的`revocablePermissions`仍是`group.permissions.keys`。所以不能把这张列表解释成最终逐项撤销过滤器。
-
-## 109. 运行中的App为何再次跳过
-
-真正操作前读取包importance，只有`packageImportance > IMPORTANCE_TOP_SLEEPING`才撤销。importance数值越大越不重要；正在顶层或接近顶层的包会跳过本轮，避免扫描恰好撞上用户正在使用。
-
-## 110. 自动撤销如何写状态
-
-先撤background，再撤foreground runtime permissions，参数`userFixed=false, oneTime=false`。随后逐项把`FLAG_PERMISSION_AUTO_REVOKED`设true、`FLAG_PERMISSION_USER_SET`设false。这样未来UI能知道它是系统因长期不用自动重置，不是用户刚按拒绝。
-
-## 111. 撤销后用户能看到什么
-
-只要本轮至少撤销一个包，Job结束前发布低重要性通知，点击进入`ACTION_MANAGE_AUTO_REVOKE`管理页，并预加载自动撤销包列表。`onStopJob()`取消协程且返回true，请求系统日后重试。
-
-## 112. macOS只读练习一：追请求入口
-
-在源码根目录执行：
+### 练习 1：验证直接Activity闸门与Fragment旁路
 
 ```bash
-rg -n "requestPermissions\(|dispatchRequestPermissionsResult|buildRequestPermissionsIntent" \
-  frameworks/base/core/java/android/app/Activity.java \
-  frameworks/base/core/java/android/content/pm/PackageManager.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'public final void requestPermissions(@NonNull String[] permissions, int requestCode) {' frameworks/base/core/java/android/app/Activity.java
+grep -n -F 'if (mHasCurrentPermissionsRequest) {' frameworks/base/core/java/android/app/Activity.java
+grep -n -F 'startActivityForResult(REQUEST_PERMISSIONS_WHO_PREFIX, intent, requestCode, null);' frameworks/base/core/java/android/app/Activity.java
+grep -n -F 'mHasCurrentPermissionsRequest = true;' frameworks/base/core/java/android/app/Activity.java
+grep -n -F 'storeHasCurrentPermissionRequest(outState);' frameworks/base/core/java/android/app/Activity.java
+grep -n -F 'restoreHasCurrentPermissionRequest(icicle);' frameworks/base/core/java/android/app/Activity.java
+grep -n -F 'onRequestPermissionsFromFragment(Fragment fragment, String[] permissions,' frameworks/base/core/java/android/app/Activity.java
+grep -n -F 'String who = REQUEST_PERMISSIONS_WHO_PREFIX + fragment.mWho;' frameworks/base/core/java/android/app/Activity.java
+grep -n -F 'mHasCurrentPermissionsRequest = false;' frameworks/base/core/java/android/app/Activity.java
 ```
 
-手动画出`requestCode`、特殊who前缀、Intent extra、回调数组四者的对应关系，并标出“第二次并发请求”和“data为null”各返回什么。
+先画两条时间线：Activity 直接请求会经过 bool 闸门；平台 Fragment 请求不经过。再模拟旋转，确认保存的是“已有直接请求”这一事实，而不是 PermissionController 当前页面的完整状态。
 
-## 113. macOS只读练习二：追用户一次选择
+## 3. 显式Intent限定处理者，resultTo链确认原始调用包
 
-执行：
+PackageManager.buildRequestPermissionsIntent 创建 ACTION_REQUEST_PERMISSIONS Intent，放入原始权限数组，并把 package 限定为系统选出的 PermissionController 包。这能防止普通应用抢占隐式 Intent，但 setPackage 只限定目标包，不是调用者身份凭据，也没有固定到某个组件。
+
+原始 App 的身份来自 ActivityTaskManager 的 resultTo 关系。PermissionController 的 GrantPermissionsActivity 在 onCreate 缓存 getCallingPackage；源码注释指出以后再读可能得不到它。GrantPermissionsActivity 随后重新读取这个包的 PackageInfo、requestedPermissions、targetSdk 和 UID，而不是相信 Intent 自报的包名。
+
+这里有两层身份，不能混为一谈：
+
+| 层次 | 身份 | 用途 |
+| --- | --- | --- |
+| UI 请求来源 | ATMS 的 resultTo 所指 Activity 包 | 决定为哪个原 App 展示和计算结果 |
+| PMS Binder caller | PermissionController UID | 接受 GRANT/REVOKE 特权与跨用户检查 |
+
+PermissionController Manifest 自身持有 GRANT_RUNTIME_PERMISSIONS 和 REVOKE_RUNTIME_PERMISSIONS。普通 App 不会因为启动了这个界面而获得这些 Binder 权限；它只是成为受信任 UI 选定的目标 package。
+
+入口还叠加两类防遮挡：主题打开 filterTouchesWhenObscured，Activity 窗口设置 HIDE_NON_SYSTEM_OVERLAY_WINDOWS。setFinishOnTouchOutside(false) 只说明触摸窗口外不结束流程，不能替代前两项安全控制。
+
+### 练习 2：分离Intent目标、UI来源与Binder调用者
 
 ```bash
-rg -n "GRANTED_ALWAYS|GRANTED_FOREGROUND_ONLY|GRANTED_ONE_TIME|DENIED_DO_NOT_ASK_AGAIN|setResultIfNeeded" \
-  packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'public Intent buildRequestPermissionsIntent(@NonNull String[] permissions) {' frameworks/base/core/java/android/content/pm/PackageManager.java
+grep -n -F 'Intent intent = new Intent(ACTION_REQUEST_PERMISSIONS);' frameworks/base/core/java/android/content/pm/PackageManager.java
+grep -n -F 'intent.setPackage(getPermissionControllerPackageName());' frameworks/base/core/java/android/content/pm/PackageManager.java
+grep -n -F 'return r != null ? r.info.packageName : null;' frameworks/base/services/core/java/com/android/server/wm/ActivityTaskManagerService.java
+grep -n -F 'return r.resultTo;' frameworks/base/services/core/java/com/android/server/wm/ActivityTaskManagerService.java
+grep -n -F 'mCallingPackage = getCallingPackage();' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F '<uses-permission android:name="android.permission.GRANT_RUNTIME_PERMISSIONS" />' packages/apps/PermissionController/AndroidManifest.xml
+grep -n -F '<uses-permission android:name="android.permission.REVOKE_RUNTIME_PERMISSIONS" />' packages/apps/PermissionController/AndroidManifest.xml
+grep -n -F 'android:theme="@style/GrantPermissions.FilterTouches"' packages/apps/PermissionController/AndroidManifest.xml
+grep -n -F '<item name="android:filterTouchesWhenObscured">true</item>' packages/apps/PermissionController/res/values/themes.xml
+grep -n -F 'getWindow().addSystemFlags(SYSTEM_FLAG_HIDE_NON_SYSTEM_OVERLAY_WINDOWS);' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
 ```
 
-任选`GRANTED_ONE_TIME`，沿调用写出foreground grant、background revoke、ONE_TIME flag、最终`checkPermission()`回报的先后顺序。
+把“谁发起 UI”“谁调用 PMS”“谁是被修改目标”分别写在纸上。若三处都写成原 App UID，就能立刻发现身份模型被压扁了。
 
-## 114. macOS只读练习三：手算AppOps
+## 4. 原始数组、Manifest权限和UI group是三种不同集合
 
-执行：
+GrantPermissionsActivity 只把“整个数组为 null”归一成空数组；null 元素在遍历 UI 时被跳过，重复元素也不会从原始数组删除。它随后重读调用包 Manifest：包不存在、没有 requestedPermissions，或 targetSdk 小于 M，都会以空或当前结果尽早结束。pre-M 包因此不进入现代请求按钮链；Java/Kotlin 模型中为 legacy App 处理 AppOp 的代码属于设置页、审查或其他消费者。
+
+真正进入 UI 的 affectedPermissions 还会扩张：
+
+- split permission 可把一个旧权限扩为多个新权限；
+- targetSdk 不高于 N_MR1 时，一个请求可扩为旧式 group 内多个权限；
+- 相同 affected permission 会在内部集合去重；
+- group 是展示与批量决策单位，runtime grant 仍以单个 permission 为状态键。
+
+foreground 与 background 会成为同组的两个 GroupState。targetSdk 至少为 R 时，background permission 必须单独请求；r48 用原始 mRequestedPermissions.length 大于 1 判断，所以“background + 重复项、null 或无效项”也会命中限制。代码调用 finish 后没有 return，后续初始化仍可能继续，但 mResultSet 会保住第一次构造的 canceled 结果。
+
+按钮结果不是一个布尔值：
+
+| UI决定 | foreground | background | flags侧重点 |
+| --- | --- | --- | --- |
+| 始终允许 | grant | grant（若流程允许） | 清 ONE_TIME |
+| 仅在使用中 | grant | revoke | 清 ONE_TIME |
+| 仅限这一次 | grant | revoke | 非 background 项置 ONE_TIME |
+| 拒绝 | revoke | revoke | 清 ONE_TIME |
+| 拒绝且不再询问 | revoke | revoke | 置 USER_FIXED，清 ONE_TIME |
+
+DevicePolicy 的自动允许或拒绝还能通过同一 Java 模型设置 POLICY_FIXED。按钮是否展示受设备形态、targetSdk、foreground 已有状态、固定 flags、restricted policy 等共同限制，不能从 switch 分支反推“每个应用必有这些按钮”。
+
+### 练习 3：从原始数组推导affected集合和按钮结果
 
 ```bash
-sed -n '633,748p' \
-  frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'mRequestedPermissions = getIntent().getStringArrayExtra(' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F 'if (requestedPermission == null) {' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F 'if (callingPackageInfo.applicationInfo.targetSdkVersion < Build.VERSION_CODES.M) {' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F 'ArrayList<String> affectedPermissions =' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F 'extendedBySplitPerms.addAll(splitPerm.getNewPermissions());' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F 'if (requestingAppTargetSDK <= Build.VERSION_CODES.N_MR1) {' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F '>= Build.VERSION_CODES.R && mRequestedPermissions.length > 1' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F 'case GRANTED_ONE_TIME:' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F 'case DENIED_DO_NOT_ASK_AGAIN :' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F 'groupState.mGroup.setOneTime(true);' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F 'if (!mResultSet) {' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F 'int numRequestedPermissions = mRequestedPermissions.length;' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F 'grantResults[i] = pm.checkPermission(mRequestedPermissions[i], mCallingPackage);' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F 'setResultIfNeeded(RESULT_CANCELED);' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F 'setResultIfNeeded(RESULT_OK);' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F 'dispatchRequestPermissionsResult(requestCode, data);' frameworks/base/core/java/android/app/Activity.java
+grep -n -F 'onRequestPermissionsResult(requestCode, permissions, grantResults);' frameworks/base/core/java/android/app/Activity.java
 ```
 
-设A、B共享UID并映射到同一op：A前景已授/背景未授，B未授。分别把它们放入foreground和ignore列表，再按`syncPackages()`顺序手算最终mode，解释为何不是B的IGNORED。
+构造一个含五项的数组：CAMERA 重复两次、一个 null、一个无效名字、一个 R 应用的 background location。分别记录原始回调数组、affectedPermissions 和 GroupState，三列不会相同。
 
-## 115. macOS只读练习四：对比两种自动撤销
+## 5. 请求UI走Java模型，而且一次选择会产生多次立即持久化
 
-执行：
+GrantPermissionsActivity 构造 AppPermissions 时传入 delayChanges=false；四参构造器最终也把 false 交给完整构造器。因此按钮路径使用 Java AppPermissionGroup 的立即持久化，不是 KotlinUtils 的轻量模型，也不是先缓存全部变化后一次提交。
+
+“仅限这一次”的真实顺序是：
+
+1. setOneTime(true) 遍历组内所有非 background permission，修改模型并立即 persistChanges(false)；
+2. grantRuntimePermissions 只用 affectedPermissions 过滤本次 grant，再次触发持久化；
+3. 每次 persistChanges 又逐 permission 发出 grant/revoke、updatePermissionFlags 和 AppOp 调用；
+4. 遍历完成后才根据组快照决定 start 或 stop one-time session。
+
+普通允许会先独立清 ONE_TIME，再 grant；拒绝会先 revoke，再独立清 ONE_TIME。setOneTime 的组范围还可能大于本次 affectedPermissions 范围。这里既没有数据库事务，也没有 compare-and-set：进程异常、另一个管理入口并发修改或 shared UID 的另一个包参与时，都可能观察到或放大中间状态。
+
+Java mask 明确包含 POLICY_FIXED、排除 SYSTEM_FIXED，并总把 AUTO_REVOKED 放进 mask 而不放进 values，从而在普通用户决策时清除自动撤销标记。system-fixed permission 不由这个模型改 grant/revoke；policy-fixed 则能由策略分支主动设置。KotlinUtils 的 changed flag mask 是另一套实现，不能拿它解释请求 UI。
+
+AppPermissionGroup 的 grant/revoke 返回 boolean，但 GrantPermissionsActivity 不据此回滚整组；多 permission 操作可能部分成功。最终界面只能重新检查每个原始项，无法把“一次点击”升级为全有或全无的承诺。
+
+### 练习 4：按源码顺序展开一次one-time点击
 
 ```bash
-rg -n "mTimerStart|IMPORTANCE_CACHED|notifyOneTimePermissionSessionTimeout|DEFAULT_UNUSED_THRESHOLD_MS|lastTimeVisible|FLAG_PERMISSION_AUTO_REVOKED" \
-  frameworks/base/services/core/java/com/android/server/pm/permission/OneTimePermissionUserManager.java \
-  packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/AutoRevokePermissions.kt
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'mAppPermissions = new AppPermissions(this, callingPackageInfo, false,' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F 'this(context, packageInfo, sortGroups, false, onErrorCallback);' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/model/AppPermissions.java
+grep -n -F 'groupState.mGroup.setOneTime(true);' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F 'groupState.mGroup.grantRuntimePermissions(true, doNotAskAgain,' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/ui/GrantPermissionsActivity.java
+grep -n -F 'if (!permission.isBackgroundPermission()) {' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/model/AppPermissionGroup.java
+grep -n -F 'if (!mDelayChanges) {' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/model/AppPermissionGroup.java
+grep -n -F 'public void persistChanges(boolean mayKillBecauseOfAppOpsChange, String revokeReason) {' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/model/AppPermissionGroup.java
+grep -n -F 'mPackageManager.grantRuntimePermission(mPackageInfo.packageName,' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/model/AppPermissionGroup.java
+grep -n -F 'mPackageManager.revokeRuntimePermission(mPackageInfo.packageName,' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/model/AppPermissionGroup.java
+grep -n -F 'mPackageManager.updatePermissionFlags(permission.getName(),' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/model/AppPermissionGroup.java
+grep -n -F '| PackageManager.FLAG_PERMISSION_POLICY_FIXED' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/model/AppPermissionGroup.java
+grep -n -F '| PackageManager.FLAG_PERMISSION_AUTO_REVOKED, // clear auto revoke' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/model/AppPermissionGroup.java
+grep -n -F 'shouldKillApp |= allowAppOp(permission, uid);' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/model/AppPermissionGroup.java
+grep -n -F 'shouldKillApp |= disallowAppOp(permission, uid);' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/model/AppPermissionGroup.java
+grep -n -F 'if (isOneTime() && areRuntimePermissionsGranted()) {' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/model/AppPermissionGroup.java
+grep -n -F '.startOneTimePermissionSession(packageName,' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/model/AppPermissionGroup.java
 ```
 
-做一张两列表：触发器、默认时间、调度者、flags、是否依赖UsageStats、是否跟踪UID importance。确保不再把“一次性权限”写成“90天自动撤销”。
+不要只列方法名。把第一次 setOneTime 的 flags/AppOp/session、第二次 grant 的 permission/flags/AppOp/session分别列出，便能看到中间态为什么真实存在。
 
-## 116. 常见误解一：用户点允许后PMS直接回调App
+## 6. PMS重新校验特权、用户、目标包、权限定义与fixed状态
 
-不准确。用户选择先由PermissionController转成grant/revoke和flags，PMS更新权威状态，PermissionController再逐项check并通过Activity result路由回App。AppOps同步还可能异步收敛。
+ApplicationPackageManager 的 grant 在 r48 仍经 IPackageManager 包装转发，revoke 已直接调用 IPermissionManager；二者最终进入 PermissionManagerService 的内部实现。服务端不信任 UI 已做完的判断，而会重新检查调用者持有 GRANT 或 REVOKE_RUNTIME_PERMISSIONS、跨用户权限、用户是否存在、包可见性、权限定义、目标是否声明或由 shared 权限状态承载、runtime/development 类型、legacy、instant app、restricted 和 fixed flags。
 
-## 117. 常见误解二：permission granted就能永远访问
+“校验失败”没有单一返回形态。未知 permission 可抛 IllegalArgumentException；某些 fixed revoke 抛 SecurityException；grant 遇 system-fixed、无 override 的 policy-fixed 或 restricted 常记录后直接返回；未知用户或包也常返回。调用方不能只靠“没有异常”推断发生了状态变化。
 
-不准确。AppOp可能是FOREGROUND或IGNORED，restricted policy也可能限制；一次性会话或长期未用Job还会在未来撤销。应用每次敏感操作都应按公开API处理当前权限与失败，而不是永久缓存第一次结果。
+成功 grant 修改 PermissionsState；若 GID 变化，callback 会安排杀 UID，随后触发 permission listener、设置写入和 runtime state 通知。成功 revoke 也先改内存状态，再调用 callback 和 runtime state 通知。默认 callback 的关键差异是：
 
-## 118. 常见误解三：一次性权限点击一分钟后必撤
+- grant 使用 writeSettings(true)，主设置写入走延迟路径；
+- revoke 使用 writeSettings(false)，packages.xml 主写同步执行，但 writeLPr 末尾的 runtime-permissions 文件仍另行调度；
+- revoke kill 投递到 PMS 的 ServiceThread；
+- PermissionPolicy 同步走 FgThread，两条队列没有顺序保证。
 
-不准确。一分钟是默认连续不活跃阈值；回到foreground会清零，foreground service可在超时点继续保活，UID gone另有默认5秒重启缓冲。它是UID重要性驱动的状态机，不是按钮点击后的墙钟倒计时。
+所以 Binder 返回可说明这次同步服务调用已走完或提前返回，却不能说明 kill 已执行、AppOps 已收敛或各 XML 已 durable。
 
-## 119. 复读后补上的精确边界
+### 练习 5：为PMS每一种拒绝建立结果表
 
-第一，自动撤销的“最后使用”按shared UID包取最大值，并受安装时间、组件基准时间和跨profile使用保护；第二，Q及更旧目标包在AppOp为DEFAULT时默认豁免，`EXEMPT_PERMISSIONS`又不是最终逐项过滤表；第三，一次性监听器按UID而非包名建Map，新start不会更新旧会话；第四，PermissionPolicyService按shared UID整体、以最宽mode优先同步，而非按最后遍历包覆盖。
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'public void grantRuntimePermission(String packageName, String permName, final int userId) {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'android.Manifest.permission.GRANT_RUNTIME_PERMISSIONS,' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'android.Manifest.permission.REVOKE_RUNTIME_PERMISSIONS,' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'if (!mUserManagerInt.exists(userId)) {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'if (pkg == null || ps == null) {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'bp.enforceDeclaredUsedAndRuntimeOrDevelopment(pkg, ps);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'if (pkg.getTargetSdkVersion() < Build.VERSION_CODES.M' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'if (bp.isHardRestricted()' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'Cannot grant system fixed permission ' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'throw new SecurityException("Cannot revoke policy fixed permission "' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'final int result = permissionsState.grantRuntimePermission(bp, userId);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'permissionsState.revokeRuntimePermission(bp, userId)' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'callback.onPermissionGranted(uid, userId);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'callback.onPermissionRevoked(UserHandle.getUid(userId,' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'mPackageManagerInt.writeSettings(true);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'mPackageManagerInt.writeSettings(false);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'mHandler.post(() -> killUid(appId, userId, KILL_APP_REASON_PERMISSIONS_REVOKED));' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+```
 
-## 120. 本章小结与下一章
+为未知 user、未知 package、未知 permission、legacy、system-fixed、policy-fixed、hard restricted 和成功变化分别填“返回、日志、异常、callback、kill、写入”。这比笼统记“PMS 会校验”更可执行。
 
-运行时权限请求是一条跨App、PermissionController与system_server的安全协议：标准API只发起显式系统UI，控制器依据真实calling package和Manifest展示分组选择，再经Binder让PermissionManagerService修改每用户grant与flags；PermissionPolicyService以shared UID为整体把状态收敛到ALLOWED、FOREGROUND或IGNORED AppOps；一次性权限由UID重要性状态机结束，长期未用权限则由周期UsageStats扫描自动重置。下一章进入权限持久化与备份恢复，继续追`runtime-permissions.xml`、异步写盘、版本升级、PermissionController备份/恢复和延迟恢复链。
+## 7. 应用回调只返回原始数组的permission-check视图
+
+GrantPermissionsActivity 完成时按原始 mRequestedPermissions 的长度创建 grantResults，并逐项调用 PackageManager.checkPermission。原始顺序、重复项和 null 都保留；null 得到 denied。split 扩展项、旧目标 group 扩展项不会额外出现在回调里。
+
+这个检查只反映当时内存中的 permission grant 视图，不携带 ONE_TIME、USER_SET、USER_FIXED 或 AUTO_REVOKED，也不读取 AppOps raw/effective mode，更不等待 PermissionPolicy、kill 或磁盘写入。checkPermission 还受 FULLER_PERMISSION_MAP 等兼容规则影响，例如更强权限可能让较弱权限的检查成立。PERMISSION_GRANTED 因而不是“完整能力已经可永久使用”。
+
+Activity.dispatchActivityResult 识别 REQUEST_PERMISSIONS_WHO_PREFIX 后，完全丢弃 resultCode，只把 requestCode 和 data 交给权限专用分发。App 观察不到权限 Activity 的 RESULT_OK 或 RESULT_CANCELED。正常结果数组也可混合 granted/denied；空数组则可能来自并发闸门、pre-M 退出、界面中断或 controller 崩溃，不能唯一反推原因。
+
+设备 Back 的差异进一步说明 resultCode 不可靠：手持实现可把 Back 映射为 UI 的 CANCELED，随后 setResultAndFinish 又写 RESULT_OK；TV/Wear 常把 Back 映射为 DENIED，实际执行 revoke/flags 路径。应用唯一稳定入口仍是 onRequestPermissionsResult 的数组，并在真正使用资源时处理后续 AppOp 或状态变化。
+
+## 8. Java模型会直接改AppOps，PermissionPolicy随后再收敛
+
+runtime permission 与 AppOp 解决不同问题。permission bit 表示持有资格，AppOp 表示某类实际操作当前以何种模式运行。位置的“仅在使用中”典型地是 permission 已 grant，而对应 op 保存为 MODE_FOREGROUND；两者不能合成一个 granted 布尔值。
+
+请求 UI 的 Java AppPermissionGroup 在逐项 persist 时会直接 allowAppOp 或 disallowAppOp，使用户决定尽快反映到操作层。随后 PMS 的 runtime permission listener 又触发 PermissionPolicyService，根据全包、shared UID、foreground/background 和 restricted 状态重新计算。第二次写不是第二次授权，而是把局部 UI 快照收敛到系统级不变量。
+
+顺序仍非原子。一个 group 内是 permission A 的 grant、flags、AppOp，再到 permission B；setOneTime 和 grant 又是两轮。任意观察者都可能在其中读到中间组合。后续同步通常会收敛，但不能把暂态从模型中删除，也不能承诺进程异常后一定已有机会执行补偿。
+
+AppOps 的变化还可能反向影响 REVOKED_COMPAT flag：普通外部 setUidMode 在进入持锁修改前调用 updatePermissionRevokedCompat，而 PermissionPolicy 带 callback 的专用写路径会跳过这一步。所谓“双向同步”不是 AppOps 直接 grant/revoke runtime bit，而是部分兼容 flags 与 policy 重算之间的协作。
+
+### 练习 6：证明runtime通知至少晚两个FgThread阶段
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'notifyRuntimePermissionStateChanged(packageName, userId);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'FgThread.getHandler().sendMessage(PooledLambda.obtainMessage' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'listeners.get(i).onRuntimePermissionStateChanged(packageName, userId);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'this::synchronizePackagePermissionsAndAppOpsAsyncForUser' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'mIsPackageSyncsScheduled.add(new Pair<>(packageName, changedUserId))' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F '::synchronizePackagePermissionsAndAppOpsForUser,' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'mAppOpsManagerInternal.setUidModeFromPermissionPolicy(opCode, uid, mode,' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'if (permissionPolicyCallback == null) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'updatePermissionRevokedCompat(uid, code, mode);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+```
+
+从 PMS 的 post、listener 执行、PPS 再 post 到 syncPackages 画消息队列。Binder 返回点放在第一条 post 之后，便不会误以为应用回调等待了 AppOps 收敛。
+
+## 9. PermissionPolicy由三类事件驱动，并按package/user去重
+
+PermissionPolicyService 启动后观察 package add/change/remove、runtime permission state change 和相关 AppOps mode change。包变化可同步包并清理 UID 下已无人请求的 AppOp permission；permission 或 AppOps 变化则进入异步去重。
+
+去重键是 packageName 与 userId 的 Pair。第一次事件把任务投到 FgThread，后续相同键只合并；真正执行时先从 scheduled 集合移除，再读取当前状态。因此它是最终状态型收敛，而不是逐事件日志回放。不同用户不能共享同一键，shared UID 的其他包则在执行阶段扩展。
+
+PMS 的 runtime listener 本身已经由 FgThread 异步通知；PPS listener 再投一次同一 FgThread。没有 future、join 或回调把这两跳连接到 grant/revoke 调用者。队列中还可能夹入 package、AppOps 和其他前台线程任务，源码只保证最终有机会按新快照重算。
+
+## 10. shared UID先扩展已安装成员，再按最宽候选写raw UID mode
+
+synchronizePackagePermissionsAndAppOpsForUser 先取得目标 PackageInfo，再加入目标用户中已安装的 shared UID 成员，最后统一 syncPackages。权限状态本身也由 PackageSetting 委托给 SharedUserSetting；因此 Binder 参数中的 packageName 不是 shared UID 内一份隔离账本。
+
+每个包/permission 会产生候选：
+
+- grant 且不带 REVOKED_COMPAT，并通过 restricted policy：通常进入 ALLOWED；
+- 有 background permission 的 foreground 权限：background 也允许时进入 ALLOWED，否则进入 FOREGROUND；
+- 不满足 grant 条件：进入 IGNORED；
+- 某些 soft-restricted/legacy storage 进入 IGNORE_IF_NOT_ALLOWED。
+
+syncPackages 固定按 ALLOWED、FOREGROUND、IGNORED、IGNORE_IF_NOT_ALLOWED 的顺序遍历。ALLOWED 循环会处理全部候选并标记 uid+switch-op；从 FOREGROUND 开始，后续候选才会因同一键已被标记而跳过。因此跨桶仍是“最宽 raw 候选优先”，但不能说同桶只写一次。IGNORE_IF_NOT_ALLOWED 也不是第四种更窄 mode：它先读当前 raw mode，若已经 ALLOWED 就保留，只在当前不是 ALLOWED 时考虑写 IGNORED。
+
+REVIEW_REQUIRED 只让那一个 permission 不产生候选；同 switch op 的另一 permission 或 shared 包仍可能提供候选。请求 UI 直接写 AppOp 时只掌握当前包模型，所以 shared UID 可先出现过宽或过窄 raw mode，等 PPS 扩展成员后再收敛。
+
+### 练习 7：手算shared UID的候选桶与第一写入者
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F '? sharedUser.getPermissionsState()' frameworks/base/services/core/java/com/android/server/pm/PackageSetting.java
+grep -n -F 'if (ps.getInstalled(userId)) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'getSharedUserPackagesForPackage(' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'LongSparseLongArray alreadySetAppOps = new LongSparseLongArray();' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'setUidModeAllowed(op.code, op.uid, op.packageName);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'setUidModeForeground(op.code, op.uid, op.packageName);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'setUidModeIgnored(op.code, op.uid, op.packageName);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'if (alreadySetAppOps.indexOfKey(IntPair.of(op.uid, op.code)) >= 0) {' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'if (currentMode != MODE_ALLOWED) {' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'Note: Called with the package lock held. Do <u>not</u> call into app-op manager.' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'int evalMode(int op, int mode) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'if (mode == MODE_FOREGROUND) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F '} else if (mode == MODE_ALLOWED) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'PROCESS_CAPABILITY_FOREGROUND_CAMERA' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'PROCESS_CAPABILITY_FOREGROUND_MICROPHONE' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'callbackSpecs.remove(mModeWatchers.get(callbackToIgnore.asBinder()));' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'mHandler.postDelayed(mWriteRunner, WRITE_DELAY);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'mHandler.postDelayed(mWriteRunner, 10*1000);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+```
+
+设 A 与 B 同 UID、同 switch op：A 给出 FOREGROUND，B 给出 ALLOWED，再加入一个 REVIEW_REQUIRED 的 C。先按源码收集，再按桶序写，答案应是 ALLOWED；C 的跳过不会冻结整个 op。
+
+## 11. raw mode不是最终访问结果，内存更新也不是appops.xml落盘
+
+PPS 比较和写入的主要是 raw UID mode。真正 check/note/start op 时，AppOpsService 的 UidState.evalMode 还会考虑 pending-top、可见 widget、UID state 与 capability。raw MODE_FOREGROUND 可能变成 ALLOWED 或 IGNORED；camera/microphone 的 raw MODE_ALLOWED 在特定前台能力约束下也存在被求值为 IGNORED 的分支。因而“ALLOWED 大于 FOREGROUND 大于 IGNORED”只描述同步器候选优先级，不是所有时刻的访问真值表。
+
+PPS 写 UID mode 后用 unsafeCheckOpRaw 再查一次。若观察值仍不等于目标，它会把当前 package-specific mode 复位到默认值。源码把常见原因描述为错误设置的 package mode，但 raw 检查还受 suspend/user restriction 等条件影响，不能把所有不相等都归因于 package override。
+
+PermissionPolicy 写 mode 时传入 mAppOpsCallback。AppOpsService 发送 watcher 通知前，用 callbackToIgnore 明确从集合移除该 callback；这才是避免 PPS 对自身写入立即自反馈的直接机制。旧值比较和 package/user 去重仍负责减少额外工作。
+
+持久化另有完成点：UID mode 内存改变后，appops.xml 默认延迟 30 分钟写；复位 package mode 的 fast write 默认延迟 10 秒。崩溃前内存已正确，不等于磁盘文件已包含该结果。
+
+## 12. one-time不是固定寿命，而是flag、UID监听和回调撤销的组合
+
+一次性权限至少包含三部分：非 background permission 的 ONE_TIME flag、system_server 中按 UID 维护的 inactivity listener、PermissionController 在超时回调中执行的实际 revoke。任何一部分单独存在都不是完整会话。
+
+AppPermissionGroup.persistChanges 在组为 one-time 且仍有 runtime grant 时调用 startOneTimePermissionSession；若包已没有任何 one-time 权限则 stop。默认超时由 PermissionController Utils 给出 1 分钟，并可被 DeviceConfig 覆盖。这一分钟是 UID 处于特定“不活跃但仍存活”区间的累计门槛，不是从用户点击起算的固定墙上时间。
+
+system_server 的计时模块不直接撤销 permission。它判定 session 结束后调用 PermissionControllerManager.notifyOneTimePermissionSessionTimeout；PermissionControllerServiceImpl 重新读取包和请求权限，收集仍标记 one-time 的 group，撤销其中仍授予的 runtime permission，清 USER_SET，再 persistChanges 并记录原因。
+
+如果回调时包已经不存在，r48 实现把 NameNotFoundException 包成 RuntimeException；listener 此前已经结束，没有内建重试。这个边界说明“发出超时通知”也不等于“撤销已经成功完成”。
+
+## 13. importance状态机混合Handler延时、墙上时钟与RTC alarm
+
+OneTimePermissionUserManager 为每个 Android user 建实例，内部 SparseArray 却只以 UID 为键。下表比较的是 importance 数值；数值越小，进程语义上越重要：
+
+| UID的importance数值 | 行为 |
+| --- | --- |
+| importance 不高于 reset 阈值 | 清 timerStart，取消或不启动累计 |
+| 高于 reset、但仍不高于 keep-alive 阈值 | 记录 System.currentTimeMillis 起点，暂不设 alarm |
+| 高于 keep-alive、但 UID 仍存在 | 以 timerStart+timeout 设置精确 RTC_WAKEUP |
+| 高于 IMPORTANCE_CACHED，即 UID gone | 主线程 Handler 延迟默认 5 秒，重查仍 gone 才结束 |
+
+活跃累计使用墙上时钟和 RTC_WAKEUP，手工改时钟会改变到期判断；gone 的 5 秒由 Handler 延时，深度睡眠可延长实际等待。两条路径不能合称一个统一单调计时器。
+
+同 UID 已有 listener 时，新 start 不更新 packageName、timeout 或阈值。shared UID 的后一个包会复用第一个包的会话；任一同 UID 包调用 stop，又能按 UID 停掉该 listener。超时回调最终只携带最初保存的 packageName，这与 shared permission state 组合后必须谨慎推演。
+
+r48 还暴露两个并发边界：
+
+- start/stop 先持 mLock，再在构造或 cancel 中进入 mInnerLock；alarm 到期路径持 mInnerLock 后在 onPackageInactiveLocked 进入 mLock，形成相反锁序；
+- ACTION_UID_REMOVED receiver 直接访问被标注由 mLock 保护的 mListeners，没有取得外锁。
+
+这两点是源码级竞态/死锁风险，不应包装成设计保证。cancel 没有移除 token callback，而 delayed gone callback 又未按方法注解持 mInnerLock；mIsFinished 只能表达实现意图，不能当作并发 no-op 的完成保证。
+
+### 练习 8：同时验证计时、shared UID与锁顺序
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private static final long DEFAULT_KILLED_DELAY_MILLIS = 5000;' frameworks/base/services/core/java/com/android/server/pm/permission/OneTimePermissionUserManager.java
+grep -n -F 'private final SparseArray<PackageInactivityListener> mListeners = new SparseArray<>();' frameworks/base/services/core/java/com/android/server/pm/permission/OneTimePermissionUserManager.java
+grep -n -F 'PackageInactivityListener listener = mListeners.get(uid);' frameworks/base/services/core/java/com/android/server/pm/permission/OneTimePermissionUserManager.java
+grep -n -F 'mTimerStart = System.currentTimeMillis();' frameworks/base/services/core/java/com/android/server/pm/permission/OneTimePermissionUserManager.java
+grep -n -F 'mAlarmManager.setExact(AlarmManager.RTC_WAKEUP, revokeTime, LOG_TAG, this,' frameworks/base/services/core/java/com/android/server/pm/permission/OneTimePermissionUserManager.java
+grep -n -F 'mHandler.postDelayed(() -> {' frameworks/base/services/core/java/com/android/server/pm/permission/OneTimePermissionUserManager.java
+grep -n -F 'synchronized (mInnerLock) {' frameworks/base/services/core/java/com/android/server/pm/permission/OneTimePermissionUserManager.java
+grep -n -F 'synchronized (mLock) {' frameworks/base/services/core/java/com/android/server/pm/permission/OneTimePermissionUserManager.java
+grep -n -F 'mPermissionControllerManager.notifyOneTimePermissionSessionTimeout(' frameworks/base/services/core/java/com/android/server/pm/permission/OneTimePermissionUserManager.java
+grep -n -F 'public static final long ONE_TIME_PERMISSIONS_TIMEOUT_MILLIS = 1 * 60 * 1000;' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/utils/Utils.java
+grep -n -F 'public void onOneTimePermissionSessionTimeout(@NonNull String packageName) {' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/PermissionControllerServiceImpl.java
+grep -n -F 'group.revokeRuntimePermissions(false);' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/PermissionControllerServiceImpl.java
+```
+
+分别画存活但后台、UID gone、shared UID 第二包 start、任一 sibling stop、alarm 与 stop 并发五条路径。锁图要标出 outer→inner 与 inner→outer，而不只是列 synchronized 次数。
+
+## 14. 长期不用自动撤销先由周期Job筛出候选包
+
+长期不用自动撤销与 one-time 不是同一个计时器。PermissionController 的 boot receiver 默认每 15 天安排 periodic Job，默认未使用阈值 90 天；两者都可由配置覆盖。Automotive 不调度，profile 自身不调度而由 parent 处理 profile group。JobInfo 只设置 periodic，没有附加充电或 idle 条件。
+
+SKIP_NEXT_RUN 是进程内 static 变量，用来绕过调度后的首次运行；进程死亡会丢失它，所以不是持久的“首轮必跳过”协议。firstBootTime 存在 SharedPreferences，并用 apply 异步写；崩溃也可能使保护时间重新初始化得更晚。
+
+候选时间以 System.currentTimeMillis 为 now，对每个包计算：
+
+1. 同 UID 所有包 UsageStats.lastTimeVisible 的最大值；
+2. 与该包 firstInstallTime 取最大；
+3. 与 PermissionController 保存的 firstBootTime 取最大；
+4. 若包允许跨 profile，再与 profile group 中同包可见时间取最大；
+5. 只有 now-lastTimeVisible 严格大于 threshold 才算 unused。
+
+因此 shared UID 任一 sibling 最近可见都会保护该 UID 下所有包不进入候选；墙上时钟跳变会影响分类。没有 UsageStats 的 user 被移出，未解锁 user 被跳过；扫描的数据范围是当前 profile group 的 LiveData，不等于设备上每个独立用户都由这一进程处理。
+
+## 15. 豁免按包判断、变更按group执行，而取消可能管不住子任务
+
+进入 unused 集合后仍有两层包级豁免。永久豁免包括提供特定 bound service、disabled/work profile 和 carrier privileged。用户可覆盖豁免由 OP_AUTO_REVOKE_PERMISSIONS_IF_UNUSED 表达：MODE_DEFAULT 下 targetSdk 不高于 Q 通常默认豁免；MODE_ALLOWED 表示允许自动撤销；其他显式非默认 mode 表示豁免。
+
+每个 group 只有在 foreground/background 都不 fixed、至少一个非 ACTIVITY_RECOGNITION permission 的 isGrantedIncludingAppOp 为真、不是 default/role grant 且 user sensitive 时才触发。ACTIVITY_RECOGNITION 只从“是否触发 group”测试中排除；group 一旦被其他权限触发，revocablePermissions 却取全部 keys，它仍可能进入实际列表。
+
+执行顺序还存在四个完成性陷阱：
+
+- stats 在 importance 检查之前逐 permission 记录，所以最后因 App 正在运行而跳过，日志也可能已经写成自动撤销事件；
+- getPackageImportance 只检查一次，检查后到 revoke 之间 App 可以变活跃；
+- anyPermsRevoked 在调用 revoke 前置 true，不根据各调用返回值确认真实变化；
+- 自动撤销先 revoke background，再 revoke foreground，最后逐项置 AUTO_REVOKED 并清 USER_SET，也不是单事务。
+
+更深的并发问题来自 forEachInParallel：默认 scope 是 GlobalScope，每项用 scope.async(Main) 启动后再 await。AutoRevokeService.onStopJob 取消的是外层 job，这些脱离父 Job 的子任务未必随之取消；它们可在 jobFinished、失败处理或重调度后继续修改权限，甚至与下一轮重叠。
+
+shared UID 又把“使用时间”和“撤销资格”拆成不同粒度：last visible 先按 UID 取并集，但永久/用户豁免、group eligibility 和 mutation 按 package 单独执行；底层 PermissionsState 却可能属于 shared user。A 包允许自动撤销、B 包因旧 target 或其他原因豁免时，处理 A 仍可能改变 B 共同依赖的 shared 权限状态。源码没有在撤销前把 sibling 的豁免做 UID 级并集。
+
+### 练习 9：构造长期不用扫描的三个反例
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private var SKIP_NEXT_RUN = false' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/AutoRevokePermissions.kt
+grep -n -F 'private val DEFAULT_UNUSED_THRESHOLD_MS =' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/AutoRevokePermissions.kt
+grep -n -F 'private val DEFAULT_CHECK_FREQUENCY_MS = DAYS.toMillis(15)' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/AutoRevokePermissions.kt
+grep -n -F '.setPeriodic(getCheckFrequencyMs(context))' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/AutoRevokePermissions.kt
+grep -n -F 'pkgs.groupBy { pkg -> pkg.uid }' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/AutoRevokePermissions.kt
+grep -n -F 'now - lastTimeVisible > getUnusedThresholdMs(context)' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/AutoRevokePermissions.kt
+grep -n -F 'val revocablePermissions = group.permissions.keys.toList()' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/AutoRevokePermissions.kt
+grep -n -F 'PermissionControllerStatsLog.write(' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/AutoRevokePermissions.kt
+grep -n -F 'if (packageImportance > IMPORTANCE_TOP_SLEEPING) {' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/AutoRevokePermissions.kt
+grep -n -F 'if (isPackageAutoRevokePermanentlyExempt(pkg, user)) {' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/AutoRevokePermissions.kt
+grep -n -F 'if (isPackageAutoRevokeExempt(context, pkg)) {' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/AutoRevokePermissions.kt
+grep -n -F 'anyPermsRevoked.compareAndSet(false, true)' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/AutoRevokePermissions.kt
+grep -n -F 'FLAG_PERMISSION_AUTO_REVOKED to true,' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/AutoRevokePermissions.kt
+grep -n -F 'job?.cancel()' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/AutoRevokePermissions.kt
+grep -n -F 'scope: CoroutineScope = GlobalScope,' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/utils/KotlinUtils.kt
+grep -n -F 'map { scope.async(context) { transform(it) } }.map { it.await() }' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/utils/KotlinUtils.kt
+```
+
+反例一：日志已写但 importance 为 TOP；反例二：Job 被 stop 后 GlobalScope child 继续；反例三：同 UID 的 A 可撤、B 豁免。每例分别标“候选、实际 grant、flags、通知、jobFinished”，不要用一个 revoked 布尔值代替。
+
+## 16. 用完成点矩阵判断这条链真正走到了哪里
+
+把整章压成一张完成点矩阵：
+
+| 观察事件 | 已能确认 | 仍不能确认 |
+| --- | --- | --- |
+| 用户点击按钮 | UI 已选择分支 | 整组原子成功 |
+| PMS Binder 返回 | 同步校验已执行；内存变化可能完成，也可能因校验提前返回 | AppOps 收敛、kill、XML durable |
+| onRequestPermissionsResult | 原始数组的当前 permission-check 视图 | ONE_TIME/flags、effective AppOp、长期稳定性 |
+| PPS syncPackages 结束 | 当前快照对应的 raw mode 已尝试收敛 | 每次实际访问必放行、appops.xml 已写 |
+| one-time alarm 到期，或 UID gone 后 5 秒复查仍 gone | system_server 已决定会话结束 | Controller 已成功撤销 |
+| auto-revoke jobFinished | 外层协程走到结束回调 | GlobalScope 子任务必已停止 |
+| 收到自动撤销通知 | revokedApps 列表非空 | 每个底层 revoke 都真实改变过 grant |
+
+排查“用户允许了却仍不能访问”时，依次检查 permission bit、flags、raw AppOp、UidState.evalMode 的有效结果以及 shared UID sibling；排查“为什么后来被撤销”时，再区分 one-time flag/listener 与 auto-revoke job。排查“重启后为什么不同”时，最后核对 runtime-permissions.xml 和 appops.xml 的延迟写入，而不是只看 UI 回调。
+
+最重要的结论有四个。第一，调用包身份来自 ATMS resultTo，而执行特权属于 PermissionController。第二，一次按钮选择在 Java 模型中会拆成多次 Binder/AppOps/session 操作，不具备事务原子性。第三，PMS 返回、应用回调、PPS raw mode 收敛和磁盘持久化是不同完成点。第四，one-time 与长期不用自动撤销都带有 UID/package 粒度错位、时钟和取消边界，shared UID 下尤其不能按单包直觉推断。

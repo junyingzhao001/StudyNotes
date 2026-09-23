@@ -1,556 +1,400 @@
-# 271 Android PermissionPolicyService：权限与AppOps同步、启动初始化、角色及一次性权限协作链
+# 271 Android PermissionPolicyService：权限与 AppOps 同步、启动初始化、角色及一次性权限协作链
 
-## 1. 本章目标
+## 1. 先看结论：它维护的是收敛协议，不是一份新权限数据库
 
-本章解释`PermissionPolicyService`为什么存在：permission grant、permission flags和AppOp mode分别由不同模块保存，但runtime permission最终必须映射为正确AppOp。我们将追每用户初始化、事件触发、shared UID合并、ALLOWED/FOREGROUND/IGNORED优先级、防回调环，以及它与Role和one-time permission的真实边界。
+本文固定在 Android 11 `android-11.0.0_r48`，`frameworks/base`提交为 `1d9b9ab57d844b18b3b1b4297725141e7788109b`。这一版的 `PermissionPolicyService`位于 system_server，却同时读写几个由不同模块拥有的状态：
 
-## 2. 版本边界
+| 状态平面 | 权威状态 | 本类做什么 |
+|---|---|---|
+| permission 事实 | PMS 的 grant 与 flags；shared UID成员共用 `PermissionsState` | 读取，不另存副本 |
+| AppOps 政策 | AppOpsService 的 UID mode 与 package mode | 从 permission事实派生并调用内部 setter |
+| 生命周期门 | `mIsStarted`与两组 scheduled marker | 决定何时接收事件、怎样合并任务 |
+| Controller 工作 | runtime数据库升级、user-sensitive计算 | 发起请求并等待或仅投递 |
+| 相邻合同 | Role旧 action门、one-time session | 只接触边界，不拥有完整状态机 |
 
-本文只读本地Android 11 `android-11.0.0_r48`。后续版本的权限控制器、角色和AppOps结构已有变化；本章不把新版本类或AttributionSource链倒灌到r48。
+因此“同步完成”必须带主语。permission 已写、AppOps 内存 mode 已写、AppOps XML 已提交、user-sensitive 已算完、初始化 callback 已返回，是五个不同完成点。源码没有跨 PMS、PermissionController 和 AppOpsService 的共同事务；变化期间短暂不一致是设计的一部分，部分 r48 边界甚至会留下不能靠当前事件自动修复的旧状态。
 
-## 3. 它是协调器而非数据库
+阅读本章时采用三步法：先确认触发入口和执行线程，再确认候选 mode 怎样产生，最后确认 setter究竟改了 UID 层、package 层，还是被外部门禁返回值遮住而没有落下持久政策。
 
-PermissionManager保存权限grant/flags，AppOpsService保存mode与访问事件，PermissionController执行可更新策略。PermissionPolicyService自己不拥有另一份权威权限表，而是监听变化、读取两侧状态并推动收敛。
+## 2. 服务先发布内部接口，再安装四组长期观察者
 
-## 4. 双向依赖不是双向复制
+SystemServer在 PMS `systemReady()`之前启动 `PermissionPolicyService`。构造器立刻把 `PermissionPolicyInternal`放入 LocalServices；`onStart()`随后取得 `PackageManagerInternal`、`PermissionManagerServiceInternal`与 `IAppOpsService`，并安装长期监听。它没有公开自己的 Binder 服务。
 
-注释说同步permission与app ops“and vice versa”，但主算法以permission和flags推导AppOp；AppOp变化主要作为重新同步触发器，并通过`FLAG_PERMISSION_REVOKED_COMPAT`等已有状态避免盲目反写grant。它不是两张表字段逐项互拷。
+四组触发源不要混成一条：
 
-## 5. 本章源码地图
+1. `PackageListObserver`接收包 added、changed、removed，用于 permission→AppOps 同步及 APPOP permission残余清理；
+2. PMS 的 runtime-permission listener在 grant、revoke或相关 runtime flags变化后触发包同步；
+3. 同一个 `IAppOpsCallback`被注册到 runtime permission的 switch op、soft-restricted extra op和一部分 APPOP-protection op；
+4. 另一个 PACKAGE_ADDED/PACKAGE_CHANGED 广播 receiver只更新 user-sensitive flags，不参与核心 mode候选计算。
 
-```text
-frameworks/base/services/core/java/com/android/server/policy/
-  PermissionPolicyService.java
-  PermissionPolicyInternal.java
-  SoftRestrictedPermissionPolicy.java
-frameworks/base/services/core/java/com/android/server/pm/permission/
-  PermissionManagerService.java
-  OneTimePermissionUserManager.java
-frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
-frameworks/base/core/java/android/app/AppOpsManagerInternal.java
-```
+此外，`onStart()`还单独给 `Process.myUserHandle()`安排一次 60 秒后的全量 user-sensitive 更新。它是 system user 的一次异步任务，不是每个用户启动时都建立的定时器。
 
-## 6. SystemService身份
+### 练习 1：把发布、依赖与四组观察者画在一张图上
 
-它由system_server启动，继承`SystemService`，主要工作跑在FgThread。构造时立即向LocalServices发布`PermissionPolicyInternal`，而`onStart()`才安装包、权限和AppOps监听器。
-
-## 7. mLock保护什么
-
-`mIsStarted`记录每个user是否已初始化；`mIsPackageSyncsScheduled`去重package/user同步；`mIsUidSyncScheduled`去重UID清理；初始化callback也在锁下。锁不保护PackageManager或AppOps权威数据。
-
-## 8. mAppOpPermissions是什么
-
-它收集带`PROTECTION_FLAG_APPOP`且能映射AppOp的permission，用于包改变/移除后清理“不再被shared UID任何包请求”的AppOp。它与dangerous runtime permission列表用途不同。
-
-## 9. onStart取得三项依赖
-
-服务从LocalServices取`PackageManagerInternal`、`PermissionManagerServiceInternal`，并从ServiceManager取`IAppOpsService`。前两者同进程调用，后者虽是Binder接口，在system_server中通常仍是本地Binder对象。
-
-## 10. 五类触发源
-
-包增加/改变/删除、runtime permission state改变、AppOp mode改变、user启动、boot phase补扫都能触发同步。多个入口最终汇聚到“同步一个shared UID相关包集合”或“同步某用户全部包”。
-
-## 11. 总体协作图
-
-```mermaid
-flowchart TD
-    BOOT["用户启动或AM ready补扫"] --> UPG["PermissionController默认权限升级"]
-    UPG --> FULL["全用户权限到AppOps同步"]
-    PKG["包增改删"] --> PART["单包加shared UID同步或清理"]
-    PERM["runtime permission变化"] --> ASYNC["FgThread去重任务"]
-    APPOP["AppOp mode变化"] --> ASYNC
-    ASYNC --> SYNC["PermissionToOpSynchroniser"]
-    SYNC --> MODE["AppOpsManagerInternal写UID/package mode"]
-    MODE -. "忽略自身callback" .-> APPOP
-```
-
-## 12. PackageListObserver的added路径
-
-包加入后，若该user已经started，立即同步该包及shared UID成员。它使用PackageManager内部包列表观察者，不依赖公开PACKAGE_ADDED广播才保证核心mode同步。
-
-## 13. changed路径多一步清理
-
-包改变既同步当前请求权限，也调用`resetAppOpPermissionsIfNotRequestedForUid(uid)`。Manifest可能删除APPOP permission，仅重新处理仍请求的权限不会清掉旧mode，所以需要反向清理。
-
-## 14. removed路径为何只清理
-
-被删包已无法读取并同步，但同UID可能仍有其他shared包；服务重新收集该UID剩余成员请求集，再把无人请求的APPOP permission恢复默认。
-
-## 15. 未started用户不响应包事件
-
-三个PackageListObserver分支都先`isStarted(userId)`。该用户尚未完成权限升级时不做局部同步，随后`onStartUser()`会全量扫描，避免用未迁移状态提前写AppOps。
-
-## 16. runtime permission监听
-
-PermissionManager内部listener给出packageName和userId，服务调用异步同步。grant、revoke或flags变化都可能改变shouldGrantAppOp，因此不只监听“grant布尔值”。
-
-## 17. AppOps mode监听
-
-服务为每个runtime permission对应switch op注册mode watcher；soft restricted permission还注册extra AppOp。APPOP flag permission也注册其op，以便外部mode更改后重新校准或清理。
-
-## 18. 为什么监听switch op
-
-FINE/COARSE等多个permission可能共享控制op。`getSwitchOp()`先permission→op，再`opToSwitch()`，使监听键与AppOpsService真正政策键一致。
-
-## 19. r48 mode watcher权限背景
-
-第270章已确认r48 `startWatchingMode()`尚无特权权限保护TODO。PermissionPolicyService位于system_server，本身可信，但不能由此反推该公开Binder入口在r48已实施同等权限门。
-
-## 20. callback做两件事
-
-`opChanged()`既安排package/user权限同步，也安排UID“不再请求APPOP permission”清理。前者针对runtime/soft restricted映射，后者针对Manifest请求集合缩减后的残余mode。
-
-## 21. 异步package任务如何去重
-
-`Pair(packageName,userId)`先加入ArraySet，只有首次加入才向FgThread发消息；任务真正开始时先remove。变化密集时可合并排队前事件，但任务运行期间的新事件又能排下一次，避免永久丢失尾部变化。
-
-## 22. UID清理任务如何去重
-
-`mIsUidSyncScheduled`以完整UID为key。第一次事件置true并发消息，执行入口先delete；同样允许执行期间再次排队，符合“最终收敛”而非“一次事务完成全部世界变化”。
-
-## 23. FgThread不是主线程
-
-异步任务发给`FgThread.getHandler()`，避免直接在PermissionManager/AppOps callback栈中进行大量包查询和mode写入。它仍是共享高优先级线程，算法必须去重并避免无界阻塞。
-
-## 24. 启动阶段的补扫
-
-到`PHASE_ACTIVITY_MANAGER_READY`，服务遍历所有user；已running却没收到`onStartUser`的用户被显式调用一次。这是生命周期事件可能遗漏时的幂等补偿。
-
-## 25. onStartUser第一道幂等门
-
-若`mIsStarted`已为true直接返回。boot phase补扫和正常SystemService回调即使都到达，也不会重复执行整套升级与全量同步。
-
-## 26. 默认权限升级先于started
-
-`grantOrUpgradeDefaultRuntimePermissionsIfNeeded(userId)`在写`mIsStarted=true`之前执行。升级期间包/权限事件被忽略，完成后全量同步统一吸收最终状态。
-
-## 27. fingerprint决定是否需要升级
-
-PackageManagerInternal的`isPermissionUpgradeNeeded(userId)`比较runtime permission fingerprint。只有需要时才调用PermissionController，成功后更新user sensitive标记并写新fingerprint。
-
-## 28. PermissionController为何参与
-
-默认权限、迁移版本和可更新策略位于PermissionController模块，不应硬编码在system_server协调器。PermissionPolicyService负责启动时序和成功门，具体grant/upgrade由Controller完成。
-
-## 29. AndroidFuture等待细节
-
-源码注释说“完成或超时”，实际调用无超时参数的`future.get()`。Controller不回调会阻塞执行`onStartUser()`的system_server线程；源码旁注明确此处在main thread，并特意让PermissionControllerManager把工作调到FgThread。失败回调则完成exception并抛IllegalStateException，这是r48注释与实现不一致的诊断边界。
-
-## 30. 失败为何如此严格
-
-默认权限升级失败会`Slog.wtf`并进入异常，注释认为系统处于undefined state，应让Rescue Party推动恢复。它不是可以静默跳过、稍后随便补一次的普通后台任务。
-
-## 31. started标志的准确完成点
-
-升级成功后，服务在锁内标记started并取callback；随后执行全用户权限/AppOps同步；最后才调用`callback.onInitialized(userId)`。所以`isInitialized()`为true可能略早于全量同步完成，但外部callback在同步之后。
-
-## 32. onStopUser只清started
-
-停止用户时删除`mIsStarted`。r48没有在这里清两个scheduled集合或取消FgThread已排消息；已入队任务也不在执行入口重新检查started，存在user stop与旧任务交错的窄窗口。
-
-## 33. 全量同步怎样枚举
-
-构造`PermissionToOpSynchroniser`后，PackageManagerInternal `forEachPackage`逐个addPackage，最后统一`syncPackages()`。收集和写入分阶段，避免在包管理锁回调内调用AppOps。
-
-## 34. 单包同步为何带shared UID
-
-先读取目标PackageInfo，再取得其shared user全部包名并加入同一个Synchroniser。注释明确要求shared UID所有包必须一起同步，因为UID mode对成员共同生效。
-
-## 35. shared包集合不是可选优化
-
-若只看发生变化的一个包，它撤销某权限就可能把UID mode设IGNORED，尽管同UID另一个包仍获grant。同步整个集合才能求出该UID最宽的合法结果。
-
-## 36. addPackage的输入检查
-
-PackageInfo、AndroidPackage、ApplicationInfo或requestedPermissions缺失都跳过。它同时需要公开快照和内部解析包：前者读用户态permission，后者提供soft restriction策略所需Manifest/包属性。
-
-## 37. root与system UID例外
-
-UID为0或1000时直接跳过。注释说明它们总能通过permission检查，为兼容性不触碰其AppOps；不能把普通应用同步公式机械应用到system_server。
-
-## 38. 只处理requestedPermissions
-
-算法遍历PackageInfo的Manifest请求列表，再从runtime权限定义表判断。没请求的权限不会进入正向同步；APPOP flag permission的残余由独立reset算法处理。
-
-## 39. Synchroniser为何预载危险权限定义
-
-构造时把所有dangerous PermissionInfo放进map，以permission name快速查询。即使列表由`getAllPermissionsWithProtection(DANGEROUS)`取得，后续仍用`isRuntime()`过滤特殊定义。
-
-## 40. 收集与应用分离
-
-`addPackage()`只向四个`OpToChange`列表加入候选；`syncPackages()`才调AppOpsManager。源码特别警告add阶段可能持package lock，不可跨入AppOps造成锁序和回调问题。
-
-## 41. 四个候选列表
-
-分别是allow、foreground、ignore、ignore-if-not-allowed。前三个代表确定目标；最后一个只在当前不是ALLOWED时压到IGNORED，避免soft restriction覆盖用户/系统已有的显式允许。
-
-## 42. 最宽mode优先顺序
-
-sync严格按ALLOW→FOREGROUND→IGNORE→IGNORE_IF_NOT_ALLOWED执行，并用`IntPair(uid,op)`去重。shared UID成员或两个permission映射同switch op发生冲突时，最宽权限获胜。
-
-## 43. 为什么packageName不进去重key
-
-真正写的是UID mode，影响整个UID；因此key只含uid和op。OpToChange仍保留packageName，用来做raw查询和必要的包级残余清理。
-
-## 44. permission review required
-
-若permission flags含`FLAG_PERMISSION_REVIEW_REQUIRED`，`addPermissionAppOp()`直接返回，不主动同步该op。legacy review流程需要用户先确认，协调器不能提前把AppOp塑造成正常grant结果。
-
-## 45. background permission没有独立op
-
-注释指出background permission通常不映射单独AppOp。前景permission的PermissionInfo带`backgroundPermission`，算法据其grant状态决定同一个op是ALLOWED还是FOREGROUND。
-
-## 46. 前景已授、背景已授
-
-前景shouldGrant为true，且背景PermissionInfo存在、背景shouldGrant也为true，则目标MODE_ALLOWED，表示前后台均可通过该政策层。
-
-## 47. 前景已授、背景未授
-
-前景可用但背景不可用时目标MODE_FOREGROUND。之后AppOpsService再结合UID state/capability实时评价，不是协调器在同步瞬间判断应用是否正前台。
-
-## 48. 前景不可授
-
-无论permission未grant、REVOKED_COMPAT、hard restriction生效或soft policy不允许，目标MODE_IGNORED。它表达权限状态不支持操作，而非一次访问事件被拒。
-
-## 49. shouldGrant第一门：实际grant
-
-`PackageManager.checkPermission()`必须GRANTED。仅Manifest请求或permission flags存在都不够；同步从当前用户的最终授权事实出发。
-
-## 50. 第二门：REVOKED_COMPAT
-
-即使grant位仍为true，`FLAG_PERMISSION_REVOKED_COMPAT`也让shouldGrant返回false。这正是pre-M兼容App保留permission位、用AppOps模拟撤销的桥梁。
-
-## 51. 第三门：hard restricted
-
-hard restricted permission若带`FLAG_PERMISSION_APPLY_RESTRICTION`便不可grant对应AppOp；有合法exemption时该flag不应用，才继续允许。
-
-## 52. 第四门：soft restricted策略
-
-软限制交给`SoftRestrictedPermissionPolicy.forPermission(...)`，调用`mayGrantPermission()`。结果可依targetSdk、包属性、存储策略等上下文，不能只看一个通用flag。
-
-## 53. 普通runtime permission
-
-不是hard/soft restricted且已grant、未REVOKED_COMPAT，就返回true。USER_SET、USER_FIXED等主要决定谁能改授权，并不在这里直接改变已经形成的grant结果。
-
-## 54. runtime权限到mode图
-
-```mermaid
-flowchart TD
-    REQ["Manifest请求runtime permission"] --> REVIEW{"REVIEW_REQUIRED?"}
-    REVIEW -- yes --> SKIP["本轮跳过同步"]
-    REVIEW -- no --> GRANT{"grant且非REVOKED_COMPAT?"}
-    GRANT -- no --> IGN["MODE_IGNORED"]
-    GRANT -- yes --> REST{"hard/soft restriction允许?"}
-    REST -- no --> IGN
-    REST -- yes --> BG{"有background permission?"}
-    BG -- no --> ALLOW["MODE_ALLOWED"]
-    BG -- yes --> BGOK{"背景权限也可grant?"}
-    BGOK -- yes --> ALLOW
-    BGOK -- no --> FG["MODE_FOREGROUND"]
-```
-
-## 55. soft restriction extra AppOp
-
-某些软限制除permission本身对应op外，还控制一个额外op。策略返回extra code，并分别给出mayAllow、mayDenyIfGranted，从而加入ALLOW、IGNORE或条件IGNORE列表。
-
-## 56. ignore-if-not-allowed的保护
-
-它先raw检查当前mode；当前ALLOWED则保持不动，其他非IGNORED才写IGNORED。返回是否已占用去重key，确保后续候选处理符合优先次序。
-
-## 57. raw检查为什么必要
-
-同步比较的是持久政策，而不是这一刻UID前后台评价。若用evaluated check，FOREGROUND在后台可能看成IGNORED，协调器会误判配置并反复写mode。
-
-## 58. 写UID mode前先比oldMode
-
-目标与raw old相同就不写，减少写盘和callback风暴。注意raw查询遵循UID优先、package其次，因此它读到的是当前有效存储层级，而非单独UID表字段。
-
-## 59. package mode为何会挡路
-
-写完UID mode后再次raw查询；若仍不是目标，源码认为存在不正确package mode干扰，便把该package mode恢复op默认值。注释称runtime permission相关AppOp本不应有这种包级覆盖。
-
-## 60. 第270章优先级带来的疑问
-
-AppOpsService正常是UID mode优先，但目标恰为该op默认值时，setUidMode会删除UID覆盖，旧package mode便重新显露；所以二次raw检查并清package mode确有实际用途。非默认UID目标写入后它也兼作防御性验证，不能因“UID优先”而删去。
-
-## 61. 防回调环的callbackToIgnore
-
-协调器调用`setUidModeFromPermissionPolicy(..., mAppOpsCallback)`；AppOpsService通知时移除该callback，避免自己写mode→自己收到变化→再同步的直接反馈环。其他观察者仍会收到变化。
-
-## 62. 防环不等于没有并发
-
-权限listener、包observer或别的AppOps变化仍可在任务运行期间到来并排下一轮。系统依赖幂等目标和去重集合最终收敛，不是用一把跨服务大锁制造全局事务。
-
-## 63. setUidMode的兼容flag旁路
-
-AppOps内部PermissionPolicy专用setter带callback参数，因非null而跳过普通`updatePermissionRevokedCompat()`。否则“由permission推mode”又反改permission flags，容易制造循环和状态污染。
-
-## 64. 清理APPOP permission的请求并集
-
-reset算法先获取UID所有package，收集每个包requestedPermissions并集。shared UID只要任一成员仍请求某APPOP permission，就不恢复该op默认值。
-
-## 65. 三个明确排除项
-
-ACCESS_NOTIFICATIONS、MANAGE_IPSEC_TUNNELS不进入清理列表；REQUEST_INSTALL_PACKAGES也排除，因为Settings允许即使Manifest状态特殊时继续由用户控制非默认AppOp。排除体现产品合同，不是遗漏。
-
-## 66. 无人请求时恢复两层
-
-对每个UID成员包raw检查；若不是default，先把UID mode设default，再把该包package mode也设default。这样清掉UID覆盖和逐包残余，而不是只处理当前触发包。
-
-## 67. default按op定义取得
-
-算法使用`opToDefaultMode(appOpCode)`，不假设默认ALLOWED。恢复默认是回到平台为该op定义的基线。
-
-## 68. package不存在时直接结束
-
-UID已没有任何package时`getPackagesForUid()`为空，reset返回。包卸载的AppOps对象生命周期还有PMS/AppOps自身清理路径，此函数只负责“剩余成员不再请求”的权限语义。
-
-## 69. onStart中的第二个广播观察器
-
-服务还注册PACKAGE_ADDED/CHANGED广播，用于让PermissionController更新`user sensitive`标记。它与PackageListObserver的AppOps同步是两条不同链，不能因action相同合并概念。
-
-## 70. setup未完成时延迟
-
-若`USER_SETUP_COMPLETE`为0，UID加入一个初始容量200但没有200上限的List并去重；setup完成后下一次相关广播会批量update并清空。这不是定时器，若无后续广播，队列不会因设置值变化自动醒来。
-
-## 71. user sensitive是什么
-
-它帮助权限UI判断哪些权限对用户敏感，并由PermissionController计算。PermissionPolicyService只安排全量或单UID更新，不在system_server里复刻判定规则。
-
-## 72. 每用户PermissionControllerManager缓存
-
-广播receiver按UserHandle缓存manager，用相应user context构造，确保更新目标用户。系统启动后还为system user安排60秒延迟的全量`updateUserSensitive()`。
-
-## 73. setup状态读取边界
-
-receiver注册给ALL users，但读取`Settings.Secure.USER_SETUP_COMPLETE`使用服务默认context而非显式`getIntForUser`。分析secondary user行为时应把这是r48代码路径记为边界，不能宣称逐user读取已显式保证。
-
-## 74. Role在本类中的真实职责
-
-PermissionPolicyInternal的activity启动检查拦截旧“修改默认拨号/短信”action。targetSdk Q及以上必须改用`RoleManager.createRequestRoleIntent()`；本类并不实现Role holder授权算法。
-
-## 75. 旧应用兼容路径
-
-targetSdk低于Q仍允许旧action，并把`Intent.EXTRA_CALLING_PACKAGE`写入Intent，让RequestRoleActivity知道来源。它是API迁移门，不是默认应用最终选择器。
-
-## 76. callingPackage为空
-
-Internal只有callingPackage非null时才调用removed-action检查。调用方应在上层验证package归属；该方法本身主要按传入UID/user读取ApplicationInfo和targetSdk。
-
-## 77. checkStartActivity的调用效果
-
-返回false表示上层应静默取消Activity启动，并记录Action Removed日志。它不抛SecurityException，也不更改permission/AppOp。
-
-## 78. Role授权发生在哪里
-
-RoleController/RoleManager和PermissionController负责holder资格及权限、AppOp等特权授予。PermissionPolicyService会因这些权限变化收到listener，再做一般同步，但不是Role状态的权威拥有者。
-
-## 79. 一次性权限不在本类计时
-
-`OneTimePermissionUserManager`由PermissionManagerService按user创建，跟踪UID importance、timeout与gone delay。PermissionPolicyService没有session表或Alarm；它只会在最终permission state改变后被listener唤醒。
-
-## 80. one-time结束的协作链
-
-计时器到期通知PermissionController，Controller撤销/调整一次性permission，PermissionManager发runtime state listener，PermissionPolicyService再把对应UID AppOp收敛为IGNORED或其他正确mode。
-
-## 81. 为什么职责要分开
-
-进程重要性计时属于权限会话生命周期；用户决策和撤权策略属于PermissionController；permission→AppOp一致性属于PermissionPolicyService。分开后每个模块只维护自己权威状态。
-
-## 82. PermissionPolicyInternal的三个API
-
-`checkStartActivity()`做旧action门；`isInitialized(userId)`返回started；`setOnInitializedCallback()`保存单个callback。它不是公开Binder接口，只供system_server内部服务协作。
-
-## 83. callback不是历史重放
-
-注释明确：若user注册callback前已经initialized，不会补调。消费者必须先查`isInitialized()`再决定是否等待，不能只注册后无限等待。
-
-## 84. 单callback覆盖语义
-
-字段只有一个`mOnInitializedCallback`，后一次set会覆盖前一次，并非listener列表。调用者数量和注册顺序由system_server架构约束。
-
-## 85. 初始化时序图
-
-```mermaid
-sequenceDiagram
-    participant SS as SystemServiceManager
-    participant PPS as PermissionPolicyService
-    participant PC as PermissionController
-    participant PM as Package/PermissionManager
-    participant AO as AppOpsService
-    SS->>PPS: onStartUser(user)
-    PPS->>PM: isPermissionUpgradeNeeded
-    alt 需要升级
-        PPS->>PC: grantOrUpgradeDefaultRuntimePermissions
-        PC-->>PPS: success/failure callback
-        PPS->>PM: updateRuntimePermissionsFingerprint
-    end
-    PPS->>PPS: mIsStarted=true
-    PPS->>PM: 枚举用户全部包和权限
-    PPS->>AO: 写UID mode，必要时清package mode
-    PPS-->>SS: onInitialized callback
-```
-
-## 86. 这不是跨服务事务
-
-读PackageInfo后到写AppOps之间，包或权限仍可能变化。算法通过变化listener再排队、幂等比较和最宽mode归并恢复一致，而不是回滚此前所有写入。
-
-## 87. 快照混合风险
-
-单包同步同时取PackageInfo与内部AndroidPackage，二者若跨更新代际可能短暂不一致；空值保护会跳过，本轮不做危险猜测，后续包changed事件再收敛。
-
-## 88. shared UID的用户维度
-
-同步以目标user context读取PackageInfo，UID是包含userId的完整值；同appId在另一user拥有独立grant与AppOps。shared user包列表也传入userId。
-
-## 89. ALLOW优先的安全解释
-
-对同一个shared UID，任一成员合法持有permission时基础UID permission检查本就可能通过共享state；AppOps若取更窄结果会与权限层矛盾。因而按UID求最宽mode是共享身份语义，不是随意偏袒某包。
-
-## 90. package级归因仍存在
-
-UID mode决定共同政策，但note事件仍按package/tag记录。PermissionPolicy清理不意味着shared UID各包审计记录被合并成一个包。
-
-## 91. REVIEW_REQUIRED跳过的后果
-
-“跳过”意味着保留当前AppOp而非强制IGNORED。legacy review流程的其他组件负责初始mode与用户确认；读本函数不能独自推导所有review状态。
-
-## 92. soft restriction不是单一表格
-
-策略对象可能为permission本身和extra op给出不同结果。调试存储类权限时应同时检查grant、APPLY_RESTRICTION、targetSdk以及extra AppOp，不能只看主op。
-
-## 93. 同步写入会安排AppOps持久化
-
-AppOpsManagerInternal最终进入第270章的setUidMode/setMode，内存立即生效并按普通/快速策略写`appops.xml`。PermissionPolicyService本身不直接操作XML。
-
-## 94. callback到达不代表文件落盘
-
-mode observer可在内存变化后很快收到通知，磁盘仍延迟。PermissionPolicy比较服务raw状态而不是读文件，避免把持久化延迟误判为写入失败。
-
-## 95. 为什么不直接revoke permission
-
-协调器的任务是让AppOp匹配已有permission合同。真正revoke涉及用户选择、fixed flags、角色、设备策略与Controller UI，不能由发现mode不一致的服务擅自执行。
-
-## 96. 为什么也不无条件尊重手工AppOp
-
-runtime permission相关AppOp是permission语义的一部分；外部修改后mode callback会触发重同步。若希望永久改变能力，应通过正确权限/策略入口，否则协调器可能恢复一致状态。
-
-## 97. APPOP flag permission例外说明产品选择
-
-REQUEST_INSTALL_PACKAGES保留Settings控制的非默认mode，说明“permission→AppOp一致”不是无例外铁律。每个排除项都应按源码与API合同分析。
-
-## 98. 排障：grant后仍IGNORED
-
-依次查REVIEW_REQUIRED、REVOKED_COMPAT、APPLY_RESTRICTION、soft policy、background permission；再查user是否started、异步任务是否排队、UID/shared包是否纳入，最后查AppOps raw与package残余。
-
-## 99. 排障：撤权后仍ALLOWED
-
-先确认另一个shared UID成员是否仍合法grant同switch op；再看两个permission是否共享switch；检查权限变化listener是否触发，及PermissionPolicy写UID mode时是否忽略了自己callback但实际写成功。
-
-## 100. 排障：包删后mode残留
-
-检查UID是否还有成员请求该APPOP permission、该permission是否在三个排除项、raw mode是否其实为op default。若UID无包，本函数直接返回，应追AppOps/PMS卸载清理链。
-
-## 101. 排障：用户启动卡住
-
-若栈停在`AndroidFuture.get()`，核对PermissionController grant/upgrade是否回调。r48没有实际timeout；日志里的默认权限升级失败或Controller绑定问题比AppOps写盘更早。
-
-## 102. 排障：初始化callback没来
-
-先查callback是否在user已初始化后才注册；再查是否被另一个调用者覆盖；最后看默认权限升级或全量同步是否阻塞。`isStarted=true`与callback之间还隔着全量sync。
-
-## 103. 排障：用户停止后仍见任务
-
-onStopUser只清started，不取消已排FgThread消息。检查任务入队时间与user停止竞态；后续新事件不会再排，但旧任务可能完成一次。
-
-## 104. 性能热点
-
-全用户同步遍历所有包、每包逐requested permission并多次查flags/grant；mode写前后还raw检查。它被放在初始化与去重后的FgThread，而不是每次permission check热路径。
-
-## 105. mIsStarted的双重语义风险
-
-字段注释称“started but not stopped”，Internal方法却名为`isInitialized`。它既作生命周期门又作初始化标志；调用者需知道stop后返回false，即使该用户过去完成过升级。
-
-## 106. getUserContext可能返回null
-
-创建跨用户package context若NameNotFound会返回null，部分调用点随后直接使用。system_server自身包正常应存在，但代码层仍有异常路径；这不是通用可空Context API范例。
-
-## 107. user sensitive的60秒任务范围
-
-onStart末尾只为`Process.myUserHandle()`构造manager并延迟全量更新，也就是system user；其他用户依赖包广播的按UID更新或其Controller流程。不能说每个user启动都在此安排60秒全量任务。
-
-## 108. 本章完整心智模型
-
-启动时先升级权限版本，再全量收敛；运行时包/permission/AppOp事件异步触发局部收敛；shared UID作为共同计算单元；mode按ALLOW→FOREGROUND→IGNORE选最宽；专用setter忽略自身callback以防环；Role和one-time只从边界协作。
-
-## 109. 与第263章的分工
-
-第263章从权限UI和一次性/自动撤销看用户选择如何产生；本章专注选择形成后，system_server如何把grant、flags、restriction转换成AppOps并在包生命周期中修复残余。
-
-## 110. 与第270章的分工
-
-第270章解释AppOpsService如何存储、评价、回调与持久化；本章解释谁依据permission政策调用其内部setter、为什么用UID mode、何时清package mode以及如何避开反馈环。
-
-## 111. 阅读完成检查
-
-应能回答：为什么user启动先升级再sync；为什么shared UID必须整组；为什么ALLOW优先；REVOKED_COMPAT和background permission如何影响mode；专用callback怎样防环；Role与one-time为何不属于本类核心状态。
-
-## 112. macOS只读练习一：画启动顺序
+先标出 SystemServer 启动与 PMS `systemReady()`的先后，再分别给包观察、permission监听、AppOps监听和 sensitive广播画出目的地。不要把相同 PACKAGE action 当成同一条业务链。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '320,455p' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'mSystemServiceManager.startService(PermissionPolicyService.class);' frameworks/base/services/java/com/android/server/SystemServer.java
+grep -n -F 'LocalServices.addService(PermissionPolicyInternal.class, new Internal());' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'packageManagerInternal.getPackageList(new PackageListObserver() {' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'permissionManagerInternal.addOnRuntimePermissionStateChangedListener(' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'mAppOpsCallback = new IAppOpsCallback.Stub() {' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'getContext().registerReceiverAsUser(new BroadcastReceiver() {' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'FgThread.getHandler().postDelayed(manager::updateUserSensitive,' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'ModeCallback cb = mModeWatchers.get(callback.asBinder());' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'if (switchOp != AppOpsManager.OP_NONE) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'if (callback.mWatchedOpCode == ALL_OPS) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'notifyOpChanged(clonedCallbacks,  code, uid, null);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
 ```
 
-标出upgrade、started=true、全量sync、initialized callback四个完成点，并圈出`future.get()`没有timeout参数。只读源码，不编译。
+## 3. 包事件同步执行，permission 与 AppOps 事件才二次排队
 
-## 113. macOS只读练习二：手算shared UID最宽mode
+旧的“主要工作都跑在 FgThread”模型不成立。执行方式按入口分裂：
+
+| 入口 | started 门 | 实际工作 |
+|---|---|---|
+| package added | 是 | 在 observer 当前线程直接同步目标包和 shared UID成员 |
+| package changed | 是 | 先直接同步，再直接做 UID 的 APPOP残余清理 |
+| package removed | 是 | 直接做 UID残余清理，不再读取已删包 |
+| runtime permission变化 | 是 | PMS 已先投 FgThread；PPS listener再投一次去重任务 |
+| AppOps mode变化 | 是 | callback分别安排 package/user同步与 UID清理 |
+| `onStartUser()` | 自己建立门 | 在生命周期调用线程同步完成升级等待和全用户扫描 |
+
+异步 package任务以 `(packageName,userId)`去重，UID清理以完整 UID去重。两者都在任务真正开始时先删除 marker，所以执行期间再来一次事件可以排下一轮；这是一种尾部变化收敛机制，不是对某个状态快照的互斥保护。
+
+`isStarted()`检查发生在取得 scheduled 集合锁之前。用户可能在检查后进入 stopping，任务仍会入队；工作入口只移除 marker，不重新检查 started。`onStopUser()`又只删除 `mIsStarted`，不取消 FgThread消息、不清 scheduled集合。因而“stop 返回”不保证旧任务停止。包 observer的同步路径也根本不享受这两组异步去重。
+
+### 练习 2：构造 stop 与排队任务交错
+
+画两条时序：一条让 permission callback通过 started检查后立刻 stop，另一条让任务开始、删除 marker后再到一个同包事件。验证第一条仍执行一次，第二条可再排一轮。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '451,705p' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'this::synchronizePackagePermissionsAndAppOpsAsyncForUser);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'mIsPackageSyncsScheduled.add(new Pair<>(packageName, changedUserId))' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'mIsPackageSyncsScheduled.remove(new Pair<>(packageName, userId));' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'mIsUidSyncScheduled.put(uid, true);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'mIsUidSyncScheduled.delete(uid);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'mIsStarted.delete(userId);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'PermissionManagerService::doNotifyRuntimePermissionStateChanged,' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
 ```
 
-假设同UID包A位置前景+背景均grant，包B只前景grant，包C撤权；按列表执行顺序算最终switch op mode，并解释去重key为何不含package。
+## 4. 一个 callback 监听很多 op，但回调里的 op 未必是实际变化项
 
-## 114. macOS只读练习三：追限制与额外op
+`onStart()`对每个 runtime permission调用 `getSwitchOp(permission)`后注册；没有 AppOp映射时会得到 `OP_NONE`。soft-restricted permission还可能注册 extra op。APPOP-protection permission则用直接映射的 op注册。相同 switch op可被多次请求，但 AppOpsService 的索引集合会把同一 callback wrapper去重。
+
+r48 的 AppOpsService以 callback Binder为主键，只在第一次注册时创建 `ModeCallback`；后续注册把同一个 wrapper加入更多 op索引，却不更新 wrapper里保存的 `mWatchedOpCode`和 flags。于是：
+
+- 若首次是具体 op，后续其他索引触发时仍可能向 callback报告首次 op；
+- 若首次是 `OP_NONE + null package`，那次注册本身没有通知来源，但 wrapper记录为 ALL_OPS；后续加入具体索引后，一次 switch变化可展开为多个 switched code回调；
+- PermissionPolicy的 `opChanged()`完全不使用 `op`参数，只按 UID和 package安排重算，所以这一首注册黏连没有直接改变它的目标选择，却会改变回调次数。
+
+AppOps user restriction变化又用 `UID_ANY`与 null package通知 op-indexed watcher。这里无法给 PermissionPolicy一个真实受影响包：负 UID被换算到 system user，null package任务通常在包查询处结束，UID清理也无法枚举该哨兵 UID。restriction本身仍直接参与 AppOps裁决，但不能据此声称 watcher一定重新计算了所有相关持久 mode。
+
+r48 的 mode watcher入口源码还没有特权权限保护。这里的调用者是 system_server内服务，不受影响；这个事实也不能反推公开入口已经有同等授权门。
+
+## 5. 用户初始化包含两套升级者，started 不是最终完成标志
+
+`onStartUser(userId)`先查 started，再调用 `grantOrUpgradeDefaultRuntimePermissionsIfNeeded()`。r48 的“默认授权与升级”实际分在两边：
+
+- PMS `systemReady()`先找出 upgrade-needed用户，仍由 system_server内的 `DefaultPermissionGrantPolicy.grantDefaultPermissions()`执行默认授权；
+- PermissionController 的同名入口先调用一个空的 default-grant占位方法，实际随后执行 `RuntimePermissionsUpgradeController.upgradeIfNeeded()`完成 runtime permission数据库升级。
+
+所以不能把所有默认权限授予都归给可更新 Controller。PPS等待的是 Controller这次 grant/upgrade请求的 Boolean结果；失败会记录严重错误、让本地 future异常完成，并在 started置位之前抛出 `IllegalStateException`。
+
+成功后的顺序是：投递 user-sensitive全量更新、更新 runtime permission fingerprint、在 `mLock`下写 `mIsStarted=true`并取得单个 callback、同步做全用户 permission→AppOps扫描，最后调用 callback。`isInitialized(userId)`只是返回当前 started值，所以它在首轮 AppOps扫描之前已经为 true，用户 stopping后又会变回 false。
+
+还有一个失败窗口：started在全量同步之前置位。如果构造 synchroniser、查询包或写 AppOps时抛异常，callback不会执行，但 started保留为 true；随后再次进入 `onStartUser()`会直接返回。源码里的幂等还依赖生命周期调用串行，因为最初的 get与后面的 put不是一个临界区。
+
+## 6. 名义 60 秒超时、main looper 与 fingerprint 是三种不同保证
+
+本地 `AndroidFuture`使用无超时参数的 `future.get()`。但其下层 `PermissionControllerManager`把 request timeout设为 60 秒，`ServiceConnector.CompletionAwareJob`会调用 `orTimeout()`；所以简单说“完全没有超时”也不准确。
+
+关键在线程：r48 `AndroidFuture`默认把 timeout消息发给进程 main Handler。system user在 AMS启动期间由 system_server main同步进入 `SystemServiceManager.startUser()`，boot phase补扫也在主启动路径调用；此时同一 main线程阻塞在 `future.get()`，用于解除等待的 timeout消息可能永远得不到执行。普通 secondary user的 `USER_START_MSG`则运行在 AMS自己的 ServiceThread，main仍可在约 60 秒触发 timeout。正常 Controller结果由 FgThread executor完成 future，两条路径都能被真实结果唤醒。
+
+Controller成功后调用 `updateUserSensitive()`只把远端任务投递出去，PPS不等它完成就更新 fingerprint。`updateRuntimePermissionsFingerprint()`也只是改内存 fingerprint并安排 runtime-permission文件异步写。因此：
+
+- fingerprint更新不证明 user-sensitive成功；后者失败只在 manager链记录日志；
+- 方法返回不证明 fingerprint已经落盘，崩溃后仍可能重做；
+- `Settings.isPermissionUpgradeNeeded()`读的是启动时计算的 `mPermissionUpgradeNeeded`缓存，不是每次现比字符串；更新 fingerprint没有把该缓存改为 false。若本次启动最初为 true，同一 boot里 stop后再 start仍可重复走 Controller升级。
+
+### 练习 3：证明超时能否发生取决于调用线程
+
+把外层等待、ServiceConnector的 60 秒任务、AndroidFuture的 main Handler与两种用户启动线程连起来。分别回答 Controller永不完成时 system user和普通 secondary user会怎样。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '705,850p' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
-rg -n "mayGrantPermission|mayAllowExtraAppOp|mayDenyExtraAppOpIfGranted" \
-  frameworks/base/services/core/java/com/android/server/policy/SoftRestrictedPermissionPolicy.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'future.get();' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'private static final long REQUEST_TIMEOUT_MILLIS = 60000;' frameworks/base/core/java/android/permission/PermissionControllerManager.java
+grep -n -F 'protected long getRequestTimeoutMs() {' frameworks/base/core/java/android/permission/PermissionControllerManager.java
+grep -n -F 'orTimeout(requestTimeout, TimeUnit.MILLISECONDS);' frameworks/base/core/java/com/android/internal/infra/ServiceConnector.java
+grep -n -F 'private @NonNull Handler mTimeoutHandler = Handler.getMain();' frameworks/base/core/java/com/android/internal/infra/AndroidFuture.java
+grep -n -F 'mSystemServiceManager.startUser(t, currentUserId);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'mInjector.getSystemServiceManager().startUser(TimingsTraceAndSlog.newAsyncLog(),' frameworks/base/services/core/java/com/android/server/am/UserController.java
+grep -n -F 'return mPermissionUpgradeNeeded.get(userId, true);' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+grep -n -F 'mFingerprints.put(userId, mExtendedFingerprint);' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+grep -n -F 'mDefaultPermissionGrantPolicy.grantDefaultPermissions(userId);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'performDefaultPermissionGrants();' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/PermissionControllerServiceImpl.java
+grep -n -F 'RuntimePermissionsUpgradeController.INSTANCE.upgradeIfNeeded(this, () -> {' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/PermissionControllerServiceImpl.java
+grep -n -F 'mIsStarted.put(userId, true);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'synchronizePermissionsAndAppOpsForUser(userId);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'callback.onInitialized(userId);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
 ```
 
-分别写出hard restricted、soft restricted主op和extra op的输入；不要把extra op误当background permission的独立op。
+## 7. initialized callback 会引出下一轮，而 user-sensitive 是另一条松耦合链
 
-## 115. macOS只读练习四：验证防环与职责边界
+r48 树中 `PermissionPolicyInternal`的 initialized callback只有一个字段，后注册者覆盖前者，也不会给已经 initialized的用户重放。唯一实际注册者是 PMS：PPS首轮 AppOps同步后调用它，PMS再执行一次 `updateAllPermissions()`。
+
+这次 PMS再评估很重要。PMS在处理 hard/soft restricted permission时用 `isInitialized(userId)`决定是否真正应用 restriction；callback里的全量更新可能刚好改变 grant或 flags，随后 PMS把 runtime状态变化先投到 FgThread，PPS listener又投递自己的 package同步。于是实际闭环可以是：
+
+`started=true → 首轮 AppOps同步 → initialized callback → PMS重评 restriction → runtime通知 → 后续 AppOps同步`
+
+因此 callback到达或返回都不是这条二次收敛的强屏障。外部消费者也不能用“先查 `isInitialized()`，否则注册 callback”拼出无竞态协议：检查与单槽注册并非原子操作，且会覆盖 PMS的固定回调。
+
+user-sensitive广播链更独立。receiver虽注册到 `UserHandle.ALL`，却用服务默认 context读取 `Settings.Secure.USER_SETUP_COMPLETE`，没有按广播 user显式读取。setup被判断为未完成时，来自所有用户的 UID进入同一个列表；它没有 ContentObserver或定时唤醒，只在以后又收到一个相关包广播且这次判断为完成时才批量刷新。
+
+刷新阶段会从完整 UID得到 `UserHandle`，按 user缓存 `PermissionControllerManager`，所以真正 `updateUserSensitiveForApp(uid)`仍投向对应用户。可是 receiver不查 started，`onStopUser()`也不清待处理 UID或 manager缓存。onStart末尾那次延迟全量更新又只针对 system user。两套链各有自己的生命周期缺口。
+
+### 练习 4：区分 initialized、sensitive投递和二次同步
+
+先顺着唯一 callback找到 PMS 的 `updateAllPermissions()`，再构造 secondary user尚未setup、system context却已setup的广播。记录每一步只是布尔置位、同步调用、消息入队还是远端完成。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '845,910p' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
-rg -n "startOneTimePermissionSession|OneTimePermissionUserManager|ACTION_CHANGE_DEFAULT" \
-  frameworks/base/services/core/java/com/android/server/{pm/permission,policy}
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'permissionPolicyInternal.setOnInitializedCallback(userId -> {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mPermissionManager.updateAllPermissions(' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mPermissionPolicyInternal.isInitialized(userId);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'Settings.Secure.getInt(getContext().getContentResolver(),' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'mUserSetupUids.add(uid);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'mUserSetupUids.clear();' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'UserHandle user = UserHandle.getUserHandleForUid(uid);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'manager.updateUserSensitiveForApp(uid);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'service.updateUserSensitiveForApp(uid, future);' frameworks/base/core/java/android/permission/PermissionControllerManager.java
 ```
 
-画出PermissionPolicy专用setter携带callbackToIgnore的闭环，再标出one-time计时和旧Role action门分别属于哪个类。
+## 8. 全量和单包扫描都以 user 为范围，shared UID却是共同计算单元
 
-## 116. 易混点一：AppOp变化不总被尊重
+全量同步创建一个目标 user context的 `PermissionToOpSynchroniser`，然后让 `PackageManagerInternal.forEachPackage()`在 PMS package锁下枚举全局解析包。回调阶段只做 `addPackage()`收集；离开枚举后才执行 `syncPackages()`并调用 AppOps，避免拿着 package锁直接进入 AppOps setter。不过 soft-restriction收集本身仍可能查询 StorageManager等同进程服务，不能把 add阶段想成一次纯内存复制。
 
-runtime permission相关mode若与permission状态冲突，watcher会触发重新同步；REQUEST_INSTALL_PACKAGES等明确例外才保留独立用户控制。判断前先看permission类型和排除表。
+单包同步先取目标 user的 `PackageInfo`，加入目标包，再取得该 user已安装的 shared-user包数组并逐个加入。PMS返回的 shared数组包含目标包本身，所以 shared UID路径会重复收集目标。ALLOW候选随后仍会逐项执行；FOREGROUND与IGNORE重复项会被 `(uid,op)`键抑制，条件 IGNORE则要等某次 setter真正返回 true后才占键。
 
-## 117. 易混点二：started不完全等于同步完成
+同一 shared UID成员的同名 permission grant与 flags来自共享 `PermissionsState`，不存在“A包授予同名权限、B包撤销同名权限”这种独立状态。冲突候选应来自不同 permission映射到同一 switch op，或 soft restriction依据包属性产生的不同 extra-op意图。
 
-`mIsStarted=true`写在全量sync前，Internal的`isInitialized()`立即可见；但初始化callback在sync后。需要强完成通知的消费者应使用正确callback并处理“已完成不补发”的合同。
+`addPackage()`同时取得用户态 `PackageInfo`和内部 `AndroidPackage`，任一为空便跳过；包在两次读取间更新时，两份对象也可能来自不同代际。root UID与 system UID为兼容直接跳过。它遍历的是解析后的 `requestedPermissions`：旧 target的兼容权限和 split permission会在解析时加入，不能把这个数组严格等同于 XML里逐字声明的集合。
 
-## 118. 易混点三：本类不管理one-time会话
+### 练习 5：用真实 shared-permission模型重做冲突题
 
-它只消费一次性撤权后的permission变化。UID importance、60秒默认timeout、gone delay和PermissionController timeout通知都在PermissionManagerService/OneTimePermissionUserManager链。
+令两个 shared成员分别请求两个不同 permission，这两个 permission映射到同一 switch op，且共享状态中一项可授、另一项不可授。再对照目标包重复加入与解析期隐式权限，预测候选列表，而不是给同名 permission虚构逐包 grant。
 
-## 119. 复读纠偏记录
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'synchroniser.addPackage(pkg.packageName);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'getSharedUserPackagesForPackage(' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'if (ps.getInstalled(userId)) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F '? sharedUser.getPermissionsState()' frameworks/base/services/core/java/com/android/server/pm/PackageSetting.java
+grep -n -F 'final PermissionsState permissionsState = ps.getPermissionsState();' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'pkg.addRequestedPermission(npi.name)' frameworks/base/core/java/android/content/pm/parsing/ParsingPackageUtils.java
+grep -n -F 'pkg.addRequestedPermission(perm)' frameworks/base/core/java/android/content/pm/parsing/ParsingPackageUtils.java
+grep -n -F 'pi.requestedPermissions[i] = perm;' frameworks/base/core/java/android/content/pm/parsing/PackageInfoWithoutStateUtils.java
+grep -n -F 'if (uid == Process.ROOT_UID || uid == Process.SYSTEM_UID) {' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+```
 
-复读后修正六点：双向依赖不等于双向字段复制；mode列表按ALLOW→FOREGROUND→IGNORE求UID最宽结果；review required是跳过而非强制拒绝；默认权限Future实际无timeout；onStopUser不取消已排任务；Role在本类仅做旧action迁移门。另记录setup complete未显式按广播user读取、system user才有60秒全量sensitive更新及getUserContext可空边界。
+## 9. 主 AppOp 候选由 grant、flags、restriction 与背景权限共同产生
 
-## 120. 本章小结与下一章
+Synchroniser构造时缓存所有 dangerous定义，以 permission name查 `PermissionInfo`。每个包只处理 requested集合中能在该 map找到的名字；主 AppOp路径还要求 `permissionInfo.isRuntime()`。
 
-PermissionPolicyService用“先升级、再全量同步；事件到来、异步局部收敛”的方式连接三套权威模块。它以shared UID为计算单元，把grant、compat/restriction flags和背景权限转换为最宽合法UID mode，并借专用setter避免自激回环。下一章继续读取受限权限策略，重点拆`SoftRestrictedPermissionPolicy`、存储权限兼容、legacy external storage与额外AppOp。
+主路径的计算顺序如下：
+
+| 门 | 不通过时的结果 | 通过后 |
+|---|---|---|
+| `FLAG_PERMISSION_REVIEW_REQUIRED` | 本包这个 permission的主 op不产生候选 | 查 switch op |
+| permission→op→switch | `OP_NONE`时不产生主候选 | 进入可授判断 |
+| 当前 user grant | false | IGNORE候选 |
+| `FLAG_PERMISSION_REVOKED_COMPAT` | true | IGNORE候选 |
+| hard restriction的 APPLY位 | 应用中 | IGNORE候选 |
+| soft policy `mayGrantPermission()` | false | IGNORE候选 |
+| 前景 permission可授 | true | 再看是否声明 background permission |
+| 没有 background permission名 | 前景可授 | ALLOW候选 |
+| background定义存在且也可授 | true | ALLOW候选 |
+| background名存在，但定义缺失或不可授 | 前景仍可授 | FOREGROUND候选 |
+
+`shouldGrantAppOp()`检查 background permission时会读它自己的 grant、REVOKED_COMPAT和 hard/soft规则，但不会再次应用主路径外层的 REVIEW_REQUIRED早退。多个 permission共享 switch op时，各自产生候选，稍后再按优先级合并。
+
+soft-restricted extra op是独立调用：即使主 op因为 REVIEW_REQUIRED已返回，`addExtraAppOp()`仍会根据 `mayAllowExtraAppOp()`与 `mayDenyExtraAppOpIfGranted()`产生 ALLOW、IGNORE或条件 IGNORE候选。它不是 background permission的独立 AppOp；具体存储兼容公式留到下一章展开。
+
+### 练习 6：分别计算主 op 与 extra op
+
+给一个 soft-restricted permission设置 REVIEW_REQUIRED，再分别计算主候选和 extra候选。随后去掉 review位，依次改变 grant、REVOKED_COMPAT、APPLY_RESTRICTION与背景 grant，验证表中每个分支。
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'addPermissionAppOp(packageInfo, pkg, permissionInfo);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'addExtraAppOp(packageInfo, pkg, permissionInfo);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'boolean isReviewRequired = (permissionFlags & FLAG_PERMISSION_REVIEW_REQUIRED) != 0;' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'int appOpCode = getSwitchOp(permissionName);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'boolean shouldGrantAppOp = shouldGrantAppOp(packageInfo, pkg, permissionInfo);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'boolean shouldGrantBackgroundAppOp = backgroundPermissionInfo != null' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'boolean isRevokedCompat = (permissionFlags & FLAG_PERMISSION_REVOKED_COMPAT)' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'if (permissionInfo.isHardRestricted()) {' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'if (policy.mayDenyExtraAppOpIfGranted()) {' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+```
+
+## 10. ALLOW→FOREGROUND→IGNORE 是候选优先级，不是最终状态定理
+
+`syncPackages()`维护四张候选表：ALLOW、FOREGROUND、IGNORE、IGNORE_IF_NOT_ALLOWED。前三者表达确定目标，最后一类只在当前 raw结果不是 ALLOWED时尝试压到 IGNORED，以免 soft storage策略夺走已有的允许。
+
+执行顺序确实是 ALLOW→FOREGROUND→IGNORE→条件 IGNORE，去重键为 `IntPair(uid,op)`，不含 packageName。可是去重要精确描述：
+
+- ALLOW循环不查 key，所有 ALLOW候选都会执行，并在每次执行后写 key；
+- FOREGROUND与IGNORE若发现任何前序候选已占 key便跳过；
+- 条件 IGNORE最后执行，只有 setter返回 true才占 key；当前 raw为 ALLOWED时返回 false。
+
+因此它表达“同一 UID/op候选中更宽者优先”。packageName仍保存在 `OpToChange`里，因为 raw检查与可能的 package层清理需要一个具体包。这个列表顺序并不能证明 shared UID每个包最终的 effective mode都等于最宽候选；下一节的读层和写层不对称会打破这个推论。
+
+### 练习 7：逐循环标出谁会跳过去重
+
+为同一 `(uid,op)`依次放入两个 ALLOW、一个 FOREGROUND、一个 IGNORE和两个条件 IGNORE。不要只看注释，按四个循环实际的 key检查位置写出调用次数。
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'LongSparseLongArray alreadySetAppOps = new LongSparseLongArray();' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'final int allowCount = mOpsToAllow.size();' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'setUidModeAllowed(op.code, op.uid, op.packageName);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'final int foregroundCount = mOpsToForeground.size();' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'if (alreadySetAppOps.indexOfKey(IntPair.of(op.uid, op.code)) >= 0) {' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'setUidModeIgnored(op.code, op.uid, op.packageName);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'boolean wasSet = setUidModeIgnoredIfNotAllowed(op.code, op.uid, op.packageName);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'alreadySetAppOps.put(IntPair.of(op.uid, op.code), 1);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+```
+
+## 11. unsafeCheckOpRaw 不是纯存储读取，合成值会遮住应该写的 UID 层
+
+`unsafeCheckOpRaw()`只保证不把 `MODE_FOREGROUND`按当前 UID状态动态评价。它仍会经过 CheckOpsDelegate、UID/package身份核对、package suspend与 user restriction，然后才按 UID覆盖→package mode→默认值返回。把它叫作“持久政策读取”会漏掉最危险的 r48边界。
+
+普通 `setUidMode()`先用这个合成 raw值比较 `oldMode`与目标；相同便完全不写 UID层。若不同，才调用 PermissionPolicy专用 UID setter，随后仍用同一包再查 raw；仍不等才把这个候选包的 package mode恢复默认。条件 IGNORE则没有后二次 package清理。
+
+考虑两个 shared成员 A、B都产生同一 `(uid,op)`的 IGNORE候选：UID层没有覆盖，op默认 ALLOWED，A恰有 package-level IGNORED，B没有。若 A先进入 IGNORE循环，raw已等于目标，UID setter被跳过；循环仍把 key视作已处理，B候选被去重跳过，B继续得到 ALLOWED。这里候选优先级正确，最终 shared成员状态却没有统一。
+
+restriction还能制造更隐蔽的版本：permission已撤销、底层仍保存 ALLOWED，但 active restriction先让 raw返回 IGNORED，于是目标 IGNORE被当作 no-op。解除 restriction只产生 `UID_ANY/null`通知，PermissionPolicy不能由该参数枚举原包，旧 ALLOWED可能重新显露。package suspend也会遮住 raw；其解除是否补救要看针对包的 suspend通知链，不能靠本 setter保证。
+
+反向地，在没有 delegate、外部门禁与并发写干扰的典型路径上，写入非默认 UID mode后，UID覆盖会遮住 package override，二次 raw等于目标，package清理不会运行；目标等于真实默认且 UID覆盖不存在或被删除时，当前候选包的旧 package mode才会重新显露并被清除。若 suspend或 restriction令二次 raw仍不等于非默认目标，也可能触发 package-default清理。ALLOW不去重能帮助逐候选包检查，但不请求相关 permission的 shared成员仍可能留有隐藏覆盖。
+
+### 练习 8：手算 raw 遮蔽与 package 残余
+
+分别构造 package override遮蔽、user restriction遮蔽和非默认 UID覆盖遮蔽。每一步写出“外部门禁结果、UID key、package mode、raw返回、setter是否真正执行”，不要只写一个最终 mode。
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'final int oldMode = mAppOpsManager.unsafeCheckOpRaw(AppOpsManager.opToPublicName(' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'if (oldMode != mode) {' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'final int newMode = mAppOpsManager.unsafeCheckOpRaw(AppOpsManager.opToPublicName(' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'if (newMode != mode) {' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'mAppOpsManagerInternal.setModeFromPermissionPolicy(opCode, uid, packageName,' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'if (isOpRestrictedDueToSuspend(code, packageName, uid)) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'if (isOpRestrictedLocked(uid, code, packageName, bypass)) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'return raw ? rawMode : uidState.evalMode(code, rawMode);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'return raw ? op.mode : op.evalMode();' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'if (!requestedPermissions.contains(appOpPermission)) {' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'if (appOpMode != defaultAppOpMode) {' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+```
+
+## 12. callbackToIgnore 只压本次自回声，setter 返回也不等于跨模块提交
+
+PermissionPolicy通过 `AppOpsManagerInternal.setUidModeFromPermissionPolicy()`和 `setModeFromPermissionPolicy()`传入同一个 `mAppOpsCallback`。在 UID setter里，AppOpsService看到非 null policy callback会跳过普通 `updatePermissionRevokedCompat()`，避免“permission推 UID mode”又反改 compat flag；package setter本来就没有这一步。两种 setter组装本次 mode watcher集合时都会删除该 Binder对应的 wrapper，阻断直接的写→回调→再写环。
+
+这个机制只有单次 setter范围：它不取消之前已排的 callback，不阻止其他 writer并发改 mode，也不抑制其他 watcher、本地 StorageManager通知或 raw读取顺带提交到期 UID state所产生的 foreground通知。任务开始即释放 scheduled marker，所以同步期间的新 permission或外部 AppOps事件仍能排下一轮。
+
+一次 `syncPackages()`又可能连续写很多 UID/op。前几个 setter成功、后一个查询或写入抛异常时，没有回滚前半结果。setter返回最多说明相应 AppOps内存路径已经返回；第270章的 fast/ordinary write、异步 watcher与 `appops.xml`提交仍有各自完成点。
+
+`mIsStarted`、PMS permission状态和 AppOps mode也没有共同锁。它们依靠事件、幂等比较和后续扫描趋近一致，而不是在 callback被忽略后获得隔离性。
+
+## 13. APPOP-protection permission 的无人请求清理是另一套算法
+
+`mAppOpPermissions`来自带 `PROTECTION_FLAG_APPOP`且能映射 AppOp的 permission。r48明确排除 `ACCESS_NOTIFICATIONS`、`MANAGE_IPSEC_TUNNELS`和 `REQUEST_INSTALL_PACKAGES`；最后一项保留 Settings独立控制非默认 op的产品合同。它不是前面 dangerous runtime候选表。
+
+清理入口取得 UID在对应 user下的全部 package，合并每个包解析后的 requestedPermissions。只要一个 shared成员仍请求该 APPOP permission就不清。若无人请求，则对每个成员查询 effective raw；只在它不等于该 op真实默认值时，先把 UID mode设回默认，再把当前包的 package mode也设回默认。
+
+这个顺序能在第一包处清 UID覆盖，并让后续包暴露各自覆盖；但它仍用非纯存储 raw。若 suspend/restriction返回值恰等于 op默认值，底层非默认 mode可被遮住而跳过。UID已没有 package时函数直接返回，完整 UID删除依赖 AppOpsService的 `uidRemoved()`等其他生命周期路径。
+
+package changed/removed调用的是同步清理，而 AppOps callback走带 UID marker的异步版本。同步入口也会先删除同一 marker，却不会移除已在 FgThread队列中的旧消息，所以同一 UID可能重复扫描。三个排除项、当前请求并集、raw门和两层 setter必须分别记录，不能把函数名理解为“清除该 UID全部 AppOps”。
+
+## 14. PermissionPolicyInternal 只提供三项内部合同，Role 只是旧 action 迁移门
+
+内部接口只有 `isInitialized()`、单槽 initialized callback和 `checkStartActivity()`。前两项服务于 PMS限制权限再评估；它们不是公开等待协议，也没有历史重放、多 listener或一次初始化永久为真的语义。
+
+ActivityStarter把 permission检查、IntentFirewall与 `checkStartActivity()`结果用 abort合并。PermissionPolicy只特殊处理两个旧 action：修改默认拨号器、修改默认短信应用。callingPackage非 null且能查到的应用若 targetSdk≥Q，策略分支返回 false；它本身不构造或抛出 SecurityException，上层把 false并入 abort、取消结果并返回 `START_ABORTED`。
+
+targetSdk<Q时仍允许，并把 `Intent.EXTRA_CALLING_PACKAGE`写回原 Intent，供后续 RequestRoleActivity识别来源。两个放行边界也要看到：callingPackage为 null时完全跳过检查；按 callingUid所属 user查询 ApplicationInfo失败时只记日志，随后仍写 extra并允许。这个内部方法本身不验证 package确属 callingUid，依赖 Activity启动上游提供可信组合。
+
+这里没有查询 Role holder、评估资格或授予 Role特权。Q及以上应用应改走 `RoleManager.createRequestRoleIntent()`，只是 API迁移要求；RoleController、PermissionController和其他策略才拥有后续选择与授权。
+
+## 15. one-time 到期会先由 Controller直接改权限与 AppOps，PPS只是后续收敛层
+
+一次性授权的 session不是 `PermissionPolicyService`持有。PermissionController的 `AppPermissionGroup.persistChanges()`在 permission带 one-time且仍获授时调用 `PermissionManager.startOneTimePermissionSession()`；PMS按 user懒创建 `OneTimePermissionUserManager`，后者以完整 UID保存 listener并监听 importance、alarm和 UID gone。
+
+到期函数先把 session标记 finished并取消 alarm，再向 `mHandler`排入通知 runnable；当前调用线程随后注销三类 importance listener，并从 map删除该 UID。入队早于后两项清理，但 runnable执行可与它们交错，尤其 UID importance入口本就可能来自线程池，不能把“通知执行”和“清理完成”排成严格全序。runnable最终经 ServiceConnector提交 oneway通知，没有等待“权限已撤销”的回执。
+
+PermissionController收到通知后找出 one-time permission group，撤销 runtime permission、清 USER_SET并 `persistChanges()`。这次 persist本身会调用 PackageManager grant/revoke与 flags API，也会直接对 `permission.affectsAppOp()`的项执行 allow/disallow AppOp。前一组 Binder调用内部就可能让 PMS把 runtime-state通知异步投到 FgThread，与 Controller对当前或后续 permission的直接 AppOps写交错；PermissionPolicy最终再按 shared UID、restriction和背景权限做一般收敛。
+
+所以至少要区分四个里程碑：session已判 finished、handler/ServiceConnector/oneway提交已经发生、Controller的 permission/AppOp写入返回、PPS后续重算返回。它们不是一条严格全序；PPS不是 one-time计时器，也不是这条链第一次改变 AppOp的唯一组件。
+
+### 练习 9：把 Role门和 one-time闭环放回各自所有者
+
+为旧默认应用 action标出“允许/阻止/Intent被改写”，再为 one-time标出 session、Controller、PMS和 PPS。检查哪一步有回执，哪一步只是 oneway或异步通知。
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'public boolean checkStartActivity(@NonNull Intent intent, int callingUid,' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'case TelecomManager.ACTION_CHANGE_DEFAULT_DIALER:' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'if (applicationInfo.targetSdkVersion >= Build.VERSION_CODES.Q) {' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'intent.putExtra(Intent.EXTRA_CALLING_PACKAGE, callingPackage);' frameworks/base/services/core/java/com/android/server/policy/PermissionPolicyService.java
+grep -n -F 'abort |= !mService.getPermissionPolicyInternal().checkStartActivity' frameworks/base/services/core/java/com/android/server/wm/ActivityStarter.java
+grep -n -F 'return START_ABORTED;' frameworks/base/services/core/java/com/android/server/wm/ActivityStarter.java
+grep -n -F 'startOneTimePermissionSession(packageName,' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/model/AppPermissionGroup.java
+grep -n -F 'mHandler.post(' frameworks/base/services/core/java/com/android/server/pm/permission/OneTimePermissionUserManager.java
+grep -n -F 'mActivityManager.removeOnUidImportanceListener(mStartTimerListener);' frameworks/base/services/core/java/com/android/server/pm/permission/OneTimePermissionUserManager.java
+grep -n -F 'mListeners.remove(mUid);' frameworks/base/services/core/java/com/android/server/pm/permission/OneTimePermissionUserManager.java
+grep -n -F 'mPermissionControllerManager.notifyOneTimePermissionSessionTimeout(' frameworks/base/services/core/java/com/android/server/pm/permission/OneTimePermissionUserManager.java
+grep -n -F 'oneway interface IPermissionController {' frameworks/base/core/java/android/permission/IPermissionController.aidl
+grep -n -F 'group.revokeRuntimePermissions(false);' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/PermissionControllerServiceImpl.java
+grep -n -F 'group.persistChanges(false, ONE_TIME_PERMISSION_REVOKED_REASON);' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/service/PermissionControllerServiceImpl.java
+grep -n -F 'shouldKillApp |= allowAppOp(permission, uid);' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/model/AppPermissionGroup.java
+grep -n -F 'shouldKillApp |= disallowAppOp(permission, uid);' packages/apps/PermissionController/src/com/android/permissioncontroller/permission/model/AppPermissionGroup.java
+grep -n -F 'notifyRuntimePermissionStateChanged(packageName, userId);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+```
+
+## 16. 用完成点矩阵收束排障，并把下一章边界留清楚
+
+面对“permission已经改了，AppOp为什么还不对”，先按下面的矩阵定位，不要直接读 `appops.xml`猜内存：
+
+| 已观察到 | 可以证明 | 仍不能证明 |
+|---|---|---|
+| Controller success callback | 本次 runtime升级请求报告成功 | sensitive完成、fingerprint落盘、started置位 |
+| fingerprint API返回 | 内存值已换并安排异步写 | cached upgrade gate已关闭、文件已提交 |
+| `mIsStarted=true` | 事件门与 PMS restriction门已打开 | 首轮 AppOps同步完成 |
+| `syncPackages()`返回 | 本轮候选 setter均已返回 | 所有 shared包 effective mode最宽、XML已写 |
+| initialized callback返回 | PMS本次 `updateAllPermissions()`返回 | 它触发的异步 permission→AppOps任务已完成 |
+| `onStopUser()`返回 | started位已删除 | 旧 Fg任务、watcher、sensitive缓存已清 |
+
+排查 mode时再拆四层：permission事实是否共享、候选是否被 REVIEW或 soft规则跳过、raw是否被 suspend/restriction/package层遮住、目标 setter是否真的改了 UID key。候选顺序、实际 effective mode与持久化提交是三件事。
+
+第271章的核心结论由此很清楚：PermissionPolicyService把多个权威模块编排成事件驱动的收敛协议，但 r48 的线程、缓存、raw门和分层 mode使“初始化”“最宽”“忽略自回调”都只能在限定范围内成立。下一章进入 `SoftRestrictedPermissionPolicy`，具体拆开存储权限兼容、shared UID最小 targetSdk、legacy external storage与 extra AppOp三套不对称规则。

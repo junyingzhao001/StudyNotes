@@ -1,812 +1,402 @@
 # 260 Android InstallArgs、copyApk、installd、dex/native准备与processPendingInstall提交前链
 
-## 1. 本章目标
+## 1. 先把“安装文件准备完成”拆成七个坐标
 
-第259章停在Verifier、Integrity与rollback三道门都完成。本章继续回答：PMS此时为何调用`copyApk()`，Session明明已有stage为何又叫copy，临时目录怎样改名为`/data/app/~~随机/包名-随机`，AppData、native库和dexopt分别在哪个阶段准备。
+第259章停在 ordinary verifier、App Integrity与 rollback三道异步门。本章继续追 Android 11 r48 的下一段：`InstallParams.handleReturnCode()`何时调用 `InstallArgs.copyApk()`，稳定候选目录怎样变成最终 code path，什么时候才真正修改包管理状态，以及 AppData、profile、dexopt和 Incremental native为何都在更晚的位置。
 
-## 2. 先记住四层完成点
+这条链最危险的口语是“APK已经复制好，所以安装完成”。源码里至少有七个互不等价的完成点：
 
-```text
-安装器写Session stage：候选字节已进入受控目录
-InstallArgs.copyApk：必要时把legacy来源复制到PMS临时stage
-doRename：把临时code path切换为最终随机code path
-post-commit：创建AppData、准备profile并按条件dexopt
-```
+| 坐标 | 已经成立 | 尚不能推出 |
+|---|---|---|
+| Session stage稳定 | PackageInstaller控制候选目录 | PMS已接受包 |
+| `copyApk()`成功 | `InstallArgs`有可继续处理的路径 | 路径已经是最终名 |
+| `doRename()`成功 | code path切到最终布局 | scan、reconcile或commit成功 |
+| prepare/scan成功 | 单包模型与局部检查通过 | 多包组合世界可提交 |
+| `commitPackagesLocked()`返回 | PMS内存与Settings提交阶段完成 | AppData、dexopt、native等待完成 |
+| post-commit步骤返回 | 安装后资源准备链已跑完 | backup/observer回程已经完成 |
+| install observer收到成功 | 本次公开安装结果已交付 | 后台优化永不再发生 |
 
-四层都可能被口语称为“安装文件准备”，但源码语义不同。
+主线可以压成一行：三门汇合 → 条件性 `copyApk()` → `processPendingInstall()` → Package Handler排队 → `mInstallLock`内 prepare/scan/reconcile/commit/post-commit → `doPostInstall()` → restore或 `POST_INSTALL` → install observer。这里所谓 post-commit“锁外”只指已经退出内层 `mLock`；整个核心安装与 post-commit仍在 `mInstallLock`保护下。
 
-## 3. 本章最容易误解的结论
+源码入口集中在 `PackageManagerService.java`，但文件动作会继续跨到 `PackageManagerServiceUtils.java`、`PackageInstallerSession.java`、`PackageAbiHelperImpl.java`、`NativeLibraryHelper.java`、`IncrementalManager.java`、`Installer.java`与 installd。排障时应记录“对象、路径、返回码、锁和阶段”五个维度，不能只记一条文件路径。
 
-现代PackageInstaller Session进入PMS时`origin.staged=true`，`FileInstallArgs.copyApk()`直接复用stage并跳过字节复制。真正调用`PackageManagerServiceUtils.copyPackage()`的主要是legacy未staged来源。
+## 2. OriginInfo的两个布尔量正交，InstallArgs也不是不可变快照
 
-## 4. 本章源码地图
+`OriginInfo`保存 `file`、`staged`、`existing`、`resolvedPath`和 `resolvedFile`。其中 `staged`只表示下游不必再做防御性复制；`existing`只表示来源是已安装应用。二者回答不同问题，不能用一个推导另一个。构造器所谓 resolved path在本版本只是 `getAbsolutePath()`，并未做 canonical解析。
 
-```text
-frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
-frameworks/base/services/core/java/com/android/server/pm/PackageManagerServiceUtils.java
-frameworks/base/services/core/java/com/android/server/pm/PackageInstallerService.java
-frameworks/base/services/core/java/com/android/server/pm/Installer.java
-frameworks/base/core/java/com/android/internal/content/NativeLibraryHelper.java
-frameworks/base/services/core/java/com/android/server/pm/PackageDexOptimizer.java
-frameworks/base/services/core/java/com/android/server/pm/dex/ArtManagerService.java
-system/vold/binder/android/os/IInstalld.aidl
-frameworks/native/cmds/installd
-```
+磁盘调用图比四个工厂方法的名字更重要：
 
-## 5. 进程与线程地图
+| 工厂 | 本树中的实际生产调用 | `InstallArgs`结果 |
+|---|---|---|
+| `fromStagedFile()` | `ActiveInstallSession.getStagedDir()` | `move == null`，选择 `FileInstallArgs` |
+| `fromExistingFile()` | `movePackageInternal()` | 私有卷完整移动有 `MoveInfo`，选择 `MoveInstallArgs`；主物理卷特殊分支没有 `MoveInfo`，反而选择 `FileInstallArgs` |
+| `fromUntrustedFile()` | 只有定义，没有调用点 | 不应写成当前普通 APK安装的生产入口 |
+| `fromNothing()` | 为既有 code/resource path构造清理参数 | 用于既有安装的删除/资源清理语境 |
 
-```text
-system_server PMS Handler：InstallParams完成门、processPendingInstall排队
-system_server安装线程/Handler：copy、parse、prepare、scan与结果汇总
-system_server mInstallLock临界区：installPackagesLI串行修改安装世界
-installd Binder线程：moveCompleteApp、createAppData、dexopt等特权文件操作
-ART/dexopt子链：根据ABI、profile和compiler filter生成优化产物
-```
+`createInstallArgs()`只看 `params.move != null`：有 `MoveInfo`才构造 `MoveInstallArgs`，否则一律是 `FileInstallArgs`。所以 `origin.existing=true`不等于“必然调用 installd整体搬迁”；主物理卷分支恰好是 existing来源、无 `MoveInfo`、走非 staged文件复制。
 
-## 6. 总体流水图
+`InstallArgs`更适合称为安装执行信封。它固化 origin、flags、InstallSource、volume、user、ABI override、签名、DataLoader type和observer等请求事实；但 `FileInstallArgs.codeFile/resourceFile`会在 copy与rename时改变，`instructionSets`也不是类级不可变事实。把它说成完全不可变快照，会掩盖失败清理究竟指向旧路径还是新路径这一关键问题。
 
-```mermaid
-flowchart TD
-    G["Verifier + Integrity + Rollback门完成"] --> C{"mRet成功?"}
-    C -- "否" --> P["processPendingInstall(失败)"]
-    C -- "是" --> A["InstallArgs.copyApk"]
-    A --> S{"origin.staged?"}
-    S -- "是" --> R["直接复用Session stage"]
-    S -- "否" --> L["分配legacy临时stage<br/>复制base/splits + native"]
-    R --> Q["processPendingInstall"]
-    L --> Q
-    Q --> H["PMS Handler异步"]
-    H --> PRE["doPreInstall"]
-    PRE --> LOCK["mInstallLock<br/>installPackagesLI"]
-    LOCK --> REN["parse/ABI/doRename/scan/reconcile/commit"]
-    REN --> POST["post-commit<br/>AppData/profile/dexopt"]
-    POST --> OBS["doPostInstall + observer/result"]
-```
-
-## 7. `OriginInfo`是理解copy的入口
-
-它同时记录`file`、`staged`、`existing`和规范化路径。来源可由四个工厂方法构造：
-
-- nothing；
-- untrusted file；
-- existing installed path；
-- staged file。
-
-## 8. `staged`表达什么
-
-注释定义为“内容已经stage，下游不必防御性复制”。它不是“安装已经成功”，只是来源目录已经由PackageInstaller/PMS控制。
-
-## 9. `existing`表达什么
-
-它表示正在移动一个已安装应用，而非装入新APK。Verifier不再针对它创建新State，`MoveInstallArgs`也走installd整体搬迁。
-
-## 10. untrusted file为何必须复制
-
-外部路径可能在PMS解析、验证、扫描之间被修改。复制到PMS分配的stage后，后续读取面对稳定副本。
-
-这与第258章content URI先复制到PackageInstaller私有临时文件目的相似，但发生层级不同。
-
-## 11. Session怎样变成staged Origin
-
-`InstallParams(ActiveInstallSession)`明确执行：
-
-```java
-origin = OriginInfo.fromStagedFile(activeInstallSession.getStagedDir());
-```
-
-所以Session路径到`copyApk()`时，数据并不来自未知外部路径。
-
-## 12. copy何时才被调用
-
-`InstallParams.handleReturnCode()`要求ordinary verification、integrity verification和rollback enable三个完成位都为true。
-
-只有`mRet == INSTALL_SUCCEEDED`时才调用`mArgs.copyApk()`。
-
-## 13. 前置失败不会再复制
-
-Verifier拒绝、位置检查失败或Integrity失败已经把`mRet`改成错误码时，直接进入`processPendingInstall()`。
-
-这避免为注定失败的候选创建额外目录和文件。
-
-## 14. `InstallArgs`是一份安装执行快照
-
-它把Origin、MoveInfo、flags、InstallSource、volume、user、ABI override、预授予权限、restricted权限白名单、签名、installReason、DataLoader type和observer集中起来。
-
-后续阶段不必反复访问PackageInstallerSession可变对象。
-
-## 15. 两个主要子类
-
-`FileInstallArgs`处理新装/更新的代码目录；`MoveInstallArgs`处理已安装应用跨volume移动。
-
-两者都实现copy、pre-install、rename、post-install和cleanup，但实际语义差异很大。
-
-## 16. codeFile与resourceFile
-
-r48的FileInstallArgs通常让两者都指向同一个目录。历史上代码与资源可能分开，抽象仍保留两个getter和独立清理判断。
-
-不要假设字段同名就一定是单个APK文件。
-
-## 17. staged路径的`doCopyApk()`
-
-```java
-if (origin.staged) {
-    codeFile = origin.file;
-    resourceFile = origin.file;
-    return INSTALL_SUCCEEDED;
-}
-```
-
-这是指针/路径接管，不是文件内容copy。
-
-## 18. 为什么Session stage已经足够
-
-Session seal前禁止开放写FD，验证阶段已经解析base/split并核对签名，stage目录由系统创建。
-
-再次逐字节复制只增加空间和时间，不能提供新的信任收益。
-
-## 19. staged路径native库何时准备
-
-第256章的`makeSessionActiveLocked()`在进入PMS前调用`extractNativeLibraries(stageDir, ...)`，Incremental则还有异步native准备。
-
-因此FileInstallArgs staged短路并不意味着忘记native库。
-
-## 20. legacy路径先分配临时stage
-
-非staged来源调用`PackageInstallerService.allocateStageDirLegacy(volumeUuid, isEphemeral)`。
-
-它分配一个legacy sessionId，构造`vmdl*.tmp`式目录并执行`prepareStageDir()`。
-
-## 21. 分配失败怎样映射
-
-`allocateStageDirLegacy()`抛IOException时，`doCopyApk()`返回`INSTALL_FAILED_INSUFFICIENT_STORAGE`。
-
-该映射比较粗：目录创建的多种IO原因都被归到空间类失败。
-
-## 22. `copyPackage()`先重新解析PackageLite
-
-它从source路径找baseCodePath、splitNames和splitCodePaths，再按规范目标名复制。
-
-这不是简单递归复制整个来源目录，未知附加文件不会自动进入stage。
-
-## 23. 目标文件名被规范化
-
-base固定写为`base.apk`；split写为`split_<splitName>.apk`。
-
-文件名先经过`FileUtils.isValidExtFilename()`，降低路径穿越与非法名字风险。
-
-## 24. 实际复制使用文件描述符
-
-目标用`Os.open(O_RDWR|O_CREAT, 0644)`创建并chmod，再由`FileUtils.copy(sourceFD, targetFD)`搬运。
-
-权限为0644不代表任意App可穿过`/data/app`父目录读取；目录和SELinux仍控制访问。
-
-## 25. copy不会在这里显式fsync每个文件
-
-`copyFile()`主要打开、复制、关闭。Session客户端的`fsync`合同属于更早写stage阶段。
-
-更精确地说，r48这个helper的finally只显式关闭source FileInputStream，没有对`Os.open()`得到的target raw FileDescriptor执行`Os.close()`；open flags也没有`O_TRUNC`。正常前提是目标位于刚创建的空stage、进程稍后回收FD，但这仍是资源管理和“目标必须全新”的实现假设，不能把它描述成严密的独立文件事务。
-
-## 26. parse/copy异常为何也报空间不足
-
-`copyPackage()`捕获PackageParserException、IOException与ErrnoException后统一返回`INSTALL_FAILED_INSUFFICIENT_STORAGE`。
-
-r48因此可能把某些格式/IO问题表现成空间类legacy错误；日志中的原异常更准确。
-
-## 27. legacy复制后才抽取native库
-
-PMS以新codeFile创建`NativeLibraryHelper.Handle`，调用`copyNativeBinariesWithOverride()`写入`lib/<abi>`。
-
-这一步只在非staged分支内。
-
-## 28. ABI override在哪里使用
-
-`abiOverride`影响选择哪套`lib/<abi>`二进制；null则由包和设备ABI规则推导。
-
-它不会改变APK内Java/Kotlin dex的指令集。
-
-## 29. Handle必须关闭
-
-无论成功还是异常，`IoUtils.closeQuietly(handle)`都在finally执行。
-
-Handle可能持有APK/zip相关FD，泄漏会阻碍目录清理和资源回收。
-
-## 30. native复制失败的返回值
-
-Helper可返回具体安装错误；创建Handle或IO异常被映射为`INSTALL_FAILED_INTERNAL_ERROR`。
-
-copy APK成功不等于`copyApk()`整体成功，native阶段也属于其返回码。
-
-## 31. `isIncremental`参数的窄边界
-
-legacy刚分配的普通stage通常不是IncFS，`isIncrementalPath(codeFile)`多为false。
-
-真正Incremental Session走staged短路，native异步策略主要在Session/Incremental链中完成。
-
-## 32. copy结束后不是直接调用installPackages
-
-`handleReturnCode()`把结果交给`processPendingInstall(args, mRet)`。
-
-单包与multi-package从这里开始分流。
-
-## 33. 单包怎样包装结果
-
-单包先创建`PackageInstalledInfo`，只写当前returnCode，uid为-1、pkg和removedInfo为空。
-
-真正包名、UID、更新信息要在prepare/scan/commit过程中填充。
-
-## 34. 为什么要异步post
-
-`processInstallRequestsAsync()`向PMS Handler post Runnable，避免在Verifier/回调当前栈上直接执行耗时安装。
-
-名字“Async”指消息队列异步，不代表每个步骤都在独立线程池并行。
-
-## 35. 成功和失败的分路
-
-只有传入`success=true`才执行`doPreInstall -> installPackagesLI -> doPostInstall`。
-
-前置失败跳过安装核心，直接进入统一restore/post-install结果回程。
-
-## 36. `doPreInstall()`对File路径很简单
-
-状态失败就`cleanUp()`；成功原样返回。
-
-但外层`processInstallRequestsAsync()`只有在传入`success=true`时才调用这个钩子，此时初始result通常已经是成功。因此copy阶段先失败、外层success=false的普通回程会整段跳过pre/post hook；这里的failure cleanup不能被当作覆盖所有前置失败的可靠保证，遗留stage还要依赖Session/legacy stage回收等外围清理。
-
-## 37. `mInstallLock`保护什么
-
-`installPackagesTracedLI()`在`synchronized(mInstallLock)`中执行，串行化涉及目录、installd和包安装世界的关键操作。
-
-它不同于`mLock`：后者主要保护PMS内存包/Settings结构。
-
-## 38. 双锁不是整段同时持有
-
-安装流程会在需要时进入`mLock`做Settings/包表操作，也会在锁外执行耗时IO。
-
-源码用prepare、scan、reconcile、commit和post-commit分段，降低大锁持有时间。
-
-## 39. `doPostInstall()`的File语义
-
-最终status失败就cleanup，成功则保留最终code path。
-
-因此copy成功但prepare/scan/reconcile失败，临时目录仍会在后置钩子清走。
-
-## 40. 统一结果回程从`restoreAndPostInstall`开始
-
-无论前面是否进入安装核心，每个InstallRequest最终都会调用它。
-
-成功新装且允许backup时可能先走restore；否则排`POST_INSTALL`，再通知observer/Session。
-
-## 41. copy到结果的时序图
-
-```mermaid
-sequenceDiagram
-    participant IP as InstallParams
-    participant IA as InstallArgs
-    participant PMS as PMS Handler
-    participant IL as installPackagesLI
-    participant ID as installd
-    IP->>IA: copyApk()
-    alt Session staged
-        IA->>IA: adopt stage path
-    else legacy untrusted
-        IA->>IA: allocate temp + copy base/splits/native
-    end
-    IP->>PMS: processPendingInstall(status)
-    PMS->>IA: doPreInstall
-    PMS->>IL: under mInstallLock
-    IL->>IA: doRename
-    IL->>ID: AppData/dex/file operations
-    PMS->>IA: doPostInstall
-    PMS-->>IP: observer/post-install result
-```
-
-## 42. prepare阶段为什么再次解析
-
-`preparePackageLI()`对`args.getCodePath()`使用`PackageParser2.parsePackage()`生成完整`ParsedPackage`。
-
-前面的PackageLite只够位置、base/split和轻量属性；组件、权限、库、ABI等需要完整模型。
-
-## 43. 重复解析不是重复信任
-
-Session验证得到的SigningDetails可直接注入ParsedPackage；若InstallArgs没有提供，prepare再读取签名。
-
-每次解析服务不同阶段的数据需求，最终仍由同一安装事务裁决。
-
-## 44. dex metadata也在此校验
-
-parse后调用`AndroidPackageUtils.validatePackageDexMetadata(parsedPackage)`。
-
-`.dm`等dex metadata与APK路径/结构不一致会在进入scan前失败。
-
-## 45. 初始scan flags
-
-默认包含`SCAN_NEW_INSTALL | SCAN_UPDATE_SIGNATURE`；move额外`SCAN_INITIAL`，DONT_KILL、instant、full、virtual preload继续转换为scan flag。
-
-Install flag和scan flag属于不同阶段，不能按相同位值理解。
-
-## 46. Instant App先做额外门
-
-外部volume不允许instant；targetSdk至少O；不能声明sharedUserId；签名方案至少v2。
-
-这些是在rename与commit前的PrepareFailure。
-
-## 47. testOnly需要显式允许
-
-ParsedPackage标记testOnly但install flags没有`INSTALL_ALLOW_TEST`时，返回`INSTALL_FAILED_TEST_ONLY`。
-
-Verifier允许不会覆盖这一平台约束。
-
-## 48. 更新身份在prepare再确认
-
-PMS根据正式包名、renamed package和`INSTALL_REPLACE_EXISTING`判断replace。
-
-这是从候选文件进入当前已安装世界的第一次深度对照。
-
-## 49. targetSdk权限模型不能倒退
-
-已有包targetSdk大于22，而更新包退回22及以下时，抛`INSTALL_FAILED_PERMISSION_MODEL_DOWNGRADE`。
-
-避免更新借旧权限模型绕过runtime permission语义。
-
-## 50. persistent App更新限制
-
-非staged安装不能更新persistent应用。
-
-staged安装保留例外，是因为关键系统更新需要更强的跨重启原子流程。
-
-## 51. 签名在scan前快速失败
-
-prepare用upgrade keyset或`verifySignatures()`先核对现有PackageSetting。
-
-后续reconcile还会从全局组合世界复核；这里是尽早退出，减少破坏性准备。
-
-## 52. 重定义权限也在prepare拦截
-
-新包若声明了已由其他非android包拥有且签名不兼容的permission，抛`INSTALL_FAILED_DUPLICATE_PERMISSION`，并记录冲突包/权限。
-
-这发生在最终目录与Settings提交之前。
-
-## 53. ABI推导与native复制不是同一件事
-
-native文件可能此前已抽出；`derivePackageAbi()`负责确定primary/secondary ABI及native library paths，并写回ParsedPackage。
-
-一个准备物理文件，一个生成包模型中的ABI事实。
-
-## 54. move路径沿用原ABI
-
-MoveInstallArgs不重新抽库，而从现有PackageSetting复制primary/secondary ABI。
-
-因为移动的是完整已安装应用，不是重新选择APK内容。
-
-## 55. 为什么加`SCAN_NO_DEX`
-
-prepare对move和普通安装都加`SCAN_NO_DEX`，避免旧scan阶段顺手dexopt。
-
-r48把安装时dexopt集中到commit之后的`executePostCommitSteps()`。
-
-## 56. `doRename()`才建立最终code path
-
-copy/stage目录仍是`vmdl*.tmp`等临时名字。prepare在ABI推导后调用`args.doRename()`。
-
-rename成功前，不应把临时目录写成正式PackageSetting codePath。
-
-## 57. 最终路径为何有两层随机名
-
-`getNextCodePath()`生成：
-
-```text
-/data/app/~~<randomA>/<packageName>-<randomB>
-```
-
-两段16字节随机值经URL-safe Base64编码，降低路径可预测性与命名冲突。
-
-## 58. 方法本身不创建目录
-
-`getNextCodePath()`只选择不存在的第一层并返回File对象。
-
-`doRename()`随后用`makeDirRecursive(parent, 0775)`真正建立父目录。
-
-## 59. 普通文件系统怎样切换
-
-普通stage调用`Os.rename(before, after)`。同一filesystem内rename避免再次复制整包，切换成本远小于字节搬运。
-
-失败被包装为rename失败并最终映射空间类PrepareFailure。
-
-## 60. Incremental不能直接`Os.rename`
-
-IncFS code path需要`IncrementalManager.renameCodePath()`，内部建立永久bind并处理storage路径。
-
-这承接第257章temporary bind到正式code path的转换。
-
-## 61. SELinux标签何时恢复
-
-普通路径rename后执行`SELinux.restoreconRecursive(afterCodeFile)`；失败则prepare失败。
-
-目录mode正确不等于SELinux label正确，两者缺一不可。
-
-## 62. r48 Incremental的restorecon TODO
-
-源码明确暂未对Incremental目录启用同样递归restorecon。
-
-不能把普通路径标签步骤无条件套到IncFS。
-
-## 63. ParsedPackage路径也要重写
-
-rename后不仅更新`codeFile/resourceFile`，还重写ParsedPackage的codePath、baseCodePath和splitCodePaths。
-
-否则后续scan/dexopt会继续指向已不存在的临时路径。
-
-## 64. canonical path失败也会终止
-
-设置ParsedPackage codePath前调用`getCanonicalPath()`。IOException使`doRename()`返回false。
-
-rename可能已发生但模型更新失败，后续cleanup必须面对这种部分推进状态。
-
-## 65. fs-verity在rename之后设置
-
-`setUpFsVerityIfPossible(parsedPackage)`使用最终路径准备verity。
-
-失败返回`INSTALL_FAILED_INTERNAL_ERROR`，说明最终路径出现还不等于已对查询世界可见。
-
-## 66. App Links验证只是异步启动
-
-非instant包在此调用`startIntentFilterVerifications()`，但域名验证不会阻塞APK安装commit。
-
-它与第259章阻塞式Package verifier完全不同。
-
-## 67. PackageFreezer保护更新窗口
-
-prepare在进一步替换操作前`freezePackageForInstall()`，防止旧进程/包状态在删除、scan和commit间继续变化。
-
-freezer生命周期跨越后续安装结果，不等于仅持一把Java锁。
-
-## 68. prepare、scan、reconcile、commit四段
-
-`installPackagesLI()`先为每个请求prepare，再scan候选，统一reconcile签名/库/replace，最后在`mLock`内commit。
-
-第252章讲的是包模型提交；本章关注进入这四段前后的文件路径与副作用。
-
-## 69. rename发生在全局reconcile之前
-
-r48在`preparePackageLI()`中先doRename，再进入后续scan/reconcile。
-
-所以reconcile失败时已经存在最终随机路径，需要`doPostInstall(failure)`清理。
-
-## 70. 为什么不能把rename叫commit
-
-rename只改变文件位置；`mPackages`、PackageSetting、权限、组件表与packages.xml尚未全部提交。
-
-文件路径成为“最终形状”不等于包管理世界已经承认它。
-
-## 71. commit后才执行昂贵外部步骤
-
-`executePostCommitSteps()`注释说明：内存/磁盘包状态commit后、释放package锁，再执行需要installd或耗时的工作。
-
-主要包括AppData、code cache、profile、dexopt和通知。
-
-## 72. AppData准备针对已安装用户
-
-`prepareAppDataAfterInstallLIF()`遍历非dying用户，仅对PackageSetting标记installed的用户创建/修复目录。
-
-不是新装一次就无条件给所有用户创建CE/DE数据。
-
-## 73. 用户运行状态决定DE/CE
-
-用户已unlocking/unlocked：准备DE+CE；仅running但未解锁：只准备DE；未运行：跳过。
-
-Direct Boot状态因此直接影响安装当下可创建的目录集合。
-
-## 74. external app data另走StorageManager
-
-用户已解锁时，内部AppData完成后还调用`StorageManagerInternal.prepareAppDataAfterInstall()`，主要处理外部存储/OBB相关目录。
-
-它不是installd`createAppData()`的同一个Binder接口。
-
-## 75. `createAppData`的关键参数
-
-PMS传volumeUuid、packageName、userId、DE/CE flags、appId、seInfo和targetSdkVersion给installd。
-
-installd据此创建所有权与SELinux语义正确的数据目录，并返回CE inode。
-
-## 76. seInfo来自包与用户状态
-
-`AndroidPackageUtils.getSeInfo(pkg, ps)`再拼接`seInfoUser`。
-
-UID相同也不代表SELinux域/类别相同，不能只用Linux owner解释AppData隔离。
-
-## 77. system AppData失败会尝试恢复
-
-系统包create失败时，PMS记录critical log、销毁对应AppData后再创建一次。
-
-它以可恢复系统一致性为优先，但可能清掉损坏数据。
-
-## 78. 第三方AppData失败不会自动wipe重试
-
-普通第三方包失败只记录error。
-
-源码避免为了修复ownership而擅自删除用户App数据；这与系统包恢复策略不同。
-
-## 79. CE inode写回PackageSetting
-
-当CE被请求且installd返回有效inode，PMS把它记到对应user的PackageSetting。
-
-注释仍有“mark dirty/persist”TODO，说明该字段持久化时机需结合后续Settings写入理解。
-
-## 80. profile准备必须在dexopt之前
-
-`mArtManagerService.prepareAppProfiles(... updateReferenceProfileContent=true)`在安装时dexopt之前调用。
-
-这样随包提供的profile/dex metadata可影响install compiler filter。
-
-## 81. install-time dexopt有三个主要排除条件
-
-默认仅当：
-
-1. 非instant，或显式开启instant dexopt；
-2. 包非debuggable；
-3. code path不在Incremental；
-
-三者同时满足才执行。
-
-## 82. 为什么debuggable默认跳过
-
-开发调试包代码变化频繁，install-time优化收益较低；后续运行/JIT或后台dexopt仍可处理。
-
-跳过不代表dex不可执行。
-
-## 83. 为什么Incremental跳过
-
-代码页可能尚未全部到达，安装时完整dexopt会触发大量缺页并失去按需安装收益。
-
-因此r48把它排除，运行与后台阶段再逐步处理。
-
-## 84. Instant默认跳过的用户体验取舍
-
-源码注释明确：dexopt可能长时间卡在进度中间，instant优先快速可用，首次运行承担额外成本。
-
-`INSTANT_APP_DEXOPT_ENABLED`可覆盖默认。
-
-## 85. layout预编译是可选步骤
-
-系统属性`PRECOMPILE_LAYOUTS`开启时，先由ViewCompiler编译layout资源。
-
-它不是所有Android 11设备安装必做项。
-
-## 86. dexopt使用REASON_INSTALL
-
-Options包含`DEXOPT_BOOT_COMPLETE | DEXOPT_INSTALL_WITH_DEX_METADATA_FILE`；设备restore/setup安装还加`DEXOPT_FOR_RESTORE`。
-
-reason与flags影响compiler filter、调度优先级和profile使用。
-
-## 87. 为什么不走公开`performDexOpt()`
-
-注释指出候选pkg此时可能尚未稳定存在于`mPackages`访问路径，因此直接调用`mPackageDexOptimizer.performDexOpt()`并传真实PackageSetting。
-
-这是commit后内部对象交接的窄窗口。
-
-## 88. dexopt失败不使安装失败
-
-源码明确“不因dexopt失败让App安装失败”。返回值没有改写installResult。
-
-App仍可通过解释/JIT/后续后台优化运行；安装耗时优化不是包可用性的硬门。
-
-## 89. BackgroundDexOptService仍会收到变化
-
-无论本次是否install-time dexopt，成功包都会`notifyPackageChanged(packageName)`。
-
-曾因编译失败进入黑名单的包可在更新后重新评估。
-
-## 90. Incremental native还有一个post-commit等待
-
-post-commit收集所有IncrementalStorage，循环末调用`NativeLibraryHelper.waitForNativeBinariesExtraction()`。
-
-这说明Incremental的native准备可能异步延续到commit后，不可套用legacy同步抽取时序。
-
-## 91. 等待发生在所有包post步骤之后
-
-代码先逐包准备AppData/profile/dex条件，再统一等待Incremental native storages。
-
-multi-package中不是每处理一个包就立刻单独阻塞等待。
-
-## 92. MoveInstallArgs的copy其实是整体搬迁
-
-`copyApk()`调用installd`moveCompleteApp(fromUuid,toUuid,...)`，搬的是完整应用代码与相关内部数据。
-
-名称沿用抽象接口，不是只复制base.apk。
-
-## 93. move目标路径保留原目录名
-
-完成后用原`fromCodePath`最后一级名字，在目标volume的`data/app`下构造codeFile。
-
-`doRename()`对move直接返回true，不重新生成随机路径。
-
-## 94. move成功后清理源volume
-
-`doPostInstall(success)`清理fromUuid；失败则清理toUuid。
-
-这构成“成功保目标、失败保源”的补偿策略。
-
-## 95. move cleanup同时处理AppData和code
-
-对所有用户调用installd`destroyAppData`清DE+CE但保ART profiles，再`removeCodePathLI`。
-
-外部storage flag被刻意排除，注释说明移动范围只针对内部数据。
-
-## 96. 这不是数据库式原子事务
-
-目录rename、installd调用、内存commit、Settings写入和post步骤分段发生。
-
-Android依靠freezer、锁、状态机和失败cleanup恢复一致性，而不是单一ACID事务回滚。
-
-```mermaid
-stateDiagram-v2
-    [*] --> StableStage
-    StableStage --> FinalPath: doRename
-    FinalPath --> Published: scan + reconcile + commit
-    Published --> DataReady: createAppData
-    DataReady --> Optimized: conditional dexopt
-    StableStage --> CleanupPending: copy/prepare failure
-    FinalPath --> CleanupPending: scan/reconcile failure
-    CleanupPending --> Removed: close IncFS + remove code/rmdex
-    Published --> Reported: post-install/observer
-    Optimized --> Reported
-```
-
-## 97. multi-package怎样等齐copy结果
-
-每个child完成`processPendingInstall`后，`MultiPackageInstallParams.tryProcessInstallRequest()`把args→status放入Map。
-
-未收齐全部child时不进入installPackages；任一非成功使整组使用同一失败status。
-
-## 98. `INSTALL_UNKNOWN`为何继续等待
-
-tryProcess发现任一状态仍为`INSTALL_UNKNOWN`就return。
-
-UNKNOWN在这里是中间/不完整结果保护，不能直接当作最终通用失败。
-
-## 99. 整组失败不会安装成功child
-
-收齐后若某child失败，构造每个InstallRequest时统一使用completeStatus，`success=false`跳过核心安装。
-
-multi-package原子性由整组汇合保证，不是各child先后独立commit。
-
-## 100. File cleanup怎样识别IncFS
-
-`cleanUp()`若codePath属于Incremental，先`mIncrementalManager.closeStorage(codePath)`，再删除code path。
-
-只递归删目录而不关闭storage可能遗留mount/bind资源。
-
-## 101. resourceFile为何额外判断contains
-
-若resourceFile不位于codeFile内部，还单独delete。
-
-r48常见路径二者相同，这段保留对历史/特殊布局的兼容。
-
-## 102. 清理dex文件需要instructionSets
-
-`cleanUpResourcesLI()`先尽力parse PackageLite收集所有code path，再将ABI instruction set转换为dex code instruction set，调用installd`rmdex`。
-
-instructionSets为null且确实有code path时会抛IllegalStateException。
-
-## 103. parse失败时cleanup仍继续
-
-无法枚举PackageLite时，allCodePaths保持空，但目录`cleanUp()`仍执行。
-
-这是best-effort：包格式坏了也不应阻止删除整个临时code path。
-
-## 104. `doPostDeleteLI(delete)`的r48疑点
-
-FileInstallArgs注释直接问“难道不该尊重delete flag吗”，实现无论参数都`cleanUpResourcesLI()`并返回true。
-
-这是明确的历史债务，阅读调用方不能按参数名推断行为。
-
-## 105. copy与rename的完成语义
-
-copy成功：有可用于prepare的稳定目录；rename成功：目录已采用最终随机路径；二者都不表示组件/权限/Settings已提交。
-
-只有commitPackages完成才进入查询可见世界。
-
-## 106. rename与AppData的完成语义
-
-rename只准备code path；AppData按用户、解锁状态另行创建。
-
-看到`/data/app`目录不能推断`/data/user/<id>/<pkg>`已准备完毕。
-
-## 107. installd边界汇总
-
-system_server负责策略、包模型和时序；installd负责需要高权限的文件系统动作，如create/destroy AppData、moveCompleteApp、rmdex和dexopt。
-
-Binder返回成功只证明该文件动作完成，不自动提交PMS内存状态。
-
-## 108. 第一次复读：staged的“copy”修订
-
-Session路径`copyApk()`只是采用现有stage；legacy路径才分配新stage、复制base/splits并同步抽native。正文不再笼统写“Verifier后再次复制APK”。
-
-## 109. 第二次复读：native时间线修订
-
-Session普通stage在`makeSessionActiveLocked`前置抽库，legacy在`doCopyApk`抽库，Incremental可能到post-commit统一等待。三条路径不可共用一个时间点。
-
-## 110. 第三次复读：dexopt完成语义修订
-
-dexopt发生在包状态commit后的昂贵步骤，且失败不使安装失败；它不是scan的一部分，也不是“安装成功”的必要证明。
-
-## 111. 版本边界
-
-本章严格对应Android 11 r48。后续版本对`/data/app/~~`布局、Incremental native、ART Service、dexopt、staging和PackageManager安装架构有显著重构。真实设备必须核对tag、filesystem、installd接口与ART实现。
-
-## 112. macOS只读练习1：比较三种Origin
+### 练习 1：从工厂调用点还原真实来源矩阵
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '14630,14920p' +  frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
-sed -n '15705,15790p' +  frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'static OriginInfo fromUntrustedFile(File file) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'static OriginInfo fromExistingFile(File file) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'static OriginInfo fromStagedFile(File file) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'origin = OriginInfo.fromStagedFile(activeInstallSession.getStagedDir());' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'final OriginInfo origin = OriginInfo.fromExistingFile(codeFile);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (params.move != null) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
 ```
 
-画出untrusted、staged、existing三种Origin，标明是否verify、是否copyPackage、是否抽native、最终使用FileInstallArgs还是MoveInstallArgs。
+分别列出普通 Session、私有卷完整移动、主物理卷移动和既有包删除四例的 `staged/existing/move`。然后用全树搜索确认 `fromUntrustedFile()`没有生产调用，不能从“方法存在”跳到“普通安装正在用”。
 
-## 113. macOS只读练习2：手算copy与rename
+## 3. 三道门只决定何时读粘滞返回码，dry run甚至不会进入copy
+
+`HandlerParams.startCopy()`这个历史名称会先执行 `handleStartCopy()`，再执行 `handleReturnCode()`。`InstallParams.handleStartCopy()`完成位置策略、创建 `InstallArgs`，把 verification、Integrity和rollback三个完成位置为初始 true，再按条件发起异步工作。任何门开始等待时才把自己的完成位改为 false。
+
+只有三个完成位同时为 true，`handleReturnCode()`才继续。接下来还有两层分路：
+
+1. `INSTALL_DRY_RUN`直接轻量解析包名并回 observer，不调用 `copyApk()`，也不调用 `processPendingInstall()`；
+2. 非 dry run仅当粘滞 `mRet == INSTALL_SUCCEEDED`时调用 `mArgs.copyApk()`，随后无论成功或失败都把当前码交给 `processPendingInstall()`。
+
+`setReturnCode()`只在旧值仍成功时写入，因此 verifier拒绝、Integrity拒绝、位置错误或更早失败不会被后来成功覆盖。`copyApk()`自己的失败码也写回同一本账。三个位全真只表示“异步门已经结束”，不表示判定结果是允许。
+
+`origin.existing`在 `handleStartCopy()`外层就跳过 ordinary与Integrity State，而不是只跳过广播；rollback若没有请求也保持初始完成。因此移动请求通常很快到 `copyApk()`，但它仍经过相同的返回码汇合方法。
+
+### 练习 2：标出copyApk的四重条件
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '916,965p' +  frameworks/base/services/core/java/com/android/server/pm/PackageManagerServiceUtils.java
-sed -n '15730,15845p' +  frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'if (mVerificationCompleted' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F '&& mIntegrityVerificationCompleted && mEnableRollbackCompleted) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if ((installFlags & PackageManager.INSTALL_DRY_RUN) != 0) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (mRet == PackageManager.INSTALL_SUCCEEDED) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mRet = mArgs.copyApk();' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'processPendingInstall(mArgs, mRet);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
 ```
 
-以一个base+两个split为例，写出legacy临时文件名、最终随机目录形状、普通rename与Incremental rename的不同调用，并列出任一步失败的cleanup对象。
+手算“ordinary晚到、Integrity先拒绝”“三门允许但copy失败”“dry run已拒绝”“existing move”四例。每例分别写完成位、进入copy与否、最终交给哪个回程，避免把门状态和安装结果合成一个布尔量。
 
-## 114. macOS只读练习3：追AppData到installd
+## 4. origin.staged不是SessionParams.isStaged，Session激活也不是native终点
+
+`InstallParams(ActiveInstallSession)`确实无条件调用 `OriginInfo.fromStagedFile(activeInstallSession.getStagedDir())`，但原始跨重启 Session不会直接进入这个构造器：`PackageInstallerSession.install()`在 `params.isStaged`分支把事务交给 StagingManager后返回；重启应用APK时，`createAndWriteApkSession()`复制参数，显式改成 `params.isStaged=false`，同时加入 `INSTALL_STAGED` flag，再由这个合成 Session进入 `makeSessionActiveLocked()`和 `InstallParams`。因此普通 Session与合成 APK Session都会得到 `origin.staged=true`，它只描述“目录已经受控、可被下游接管”，不能反推原始事务是否跨重启。
+
+因此常规 Session的 `FileInstallArgs.doCopyApk()`只把 `codeFile`与 `resourceFile`指向 `origin.file`并返回成功。它完成的是路径接管，不是第二次字节复制。上游 Session已 seal，提交前验证过 base/split结构和签名，并在 `makeSessionActiveLocked()`中处理继承文件；这才是下游敢复用目录的上下文。
+
+native库在交给 PMS前已经有第一处动作。对单 APK Session或 multi的每个非父 child，`makeSessionActiveLocked()`在创建 `ActiveInstallSession`之前调用 `extractNativeLibraries(stageDir, abiOverride, mayInheritNativeLibs())`。普通文件系统在这里同步抽取；Incremental路径会向 Incremental Service配置 native文件，真实数据抽取可继续异步。multi parent本身不代表一个 APK，所以跳过这一段，children各自处理。
+
+但这还不是本章可以宣称的“native最终完成”。prepare阶段的 ABI推导会再次调用 native helper，Incremental还要在 commit后的组末等待。看到 Session激活成功，只能说第一处 native准备调用已经返回。
+
+### 练习 3：区分路径接管、Session抽取与prepare再抽取
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '22900,23025p' +  frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
-sed -n '160,220p' +  frameworks/base/services/core/java/com/android/server/pm/Installer.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'if (origin.staged) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'codeFile = origin.file;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'params.isStaged = false;' frameworks/base/services/core/java/com/android/server/pm/StagingManager.java
+grep -n -F 'params.installFlags |= PackageManager.INSTALL_STAGED;' frameworks/base/services/core/java/com/android/server/pm/StagingManager.java
+grep -n -F 'extractNativeLibraries(stageDir, params.abiOverride, mayInheritNativeLibs());' frameworks/base/services/core/java/com/android/server/pm/PackageInstallerSession.java
+grep -n -F 'final boolean extractNativeLibs = !AndroidPackageUtils.isLibrary(parsedPackage);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'derivedAbi = mInjector.getAbiHelper().derivePackageAbi(parsedPackage,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'copyRet = NativeLibraryHelper.copyNativeBinariesForSupportedAbi(handle,' frameworks/base/services/core/java/com/android/server/pm/PackageAbiHelperImpl.java
 ```
 
-选择“用户已解锁、仅running未解锁、未running”三种状态，手算DE/CE flags、是否调用外部storage准备，以及system/third-party create失败的恢复差异。
+画四列时间线：普通 Session、原始跨重启 Session及其合成 APK Session、Incremental Session、multi parent加两个 children。明确哪些动作是采用路径、同步复制、异步配置、ABI选择和最终等待；不要用一个“extract完成”覆盖全部节点。
 
-## 115. macOS只读练习4：核对dexopt硬门
+## 5. 非staged FileInstallArgs在当前树中服务主物理卷移动，不是普通APK入口
+
+`FileInstallArgs.doCopyApk()`确实保留一条通用的非 staged防御性复制实现：分配新 stage、复制 APK集合、准备 native库。但在这份 r48源码中，`OriginInfo.fromUntrustedFile()`只有定义没有调用。把这条实现描述成“普通 legacy APK安装的主要路径”，会把能力边界误当成当前调用图。
+
+可证的生产入口来自 `movePackageInternal()`。目标是内部私有卷或 adoptable private volume时，`moveCompleteApp=true`并构造 `MoveInfo`；目标是 `StorageManager.UUID_PRIMARY_PHYSICAL`时，`moveCompleteApp=false`、`move=null`。两者都把旧 code path包装成 `OriginInfo.fromExistingFile(codeFile)`，但后者因为没有 `MoveInfo`而落入 `FileInstallArgs`。
+
+这条特殊路径同时证明两个布尔量确实正交：`existing=true`让 package verification外层整体旁路，`staged=false`又让 `doCopyApk()`实际复制。它不是从不可信下载目录装一个新包，而是把已安装包的代码重建到主物理卷的受控 stage。
+
+非 staged分支调用已废弃标记的 `allocateStageDirLegacy(volumeUuid, isEphemeral)`。PackageInstallerService分配随机 legacy sessionId，在相应 volume的 app目录创建 `vmdl<id>.tmp`，mode为0775并做一次 restorecon。分配中任何 `IOException`都被压成 `INSTALL_FAILED_INSUFFICIENT_STORAGE`，即使真实原因不是容量不足。
+
+随后 `copyPackage()`复制 APK，`NativeLibraryHelper.Handle.create(codeFile)`重新打开目标集合，再由 `copyNativeBinariesWithOverride()`准备 `lib/<isa>`。Handle在 finally中关闭；APK复制成功并不保证整个 `copyApk()`成功，native返回码仍能把结果改为失败。
+
+## 6. copyPackage只复制base与split，fresh-stage假设承担了文件事务安全
+
+`PackageManagerServiceUtils.copyPackage()`不是递归目录复制。它先重新解析 `PackageLite`，只取 `baseCodePath`、`splitNames`与 `splitCodePaths`：base落成 `base.apk`，split落成 `split_<name>.apk`。来源目录里的 oat、旧 lib、杂项文件乃至未列入 PackageLite的内容都不会随手带过去；native随后从目标 APK重新构建。
+
+目标名经过 `FileUtils.isValidExtFilename()`。不过这个检查抛 `IllegalArgumentException`，外层只捕获 `PackageParserException | IOException | ErrnoException`；若真触发，它不会被映射成空间错误，而会越出 helper。常规 base名固定且 split名此前已经解析，正常输入依赖上游约束不触发这个分支。
+
+文件级实现还有两个必须按源码记录的假设：目标用 `Os.open(..., O_RDWR | O_CREAT, 0644)`打开，没有 `O_EXCL`或 `O_TRUNC`；finally只关闭 source `FileInputStream`，没有把 raw target `FileDescriptor`交给可关闭包装对象，也没有调用 `Os.close()`。libcore的 `FileDescriptor`注释明确由创建者负责关闭，因此这是该 helper保留分支中的FD泄漏疑点；普通GC不能假定为它代关，只有进程退出时内核才兜底。新建且空的 stage使“目标此前不存在”成为常态，也掩盖了覆盖旧文件时尾部残留。不能把它描述为自足、可重放的原子复制 helper。
+
+映射也很粗：解析、普通IO与 errno异常统一变成 `INSTALL_FAILED_INSUFFICIENT_STORAGE`，应结合 `Failed to copy package at ...`日志保留原异常类别。反过来，前述未捕获的运行时异常不会获得这个状态码。
+
+清理边界同样反直觉。若 `copyApk()`已经分配 legacy stage后返回失败，`processInstallRequestsAsync(success=false)`会跳过全部 `doPreInstall()`与 `doPostInstall()`，所以 `FileInstallArgs`自身的 failure cleanup在这条路径根本没有执行。现代 Session通常会在最终 observer回调中销毁自身 stage；对独立 legacy stage，源码可见的延迟兜底是 `PackageInstallerService.reconcileStagesLocked()`：`systemReady()`只对内部私有卷调用，私有卷挂载时再按该卷调用。这不是本次失败回程的即时删除，也不能据此断言每个主物理卷目标都一定被覆盖。
+
+删除侧还有一处历史不对称：`FileInstallArgs.doPostDeleteLI(boolean delete)`无论参数真假都调用 `cleanUpResourcesLI()`。后者先尽力解析 code paths，再调用 `cleanUp()`，最后按 instruction sets调用 installd `rmdex`。PackageLite解析失败只会让 dex路径枚举为空；只要 `codeFile`还存在，目录清理仍会继续。反过来，`codeFile`缺失会让 `cleanUp()`立即返回，连位于其外部的 `resourceFile`也不会单独尝试删除。参数名不能替代实现证据。
+
+### 练习 4：审计copyFile的输入边界与FD所有权
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '17015,17125p' +  frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'final PackageParser.PackageLite pkg = PackageParser.parsePackageLite(packageFile, 0);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerServiceUtils.java
+grep -n -F 'copyFile(pkg.baseCodePath, targetDir, "base.apk");' frameworks/base/services/core/java/com/android/server/pm/PackageManagerServiceUtils.java
+grep -n -F '"split_" + pkg.splitNames[i] + ".apk");' frameworks/base/services/core/java/com/android/server/pm/PackageManagerServiceUtils.java
+grep -n -F 'if (!FileUtils.isValidExtFilename(targetName)) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerServiceUtils.java
+grep -n -F 'O_RDWR | O_CREAT, 0644);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerServiceUtils.java
+grep -n -F 'FileUtils.copy(source.getFD(), targetFd);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerServiceUtils.java
+grep -n -F 'IoUtils.closeQuietly(source);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerServiceUtils.java
 ```
 
-分别判断普通release、debuggable、instant默认、instant开关开启、Incremental五种包是否install-time dexopt，并解释dexopt失败为何不改安装status。
+假设目标是全新空目录，再假设同名目标已有更长旧文件，分别推导结果。列出 source FD、target FD各由谁关闭，并说明为什么“当前调用通常安全”与“helper本身具备覆盖事务语义”是两种结论。
 
-## 116. 第四次复读：文件完成不等于包完成
+## 7. MoveInstallArgs让installd先复制完整应用，PMS提交后才删源端
 
-stage存在、copy成功、rename成功、AppData创建、dexopt结束、Settings提交和observer成功是七个不同事实。排查时必须写出当前codePath、PMS返回码和所在阶段，不能只用“文件已经在/data/app”判断安装完成；还要确认当前失败是否真正经过doPostInstall，不能仅因InstallArgs定义了cleanup钩子就假定它已执行。
+`movePackageInternal()`按目标位置选择完整搬迁：目标是内部私有存储或已挂载可写的private volume时，`moveCompleteApp=true`并使用 `MoveInstallArgs`；源端也可能是此前位于 `PRIMARY_PHYSICAL`的代码，不能把“目标为private”误读成两端都必须是private。方法先在 `mLock`下检查包、volume、设备管理员与冻结状态，取得已安装用户，冻结包；若文件级加密启用，还要求所有已安装用户的key已解锁。它测量 code+data并确认目标空间后，才构造 `MoveInfo`进入 `INIT_COPY`。
 
-## 117. 自测题
+`MoveInstallArgs.copyApk()`这个名字并不准确描述动作范围。它在 `synchronized(mInstaller)`中调用 `Installer.moveCompleteApp()`；installd端复制 code tree并对目标恢复SELinux标签。对 `get_known_users(from_uuid)`返回的每个用户，它先检查CE源目录：CE不存在就跳过整个用户，存在才创建目标并依次复制DE、CE，再做AppData restorecon。源端此时仍保留，C++注释明确把“框架先扫描、持久化目标，再删除源”作为断电恢复顺序。
 
-1. Session路径为何`copyApk()`通常不复制？
-2. legacy`copyPackage()`会复制目录里所有文件吗？
-3. native抽取三条路径分别在何时完成？
-4. copy成功与rename成功有什么区别？
-5. Incremental rename为何不能用`Os.rename`？
-6. AppData的DE/CE flags怎样由用户状态决定？
-7. install-time dexopt的三个主要排除条件是什么？
-8. dexopt失败为何不导致安装失败？
-9. multi-package怎样避免部分child先安装？
-10. `doPostDeleteLI(delete)`有什么r48疑点？
+installd内部任一步失败会尽力删除已经复制到目标的 code、DE和CE目录，再把错误返回 system_server；各个删除失败只记录warning，所以“回滚目标端”是意图而非绝对保证。成功返回后，`MoveInstallArgs`以原 `fromCodePath`的最后一级名字构造目标 `codeFile`；`doRename()`直接返回 true，因为整体复制已经把目标路径建立好，不再生成另一组随机名。
 
-## 118. 自测题参考答案
+框架侧的补偿矩阵是：核心安装成功，`doPostInstall()`清理 `fromUuid`；失败则清理 `toUuid`。清理遍历所有 userId，调用 `destroyAppData(DE|CE|KEEP_ART_PROFILES)`并删除 code path。`destroyAppData()`异常会被逐用户记录后继续，底层删除也可能失败，所以成功后仍可能残留源端、失败后也可能残留目标端。profiles刻意保留，因为它们没有一起搬移，误删会丢掉唯一副本。这里依靠“先复制、提交、后删源”恢复一致性，不是跨 Binder、文件系统和Settings的一次数据库事务。
 
-1. ActiveInstallSession把受控stage标成origin.staged，下游直接采用路径。
-2. 不会；重新parse PackageLite，只按base.apk和规范split名复制。
-3. 普通Session在激活阶段；legacy在doCopyApk；Incremental可能到post-commit统一等待。
-4. copy只得到稳定候选目录；rename才切到最终随机code path，两者都未必已commit包状态。
-5. IncFS需要把临时bind转换为永久code path bind并维护storage。
-6. unlocked准备DE+CE，仅running准备DE，未running跳过。
-7. instant默认、debuggable、Incremental；满足任一通常跳过。
-8. ART仍可解释/JIT或以后后台优化，源码明确不让优化失败否决包安装。
-9. Map收齐全部child状态，任一失败就整组success=false，跳过installPackages。
-10. 实现无视delete参数，总会cleanup，源码自身留有质疑注释。
+主物理卷分支没有 `MoveInfo`，所以不能把这一套 complete-app补偿套给它。它走上一节的 `FileInstallArgs`代码复制，移动进度所计容量也只有 `stats.codeSize`，不是 code+data。
 
-## 119. 本章总结
+### 练习 5：推导完整移动的源端与目标端补偿
 
-Verifier放行后，InstallParams只有在三道完成门齐且mRet仍成功时才调用InstallArgs.copyApk。PackageInstaller Session的Origin已经staged，因此FileInstallArgs只是接管现有目录；legacy未staged来源才分配vmdl临时stage、按base/split规范名复制并同步抽取native，MoveInstallArgs则让installd整体搬迁。processPendingInstall把结果异步交给PMS Handler，成功组在mInstallLock下prepare、完整parse、签名/权限/ABI核验，并把临时目录普通rename或IncFS永久bind到随机最终code path；之后scan/reconcile/commit才发布包状态。锁外post-commit再按用户状态创建DE/CE AppData、准备profile并按非instant/非debuggable/非Incremental条件dexopt，优化失败不否决安装。进入核心安装后的失败通常由doPostInstall、IncFS close与rmdex补偿；copy本身先失败时外层会跳过pre/post hook，仍需外围stage回收。多包则先收齐全部child状态再整体进入安装。
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'mInstaller.moveCompleteApp(move.fromUuid, move.toUuid, move.packageName,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'codeFile = new File(Environment.getDataAppDirectory(move.toUuid), toPathName);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'cleanUp(move.fromUuid);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'cleanUp(move.toUuid);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'final int flags = FLAG_STORAGE_DE | FLAG_STORAGE_CE' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mInstaller.destroyAppData(volumeUuid, move.packageName, userId, flags, 0);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'copy_directory_recursive(fromCodePath.c_str(), to_app_package_path_parent.c_str());' frameworks/native/cmds/installd/InstalldNativeService.cpp
+```
 
-## 120. 下一章预告
+分别在 code复制后失败、第三个用户CE复制后失败、PMS reconcile失败和最终成功四个时间点画源/目标矩阵。区分 installd函数内部回滚与 `MoveInstallArgs.doPostInstall()`补偿，不能把两层清理当成同一次调用。
 
-第261章进入“Android Package替换安装、PackageFreezer、旧进程终止、旧代码删除与用户数据保留链”，专门追更新安装如何在新旧PackageSetting与code path之间安全交接。
+## 8. processPendingInstall是状态汇合桥，Async只是向同一Package Handler再排一条消息
+
+单包进入 `processPendingInstall()`时，PMS新建 `PackageInstalledInfo`，只写当前 returnCode，并把 uid初始化为 -1、pkg与removedInfo置空。包名、UID、更新信息和freezer都要在后续 prepare/scan/commit中逐步填入。
+
+multi-package不会让第一个成功 child先安装。每个 child把 `InstallArgs -> status`写入 parent的 `mCurrentState`；Map大小未达到 child数就返回，任何值仍是 `INSTALL_UNKNOWN`也返回。这个返回不会安排timer或主动重试，必须由同一个 `InstallArgs`之后再次回调并覆盖状态才能推进。全部可判定后，遍历中遇到的第一个非成功码成为 `completeStatus`，再用这个同一状态为每个 child重建 `PackageInstalledInfo`。因此只有进入核心前的汇合失败会给全组同一个码；它保证“整组是否进入核心”一致，却不会保留各child的原始错误码。
+
+`processInstallRequestsAsync()`的 Async不表示另开并行worker。它调用 `mHandler.post()`，仍落在 PMS自己的 background-priority `PackageHandler`/`ServiceThread`。这样把耗时核心与当前 verifier或rollback消息栈断开，却仍按同一Looper串行执行。
+
+传入 `success=true`时，Runnable按 `doPreInstall()` → `synchronized(mInstallLock)`中的 `installPackagesTracedLI()` → `doPostInstall()`顺序执行。两个钩子的返回值都被忽略，当前子类主要靠共享 `PackageInstalledInfo.returnCode`和清理副作用协作。传入 false时，pre、核心与post三段全部跳过，直接为每个请求调用 `restoreAndPostInstall()`。
+
+正常返回下，无论安装成功或普通状态码失败都会进入 restore/`POST_INSTALL`统一回程；新装、允许backup且成功时可能先做restore round-trip。这里必须保留“正常返回”限定：Runnable没有包住核心的 catch/finally，未捕获运行时异常可以截断 `doPostInstall()`和install observer链，第15节给出 commit后的具体入口。
+
+### 练习 6：手算multi汇合与Handler上的四段分路
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'args.mMultiPackageInstallParams.tryProcessInstallRequest(args, currentStatus);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mCurrentState.put(args, currentStatus);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (mCurrentState.size() != mChildParams.size()) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (status == PackageManager.INSTALL_UNKNOWN) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'completeStatus = status;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mHandler.post(() -> {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'request.args.doPreInstall(request.installResult.returnCode);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'installPackagesTracedLI(installRequests);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'request.args.doPostInstall(' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'restoreAndPostInstall(request.args.user.getIdentifier(), request.installResult,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+```
+
+给三个 children依次输入成功、UNKNOWN、-2，再让 UNKNOWN更新为-22。写出何时开始核心、所有child最终看到哪个码，以及在 `success=false`时哪些清理钩子实际没有运行。
+
+## 9. 四阶段只把可预测错误赶到commit前，post-commit仍持有mInstallLock
+
+`installPackagesLI()`源码注释把事务分成 prepare、scan、reconcile、commit四阶段：prepare解析并做初始验证；scan把候选放进扫描模型；reconcile把所有候选与当前系统状态一起检查；commit才发布扫描结果并更新系统状态。prepare、scan或reconcile通过 catch+return表达的受控失败会让整组退出，随后外层为全部请求执行 failure `doPostInstall()`；但结果码并不总相同：prepare或scan只给触发失败的请求写具体错误，finally把仍为成功的兄弟改成 `INSTALL_UNKNOWN`，只有reconcile失败显式给所有请求写同一个错误。commit或其他未捕获运行时异常则会继续传播，不能套用这条正常补偿结论。
+
+真实锁层次如下：
+
+| 区域 | `mInstallLock` | `mLock` | 主要工作 |
+|---|---:|---:|---|
+| copy与`processPendingInstall()`前 | 否 | 局部读取 | stage/move文件准备、异步门 |
+| `installPackagesTracedLI()`整体 | 是 | 分段 | prepare、scan、reconcile、commit、post-commit |
+| reconcile与commit代码块 | 是 | 是 | 组合校验、包表与Settings提交 |
+| `executePostCommitSteps()` | 是 | 否（内部短暂再取） | installd、AppData、profile、dexopt、IncFS native等待 |
+| `doPostInstall()`与结果回程 | 否 | 视子路径而定 | 清理、restore、observer |
+
+所以源码所说“commit后释放 package lock”指退出 `mLock`，不等于退出 `mInstallLock`。AppData、dexopt和 Incremental native wait依然串行占住安装锁；这既避免多个安装互相踩文件状态，也意味着慢 post-commit会推迟后续安装。
+
+prepare对每个请求运行后才scan该请求；scan时还会拒绝同一 multi中解析出重复包名，并可能乐观注册 appId。reconcile与commit统一在 `mLock`内执行。若 commit前退出，finally会清理由乐观扫描创建的 appId、关闭已有 freezer，并把仍标成功的请求改为 `INSTALL_UNKNOWN`，防止其被误报为成功。
+
+“原子安装”主要约束最终包状态发布，不是文件系统零副作用。native复制与 `doRename()`已经在 prepare中发生，远早于全组reconcile；失败后依赖 `doPostInstall()`逐项补偿。断电、未捕获异常或实现缺口都要求磁盘对账，不能拿四阶段注释证明 ACID回滚。
+
+### 练习 7：用锁与方法顺序重建四阶段
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private void installPackagesLI(List<InstallRequest> requests) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'preparePackageLI(request.args, request.installResult);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'final ScanResult result = scanPackageTracedLI(' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'reconciledPackages = reconcilePackagesLocked(' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'commitPackagesLocked(commitRequest);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'executePostCommitSteps(commitRequest);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'synchronized (mInstallLock) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (!args.doRename(res.returnCode, parsedPackage)) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+```
+
+在每个命中点标出 `mInstallLock/mLock`持有情况。再假设第二个child在scan失败，列出第一个child此前已经发生的 native、rename、appId动作和最终由哪条路径清理。
+
+## 10. prepare重新建立完整包事实，并把rename放在scan之前
+
+`preparePackageLI()`从 `args.getCodePath()`重新做完整 `PackageParser2.parsePackage()`，随后验证 dex metadata。上游 `PackageLite`只够位置、base/split和轻量策略；组件、权限、库、完整 Manifest与ABI需要 `ParsedPackage`。若 Session已经提供 `SigningDetails`就注入，否则重新读取签名；这不是 verifier投票的替代，而是包身份链的正式输入。
+
+prepare在破坏性发布前设置多层硬门：instant不能位于外部volume、targetSdk至少O、不能有sharedUserId且签名方案至少v2；testOnly需要 `INSTALL_ALLOW_TEST`；static shared library只能在内部存储。更新还会处理 renamed package、禁止 targetSdk从runtime-permission模型退回旧模型、限制没有 `PackageManager.INSTALL_STAGED` flag的 persistent app更新，并先用upgrade keyset或签名能力检查快速失败。这里检查的是install flag，不是 `origin.staged`。
+
+权限重定义也在这里处理。候选若以不兼容签名重声明其他非 `android`包拥有的permission，会得到 `INSTALL_FAILED_DUPLICATE_PERMISSION`；重声明平台permission则移除候选声明并记录警告。随后replace分支还会再次核对签名、restrict-update hash、sharedUserId与 full/instant转换，说明“前面验过签名”从不等于后续世界无需复核。
+
+`SCAN_NO_DEX`加入 move和普通安装的 scan flags，只表示旧scan路径不要顺手dexopt；它不是“包没有dex”，也不是禁用稍后的 install-time dexopt。Move复用 PackageSetting里的 primary/secondary ABI；File路径调用 `derivePackageAbi()`。
+
+关键时序是：完整parse与策略检查 → ABI/native处理 → `args.doRename()` → fs-verity → 异步启动 App Links验证 → `freezePackageForInstall()` → 构造 `PrepareResult` → scan。也就是说最终形状的随机目录在scan、reconcile和commit之前就可能存在；看到 `/data/app/~~...`只能证明 prepare推进过，不能证明包已经发布。
+
+## 11. native有Session、copy、derive和组末wait四个触点
+
+本版本不能用“三类来源各抽取一次”概括 native。对非 library APK，至少要区分四个触点：
+
+1. PackageInstaller Session激活时调用 `extractNativeLibraries()`；普通文件同步复制，Incremental配置异步抽取；
+2. 非 staged `FileInstallArgs.doCopyApk()`在复制 APK后调用 `copyNativeBinariesWithOverride()`；
+3. `preparePackageLI()`调用 `PackageAbiHelperImpl.derivePackageAbi(..., extractLibs=true)`，实现会再次 `copyNativeBinariesForSupportedAbi()`，同时计算 primary/secondary ABI与最终 native paths；
+4. `executePostCommitSteps()`收集所有 IncrementalStorage，处理完所有包后统一 `waitForNativeBinariesExtraction()`。
+
+普通 Session会经历1和3；当前非 staged File分支会经历2和3；Incremental会在1、3重复配置并在4等待。`MoveInstallArgs`是例外：它搬的是完整已安装世界，prepare直接复用旧 PackageSetting的ABI，不走 File路径的derive。
+
+第3处尤其容易被方法名误导。ABI推导不是纯函数：multiArch分别处理32/64位，普通包按 override或设备ABI选择；只要 `extractLibs`为真就会实际复制或配置 native。更新时若既有 `PackageSetting.cpuAbiOverrideString`非空，它优先于本次 `args.abiOverride`，否则才采用请求值。只有 `AndroidPackageUtils.isLibrary(parsedPackage)`使安装路径传 false，未更新的system包也会在 helper内关闭提取。
+
+错误语义也不是单一 hard fail。multiArch分支显式容忍 `NO_NATIVE_LIBRARIES`与 `INSTALL_FAILED_NO_MATCHING_ABIS`；单ABI分支容忍前者，其余负码才抛 `PackageManagerException`。这些异常到 prepare外层统一映射成 `INSTALL_FAILED_INTERNAL_ERROR`；但 `PackageAbiHelperImpl.derivePackageAbi()`自己的 `IOException` catch只记录日志并继续返回当前ABI/path结果。诊断时要区分“被容忍的无库/不匹配”“helper失败码”“IOException被吞并”和“Incremental异步结果”。
+
+最后的 wait只遍历storage并调用布尔返回的方法，却不检查返回值。因此“wait调用返回”不严格等于“所有抽取都成功”；false不会在这里改写 installResult。只有明确的状态、文件与服务日志合起来，才能判断 native是否可用。
+
+## 12. doRename建立最终路径，但restorecon与IncFS异常暴露两个清理缺口
+
+`FileInstallArgs.doRename()`以当前 `codeFile.getParentFile()`为 targetDir，通过 `getNextCodePath()`选择 `${targetDir}/~~<randomA>/<packageName>-<randomB>`。两段随机值各用16字节随机数做URL-safe Base64；常见内部存储因此呈现 `/data/app/~~.../...`，其他volume应以实际 targetDir为准。
+
+`getNextCodePath()`只挑一个尚不存在的第一层目录，不创建它。`doRename()`先 `makeDirRecursive(parent, 0775)`；普通文件系统用 `Os.rename(before, after)`，Incremental则由 `IncrementalManager.renameCodePath()`创建 permanent bind storage、递归链接文件并解绑旧stage。后者不是字节复制，也不能用普通rename替代。
+
+普通路径rename后才执行 `SELinux.restoreconRecursive(afterCodeFile)`；Incremental在 r48明确跳过这一递归步骤。通过后，代码才把 `codeFile/resourceFile`改成 after path，并重写 `ParsedPackage.codePath/baseCodePath/splitCodePaths`。canonical path失败发生在字段更新之后，因此常规 failure `doPostInstall()`能指向after路径清理。
+
+restorecon失败却发生在字段更新之前：磁盘rename已经成功，`codeFile`仍指旧stage；后续 `cleanUp()`看到旧路径不存在便直接返回，最终随机目录可能遗留。这不是抽象上的可能性，而是本版本字段赋值顺序直接造成的补偿缺口。
+
+Incremental还有不同的异常边界。`renameCodePath()`声明并可能抛 `IllegalArgumentException`，例如旧路径无法打开为 IncrementalStorage；`doRename()`只捕获 `IOException | ErrnoException`。这类未捕获异常不会被正常转换成“rename失败/空间不足”，还可能越过 `doPostInstall()`与结果回程。看到无observer结果且 Handler异常时，应检查这一分支，而不是只搜索 `INSTALL_FAILED_INSUFFICIENT_STORAGE`。
+
+如果普通rename本身失败，刚创建的随机第一层父目录也可能留下；旧stage仍由 failure cleanup处理。文件切换由多步组成，任何“rename是原子操作”的结论都只能描述单次同文件系统 `Os.rename()`，不能覆盖父目录创建、restorecon与模型重写。
+
+### 练习 8：推演普通rename与Incremental永久bind的失败点
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'final File afterCodeFile = getNextCodePath(targetDir, parsedPackage.getPackageName());' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mIncrementalManager.renameCodePath(beforeCodeFile, afterCodeFile);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'Os.rename(beforeCodeFile.getAbsolutePath(), afterCodeFile.getAbsolutePath());' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (!onIncremental && !SELinux.restoreconRecursive(afterCodeFile)) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'codeFile = afterCodeFile;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'parsedPackage.setCodePath(afterCodeFile.getCanonicalPath());' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'String dirName = RANDOM_DIR_PREFIX' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'throw new IllegalArgumentException("Not an Incremental path: " + beforeCodeAbsolute);' frameworks/base/core/java/android/os/incremental/IncrementalManager.java
+```
+
+分别让父目录创建、Os.rename、restorecon、canonical path和IncFS open失败。每例写磁盘上的 before/after、`codeFile`字段、异常类型、是否进入普通failure cleanup，以及可能遗留什么。
+
+## 13. fs-verity、App Links与PackageFreezer都在rename之后，且freezer可以是空壳
+
+rename之后，prepare调用 `setUpFsVerityIfPossible(parsedPackage)`。两个模式都关闭时直接返回；standard模式只在相应 `.fsv_sig`存在且目标尚未启用时设置，所以“没有签名文件”是可选跳过，不是失败。legacy模式只为已有 privileged PackageSetting的 APK候选准备数据。
+
+返回码不能笼统写成内部错误。standard设置时的IOException以及legacy显式失败会在 helper内部抛 `PrepareFailure(INSTALL_FAILED_BAD_SIGNATURE)`；外围只把 `InstallerException/IOException/DigestException/NoSuchAlgorithmException`转换成 `INSTALL_FAILED_INTERNAL_ERROR`。同叫“verity失败”，进入的异常层不同，对外码也不同。
+
+非instant包随后调用 `startIntentFilterVerifications()`。这是 App Links域名默认处理的异步起点，不等待结果，也不是第259章阻塞 copy的 package verifier。它发生在 freezer之前，更不能拿“域名验证已启动”推断候选已经commit。
+
+`freezePackageForInstall()`再保护更新窗口，但有明确例外：install flags带 `INSTALL_DONT_KILL_APP`时返回无目标的 `new PackageFreezer()`，不会把包加入 frozen set，也不会杀旧进程。普通分支才冻结包并把freezer交给 `PackageInstalledInfo`延后关闭。因而“所有更新都由freezer阻止旧进程活动”是过度概括。
+
+prepare成功返回后才进入scan、reconcile与commit。`commitPackagesLocked()`是本链首次可以称为包状态发布的节点；rename、verity、App Links启动与freezer都只是它的前置副作用。commit前普通失败会由 installPackages finally与外层 `doPostInstall(failure)`补偿，但第12节的字段顺序缺口仍需单独对账。
+
+## 14. AppData按installed与用户运行态创建，失败策略不会回滚已commit包
+
+`commitPackagesLocked()`返回并退出 `mLock`后，`executePostCommitSteps()`先为每个包调用 `prepareAppDataAfterInstallLIF()`。此时仍持有 `mInstallLock`。方法先从Settings取 `PackageSetting`并写 kernel mapping，然后遍历 `mUserManager.getUsers(false /*excludeDying*/)`：参数为 false意味着不排除正在移除的用户；实现仍排除partial与pre-created用户。旧结论“只遍历非dying用户”正好相反。
+
+对每个用户还要先满足 `ps.getInstalled(userId)`。目录flags由运行态决定：`isUserUnlockingOrUnlocked()`为true时准备 DE+CE；仅running但未解锁只准备 DE；未运行直接跳过。前一种判断还特意把STOPPING/SHUTDOWN但key仍解锁的用户算作true，也只有这组用户会在内部AppData之后再调用 `StorageManagerInternal.prepareAppDataAfterInstall()`处理外部存储/OBB相关状态。
+
+`prepareAppDataLeafLIF()`计算 appId与 `seInfo + seInfoUser`，通过 `Installer.createAppData(volumeUuid, packageName, userId, flags, appId, seInfo, targetSdk)`进入 installd并取得CE inode。Linux UID只是隔离的一部分，volume、user、DE/CE和SELinux输入共同决定目录语义。
+
+失败是 post-commit best-effort策略。system app首次创建失败会记录critical信息，销毁对应数据后重试；第三方包只记错误，避免擅自wipe用户数据。两类失败都没有把本次 `PackageInstalledInfo.returnCode`改回失败，所以此时包状态可能已成功发布，而某用户数据目录仍有问题。
+
+若请求CE且inode有效，代码把值写回对应user的 PackageSetting；源码只在此处更新内存字段，没有就地展示一次专门的持久化调度。随后还会准备AppData内容。对非system user、系统升级或首次开机，leaf方法内部会以 `updateReferenceProfileContent=false`准备profile；安装主链稍后还会以 true针对安装用户再准备一次。两处触发用户集合和 `updateReferenceProfileContent`参数不同、集合也可能重叠，不能简单去重成一处。
+
+## 15. profile先于条件dexopt，Incremental native wait的布尔结果却被忽略
+
+每个包的 post-commit顺序是：必要时打开 IncrementalStorage → AppData → 可选清 code cache → 仅replace时更新DexManager → `prepareAppProfiles(..., true)` → 条件性layout编译与dexopt → 通知 BackgroundDexOptService和包变化观察者。全部包完成这些步骤后，才对收集到的 IncrementalStorage做组末 native等待。
+
+profile准备无论是否dexopt都会调用，而且先于dexopt；`ArtManagerService.prepareAppProfiles()`对false结果和 `InstallerException`都只记日志，所以这个顺序是优化输入依赖，不是安装成功硬门。install-time dexopt只有三个外层条件同时成立才调用optimizer：包不是instant，或全局开关允许instant优化；包不 debuggable；code path不在 Incremental File System。进入optimizer后，无code包或不需处理的单个路径仍可得到 `DEX_OPT_SKIPPED`。layout预编译还要额外由系统属性开启。dexopt reason是 `REASON_INSTALL`，device restore/setup会再加 restore flag。
+
+代码直接调用 `mPackageDexOptimizer.performDexOpt()`并忽略返回值，旁边注释要求不要因dexopt失败码否决安装。因此编译失败仍可依靠解释执行、JIT或以后后台优化；但这个保证针对正常返回的dexopt结果，不应扩大成“任意未捕获运行时异常都不会影响回程”。成功走到末尾还会通知 BackgroundDexOptService，使更新包从历史编译失败黑名单中重新评估。
+
+Incremental等待也忽略服务返回的 boolean：false不会改安装status。C++实现用带谓词的 `mJobCondition.wait()`，没有超时；只要服务仍running且该mount仍有pending或queued job，它就会在 `mInstallLock`内持续等。更尖锐的边界发生在等待之前：`openStorage(pkg.getCodePath())`返回 null会在 commit之后抛 `IllegalArgumentException`。此时 `installPackagesLI.success`已经是 true，finally不会走失败清理；它甚至仍会为 Incremental+V4发送第259章所述事后 `ACTION_PACKAGE_VERIFIED`。异常随后越过没有 finally保护的 `processInstallRequestsAsync()`，跳过整组 `doPostInstall()`、`restoreAndPostInstall()`与install observer；异常前已处理child的package-change observer却可能已经收到通知。freezer的正常显式关闭路径也被绕过，只能等待其finalizer等更晚的兜底，形成“包已commit、外部结果未交付”的分叉。
+
+这一具体边界也解释了为什么终局诊断必须同时看包表、Settings、code path、Handler异常和observer，不能只等一个 callback。组末wait无超时且仍处于 `mInstallLock`内；某个Incremental native job不结束，就会串行拖住后续安装，即使前面的包已经commit。
+
+### 练习 9：建立post-commit资源与异常矩阵
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'prepareAppDataAfterInstallLIF(pkg);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'flags = StorageManager.FLAG_STORAGE_DE | StorageManager.FLAG_STORAGE_CE;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'flags = StorageManager.FLAG_STORAGE_DE;' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'ceDataInode = mInstaller.createAppData(volumeUuid, packageName, userId, flags,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mArtManagerService.prepareAppProfiles(' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'final boolean performDexopt =' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F '&& !pkg.isDebuggable()' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F '&& (!onIncremental);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mPackageDexOptimizer.performDexOpt(pkg, realPkgSetting,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'NativeLibraryHelper.waitForNativeBinariesExtraction(incrementalStorages);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'throw new IllegalArgumentException(' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+```
+
+手算普通release、debuggable、instant默认、instant开关开启、Incremental五例的 AppData/profile/dexopt/native动作。再分别让 `createAppData`失败、dexopt返回失败、native wait返回false、Incremental openStorage返回null，写出是否已commit、是否改returnCode、是否还能到observer。
+
+## 16. 用证据矩阵定位“有文件、没结果”和“结果成功、资源未齐”
+
+本章最可靠的排障方法不是问“安装到哪一步”，而是逐项回答：
+
+| 证据 | 能证明 | 仍需继续查 |
+|---|---|---|
+| Session seal与stage目录 | 候选字节进入受控区 | `copyApk()`是否接管 |
+| `copyApk` trace/返回码 | 路径准备方法已经返回 | 是否发生字节复制、是否清理失败stage |
+| `/data/app/~~...`或volume对应随机路径 | rename/bind至少部分成功 | restorecon、ParsedPackage重写、scan与commit |
+| prepare/scan/reconcile日志 | 可预测检查推进情况 | `commitPackagesLocked()`是否返回 |
+| Settings/包查询可见 | 包状态已经发布 | post-commit与observer是否完整 |
+| DE/CE目录与seInfo日志 | 某用户AppData状态 | 其他用户、external data、CE inode |
+| profile/dexopt日志 | 优化准备状态 | native异步抽取和公开结果 |
+| Session callback或install observer | 结果回程已交付 | 后台dexopt、以后用户解锁准备 |
+
+失败恢复也应按阶段写：验证或位置失败不调用copy；copy普通返回失败仍走统一结果，但跳过pre/post钩子；prepare、scan或reconcile以状态码正常退出时，外层post钩子清理 File路径或按Move矩阵保源；restorecon失败可能因 `codeFile`仍指旧路径而留下after目录；commit后的未捕获异常则不能再假装“整组从未安装”，还可能截断observer。
+
+九个自检问题可以验证是否真正拆清边界：
+
+1. 为什么 `origin.staged=true`不能证明 `SessionParams.isStaged=true`？
+2. 为什么 `origin.existing=true`仍可能执行 `copyPackage()`？
+3. 为什么当前树中 `fromUntrustedFile()`方法存在却不能算生产入口？
+4. copy失败后为什么 `doPreInstall(failure)`未必运行？
+5. native为何会在 Session、File copy、ABI derive和组末wait四处出现？
+6. 进入 `executePostCommitSteps()`时哪把锁已经释放，又仍持哪把锁？
+7. restorecon失败为何会让cleanup看错路径？
+8. AppData或dexopt失败为什么可能不改已经commit的安装码？
+9. 哪个具体异常能造成“commit成功但install observer没收到结果”？
+
+Android 11 r48之后，PackageManager拆分类、ART Service、Incremental、staging与 `/data/app`布局持续演进。迁移结论时应重新搜索调用点和锁范围，而不是照搬方法名。第261章将沿着replace分支继续追 PackageFreezer、旧进程终止、旧 code path删除与用户数据保留，回答新旧包怎样真正交接。

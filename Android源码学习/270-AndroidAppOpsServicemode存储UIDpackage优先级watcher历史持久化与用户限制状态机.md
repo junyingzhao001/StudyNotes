@@ -1,574 +1,492 @@
-# 270 Android AppOpsService：mode存储、UID/package优先级、watcher、历史持久化与用户限制状态机
+# 270 Android AppOpsService：mode 存储、UID/package 优先级、watcher、历史持久化与用户限制状态机
 
-## 1. 本章目标
+一次 AppOp 返回 `MODE_IGNORED`，可能是保存的 mode 拒绝，也可能是 package suspend、用户限制或 UID 动态能力把它收缩；一个 mode 已经改回默认，磁盘、回调和运行中事件也未必同时收敛。若把 `AppOpsService` 看成一张 `package -> mode` 表，这些现象都会显得矛盾。
 
-第269章从调用者一侧看了PermissionChecker如何把permission与AppOp组合。本章进入`AppOpsService`内部，回答五个更底层的问题：mode究竟存在哪里；UID级与package级规则谁优先；四类watcher各在观察什么；`appops.xml`和history目录分别保存什么；用户限制、应用挂起与foreground mode怎样参与最终裁决。
+全文只讨论本地 `android-11.0.0_r48`，`frameworks/base` 提交为 `1d9b9ab57d844b18b3b1b4297725141e7788109b`。这一版的状态仍集中在 `AppOpsService` 与 `HistoricalRegistry`，还没有后来拆出的独立 checking service。本文会把源码的正常协议与 r48 已存在的实现缺口同时标出来；“接口意图”不能替代“这一版实际执行的分支”。
 
-## 2. 版本与阅读边界
+## 1. 先分开五个状态平面与六个完成点
 
-本文只描述本地`android-11.0.0_r48`。Android 11已有attributionTag、UID state/capability和分层历史，但没有后续版本拆出的独立`AppOpsCheckingService`，也没有多跳`AttributionSource`持续代理链；因此不要拿新版本类名反推本章源码。
+AppOps 至少有五个状态平面：
 
-## 3. 先建立“三本账”模型
+| 平面 | 主要对象或存储 | 回答的问题 |
+|---|---|---|
+| 保存政策 | `UidState.opModes`、package `Op.mode` | UID 或包对 switch op 配了什么 mode |
+| 动态评价 | UID state、capability、widget、suspend、restriction | 这一刻保存政策能否变成允许 |
+| 最近事件 | `AttributedOp` 的 access/reject/in-progress | 各 tag、UID state、flags 最近发生了什么 |
+| 聚合历史 | `HistoricalRegistry` 的 current/pending/disk | 一段时间内发生了多少次、累计多久 |
+| 观察与限制 | 四类 watcher、restriction token | 谁关心变化，谁临时施加额外门禁 |
 
-第一本是“政策账”：UID或package对某个switch op保存的mode。第二本是“最近事件账”：每个attributionTag、UID state和flags组合的最近允许、最近拒绝、持续时长及proxy。第三本是“历史统计账”：按时间区间压缩的访问次数、拒绝次数和累计时长。三者服务不同问题，不能把“允许不允许”和“过去访问过几次”混成一张表。
+它们对应的完成点也不同：setter 返回只表示内存路径走完；异步 mode callback 到达不表示文件已提交；`appops.xml` 提交不表示 history 同步提交；started callback 不表示进入 running；active=true 不表示每个嵌套 start 都各有一条边沿；restriction token 消失也不表示历史证据被清除。
 
-## 4. 当前状态不等于完整历史
+主要源码地图如下：
 
-`appops.xml`虽然也写最近访问/拒绝时间，却只保留每个key的最后事件；`/data/system/appops/history`则保存聚合统计并随时间降低精度。前者适合恢复当前政策和最近证据，后者适合回答某段时间内的次数与时长。
+| 职责 | 文件 |
+|---|---|
+| 当前政策、事件、watcher、restriction | `frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java` |
+| 聚合历史与分层文件 | `frameworks/base/services/core/java/com/android/server/appop/HistoricalRegistry.java` |
+| mode、UID state、历史对象和客户端包装 | `frameworks/base/core/java/android/app/AppOpsManager.java` |
+| Binder 接口 | `frameworks/base/core/java/com/android/internal/app/IAppOpsService.aidl` 及四个 callback AIDL |
+| shared UID permission flag 实体 | `PackageSetting.java`、`PermissionManagerService.java` |
 
-## 5. 本章源码地图
+阅读时先问“正在看哪个平面”，再问“代码已经越过哪个完成点”。同一个 `MODE_ALLOWED` 或同一次 callback，跨平面外推都会制造错误结论。
 
-```text
-frameworks/base/services/core/java/com/android/server/appop/
-  AppOpsService.java
-  HistoricalRegistry.java
-  AudioRestrictionManager.java
-frameworks/base/core/java/android/app/AppOpsManager.java
-frameworks/base/core/java/com/android/internal/app/IAppOpsService.aidl
-frameworks/base/core/java/com/android/internal/app/
-  IAppOpsCallback.aidl
-  IAppOpsActiveCallback.aidl
-  IAppOpsStartedCallback.aidl
-  IAppOpsNotedCallback.aidl
-```
+## 2. 对象树同时容纳政策、最近事件和运行态
 
-## 6. 最外层索引mUidStates
+顶层 `mUidStates` 以完整 Linux UID 为键，user 0 的 appId 10001 与 user 10 的同一 appId 是不同记录。`UidState` 不只是进程前后台状态，它同时保存：
 
-`SparseArray<UidState> mUidStates`以完整Linux UID为key，所以user 0的appId 10001与user 10的同一appId是两条记录。多用户隔离不是在package map末端补一个user字段，而是从顶层UID索引就分开。
+- 已提交与待提交的 UID state、capability、widget 可见性；
+- `opModes`：整个 UID 的显式 mode；
+- `pkgOps`：`packageName -> Ops`；
+- `foregroundOps` 与 `hasForegroundWatchers`：为动态 mode 通知维护的派生缓存。
 
-## 7. UidState不只是进程前后台
+`Ops extends SparseArray<Op>`，绑定 package、所属 `UidState`、restriction bypass 信息和已知 attribution tag。每个 `Op`含一个 package 级 `mode`，再以 `attributionTag -> AttributedOp`保存事件。`AttributedOp`内部有三组容器：
 
-它同时保存`state/pendingState`、`capability/pendingCapability`、widget可见性、package状态`pkgOps`、UID级mode `opModes`，以及foreground watcher的派生信息。名字叫UidState，实际是“某UID所有AppOps政策和运行态的根对象”。
+| 容器 | 键 | 内容 |
+|---|---|---|
+| `mAccessEvents` | `uidState + opFlags` | 每个键最后一次成功访问或完成的 start |
+| `mRejectEvents` | `uidState + opFlags` | 每个键最后一次被记账的拒绝 |
+| `mInProgressEvents` | client Binder | 尚未配平的 start 与嵌套计数 |
 
-## 8. pending状态为何存在
+政策通常先归并到 switch op，事件却记在调用的原始 op 上。于是可以出现“一个开关控制一组细分动作，但每种动作仍分别留下 tag 和 flags 证据”。聚合次数与累计时长不在这棵 current 对象树里，而是送入 `HistoricalRegistry`；UID 的实时 state/capability、watcher 与 restriction 也不会写进 `appops.xml`。
 
-UID从前台降到后台时并非所有变化都立即提交，服务用settle time避免界面短暂切换造成敏感能力抖动。升到更重要状态通常要及时生效，降级则可延迟；所以调试时应同时看current与pending，不能只盯一个procState快照。
+### 练习 1：把三层对象与三组事件容器连起来
 
-## 9. pkgOps与opModes的分工
-
-`UidState.opModes`保存“整个UID”的非默认switch-op mode；`UidState.pkgOps`是`packageName -> Ops`，继续保存包级mode和事件。shared UID内多个包会共享前者，但各自仍可拥有后者和各自的attributionTag。
-
-## 10. Ops对象是什么
-
-`Ops extends SparseArray<Op>`，key是op code；它还绑定packageName、所属UidState、限制绕过属性`bypass`以及manifest已知attributionTag缓存。一个Ops可理解为“某UID下某package的AppOps抽屉”。
-
-## 11. Op对象保存两类内容
-
-每个`Op`既有package级`mode`，又有`attributionTag -> AttributedOp`事件集合。政策通常按switch op读取，事件却按原始op记录；例如多个细分操作可以受同一个总开关控制，但仍分别留下访问痕迹。
-
-## 12. AttributedOp的三组容器
-
-`mAccessEvents`保存最近成功访问，`mRejectEvents`保存最近拒绝，`mInProgressEvents`保存尚未finish的持续操作。前两者按`makeKey(uidState, flags)`索引，运行中事件按客户端Binder token索引，因此同一tag可同时容纳不同调用来源和不同生命周期。
-
-## 13. 三本账与主对象关系图
-
-```mermaid
-flowchart TD
-    UIDMAP["mUidStates：完整UID索引"] --> UIDS["UidState"]
-    UIDS --> UM["opModes：UID级非默认mode"]
-    UIDS --> PKGMAP["pkgOps：package到Ops"]
-    PKGMAP --> OP["Op：包级mode加事件"]
-    OP --> ATTR["AttributedOp：tag维度"]
-    ATTR --> LAST["最近access/reject/in-progress"]
-    LAST --> XML["appops.xml：当前政策与最近事件"]
-    ATTR --> AGG["HistoricalRegistry：次数与累计时长"]
-    AGG --> HIST["history目录：分层压缩历史"]
-```
-
-## 14. switch op是政策归并键
-
-入口先用`AppOpsManager.opToSwitch(code)`把原始op映射到控制它的switch op。`setMode()`、`setUidMode()`和check政策都围绕switch code；note/start仍把原始code写入事件，这就是“一个旋钮控制一组动作，但审计还能区分动作”的实现。
-
-## 15. default mode不是固定ALLOWED
-
-没有显式记录时返回`opToDefaultMode(code)`，不同op的默认值可能不同。`MODE_DEFAULT`又是一个可返回的mode语义，不能一概把“表中没有条目”“默认mode字段”和`MODE_DEFAULT`常量当成同一回事。
-
-## 16. raw检查与evaluated检查
-
-`checkOperationRaw()`要求返回存储政策，`checkOperation()`则对UID运行态求值。raw看到`MODE_FOREGROUND`仍是FOREGROUND；evaluated可能根据widget、pending-top、UID state与capability变成ALLOWED或IGNORED。
-
-## 17. check的第一道门：包解析与身份验证
-
-服务先解析packageName，再用UID/package关系校验。解析失败直接IGNORED；身份不匹配抛出的SecurityException在unchecked层被捕获后返回该op默认mode并记录错误。源码诊断必须区分“策略拒绝”与“包身份本身不可信”。
-
-## 18. 应用挂起比mode更早
-
-`isOpRestrictedDueToSuspend()`先判断目标package是否被suspend；r48的`OPS_RESTRICTED_ON_SUSPEND`包括音频播放、录音和相机等。命中后直接IGNORED，不再让UID/package mode把它放行。
-
-## 19. 用户限制也在mode之前
-
-`isOpRestrictedLocked()`遍历所有restriction token，只要任一客户端对该用户/op设限且package不在例外列表，就返回IGNORED。它是外层强制门，不是写一条package mode，所以reset mode不会清除用户限制。
-
-## 20. UID级mode优先于package级mode
-
-检查顺序非常明确：若`UidState.opModes`存在该switch code，立即使用它；只有UID层没有显式项，才找package的Op mode。shared UID中一个UID mode因此覆盖所有成员包的package差异。
-
-## 21. package项不存在怎么办
-
-`getOpLocked(..., edit=false)`找不到package或op时不创建对象，直接返回op默认mode。只读check本身不会为了“查一次”污染状态；note/start等编辑路径才会建立对象并安排写盘。
-
-## 22. 最小裁决伪代码
-
-```java
-if (suspended || userRestricted) return MODE_IGNORED;
-switchCode = opToSwitch(code);
-if (uidState.opModes contains switchCode) {
-    return raw ? uidMode : uidState.evalMode(code, uidMode);
-}
-Op op = findPackageOpWithoutCreating(switchCode);
-if (op == null) return opToDefaultMode(switchCode);
-return raw ? op.mode : op.evalMode();
-```
-
-注意评价UID mode时传入的是原始`code`，因为不同原始op的foreground capability规则可能不同。
-
-## 23. MODE_FOREGROUND的第一组放行条件
-
-widget可见、AMS认定为pending-top，或UID state达到TOP，都直接ALLOWED。这几条体现“用户正在看见或马上看见该应用”的临时资格，不要求再查location/camera/microphone capability。
-
-## 24. 第一无限制UID状态
-
-若进程不在TOP但仍不劣于`resolveFirstUnrestrictedUidState(op)`，普通op可放行；位置、相机、麦克风则继续要求对应process capability。于是“前台服务”不是天然拥有所有while-in-use能力，进程状态和能力位必须组合判断。
-
-## 25. 三类process capability
-
-位置看`PROCESS_CAPABILITY_FOREGROUND_LOCATION`，相机看FOREGROUND_CAMERA，录音看FOREGROUND_MICROPHONE。能力由AMS/OomAdjuster根据组件、绑定和权限语义传播给UID，AppOps只消费最终位，不自行重新推导组件图。
-
-## 26. MODE_ALLOWED也不总是最终允许
-
-r48对CAMERA和RECORD_AUDIO还有while-in-use保护：即使存储mode是ALLOWED，UID若既非pending-top、也无合适临时allowlist/能力，评价后仍可IGNORED。这是第269章“raw ALLOWED仍可能被挡住”的服务端根源。
-
-## 27. 为什么要保留raw API
-
-设置页、策略同步和preflight常常需要知道“配置是什么”，而不是“这一毫秒进程是否前台”。若只提供evaluated结果，MODE_FOREGROUND在后台会看起来像永久IGNORED，调用方将无法区分可随状态恢复的限制。
-
-## 28. setUidMode的授权边界
-
-同进程调用可通过；profile owner只可更改自己user内目标UID；其他调用者需要`MANAGE_APP_OPS_MODES`。这条授权只允许改mode，不会绕过后续UID/package合法性、用户限制或挂起门。
-
-## 29. setUidMode先归并到switch code
-
-入口先`verifyIncomingOp(code)`，随后`code = opToSwitch(code)`。因此为一组中的任意成员设置UID mode，实际写入同一个switch key；回调时再根据listener flags决定报告switch还是受影响成员。
-
-## 30. UID层只保存非默认项
-
-目标mode等于该switch op默认值时会删除`opModes`条目；整个SparseIntArray空后设为null。这样“恢复默认”不是再存一条default，而是移除覆盖，让下层package mode重新有机会生效。
-
-## 31. previousMode的细节
-
-UID从未建立或`opModes==null`时，`previousMode`记为`MODE_DEFAULT`。但若数组非空而目标key缺失，r48直接调用无默认参数的`SparseIntArray.get(code)`，得到0，也就是`MODE_ALLOWED`；这不一定等于该op真实默认值。还有一个不对称：全新UidState设置默认值会直接return，已有UidState但`opModes==null`时设置默认值虽不写盘，却仍走通知。`previousMode`只是这条实现传给同步消费者的值，不能当可靠的“此前有效mode”查询结果。
-
-## 32. setUidMode为何用普通延迟写
-
-它调用`scheduleWriteLocked()`，默认延迟30分钟；短时间内多次改变可合并。进程内状态立即生效，延迟的只是磁盘持久化，而不是裁决延迟30分钟。
-
-## 33. runtime permission兼容标志联动
-
-非PermissionPolicy回调触发的setUidMode会调用`updatePermissionRevokedCompat()`。它遍历该switch映射的权限，把mode映射到`FLAG_PERMISSION_REVOKED_COMPAT`，帮助legacy授权位与AppOps禁用状态表达一致。
-
-## 34. background permission的特殊映射
-
-有backgroundPermission时，后台权限只在mode为ALLOWED时不标兼容撤销；前台权限在ALLOWED或FOREGROUND时都可保持。因为FOREGROUND表达“前台仍可用、后台不可用”，不能把前后景两层权限一起标成撤销。
-
-## 35. shared UID第一包边界
-
-`updatePermissionRevokedCompat()`取得`getPackagesForUid(uid)`后只选择`packageNames[0]`检查和改flag。UID mode本来覆盖整个shared UID，但兼容permission flag联动只落第一包，是阅读源码时必须记录的实现边界，不能宣称所有成员逐包同步。
-
-## 36. 现代targetSdk不鼓励用mode代替撤权
-
-若支持runtime permission的应用仍持有危险权限，却通过setUidMode制造不一致，源码会警告应真正revoke runtime permission。AppOps可承担兼容策略，却不是现代权限状态的任意替代品。
-
-## 37. UID mode变化怎样通知包
-
-服务查询该UID全部package，把op watcher和各package watcher合并去重，再异步投递。因为UID政策会影响shared UID全部成员，只通知调用时传入的一个包会遗漏真实影响面。
-
-## 38. 同步StorageManager通知
-
-mode变化还调用`StorageManagerInternal.onAppOpsChanged()`。这条LocalServices回调是同步的，与Handler异步mode watcher不同；分析延迟或锁风险时应分别看本地同步消费者和Binder callback消费者。
-
-## 39. setMode是包级覆盖
-
-它同样先验权、校验op并转switch code，然后严格验证UID/package关系并获取restriction bypass属性。身份不匹配会记录`Cannot setMode`并返回，避免给伪造包名创建政策。
-
-## 40. setMode为何快速写盘
-
-包级mode改变调用`scheduleFastWriteLocked()`，固定10秒；若已有普通写任务，会移除并替换为快写。用户在设置界面改变单包权限期望更快持久化，这和访问事件自然合并的30分钟策略不同。
-
-## 41. 包级恢复默认会尝试裁剪
-
-当新mode等于`opToDefaultMode(op.op)`，源码调用`pruneOpLocked()`；只有该Op没有其他有价值事件/运行信息时才真正删除。恢复政策默认不代表必须删除最近访问证据。
-
-## 42. UID层会遮住包层但不删除包层
-
-先有package=IGNORED，再设UID=ALLOWED时，评价使用UID ALLOWED，package记录仍在；删除UID覆盖后，旧package IGNORED重新显现。这种“遮蔽而非覆盖写坏”是排查mode突然恢复时的重要思路。
-
-## 43. resetAllModes不是清空所有数据
-
-它只重置允许reset的UID/package政策，不清最近访问、历史统计、用户restriction或应用suspend状态。方法名容易让人误解为“AppOps恢复出厂”，实际范围只是可重置mode。
-
-## 44. reset先处理user与package范围
-
-`ActivityManager.handleIncomingUser()`规范化目标用户；若指定package，还解析该用户中的UID。随后只扫描匹配范围，避免一个用户的设置重置波及另一个用户同appId的状态。
-
-## 45. opAllowsReset是硬过滤器
-
-不是每个op都允许普通reset。UID `opModes`和package Op都要通过`AppOpsManager.opAllowsReset(code)`才恢复默认；某些包级op还会由`DevicePolicyManagerInternal.supportsResetOp()`接管并延后处理。安全审计时不能仅凭reset调用成功就假定所有特殊策略已经同步消失。
-
-## 46. reset的通知是先收集后投递
-
-服务在锁内收集`ChangeRec(op, uid, pkg, previousMode)`并修改/裁剪，锁外经Handler发送mode回调，再同步通知StorageManager。这样避免在AppOps主锁内执行外部Binder代码。复读还发现一个r48实现缺口：局部变量`changed`只在包级mode被重置时置true；若本次只删除UID级`opModes`，内存和回调会变化，却不会由这次reset安排fast write，必须等待以后别的写任务才落盘。
-
-## 47. 四类watcher先按“问题”区分
-
-mode watcher问“政策或有效资格变了吗”；active watcher问“某持续操作现在是否处于活动”；started watcher问“有人尝试start，结果是什么”；noted watcher问“有人尝试note，结果是什么”。它们不是同一事件的四种名字。
-
-## 48. mode watcher的两个索引
-
-`mOpModeWatchers`按switch op索引，`mPackageModeWatchers`按包名索引，`mModeWatchers`按callback binder保存唯一回调对象。注册可同时指定op和package，通知时集合去重，避免同一callback收到重复消息。
-
-## 49. r48 mode watcher的权限缺口
-
-`startWatchingModeWithFlags()`源码直接写着TODO：应有特权权限保护，但当前没有。它把`watchedUid`初始化为-1，因此不能套用其他三类watcher“无WATCH_APPOPS只看自己UID”的结论；这是Android 11该实现的明确边界。
-
-## 50. OP_NONE与CALL_BACK_ON_SWITCHED_OP
-
-监听OP_NONE表示所有op；默认回调可报告受switch影响的原始op，特定flags则要求以switch op回调。写listener时应先决定消费的是“策略旋钮”还是“具体动作”，否则同一变化会出现意外code。
-
-## 51. WATCH_FOREGROUND_CHANGES
-
-UID state或capability变化可能使MODE_FOREGROUND的有效结果改变，却没有修改存储mode。只有请求该flag的mode watcher才接收这类前后台有效性变化，从而把“配置变更”和“运行态评价变化”区分开。
-
-## 52. active watcher观察边沿
-
-`AttributedOp.started()`仅在整个父Op原先不running时安排`active=true`；`finished()`在最后一个运行中事件消失且父Op不再running时安排`active=false`。它观察0→1和1→0，不为每次嵌套start都重复通知。
-
-## 53. 嵌套start怎样计数
-
-同一clientId重复start会增加`numUnfinishedStarts`；每次finish减一，归零才移除事件、计算持续时长并可能发inactive。一次finish不能结束两次start，客户端死亡则把该token的计数压为1后走统一finish清理。
-
-## 54. started watcher不是active watcher
-
-每次start尝试，无论最后ALLOWED、IGNORED还是其他结果，服务都会安排`opStarted(code, uid, package, result)`。即使被拒且从未进入running，也可被started watcher看到；active watcher则不会发true。
-
-## 55. noted watcher观察瞬时尝试
-
-每次note完成裁决后安排`opNoted(..., result)`，允许和拒绝都报告。它是实时事件通知，不是历史查询；listener掉线期间的旧note应从持久化/历史接口查，而不是期待callback补发。
-
-## 56. watcher语义对照图
-
-```mermaid
-sequenceDiagram
-    participant C as Caller
-    participant A as AppOpsService
-    participant S as StartedWatcher
-    participant V as ActiveWatcher
-    participant N as NotedWatcher
-    participant M as ModeWatcher
-    C->>A: startOperation()
-    A-->>S: opStarted(result)，每次尝试
-    alt 首个成功的持续操作
-        A-->>V: active=true
-    end
-    C->>A: finishOperation()
-    alt 最后一个运行实例结束
-        A-->>V: active=false
-    end
-    C->>A: noteOperation()
-    A-->>N: opNoted(result)，每次尝试
-    C->>A: setMode或有效foreground资格变化
-    A-->>M: opChanged()
-```
-
-## 57. active/started/noted的可见UID限制
-
-这三类注册先检查`WATCH_APPOPS`；没有权限时把`watchedUid`固定为callingUid，有权限才用INVALID_UID观察更广范围。回调分发再次比较目标UID，注册参数本身不能绕过权限扩大视野。
-
-## 58. Binder death自动清理
-
-四类callback对象都linkToDeath；客户端进程死亡会调用对应stopWatching并从索引移除。active/started/noted同一binder下按op保存对象，停止时逐个unlink，避免失效listener长期滞留系统服务。
-
-## 59. 回调为何clearCallingIdentity
-
-通知在system_server内执行，但触发者可能是权限较少的远端进程。源码投递前`Binder.clearCallingIdentity()`，避免同进程消费者在回调中继承触发者身份而意外权限失败；finally恢复身份。
-
-## 60. 回调走Handler的意义
-
-服务在锁内只收集callback集合并发消息，真正Binder调用在Handler上执行。这样既避免外部代码持锁回调，也使状态改变与通知存在短暂时间差；listener收到事件时应重新查询，而不要把回调参数当事务快照。
-
-## 61. async-noted是另一套设施
-
-应用还可收集自己包的`AsyncNotedAppOp`，服务为未转发消息设上限10。它不等于全局noted watcher：前者面向应用侧异步归因消息与丢失缓冲，后者是系统观察者接口。
-
-## 62. current状态文件在哪里
-
-AppOpsService构造时接收storagePath并创建AtomicFile；常规系统路径是`/data/system/appops.xml`。本章在macOS源码机只读代码，不假设本地有设备运行数据，也不尝试生成或修改该文件。
-
-## 63. 两种写盘延迟
-
-`WRITE_DELAY`正常为30分钟；fast write固定10秒。`scheduleWriteLocked()`只在尚未安排时发任务，`scheduleFastWriteLocked()`会移除普通任务并提速。两者都只控制落盘，不改变内存中的即时裁决。
-
-## 64. note/start为何也能安排写盘
-
-`getOpLocked(..., edit=true)`无论是新建还是取到已有Op都会调用`scheduleWriteLocked()`。因此访问/拒绝时间及finish后的duration最终会进入current XML；并非只有setMode才写`appops.xml`。
-
-## 65. AtomicFile保证什么
-
-`startWrite()`写临时版本，成功`finishWrite()`提交，IOException走`failWrite()`恢复备份。它提高单个current文件抗半写能力，但不能让`appops.xml`与独立history目录跨文件原子提交。
-
-## 66. writeState先做快照
-
-它调用`getPackagesForOps(null)`取得package/event快照，再在主锁内克隆各UID的`opModes`，随后锁外序列化。这样减少长时间持有AppOps主锁，但两次快照并非同一个全局原子时刻。
-
-## 67. UID级XML结构
-
-根为`<app-ops v="1">`；顶层`<uid n="...">`内每个`<op n="..." m="...">`代表UID级非默认mode。因为内存只存非默认项，XML无需为每个UID写完整op矩阵。
-
-## 68. package级XML结构
-
-`<pkg n="包名">`下可有多个`<uid n="完整UID">`，再下是`<op n="code" [m="mode"]>`。package mode等于该op默认值时省略`m`，但只要还有事件，Op节点仍可存在。
-
-## 69. st节点如何编码维度
-
-每个`<st>`的`id`是attributionTag，`n`是UID state与op flags组合key，`t`最近允许时间，`r`最近拒绝时间，`d`最近持续时长。`pp/pc/pu`分别保存proxy包、proxy attributionTag与proxy UID。
-
-## 70. 拒绝事件不保存proxy
-
-源码明确注释“Proxy information for rejections is not backed up”。内存拒绝事件也用null proxy，因此重启后不能从current XML还原“谁代理了一次被拒访问”；诊断报告要坦白这个信息缺口。
-
-## 71. 零值事件会被跳过
-
-若accessTime、rejectTime、duration都无有效值且proxy为空，writer不输出st。duration只在大于0时写；极短持续操作可能有access/start证据，但不能据XML缺少`d`断言从未持续运行。
-
-## 72. 正在运行的操作怎样快照
-
-查询OpEntry时，运行中事件会按start到当前elapsed时间形成可读duration快照，但内存中的正式完成记录仍要等finish。写盘只是一刻的观察，不替客户端完成协议；重启也不会让旧Binder token继续running。
-
-## 73. readState的锁顺序
-
-读取先锁`mFile`再锁AppOpsService，并在解析前清空`mUidStates`。其他涉及current文件的路径应保持相同顺序，避免文件锁与服务锁反向造成死锁。
-
-## 74. 解析失败是全量回退为空
-
-无论IllegalStateException、数字/XML/IO错误或越界，只要未成功，finally都会再次`mUidStates.clear()`。r48不保留“前半段成功记录”；坏文件的后果是本次内存current state整体为空，而AtomicFile备份只处理写入中断场景。
-
-## 75. current XML版本升级
-
-`CURRENT_VERSION=1`。旧文件无version时，升级把RUN_IN_BACKGROUND的非默认UID/package mode复制给RUN_ANY_IN_BACKGROUND，然后安排fast write；这是迁移政策，不是复制所有事件。
-
-## 76. readUidOps调用setUidMode的微妙处
-
-读取顶层UID项没有直接put，而是调用公开逻辑`setUidMode()`。system_server同进程可通过授权，早期启动PackageManager可能为null而跳过兼容联动；调用仍可能安排写盘、评价foreground并触发内部通知。不要把readState想成完全无副作用的纯反序列化。
-
-## 77. 最近事件为何不是统计次数
-
-`AttributedOp.accessed()`对同一key用`reinit()`覆盖旧NoteOpEvent，所以current容器只保留最后一次。次数另送HistoricalRegistry递增；只解析`appops.xml`无法还原一天访问了100次还是1次。
-
-## 78. HistoricalRegistry的目录边界
-
-长期历史使用`AtomicDirectory`管理`/data/system/appops/history`，与current AtomicFile分离。一个目录内可原子切换版本集合，但仍无法与current文件形成跨两套存储的共同事务。
-
-## 79. 默认历史参数
-
-r48默认模式是`HISTORICAL_MODE_ENABLED_ACTIVE`，基础快照间隔15分钟，压缩倍率10。Settings.Global的`APPOP_HISTORY_PARAMETERS`可同时设置mode、base interval和multiplier；三项不完整或格式错误不会按半套参数生效。
-
-## 80. 为什么到systemReady才初始化
-
-构造阶段SettingsProvider尚未可靠可用。`systemReady(ContentResolver)`注册全局设置观察者、读取参数，并初始化Persistence；在此之前若收到采集调用，源码记录“Interaction before persistence initialized”并返回。
-
-## 81. ACTIVE模式的准确含义
-
-正常note/start/finish会自动调用`incrementOpAccessedCount()`、`incrementOpRejected()`和`increaseOpAccessDuration()`。三者只有在mode等于ACTIVE时修改当前历史批次，因此ACTIVE才是完整开启自动采集。
-
-## 82. PASSIVE不是低频采集
-
-PASSIVE保留历史API和持久化能力，却不自动记录应用实际AppOp；内容只能经专用`addHistoricalOps()`等接口注入，主要用于测试。把它解释成“仍采集但更省电”是错误的。
-
-## 83. DISABLED会做什么
-
-切换到DISABLED时`setHistoryParameters()`调用`clearHistoryOnDiskDLocked()`；查询API也视为关闭。它不只是停止未来采集，还清除磁盘历史，因此调试设备上改变此参数是有损操作，本章只读练习不会执行。
-
-## 84. 历史的内存当前批次
-
-HistoricalRegistry维护一个正在增长的`HistoricalOps`及`mNextPersistDueTimeMillis`。到基础区间边界后，旧批次进入pending writes，新批次从下一窗口开始，后台线程再持久化；调用线程不直接同步写整个历史目录。
-
-## 85. access、reject与duration分别记账
-
-一次允许note增加access count；一次拒绝增加reject count；成功start也先增加access count，finish再把elapsed duration累加。次数与时长是不同指标，持续30分钟的单次相机访问不是1800次访问。
-
-## 86. wall clock与elapsed time分工
-
-事件展示需要wall clock，持续时间用elapsedRealtime避免手动改时间造成负duration。HistoricalRegistry还比较上次持久化wall time并记录offset，用于系统重启或时钟变化后的时间轴调整。
-
-## 87. 时间回拨怎样处理
-
-若时间轴需要负向偏移，历史会整体offset并裁剪落在“未来”的记录。它尽量保持时间区间可查询，但无法凭空恢复用户改时钟前的绝对真实时间；审计时应结合系统time-change证据。
-
-## 88. 分层压缩的直觉
-
-越近的数据使用基础15分钟粒度，越旧的层级覆盖区间按倍率10扩大。目标是长期保留趋势而不是永久保留每个精细窗口；注释称历史可长期保存，但fidelity会随年龄降低。
-
-## 89. 历史层级里的业务维度
-
-每个时间片继续按UID→package→attributionTag→op→`uidState+flags`聚合，并保存access count、reject count和duration。时间压缩会合并相邻窗口，但不会故意抹掉这些身份维度。
-
-## 90. 查询为何要合并三处
-
-查询区间可能横跨当前内存批次、尚未写盘队列和磁盘层级。HistoricalRegistry分别过滤后合并，并把内部相对时间重基准到epoch返回；只读磁盘文件会漏掉最新尚未落盘部分。
-
-## 91. 历史锁顺序
-
-涉及磁盘时先拿`mOnDiskLock`再拿`mInMemoryLock`；共享服务状态时还要遵守AppOps锁关系。源码注释与嵌套synchronized是理解死锁风险的关键，不能随意在回调里反向获取这些锁。
-
-## 92. 历史参数改变会重采样
-
-base interval或compression multiplier改变会新建Persistence并调用resample，将旧数据对齐到新时间层级。重采样可能降低精细度，不是简单改两个字段后原文件原样继续。
-
-## 93. clearHistory的两个范围
-
-无参`clearHistory()`清磁盘、pending和当前批次并重置调度时间；`clearHistory(uid, package)`只清目标身份，但r48仅在ACTIVE模式执行该局部清理。调用API前应确认mode，否则“成功返回”不代表局部数据真被删。
-
-## 94. 历史损坏的恢复取舍
-
-持久化读取异常时实现倾向于丢弃/清理不可用历史，保证服务继续工作。历史是审计辅助而非权限裁决的唯一真相；坏history不应让AppOps mode检查停止，但会造成统计证据缺口。
-
-## 95. 用户限制由token持有
-
-`mOpUserRestrictions`以客户端Binder token映射`ClientRestrictionState`。一个客户端可为多个user和多个op设限，并给每个user配置excludedPackages；多个token的限制是“任一命中就拒绝”。
-
-## 96. USER_ALL如何展开
-
-设置USER_ALL时，源码读取当前live users并逐个写入boolean数组，并不是存一个永远自动覆盖未来用户的通配符。之后新建用户是否继承，要看上层策略是否再次下发，不能仅从旧token状态推断。
-
-## 97. 例外包只绕过对应token
-
-`hasRestriction()`先确认该user/op为true，再判断package是否位于该token该user的excludedPackages。若另一个token没有排除它，另一条限制仍会拒绝；例外列表不是全局白名单。
-
-## 98. restriction默认态会裁剪
-
-取消最后一个true后删除该user数组；所有user均空时状态成为default并可从全局map移除。excludedPackages只在restriction存在时有意义，取消限制会同步清理无效例外容器。
-
-## 99. token死亡会撤销限制并通知
-
-ClientRestrictionState linkToDeath。binderDied时从map移除token，对它曾限制的每个op安排`notifyWatchersOfChange(code, UID_ANY)`，再unlink；这样临时策略客户端崩溃不会留下永久幽灵限制。
-
-## 100. 设置用户限制需要什么权限
-
-外部`setUserRestriction()`要求`MANAGE_APP_OPS_RESTRICTIONS`。跨用户时r48接受`INTERACT_ACROSS_USERS_FULL`或`INTERACT_ACROSS_USERS`任一权限；这和某些只接受FULL的服务不同，必须按当前源码写。
-
-## 101. Bundle批量接口更严格
-
-`setUserRestrictions(Bundle, token, userHandle)`只允许system UID，并把系统user restriction键通过`opToRestriction()`映射到各AppOp。它服务系统政策批量桥接，不是普通管理App可随意提交Bundle的快捷入口。
-
-## 102. removeUser的清理面
-
-仅system UID可调用。它从所有ClientRestrictionState删除该user的限制/例外，并删除`mUidStates`中属于该user的UID状态；用户移除后不应留下同appId旧政策被未来用户复用。
-
-## 103. system bypass不是“系统永远不受限”
-
-`opAllowSystemBypassRestriction(code)`为少数op返回条件，随后还要求目标package的`RestrictionBypass`属性匹配，例如双方均privileged，或满足录音限制特例。仅凭UID看起来像system并不会无条件穿透所有restriction。
-
-## 104. suspend、restriction、mode三者生命周期不同
-
-suspend来自PackageManager包状态；restriction来自带死亡生命周期的政策token；mode来自AppOps current持久化。它们都可导致IGNORED，却有不同设置者、持久化位置与清理入口，排障必须先找拒绝来自哪一层。
-
-## 105. 从setMode到回调的完整时序
-
-调用者通过授权与包校验后，服务写内存package mode、重算foreground watcher信息、必要时裁剪、安排10秒写盘；锁外再发异步mode callbacks，并同步通知StorageManager。回调先到还是文件先落盘没有绝对保证，消费者应查询服务状态而非直接读XML。
-
-## 106. 从note到两本事件账
-
-note先用switch政策与当前UID state裁决，然后把结果写入原始op的AttributedOp：允许覆盖最近access并增加历史access count，拒绝覆盖最近reject并增加历史reject count；最后发noted watcher。current是“最后一次”，history是“累计”。
-
-## 107. 从start到finish的完整账
-
-成功start建立clientId对应InProgressStartOpEvent、增加访问次数，并在父Op首次运行时发active=true；finish归零后用elapsed计算duration，写最近完成事件、累加历史时长，并在父Op最后停止时发active=false。started watcher则在每次尝试后都收到result。
-
-## 108. 状态、事件、持久化时序图
-
-```mermaid
-flowchart LR
-    CALL["check/note/start"] --> GATE["suspend与user restriction"]
-    GATE --> POLICY["UID mode优先，否则package/default"]
-    POLICY --> EVAL["UID state与capability评价"]
-    EVAL --> RESULT["ALLOWED/IGNORED/其他结果"]
-    RESULT --> LAST["AttributedOp最近事件或in-progress"]
-    RESULT --> WATCH["noted/started/active回调"]
-    LAST --> DELAY["普通30分钟写调度"]
-    DELAY --> XML["AtomicFile appops.xml"]
-    LAST --> AGG["HistoricalRegistry聚合"]
-    AGG --> BG["BackgroundThread分层写入"]
-    BG --> DIR["AtomicDirectory history"]
-```
-
-## 109. 一份拒绝排查顺序
-
-先验证UID/package与原始op；再查包是否suspend；再查user restriction及例外/bypass；再查switch op的UID mode；UID层无项才查package/default；最后看raw mode是否被UID state、pending-top、widget与capability评价成IGNORED。按此顺序才能对应真实早返回。
-
-## 110. 一份“回调没来”排查顺序
-
-先确认注册的是mode、active、started还是noted；再看op code是否原始/switch匹配、是否缺`WATCH_APPOPS`而被限到callingUid；active还要确认是否真的发生0↔1边沿；最后查callback Binder是否死亡及Handler是否拥堵。
-
-## 111. 本章只读验证清单
-
-读完应能手画`mUidStates -> UidState -> Ops -> Op -> AttributedOp`；能解释UID mode为何遮蔽package mode；能区分四类watcher；能说清current XML与history目录；能按suspend→restriction→UID/package mode→UID state顺序推演结果。
-
-## 112. macOS只读练习一：追mode优先级
+先只定位字段，不追调用。手画 `mUidStates -> UidState -> pkgOps -> Ops -> Op -> AttributedOp`，再把 UID mode、package mode、recent event 与 pending history 放到正确节点。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '2880,2960p' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
-sed -n '500,575p' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'final SparseArray<UidState> mUidStates = new SparseArray<>();' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'public ArrayMap<String, Ops> pkgOps;' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'public SparseIntArray opModes;' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'final ArrayMap<String, AttributedOp> mAttributions = new ArrayMap<>(1);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'private @Nullable LongSparseArray<NoteOpEvent> mAccessEvents;' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'private @Nullable LongSparseArray<NoteOpEvent> mRejectEvents;' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'private @Nullable ArrayMap<IBinder, InProgressStartOpEvent> mInProgressEvents;' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'private @NonNull LinkedList<HistoricalOps> mPendingWrites = new LinkedList<>();' frameworks/base/services/core/java/com/android/server/appop/HistoricalRegistry.java
 ```
 
-用纸写出五个早返回：包解析失败、suspend、user restriction、UID mode、package/default；再标出raw与evaluated从哪一行分叉。不要修改源码，也不需要编译。
+## 3. check、note 与 start 不是同一条裁决流水线
 
-## 113. macOS只读练习二：对照四类watcher
+三类入口共享一些结构，却有不同的早返回、动态求值和副作用。最可靠的对照是：
+
+| 阶段 | `checkOperation` | `noteOperation` | `startOperation` |
+|---|---|---|---|
+| package 解析失败 | 返回 IGNORED | 返回 IGNORED，无 noted callback | 返回 IGNORED，无 started callback |
+| UID/package 校验失败 | 捕获后返回 op 默认 mode | 返回 ERRORED，无 noted callback | 返回 ERRORED，无 started callback |
+| package suspend | 对指定的一组 op 返回 IGNORED | 没有这道显式检查 | 没有这道显式检查 |
+| user restriction | 返回 IGNORED | callback 报 IGNORED，但不写 reject | callback 报 IGNORED，但不写 reject |
+| mode 拒绝 | 只返回结果 | 写 recent/history reject 并发 noted | 写 recent/history reject 并发 started |
+| mode 允许 | 只返回结果 | 写瞬时 access 并发 noted | 发 started，建立 in-progress，首个实例再发 active |
+
+因此 check 不建事件、不增加历史、不触发 noted/started/active。note/start 也不是“所有尝试均可观察”：包解析、身份失败，以及 start 的 hotword 前置失败都在事件 watcher 之前返回。更细的一个 r48 不一致是：`getOpsLocked()`失败时 noted/started callback 被安排为 IGNORED，方法返回值却是 ERRORED。
+
+switch code 的使用也不完全相同：
+
+- check 在读取 UID/package policy 前直接把局部 `code`替换为 switch code，所以两层动态求值都看 switch code；
+- note/start 保留原始 `code`，UID 覆盖分支用原始 code 求值，package 分支则对 switch `Op`求值；
+- restriction 在三条路径中都用原始 code；suspend 也在 check 归并 switch 前看原始 code。
+
+对 r48 当前 op 表，这种差别经常落到相同能力族，但它仍是不能抹平的实现边界。维护或移植时，不应写一份抽象伪代码替代三条真实路径。
+
+`checkOperationRaw()`也只跳过 `evalMode()`，并不跳过 package 解析、身份校验、suspend 或 user restriction。身份不匹配还会回落 op 默认 mode，所以 raw API 不是身份认证接口。缺少显式 `Op`时直接返回默认值，也不会再经过 CAMERA/MIC 对 ALLOWED 的特殊动态收缩。
+
+root UID 是包校验规则的特例：`resolvePackageName()`把它规范成 `"root"`，`verifyAndGetBypass()`也直接返回 unrestricted bypass，不走普通 package/UID 归属核对。因而上表描述的是普通应用身份失败路径，不能外推成所有 UID 都使用同一 package 校验。
+
+### 练习 2：逐行证明三条路径的分叉
+
+把下列命中按 check、note、start 三列排列。特别标出 suspend 的唯一调用点、restriction 与创建 `AttributedOp`的相对位置，以及 check 何时覆盖局部 `code`。
 
 ```bash
-cd /Users/ninebot/androidSource
-rg -n "startWatchingMode|startWatchingActive|startWatchingStarted|startWatchingNoted|scheduleOpActiveChanged|scheduleOpStarted|scheduleOpNoted" \
-  frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'return checkOperationInternal(code, uid, packageName, false /*raw*/);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'if (isOpRestrictedDueToSuspend(code, packageName, uid)) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'code = AppOpsManager.opToSwitch(code);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'return raw ? op.mode : op.evalMode();' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'private int noteOperationImpl(int code, int uid, @Nullable String packageName,' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'final int switchCode = AppOpsManager.opToSwitch(code);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'public int startOperation(IBinder clientId, int code, int uid, String packageName,' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'scheduleOpStartedIfNeededLocked(code, uid, packageName, AppOpsManager.MODE_ALLOWED);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'scheduleOpNotedIfNeededLocked(code, uid, packageName, AppOpsManager.MODE_ALLOWED);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
 ```
 
-做一张四列表：触发条件、是否报告拒绝、是否只报0↔1边沿、无`WATCH_APPOPS`时的UID范围。特别圈出mode watcher源码TODO，避免把其他三类规则复制过去。
+## 4. UID 覆盖优先，FOREGROUND 与部分 ALLOWED 还要动态求值
 
-## 114. macOS只读练习三：读current XML协议
+只要 `UidState.opModes`含该 switch key，UID 层就遮蔽 package 层；删除 UID 覆盖后，原有 package mode 才重新显现。遮蔽不会删除 package 记录。若两层都没有显式项，则使用 `opToDefaultMode()`。
+
+这里有三个容易混为一谈的“默认”：表中没有 key、某个 op 的 `opToDefaultMode(op)`、常量 `MODE_DEFAULT`。setter 只在目标 mode 等于该 op 的真实默认值时删除覆盖；若某 op 的真实默认不是 `MODE_DEFAULT`，显式设置 `MODE_DEFAULT`反而会留下一个优先级很高的 UID/package 记录，不能自动回落下层。
+
+UID state 数值越小越重要。从更差状态升到更重要状态会立即提交；跨入可能前台的边界也立即提交；同一 state 但 capability 改变同样立即提交。向更差状态移动则按来源状态使用 settle time，r48 默认 TOP 5 秒、foreground-service 5 秒、background 1 秒，避免短暂切换造成能力抖动。
+
+`MODE_FOREGROUND`的评价顺序是：widget 可见、pending-top、state 不差于 TOP可直接 ALLOWED；否则若 state 仍处在该 op 的首个不受限范围，位置、相机、录音还要各自 capability，其他 op 可 ALLOWED；再差则 IGNORED。
+
+`MODE_ALLOWED`也不是所有 op 的恒等返回。CAMERA 与 RECORD_AUDIO 仍要求 pending-top、临时 while-in-use allowlist 或对应 capability，缺少时收缩为 IGNORED。普通 op 的 ALLOWED 才原样返回。这个动态结果既会随 UID 状态改变，也可能因 check/package 默认早返回而根本没有经过同一段评价代码。
+
+运行中的 `AttributedOp`在 UID state 改变时会内部执行一次不触发 active 边沿的 finish/start，把累计 duration 切到旧 state，再在新 state 下继续。这意味着 historical access count 不是“业务 API 调用次数”的绝对同义词：一次长会话跨 UID state，内部重段也会再次增加 access count。
+
+## 5. setUidMode 的状态转移、兼容 permission flag 与通知边界
+
+`setUidMode()`先执行管理授权、校验 op、归并 switch code。它不接收 package，也不调用 `verifyIncomingUid()`；只要调用者通过 `enforceManageAppOpsModes()`，就可直接为目标 UID 创建 `UidState`。同进程调用直接通过，当前 user 的 profile owner 可改本 user 的目标 UID，其余调用者需要 `MANAGE_APP_OPS_MODES`。
+
+非 PermissionPolicy 内部回调发起时，方法在进入 AppOps 主锁前先执行 `updatePermissionRevokedCompat()`。这带来两个结论：
+
+1. 后面即使发现相同 mode 并提前返回，兼容 permission flag 联动也已经执行；
+2. permission flag 更新与 AppOps mode 写入不是同一把锁保护的事务。
+
+兼容 flag 步骤完成后，UID mode 的 AppOps 侧核心分支如下：
+
+| 旧状态 | 目标状态 | r48 行为 |
+|---|---|---|
+| 无 `UidState` | op 真实默认 | 直接返回，不通知、不安排写 |
+| 无 `UidState` | 非默认 | 创建 root 与 `opModes`，普通延迟写 |
+| 有 root、`opModes == null` | 真实默认 | 不写盘，但仍重算并通知 |
+| `opModes`已有同 key 同值 | 任意 | 直接返回 |
+| 数组非空但缺该 key | 任意 | `previousMode = get(code)`得到整数 0，即 MODE_ALLOWED |
+| 有显式 key | 恢复真实默认 | 删除 key；数组空后置 null，普通延迟写 |
+
+最后一种“缺 key 时 previous=0”不是此前有效策略的可靠描述；如果 op 的默认值不是 ALLOWED，传给 `StorageManagerInternal`的 previous 值尤其会失真。
+
+兼容 permission 联动遍历该 switch 控制的权限，只处理当前已授予的 runtime permission。存在 background permission 时，FOREGROUND 会把后台权限标为 compat-revoked、保留前台权限；现代 targetSdk 只会触发“不应以 mode 代替真正 revoke”的警告，代码仍继续更新 flag。
+
+源码确实把 `getPackagesForUid(uid)[0]`作为 PackageManager API 的 package 参数，但不能据此得出“shared UID 只有第一个包收到 flag”。`PackageSetting.getPermissionsState()`在 shared UID 下返回共同的 `SharedUserSetting` permission state，更新的是共享实体；第一个包主要承担调用参数、请求权限查找与通知归因角色。
+
+内存处理后，服务为 UID 的全部 package 合并 op/package watcher 并异步通知，再同步调用 `StorageManagerInternal.onAppOpsChanged(code, uid, null, mode, previousMode)`。异步观察者和同步本地消费者不是一个完成点。
+
+### 练习 3：对照两个 setter 的写盘与 previousMode
+
+为 UID setter 和 package setter 各画一个“无 root、空数组、缺 key、同值、改值、恢复默认”表。再沿 shared UID permission state 确认“第一包参数”不等于“第一包私有 flag”。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '4097,4485p' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
-rg -n 'out\.attribute\(null, "(v|n|m|id|t|r|d|pp|pc|pu)"' \
-  frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private void setUidMode(int code, int uid, int mode,' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'previousMode = uidState.opModes.get(code);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'private void updatePermissionRevokedCompat(int uid, int switchCode, int mode) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'String packageName = packageNames[0];' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'return (sharedUser != null)' frameworks/base/services/core/java/com/android/server/pm/PackageSetting.java
+grep -n -F '? sharedUser.getPermissionsState()' frameworks/base/services/core/java/com/android/server/pm/PackageSetting.java
+grep -n -F 'private void setMode(int code, int uid, @NonNull String packageName, int mode,' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'scheduleFastWriteLocked();' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'notifyOpChangedSync(code, uid, packageName, mode, previousMode);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
 ```
 
-手写一个最小XML树，分别放一条UID mode、一条package mode和一条带tag的最近访问。只根据writer/read方法解释字段，不在Mac上伪造设备`/data/system`文件。
+## 6. setMode 的 no-op、fast write 与 running-only prune 陷阱
 
-## 115. macOS只读练习四：核对历史三种模式
+`setMode()`也先授权、校验并归并 switch code。普通 UID 必须通过 `verifyAndGetBypass(uid, packageName, null)`确认 UID/package 关系，失败只记录并返回；root UID 为兼容旧行为会跳过 packageName 校验，因而不能把这一步当作 root 输入的真实性证明。进入锁后，它先取旧 `UidState`引用，再用 `getOpLocked(..., edit=true)`找或创建 package `Op`。
+
+“edit=true”本身就会调用 `scheduleWriteLocked()`，无论 Op 是新建还是已存在；只有当前尚无已安排写任务时，它才新发一个 30 分钟 runner。因此 no-op 并非无副作用：
+
+- 对一个从未存在的 package/op 设置其真实默认值，会创建空 `Ops/Op`并请求普通写；因为 mode 没变化，代码不会进入 prune；
+- 对已有相同非默认 mode 再设置一次，也会请求普通写；
+- mode 相等分支本身不安排 mode-change callback，却仍无条件同步通知 StorageManager；局部 `previousMode`没有在 no-op 中更新，仍是 `MODE_DEFAULT`。不过前置 `getUidStateLocked(uid, false)`可能顺带提交已到期的 pending UID state并安排 foreground callback，不能据“setter 参数同值”断言整个调用绝无异步通知。
+
+真正发生 mode 改变时才会重算 foreground 缓存、收集 op 与 package watcher、安排 10 秒 fast write。这里还有一个顺序边界：局部 `uidState`在 `getOpLocked(edit=true)`之前取得；若 root 原先不存在，后者新建 root，但局部变量仍为 null，本次首次写入即便是 FOREGROUND也不会调用 `evalForegroundOps()`。
+
+恢复真实默认时会调用 `pruneOpLocked()`，但“有价值事件”的判断只看 access/reject：`AttributedOp.hasAnyTime()`完全不看 `mInProgressEvents`。所以一个刚 start、尚无已完成 access/reject 的 running-only attribution 可被删除，父 `Op`甚至可从 map 裁掉。之后按 UID/package/tag 执行显式 finish 可能找到新建的另一个 Op，却找不到旧 attribution；running 查询和 active 边沿也可能失配。旧对象可因 client death recipient 暂时存活，但这不是可依赖的完成协议。
+
+UID mode 只遮蔽 package mode，不会阻止上述 package 记录被创建或裁剪。排查 setter 时应分别记录“有效结果是否改变”“存储对象是否改变”“是否安排普通/快速写”“哪类 callback 被触发”。
+
+## 7. resetAllModes 的名字比实际范围更宽，参数约束却比想象更窄
+
+正常意图是把允许 reset 的 UID/package mode 恢复到各自真实默认值。它不清 recent event、不清 historical count、不撤销 restriction token，也不解除 package suspend。package `Op`恢复默认后只移除没有 access/reject 的 attribution；这也继承了 running-only prune 问题。
+
+package 分支会按 `reqUserId`和 `reqPackageName`过滤，并对 `opAllowsReset()`为真、当前非默认的记录改值。若 `DevicePolicyManagerInternal.supportsResetOp(op)`为真，代码直接同步调用 `dpmi.resetOp(op, reqPackageName, reqUserId)`并跳过本地处理；“defer”只是方法名，不代表异步排队，而且判断发生在本地 mode 是否非默认之前。
+
+UID 分支在 r48 有四个必须单独记录的缺口：
+
+| 缺口 | 直接后果 |
+|---|---|
+| 只判断 `uid == reqUid || reqUid == -1`，不判断 `reqUserId` | `resetAllModes(user10, null)`可清所有用户的可重置 UID mode |
+| 指定不存在的 package 时 UID 查询仍保留 `reqUid == -1` | 看似单包 reset 可退化成全 UID-mode 扫描 |
+| 删除 UID key 不把 `changed`或`uidChanged`置 true | 仅 UID 变化时不安排 fast write，也不重算 foreground 缓存 |
+| `pkgOps == null`后直接 continue | 删除最后一个 UID mode 后，空 `UidState`可留在内存 |
+
+若同一次 reset 还改了任一 package mode，`changed=true`会让完整 current 快照最终包含 UID 删除；但这只是搭便车，不能补成 UID 分支自己的持久化保证。
+
+通知也有边界。锁内收集 ChangeRec，锁外先把 Handler 消息入队，再同步通知 StorageManager。`addChange()`判重只比较 op 与 package，不比较 UID；`USER_ALL`场景中不同用户的同名 package 可被错误合并，后一个 UID 的 callback/同步通知记录可能消失。
+
+### 练习 4：用三个输入证明 reset 的范围漏洞
+
+分别推演 `(user10, null)`、`(user10, 存在包)`、`(user10, 不存在包)`。在纸上给 UID-mode 循环和 package-mode 循环各标一次过滤条件，不要用方法入口的参数名替代循环内条件。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '300,350p' frameworks/base/core/java/android/app/AppOpsManager.java
-sed -n '440,545p' frameworks/base/services/core/java/com/android/server/appop/HistoricalRegistry.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'public void resetAllModes(int reqUserId, String reqPackageName) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'int reqUid = -1;' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'if (opModes != null && (uidState.uid == reqUid || reqUid == -1)) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'if (reqUserId != UserHandle.USER_ALL' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'if (AppOpsManager.opAllowsReset(code)) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'if (shouldDeferResetOpToDpm(curOp.op)) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'if (changed) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'if (report.op == op && report.pkg.equals(packageName)) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
 ```
 
-逐字总结ACTIVE、PASSIVE、DISABLED：谁自动采集、谁只允许显式注入、谁清磁盘。再追access count、reject count、duration三个入口，确认它们都只在ACTIVE执行。
+## 8. mode watcher 的两个索引是并集，不是 `(op, package)`交集
 
-## 116. 易混点一：mode变化不等于访问发生
+mode watcher 有三张表：binder 到唯一 `ModeCallback`、switch op 到 callback 集合、package 到 callback 集合。注册同时给出 op 与 package 时，同一对象被放进两种索引；通知端从命中的集合取并集。因此它表达的是“这个 op 在任意包变化，或这个包的任意受索引变化”，不是只观察这个精确二元组。
 
-mode watcher收到的是政策或有效foreground资格变化；noted/started/active才描述操作尝试或运行边沿。设置页改成IGNORED可以触发mode callback，却不应伪造一次reject历史；一次被拒note会写reject并发noted callback，却未必改变mode。
+组合的实际可达性如下：
 
-## 117. 易混点二：XML有时间不等于XML有完整历史
+| 注册参数 | 加入的索引 | 可收到什么 |
+|---|---|---|
+| 具体 op，package null | switch-op 索引 | 该 switch 的变化，跨 package |
+| `OP_NONE`，具体 package | package 索引 | 该 package 经 setter/reset 进入此索引的变化 |
+| 具体 op，具体 package | 两个索引 | 两类事件的并集，通知集合再去重 |
+| `OP_NONE`，package null | 无分发索引 | binder 表里有对象，但没有通知来源 |
 
-`appops.xml`的`t/r/d`是每个维度最后事件；HistoricalRegistry才有次数与累计时长。两边写盘节奏、原子边界也不同，文件内容暂时不一致是可能的，不能用单文件做跨账本强一致证明。
+没有 `CALL_BACK_ON_SWITCHED_OP`时，具体 op watcher 记住原始 op；`OP_NONE`记为 `ALL_OPS`，通知时把变化的 switch 展开成受控成员。带该 flag 时记住 switch op；`OP_NONE`则在 callback 时只回传触发的 code。这里的“all”只有 package 索引提供触发源，不能把 `OP_NONE + null`理解成全局订阅。
 
-## 118. 易混点三：FOREGROUND不是一个固定结果
+r48 服务端没有执行 `WATCH_APPOPS`权限检查，`watchedUid`固定为 -1；源码旁边也承认需要特权保护。客户端 API 的注解或文档不能补上服务端缺失的强制检查。
 
-它是存储政策，必须结合widget、pending-top、UID state、first unrestricted state和process capability评价。甚至CAMERA/MIC的ALLOWED也可能再受while-in-use能力门约束；raw配置与实时结果必须分别记录。
+同一 callback binder 重复注册时，服务复用第一次创建的 `ModeCallback`。后续调用只增加 op/package 索引，不更新第一次的 flags、`mWatchedOpCode`、calling uid/pid。因此“先注册 A、再用同一 listener 注册 B”可能仍按 A 的 code 与 flags 回报。`WATCH_FOREGROUND_CHANGES`也受首次 flags 黏连影响。
 
-## 119. 复读后的纠偏结论
+索引并集还会影响 code 的解释：一个同时注册具体 op 与 package 的 callback，可因该 package 的另一个 op 变化而从 package 索引被唤醒，但 `notifyOpChanged()`仍可能按首次保存的具体 `mWatchedOpCode`回报。callback 参数因此不是“这个二元组刚发生精确变更”的事务证据。
 
-本章复读后重点修正了四处容易误导的说法：PASSIVE完全不自动采集而非低频采集；mode watcher在r48没有像其他三类一样按`WATCH_APPOPS`限域；reset只重置可重置mode，不清restriction/history；current XML确实含最近事件，但仍不是聚合历史。另记录了UID数组缺key时`previousMode`意外为0、仅重置UID mode未安排fast write、shared UID兼容flag只处理第一包、拒绝proxy不备份及readUidOps复用setter等版本边界。
+并非所有有效资格变化都走同一索引：UID state/capability 的 foreground 变化依赖 op 索引；restriction 变化只取 `mOpModeWatchers.get(code)`并以 `UID_ANY/null package`通知；package-only watcher收不到它们。suspend receiver同样只取 op 索引，但随后在 receiver 线程直接调用通知方法，不经 Handler。
 
-## 120. 本章小结与下一章
+### 练习 5：画出 mode watcher 的索引并集
 
-AppOpsService的核心不是一张`package -> mode`表，而是UID根状态、package政策、attribution事件、运行态评价、四类观察者和两套持久化共同组成的状态机。牢记真实裁决顺序“外层限制→UID覆盖→package/default→前台能力评价”，再把最近事件与聚合历史分开，就能读懂一次AppOp为何被允许、怎样被观察、以及重启后能恢复多少证据。下一章继续追AppOps与PermissionPolicyService如何在权限授予、升级、角色与one-time permission变化之间保持同步。
+用同一个 callback 依次注册 `(CAMERA, null)`与 `(OP_NONE, pkg)`，追踪 binder 表只创建一次、两个索引怎样增加、最终 `mWatchedOpCode`为何仍来自首次注册。再验证 restriction 通知没有查 package 索引。
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'final ArrayMap<IBinder, ModeCallback> mModeWatchers = new ArrayMap<>();' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'final SparseArray<ArraySet<ModeCallback>> mOpModeWatchers = new SparseArray<>();' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'final ArrayMap<String, ArraySet<ModeCallback>> mPackageModeWatchers = new ArrayMap<>();' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'int watchedUid = -1;' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'if ((flags & CALL_BACK_ON_SWITCHED_OP) == 0) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'ModeCallback cb = mModeWatchers.get(callback.asBinder());' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'if (callback.mWatchedOpCode == ALL_OPS) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'ArraySet<ModeCallback> callbacks = mOpModeWatchers.get(code);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'evalAllForegroundOpsLocked();' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+```
+
+## 9. active、started、noted 分别观察边沿、start 结果与 note 结果
+
+另外三类 watcher 都按原始 op code 建索引，不经过 switch 归并。无 `WATCH_APPOPS`时，服务把 `mWatchingUid`固定为 callingUid；有权限时使用负值表示不限 UID，分发时再次过滤。
+
+三者的语义是：
+
+| watcher | 触发单位 | 被拒是否可见 | 关键边界 |
+|---|---|---|---|
+| active | 父 `Op`从无 running 到有、从有到无 | 否 | 多 tag、多 client 的总体 0↔1 边沿 |
+| started | 到达 `scheduleOpStartedIfNeededLocked()`的一次 start 裁决 | 是 | 更早返回不可见；callback result 有一个 getOps 异常分支不等于返回值 |
+| noted | 到达 `scheduleOpNotedIfNeededLocked()`的一次 note 裁决 | 是 | restriction 拒绝可见但不一定有 reject 账 |
+
+同一 client Binder 对同一 attribution 重复 start，只增加 `numUnfinishedStarts`；相同次数的 finish 才归零。父 Op 内第一个成功 start 发 active=true，最后一个 running event 结束才发 false。client death 会把该 token 的未完成计数压成 1，再走统一 finish，保证一次清理结束全部嵌套层。
+
+注册 API 还有两个 r48 边界。`startWatchingActive()`允许 `ops == null`通过前置范围检查，却随后执行 `for (int op : ops)`，原始 Binder 调用会 NPE；started/noted 则明确拒绝 null 或空数组。公共 Java wrapper通常会挡掉 active 的 null，但服务端缺口仍然存在。
+
+其次，active/started/noted 对同一 binder 的每次注册都会新建 wrapper 并 `linkToDeath`，再按 op 覆盖 SparseArray。重复覆盖同一个 op 时不会先 destroy 旧 wrapper，显式 stop 只能遍历当前 map 值；旧 death recipient 可一直保留到 binder 死亡。一次注册把同一 wrapper 放入多个 op 时，stop 又会对同一对象重复 unlink。它们没有 mode watcher 的“首个 wrapper 完全复用”，却有另一种重复注册生命周期瑕疵。
+
+### 练习 6：证明 callback 可见性不等于记账可见性
+
+分别从 package 解析失败、restriction 拒绝、UID mode 拒绝、允许四个点进入 note/start，记录返回值、started/noted、recent reject、history reject、active 五列。最后验证 active 的 null 数组为何在循环处失败。
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'public void startWatchingActive(int[] ops, IAppOpsActiveCallback callback) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'for (int op : ops) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'Preconditions.checkArgument(!ArrayUtils.isEmpty(ops), "Ops cannot be null or empty");' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'public void startWatchingNoted(@NonNull int[] ops, @NonNull IAppOpsNotedCallback callback) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'if (triggerCallbackIfNeeded && !parent.isRunning()) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'event.numUnfinishedStarts++;' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'deadEvent.numUnfinishedStarts = 1;' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'scheduleOpStartedIfNeededLocked(code, uid, packageName, uidMode);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'scheduleOpNotedIfNeededLocked(code, uid, packageName, uidMode);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+```
+
+## 10. 回调、recent event 与 history counter 是三种不同证据
+
+一次允许 note 会覆盖对应 `uidState+flags`的最后 access，并增加 historical access count；mode 拒绝会覆盖最后 reject 并增加 reject count。restriction 拒绝虽然能发 noted/started，却发生在创建 `AttributedOp`之前，所以不写 recent/history reject。check 更是三者都不写。
+
+成功 start 先安排 started(ALLOWED)，随后创建或递增 in-progress event，并增加 access count；第一次让父 Op running 时再安排 active=true。finish 到零后以 `elapsedRealtime`计算 duration，把开始 wall time 和持续时长写入 recent access，再增加 historical duration。started 与 active 的消息通常按这一调用顺序入 Handler 队列，但 callback 是异步观察，不是 setter/start 的事务提交凭证。
+
+大多数 mode、active、started、noted 通知在锁内复制集合或安排消息，真正 callback 时 `clearCallingIdentity()`，避免 system_server 内消费者继承触发者身份。存在两个重要例外：package suspend receiver复制集合后在 receiver 路径直接执行 mode callback；async-noted 使用另一套 `RemoteCallbackList`直接广播。两者内部仍处理 Binder identity，但“所有外部通知都经同一个 Handler”不成立。
+
+StorageManager 的 mode 通知又是第三种路径：它是锁外同步的 LocalServices 调用，setter no-op 也可能触发，并且不经过 mode watcher 的去重与 Handler。排查“回调先后”时至少要分清远端 watcher、本地同步 consumer、async-noted 应用侧消息。
+
+## 11. appops.xml 的普通写、快速写与 AtomicFile 只保护一份 current 文件
+
+ActivityManagerService把 `/data/system/appops.xml`传给 `AppOpsService`构造器，服务以 `AtomicFile`管理。普通写延迟默认 30 分钟；快速写固定 10 秒。`scheduleWriteLocked()`已有任务时不重复发；`scheduleFastWriteLocked()`首次提速时设置普通与快速标志、移除旧 runner，再发 10 秒任务。
+
+runner 在 AppOps 主锁内先把两个 scheduled 标志清零，再把 `writeState()`交给 `AsyncTask.THREAD_POOL_EXECUTOR`。因此快照写入期间的新变化可以重新安排下一轮，不必等当前 I/O 完成。shutdown 只在当时 `mWriteScheduled`为真时同步写 current：尚未触发的 fast write也设置该标志，因而会被补写；若 runner 已清标志并把 I/O交给 AsyncTask，shutdown既不等待这次在途写，也不会仅因它在途而另补一次。原 Handler callback也没有在 shutdown 中显式移除，正常依赖进程退出结束生命周期。
+
+note/start/finish 会调用 `getOpLocked(..., edit=true)`，而这个 helper 即使只取到已有 Op 也安排普通写。因此 recent event最终有机会落到 current XML；“30 分钟后才允许”是错误的，内存裁决立即生效，延迟的只是提交。
+
+AtomicFile 的成功路径是 `startWrite -> finishWrite`，`IOException`走 `failWrite`恢复文件级备份。它能防止这一份 XML 的典型半写，却不能保证：
+
+- 内存 policy 与 watcher callback 同时提交；
+- package/event 快照与 UID-mode 快照来自同一时刻；
+- `appops.xml`与 history 目录跨存储原子提交；
+- 运行中的 Binder 生命周期能在重启后恢复。
+
+### 练习 7：区分调度标志、快照与文件提交
+
+沿 `getOpLocked(edit)`、普通调度、快速调度、runner、`writeState()`顺序画时间线。把“内存已变”“runner 已入队”“快照已取”“AtomicFile 已提交”标成四个不同完成点。
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'static final long WRITE_DELAY = DEBUG ? 1000 : 30*60*1000;' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'mFile = new AtomicFile(storagePath, "appops");' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'mWriteScheduled = false;' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'mHandler.postDelayed(mWriteRunner, WRITE_DELAY);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'mHandler.postDelayed(mWriteRunner, 10*1000);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'stream = mFile.startWrite();' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'List<AppOpsManager.PackageOps> allOps = getPackagesForOps(null);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'mFile.finishWrite(stream);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'mFile.failWrite(stream);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+```
+
+## 12. current XML 能恢复政策与最后事件，不能恢复 active 会话
+
+writer 先通过 `getPackagesForOps(null)`在主锁内取得 package/op/event 条目，随后另一次进入主锁克隆 UID `opModes`。序列化在锁外进行，所以两份快照各自一致，却不是单一全局时刻。
+
+根节点是 `<app-ops v="1">`。顶层 `<uid n>`里的 `<op n m>`保存 UID 非默认覆盖；package 路径是 `<pkg n> -> <uid n> -> <op n [m]> -> <st>`。package mode 等于真实默认时省略 `m`，但只要 Op 对象仍在，空 `<op>`或带事件的 `<op>`都可写出。
+
+`<st>`字段可按下表读：
+
+| 属性 | 含义 |
+|---|---|
+| `id` | attribution tag，可省略 |
+| `n` | UID state 与 op flags 的组合 key |
+| `t` / `r` | 最后 access / reject 的 wall time |
+| `d` | 最后完成持续时间，仅大于 0 才写 |
+| `pp` / `pc` / `pu` | 最后 access 的 proxy package/tag/uid |
+
+reject 从一开始就没有 proxy info。若 `t/r/d/proxy`均无可写值，整个 `st`跳过。零 duration 不写 `d`，所以缺少 `d`不能证明从未 start。
+
+生成快照时，running event会被复制成“开始时间 + 到当前的 duration” access event；`isRunning`虽存在于内存 `AttributedOpEntry`，writer不序列化它。重启读取后只调用 `accessed(time,duration,...)`，不会重建 client token 或 active 状态。因此运行中快照在 XML 里看起来像一条截至快照时刻的已完成 recent access，这个区间也不会自动延续。
+
+`readState()`先锁 `mFile`再锁服务。成功打开文件后立即清空 `mUidStates`；任何受捕获的解析错误都会再清空整棵树，不保留前半文件。一个容易漏掉的分支是：`openRead()`报文件不存在时在 clear 之前直接返回。首次构造时内存本来为空；但 `reloadNonHistoricalState()`等已有内存场景下，缺文件不会把旧内存清空。
+
+无 version 的旧文件会把 RUN_IN_BACKGROUND 的非默认 UID/package mode复制到 RUN_ANY_IN_BACKGROUND，并安排 fast write；package 事件不会跟着复制。顶层 UID XML又通过 `setUidMode()`读取，可能触发 compat permission flag、foreground 评价、写调度和内部通知，所以反序列化并非纯粹的无副作用 put。
+
+## 13. HistoricalRegistry 的 mode 不是 add/query 的统一总闸
+
+默认参数是 ACTIVE、基础区间 15 分钟、压缩倍率 10。构造阶段 SettingsProvider 尚未就绪，`systemReady()`才注册 `APPOP_HISTORY_PARAMETERS`观察者、应用配置并初始化 `Persistence`。普通自动上报在此前会记录“persistence 未初始化”并丢弃。
+
+三种 mode 的最小可靠语义是：
+
+| mode | 自动 access/reject/duration | 进入该 mode 时的动作 | 显式 add/query |
+|---|---|---|---|
+| ACTIVE | 记录 | 无额外清理 | persistence 可用时可用 |
+| PASSIVE | 不记录 | 无额外清理 | 可显式注入，主要供测试 |
+| DISABLED | 不记录 | 仅在 mode 真正变化时清一次 current/pending/disk | 没有被 mode 本身统一阻断 |
+
+这里的表描述的是请求已经进入 `HistoricalRegistry`之后的 mode 行为，不表示任意 caller 都能抵达它：服务层普通 history query先把 caller限定为 system、受 instrumentation 的 UID或 permission controller，再要求 `GET_APP_OPS_STATS`；`addHistoricalOps()`要求 `MANAGE_APPOPS`。通过这些入口检查后，`isApiEnabled()`只看调用身份/DeviceConfig而不看 `mMode`，registry 内的 add/query也只检查 persistence 是否已初始化。因此从 ACTIVE/PASSIVE 切到 DISABLED 后，获准的显式 add 仍能重新写入，获准的 query 仍能读出；再次设置相同 DISABLED 且 interval/multiplier 也不变时，不会再次触发清理。不能把它描述成封闭且自洽的三态机。
+
+反向还有初始化缺口：设备若以 DISABLED 且默认 interval/multiplier 启动，`systemReady()`跳过创建 persistence。之后只把 mode 改回 ACTIVE/PASSIVE、两个数值不变，`setHistoryParameters()`既不重采样也不补建 persistence；自动采集继续因未初始化而丢弃。若此前是已初始化状态再切 DISABLED，clear 不会把 persistence 置 null，行为又不同。
+
+设置解析也要按分支描述。缺少三项之一或数值解析失败，会记录警告并保留当前参数，日志文字声称 reset 但没有真的调用 reset。未知 mode 字符串却被 `parseHistoricalMode()`解释为 DISABLED；只要两个数字合法，整套设置会真实应用并可能清历史。interval 与 multiplier 在这条内部路径也没有正值校验。
+
+## 14. current、pending、disk 的合并存在丢批次竞态与锁序反转
+
+聚合历史内部以“距现在多久”的相对时间组织 current batch。达到区间边界并不会由独立定时器准点触发；下一次 increment、query 等调用进入 `getUpdatedPendingHistoricalOpsMLocked()`时才 rollover，把完整 batch放入 `mPendingWrites`并给 BackgroundThread 发消息。空闲设备可以越过边界而没有准点磁盘写。
+
+磁盘位于 `/data/system/appops/history`，用 `AtomicDirectory`切换整个目录版本。第 0 层保留最近且细的窗口，更老层级按倍率扩大间隔并合并统计；持久化的是 UID、package、tag、op、`uidState+flags`下的 access count、reject count、duration。它适合趋势统计，不是逐事件日志。读取或版本异常会清掉不可用 history，权限裁决仍可继续，但审计证据会出现空洞。
+
+正常跨旧区间 query 会合并 current，并把 pending 强制持久化后读取 disk；raw-disk API则只读磁盘。可 r48 的普通 query 有一个真实丢失窗口：它在主锁内无条件复制并清空 `mPendingWrites`，只有当查询区间需要 disk 时才调用 `persistPendingHistory(localCopy)`。若一个只覆盖 current 的查询抢在后台 writer 前执行，`collectOpsFromDisk=false`，局部副本既不合并也不持久化；后台消息随后看到的全局队列已经为空。
+
+锁方面，类注释规定涉及两边时必须 `mOnDiskLock -> mInMemoryLock`，而 `mInMemoryLock`就是 `AppOpsService.this`。query遵守 disk→memory；但 `AppOpsService.packageRemoved()`先持有服务锁，再调用 `HistoricalRegistry.clearHistory(uid, package)`去拿 disk 锁，形成 memory→disk。并发时可出现：删除线程持 memory 等 disk，查询线程持 disk 等 memory。这不是抽象风险，而是 r48 可见的 ABBA 环。
+
+锁持有范围还越过结果回调：普通 query在持有 disk 锁时执行 `RemoteCallback.sendResult()`，raw-disk query更在 disk 与 memory 两把锁都未释放时发送。远端回调的耗时或重入会延长锁占用，不能把“已经构造 Bundle”当作历史锁已经释放。
+
+调整 interval/multiplier 的“重采样”也只覆盖先读出的磁盘历史。`offsetHistory()`先 `readHistoryDLocked()`，随后 `clearHistory()`会清 current、pending 与 disk，再把旧磁盘副本按新参数写回；尚未落盘的近期统计被删除，不是一起重采样。
+
+wall clock用于窗口与重启偏移，单次 start duration仍由 `elapsedRealtime`产生。自动发现 wall clock 回拨时，`getUpdatedPendingHistoricalOpsMLocked()`只记录正的 `mPendingHistoryOffsetMillis`，下一次持久化再据此重采样磁盘历史；它不会直接调用 `pruneFutureOps()`。裁去落到未来的历史只发生在显式 `offsetHistory(offsetMillis)`收到负 offset 的路径。两者都不能恢复真实绝对时间，审计工具仍应把系统改时与重启证据一起记录。
+
+### 练习 8：构造 pending 丢失与 ABBA 两条时序
+
+第一条令 rollover 产生 pending，再让 current-only query先于后台消息；第二条让 package removal持服务锁、query持 disk 锁。只按 acquire/clear/persist 的源码顺序画箭头，不假定 AtomicDirectory能跨锁修复内存竞态。
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private final Object mOnDiskLock = new Object();' frameworks/base/services/core/java/com/android/server/appop/HistoricalRegistry.java
+grep -n -F 'mPendingWrites = new LinkedList<>();' frameworks/base/services/core/java/com/android/server/appop/HistoricalRegistry.java
+grep -n -F 'mInMemoryLock = lock;' frameworks/base/services/core/java/com/android/server/appop/HistoricalRegistry.java
+grep -n -F 'mHistoricalRegistry = new HistoricalRegistry(this);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'pendingWrites = new ArrayList<>(mPendingWrites);' frameworks/base/services/core/java/com/android/server/appop/HistoricalRegistry.java
+grep -n -F 'mPendingWrites.clear();' frameworks/base/services/core/java/com/android/server/appop/HistoricalRegistry.java
+grep -n -F 'collectOpsFromDisk = inMemoryAdjEndTimeMillis > currentOps.getEndTimeMillis();' frameworks/base/services/core/java/com/android/server/appop/HistoricalRegistry.java
+grep -n -F 'if (collectOpsFromDisk) {' frameworks/base/services/core/java/com/android/server/appop/HistoricalRegistry.java
+grep -n -F 'mPendingWrites.offerFirst(ops);' frameworks/base/services/core/java/com/android/server/appop/HistoricalRegistry.java
+grep -n -F 'final File newBaseDir = sHistoricalAppOpsDir.startWrite();' frameworks/base/services/core/java/com/android/server/appop/HistoricalRegistry.java
+grep -n -F 'public void packageRemoved(int uid, String packageName) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'mHistoricalRegistry.clearHistory(uid, packageName);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+```
+
+## 15. restriction 由 Binder token 持有，removeUser 只做即时内存删除
+
+`mOpUserRestrictions`以客户端 Binder token映射 `ClientRestrictionState`。每个 state为各 user保存一组 op boolean和一组 excluded package；任意 token命中 user/op且目标包不在该 token例外中，就构成 restriction。另一个 token 的例外不会成为全局白名单。
+
+`setUserRestriction()`对外要求 `MANAGE_APP_OPS_RESTRICTIONS`；跨 user 接受 `INTERACT_ACROSS_USERS_FULL`或 `INTERACT_ACROSS_USERS`。批量 `setUserRestrictions(Bundle,...)`只允许 system UID。`USER_ALL`不是持久通配符，而是在调用当刻通过 `UserManager.getUsers(false)`展开已创建用户快照；该参数不会排除 dying/removing 用户，同时默认排除 partial 与 pre-created 用户，未来新增 user不会自动继承。
+
+少数 op可由 `opAllowSystemBypassRestriction()`声明 bypass 类别，但还要目标 package 的 `RestrictionBypass`具备对应 privileged 或录音特例属性；“system UID 总能绕过”不成立。restriction 只在内存，不写 current XML或 history，依赖上层持有 token并在需要时重新下发。
+
+状态变化只通知 op-indexed mode watcher，package 参数为 null、UID 为 `UID_ANY`。取消某 user最后一个 true 时会先删 restriction 数组并把局部变量置 null，后面的 exclusion 清理块因此跳过；若同一 token还有其他 user，已无意义的 exclusion entry会残留，但不影响 `hasRestriction()`结果。
+
+token死亡会从全局 map移除整份 state，并对死亡时仍为 true 的每个 user/op安排通知；同一 op在多个 user为 true 时可重复发 `UID_ANY`。显式取消最后限制则由 setter发现 default、移除 state并 unlink death。
+
+`removeUser()`只允许 system UID，但这一入口的保证很窄：它从每个 token删除该 user数组，再从内存 `mUidStates`删相应 UID。它没有安排 current 写盘、没有清 HistoricalRegistry、没有 finish running event、没有通知 watcher，也没有把因此变成 default 的 restriction state从 token map移除。后续其他系统流程或无关写盘可能收敛部分状态，不能把那些外部效果算作此方法自己的完成点，更不能由这段代码保证 userId未来复用绝无旧 XML/history 影响。
+
+### 练习 9：把 token 生命周期与 user 生命周期分开
+
+分别模拟“同一 token 两个 user”“两个 token 同一 user”“USER_ALL 后新增 user”“removeUser 后立即重启”。标出 restriction 命中、例外、watcher、current 文件和 history各自是否变化。
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private final ArrayMap<IBinder, ClientRestrictionState> mOpUserRestrictions = new ArrayMap<>();' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'public void setUserRestriction(int code, boolean restricted, IBinder token, int userHandle,' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'if (userId == UserHandle.USER_ALL) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'List<UserInfo> liveUsers = UserManager.get(mContext).getUsers(false);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'return !ArrayUtils.contains(perUserExclusions, packageName);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'if (restrictionState.isDefault()) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'public void removeUser(int userHandle) throws RemoteException {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'opRestrictions.removeUser(userHandle);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'removeUidsForUserLocked(userHandle);' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+grep -n -F 'private void removeUidsForUserLocked(int userHandle) {' frameworks/base/services/core/java/com/android/server/appop/AppOpsService.java
+```
+
+## 16. 用两张边界表收束一次 AppOp 的诊断
+
+先按入口选择真实裁决链：
+
+| 问题 | 首先查看 | 不应直接推断 |
+|---|---|---|
+| check 为何拒绝 | package 身份、原始 op suspend/restriction、switch UID/package policy、动态评价 | 一定已有 reject 或 watcher 证据 |
+| note 为何拒绝 | package/身份早退、restriction、UID 原始-code评价、package switch评价 | 一定检查过 suspend；callback 一定等于 recent/history |
+| start 为何没 active | 更早返回、started result、client token、父 Op是否已 running | 每次 start 都有 active=true |
+| setter 后为何仍拒绝 | UID 覆盖、真实默认、FOREGROUND/capability、restriction/suspend | package mode 单独决定有效结果 |
+
+再按证据选择账本：
+
+| 想回答的问题 | 权威位置 | 主要损失边界 |
+|---|---|---|
+| 当前保存政策 | 内存 `opModes` / `Op.mode` | XML 有延迟，两层快照非同一时刻 |
+| 最近一次可记事件 | `AttributedOp` / `appops.xml` | restriction 拒绝不记；每个 key只留最后一次 |
+| 当前是否 active | `mInProgressEvents` | 不持久化；running-only prune 可断开查找 |
+| 区间次数与时长 | HistoricalRegistry | 压缩、损坏清理、pending query竞态 |
+| 临时用户门禁 | restriction token | 内存态；death/removeUser通知与清理并不对称 |
+
+最后按完成点审查状态变化：内存 mode已改，不等于异步 watcher已到；watcher已到，不等于 Storage consumer看到相同 previous 值；current 文件已提交，不等于 history已提交；AtomicFile/AtomicDirectory各自成功，不等于两者共同事务；removeUser内存已删，也不等于旧文件和历史已清。
+
+本章最值得保留的 r48 结论不是一条漂亮的“总状态机”，而是几条明确的不对称：check独有 suspend；note/start的 restriction callback与 reject账分离；UID/package动态求值使用 code 的方式不同；setter no-op仍可能创建、写盘或同步通知；reset 的 UID 范围漏掉 user；mode watcher是索引并集且首注册黏连；current-only history query可丢 pending；历史锁序存在反转；removeUser只完成即时内存删除。
+
+下一章进入 `PermissionPolicyService`，继续追 runtime permission、AppOps mode、角色与 one-time permission怎样在每用户启动和变更回调中尝试收敛，并检验这种收敛在哪些完成点仍可能出现短暂或永久偏差。

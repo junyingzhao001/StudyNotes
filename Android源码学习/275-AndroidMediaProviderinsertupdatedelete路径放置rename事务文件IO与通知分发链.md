@@ -1,566 +1,482 @@
-# 275 Android MediaProvider insert/update/delete、路径放置、rename事务、文件I/O与通知分发链
+# 275 Android MediaProvider insert、update、delete、路径放置、rename事务、文件I/O与通知分发链
 
-## 1. 本章目标
+## 1. 先看结论：一次“写成功”至少有六个不同的完成点
 
-第274章从扫描器研究文件与row怎样最终收敛，本章转向一次主动写操作：insert怎样选目录与文件名，update为什么可能rename真实文件，delete如何协调实体与索引，openFile关闭后为何触发扫描，以及事务成功后通知、缩略图、quota与URI grant如何分阶段处理。
+本文以 Android 11 `android-11.0.0_r48` 为边界：`frameworks/base` 位于 `1d9b9ab57d844b18b3b1b4297725141e7788109b`，`packages/providers/MediaProvider` 位于 `47c141d93e93b25cc85c36f3579fda25a1695952`。MediaProvider 的写路径不能简化成“改一行数据库并通知一下”。更准确的模型是六个可分别成功或失败的完成点：
 
-## 2. Android 11版本边界
+1. **请求已通过政策检查**：URI、调用身份、列、MIME、volume 与目标目录组合合法。
+2. **目标路径已确定**：`RELATIVE_PATH + DISPLAY_NAME + MIME_TYPE` 被清洗、补扩展名并映射为 `_data`；必要的父目录可能已经创建。
+3. **数据库 row 已提交**：`files` 表 mutation 与 generation 提交，唯一键冲突已失败、upsert 或兼容 replace。
+4. **文件实体已改变**：媒体字节被写入，或者 lower filesystem 的 rename/unlink 已发生。
+5. **索引元数据已收敛**：写 FD 关闭或 pending 发布后，扫描器重新读取文件事实。
+6. **通知与派生副作用已分发**：observer 通知、thumbnail 失效、quota、URI grant、SAF 与 DownloadManager 工作进入各自执行阶段。
 
-本文基于本地`android-11.0.0_r48`。后续MediaProvider可能修复这里记录的非原子窗口、TODO和兼容分支；尤其不要把本章的raw DATA兼容、旧target replace和typed open TODO推断为新版本仍相同。
+SQLite 事务只能原子化数据库状态。`mkdirs()`、`Os.rename()`、`File.delete()`、写 FD 和扫描器都不属于同一提交域。因此，`insert()` 返回 URI、`update()` 返回 1、普通 row-backed `delete()` 返回 1、FUSE rename 返回 0，各自证明的范围都不同；`media_scanner` 等特殊控制 URI 的 delete 返回值不能按 row count 解释。
 
-## 3. 写MediaStore不是只写SQLite
+| 对外结果 | 能直接证明什么 | 不能直接证明什么 |
+|---|---|---|
+| 普通媒体 `insert()` 返回 item URI | row 已插入或受限 upsert 已完成 | 目标媒体文件已有字节、元数据已扫描 |
+| placement `update()` 返回 1 | row update 已提交 | rename 与 row 从未出现过分叉窗口 |
+| 普通 row-backed `delete()` 返回 1 | 累计删除了一行匹配的数据库记录 | `File.delete()` 确实返回 true、介质已安全擦除 |
+| 受管 FUSE rename 返回 0 | lower rename 成功且数据库事务被标记成功 | 后续扫描已完整修好全部索引、观察者已消费通知 |
+| 写 FD `close()` 返回 | 内核句柄关闭 | 后台 close listener 和扫描已经跑完 |
 
-一次insert可能创建父目录但不创建目标文件；一次update可能先在lower filesystem执行rename；一次delete可能先尝试unlink再删row；一次写FD关闭后又扫描元数据。ContentProvider的返回值只描述当前API阶段，不代表磁盘与索引已经永久、原子地一致。
+## 2. 两个写入平面共享政策，却不共享操作顺序
 
-## 4. 两类入口必须分开
+第一类入口来自 `ContentResolver`：`insertInternal()`、`updateInternal()`、`deleteInternal()`、`openFileCommon()` 从 URI、`ContentValues` 与 extras 出发。第二类来自 FUSE：native 的 create、unlink、rename 回调进入 Java 的 `insertFileIfNecessaryForFuse()`、`deleteFileForFuse()`、`renameForFuse()`。两类入口复用 `files` 表、路径推导、owner、权限与 trigger，却刻意采用不同顺序。
 
-ContentResolver的insert/update/delete/openFile从URI和ContentValues进入；直接路径create/delete/rename从FUSE JNI回调进入。两者复用路径、owner、数据库和通知设施，但操作顺序不同，特别是rename事务不能混为一条流程。
+普通 collection insert 先确定路径、可能建父目录，再提交 row；目标媒体文件通常等调用者随后打开 URI 才创建。ContentProvider placement update 先 rename 文件，再提交 row。受管 FUSE rename 则在数据库事务内先尝试协调 row、再 rename lower 文件，成功后才提交；unchecked 兜底也可在没有 source-row update 时继续。FUSE 的 database-bypass 身份又会直接 rename lower 文件，不更新数据库。
 
-## 5. 本章源码地图
+源码地图如下：
 
-```text
-packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
-packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
-packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
-packages/providers/MediaProvider/src/com/android/providers/media/util/SQLiteQueryBuilder.java
-packages/providers/MediaProvider/src/com/android/providers/media/scan/ModernMediaScanner.java
-packages/providers/MediaProvider/apex/framework/java/android/provider/MediaStore.java
-packages/providers/MediaProvider/jni/MediaProviderWrapper.cpp
-```
+- `MediaProvider.java`：四类 ContentProvider 入口、FUSE Java 回调、权限与后处理；
+- `FileUtils.java`：现代列与 `_data` 双向计算、清洗、扩展名和唯一命名；
+- `SQLiteQueryBuilder.java`：每次 mutation 强制进入 helper 事务；
+- `DatabaseHelper.java`：事务状态、files trigger、通知聚合和三阶段任务；
+- `FuseDaemon.cpp`、`MediaProviderWrapper.cpp`：native create/unlink/rename 顺序；
+- `ModernMediaScanner.java`：写入后的元数据收敛。
 
-## 6. 五类状态变化
+`applyBatch()` 会为每个进入本批次前尚未活动的 helper 打开独立外层事务；若 helper 在进入批次前已有事务，它的每个 operation 只有允许异常才能 piggyback。同一 helper 的 `runWithTransaction()` 复用该事务。`super.applyBatch()` 正常返回后——允许异常的 operation 即使失败，也会把异常装进 `ContentProviderResult` 而不阻止此处继续——本次新开的 helper 才各自被标记 successful，然后在 `finally` 里依次 `endTransaction()`。因此 exception-allowed 失败不自动触发整批回滚，它早先产生的非 DB 副作用也没有单 operation 回滚保证。多个 helper 更不是分布式原子提交：较早 helper 可能已 commit 并启动后处理，较晚 helper 仍可能在 commit 或 post-commit blocking task 中失败；一次 `endTransaction()` 抛异常还会中断这个循环。
 
-本章把变化拆为row列值、真实路径、文件字节、调用者owner/URI授权缓存、观察者与系统副作用五类。源码的难点不是某一类怎么改，而是失败发生在五类变化之间时，哪些已经生效、哪些等待后台修复。
+### 练习 1：画出两类入口与批事务边界
 
-## 7. collection URI提供默认政策
-
-Images、Video、Audio、Downloads和Files URI不只是SQL view名，它们还决定默认MIME、media_type、默认目录和允许的顶级目录。向Images插audio MIME会在`ensureFileColumns()`中失败，而generic Files允许的类型更宽。
-
-## 8. raw DATA与现代列模型
-
-现代调用推荐DISPLAY_NAME、MIME_TYPE、RELATIVE_PATH，让MediaProvider生成DATA；raw DATA是兼容与内部入口。insert、update对DATA的放行条件并不完全相同，所以不能只记“MANAGE可以写任意路径”一句口号。
-
-## 9. 原子性的真实边界
-
-SQLite事务只能回滚row，不能自动撤销`mkdirs()`、`Os.rename()`或`File.delete()`。MediaProvider通过先检查、恰当排序、FUSE cache invalidation、扫描器和idle maintenance降低裂缝，但并未创造跨VFS与SQLite的分布式事务。
-
-## 10. 总体写链
-
-```mermaid
-flowchart TD
-    APP["App ContentResolver或直接文件路径"] --> CP["MediaProvider URI入口"]
-    APP --> FUSE["FUSE JNI回调"]
-    CP --> POLICY["identity/collection/column/path校验"]
-    FUSE --> POLICY
-    POLICY --> PATH["生成或验证DATA"]
-    PATH --> FS["mkdir/rename/open/delete lower FS"]
-    PATH --> DB["files表事务"]
-    DB --> TRIGGER["SQLite trigger→OnFilesChangeListener"]
-    TRIGGER --> NOTIFY["事务成功后聚合notifyChange"]
-    TRIGGER --> SIDE["quota/缩略图/SAF/grant后台副作用"]
-    FS --> SCAN["close/rename后按需扫描"]
-    SCAN --> DB
-```
-
-## 11. insertInternal先处理控制URI
-
-media_scanner URI用于开始扫描状态，volumes URI用于attach卷，playlist members会改真实playlist文件。只有普通媒体插入才进入helper、query builder和`insertFile()`；读代码时先看URI match，不能假定所有insert都插files表。
-
-## 12. _id由Provider控制
-
-传入ContentValues的`_id`首先移除，常规App不能自行挑row id。FUSE删除/重建为兼容路径替换时有专门的`_GET_ID`恢复机制，那是DatabaseHelper内部受控例外，不是公开insert能力。
-
-## 13. DATE_EXPIRES同样由Provider控制
-
-`computeDateExpires()`先删调用方传入的DATE_EXPIRES，再由IS_PENDING或IS_TRASHED计算7天/30天期限或置null。这里和第274章一致：状态可请求，到期秒不能由普通App任意指定。
-
-## 14. insert时raw DATA的放行矩阵
-
-self/scanner、legacy write和MANAGE_EXTERNAL_STORAGE调用者可保留传入DATA；其他调用者的raw path会被记录警告后移除，再按RELATIVE_PATH与DISPLAY_NAME生成。MANAGE在insert分支明确存在，不能套用update的不同条件。
-
-## 15. IS_DOWNLOAD不能由普通App伪造
-
-非self调用者传来的IS_DOWNLOAD被移除，随后`maybeMarkAsDownload()`根据最终DATA是否位于Download路径计算。Downloads collection是路径与数据库标志的组合，不能只靠写一个布尔列把任意文件变成下载项。
-
-## 16. 经纬度列在R不再保存
-
-insert/update看到LATITUDE、LONGITUDE便写null。对target Q及以下还移除已经在R废弃的primary_directory、secondary_directory兼容列；现代放置统一围绕RELATIVE_PATH。
-
-## 17. insert的owner规则
-
-self或shell可显式给owner，缺失时从Android/media等路径猜；delegator可代表另一App给owner，缺失时回退Binder package；普通远端调用者不能直接控制OWNER_PACKAGE_NAME，Provider强制为真实calling package。
-
-## 18. owner不是文件inode uid
-
-它是MediaStore对象级所有权，影响无需广泛collection权限的访问、pending发布与冲突upsert。文件系统上的Linux uid、FUSE calling uid和row owner相互关联，但不是同一字段的三个名字。
-
-## 19. collection分派到insertFile
-
-image/audio/video/downloads/files/playlist先补owner和download状态，再给`insertFile(qb, helper, match, uri, extras, values, mediaType)`。thumbnail与album art有专门权限和列投影逻辑，不完全沿普通媒体路径。
-
-## 20. ensureFileColumns是放置核心
-
-它为不同URI设置默认MIME、默认media type、默认primary目录与allowedPrimary集合；随后处理raw DATA、MIME、DISPLAY_NAME、RELATIVE_PATH、唯一文件名、路径合法性、父目录和派生列。
-
-## 21. Audio的目录集合
-
-Audio默认`audio/mpeg`与Music，可放Alarms、Audiobooks、Music、Notifications、Podcasts、Ringtones。这个集合表达媒体用途组织，不代表拥有音频权限的App自动获得这些目录里每个既有对象的写权。
-
-## 22. Video与Images目录集合
-
-Video默认`video/mp4`与Movies，可放DCIM、Movies、Pictures；Images默认`image/jpeg`与Pictures，可放DCIM、Pictures。collection类型与top-level目录必须匹配，否则现代insert抛IllegalArgumentException。
-
-## 23. Downloads与Files默认
-
-Downloads只允许Download作为常规primary；generic Files默认允许Download和Documents，并能根据MIME把playlist/subtitle扩展到Music/Movies。Files更通用，但不是“任意外部路径”免检入口。
-
-## 24. internal不能由普通写入创建路径
-
-当DATA为空且resolved volume为internal时直接抛UnsupportedOperationException。internal.db主要索引系统内置媒体资源，不是让App借MediaStore往只读系统媒体目录创建新文件的目标。
-
-## 25. raw DATA先反推其他列
-
-若调用者被允许提供DATA，`computeValuesFromData()`从路径重算volume_name、relative_path、display_name、bucket、pending/trashed与expires。Provider不会盲信同时给出的矛盾RELATIVE_PATH。
-
-## 26. MIME缺失的target差异
-
-target R及以上先尝试由DISPLAY_NAME扩展名推导，失败才用collection默认；旧target在具体媒体collection偏向保留历史默认行为。generic Files的默认media type为NONE，处理又有所不同。
-
-## 27. 不支持的MIME
-
-具体collection收到无可识别扩展的unsupported MIME时，若文件扩展名能推到同类media type则采用扩展名结果；仍无法合理推断时，target R+抛错，旧target退回默认MIME。
-
-## 28. MIME必须匹配collection
-
-最终解析出的media type若与Images/Video/Audio默认类型不同，Provider抛“expected image/*”等错误。这样调用者不能把MP3塞进Images URI，再依赖扫描器事后纠正collection。
-
-## 29. DISPLAY_NAME缺失的默认
-
-若仍为空，Provider用当前毫秒时间的字符串作为名字。它保证路径生成有叶子节点，但生成的名字是否带扩展名还由MIME与`splitFileName()`决定。
-
-## 30. RELATIVE_PATH缺失的默认
-
-普通媒体使用各自defaultPrimary并保证末尾`/`；thumbnail可能附加`.thumbnails/` secondary。路径段会经过FAT兼容字符清洗，非FUSE调用还会改写隐藏名字，降低App无意创建隐藏媒体的风险。
-
-## 31. pending/trash改变真实文件名
-
-非FUSE路径下，pending或trash会把DISPLAY_NAME编码为`.pending-到期-原名`或`.trashed-到期-原名`生成DATA；row仍保存用户可理解的DISPLAY_NAME。发布/恢复时重新计算路径并触发rename。
-
-## 32. MIME决定默认扩展名
-
-`buildUniqueFile()`先用MIME拆分文件名；已有扩展不匹配时可能把它视为basename的一部分并追加MIME默认扩展。比如名字看似有后缀，并不保证Provider原样保留。
-
-## 33. 唯一名字的普通策略
-
-若目标已存在，普通目录依次尝试原名、`name (1)`等，迭代上限32。返回的DATA与DISPLAY_NAME会再由最终路径重算，App应以insert结果查询为准，不应假定请求名就是落盘名。
-
-## 34. DCIM命名有特殊序列
-
-`ABCD0001`式DCF严格名可递增到9999，`IMG_日期_时间`式宽松名使用`~2`等最多99；其他名字才走括号编号。这是相机生态兼容，不是全目录统一算法。
-
-## 35. update重算时先可非唯一probe
-
-路径移动先用`buildNonUniqueFile()`计算probe，判断路径是否真的变化、卷和owner边界是否改变；确认要移动后再用unique版本求最终目的地。两阶段避免仅为比较就提前换成另一个唯一名。
-
-## 36. 未改变父目录可以原地改名
-
-`currentPath`存在时，生成结果父目录与旧父目录相同会先被视为valid。这允许修改DISPLAY_NAME而不要求重新通过顶级目录列表；跨目录时才依次检查allowed primary、related URI等扩展规则。
-
-## 37. related URI放置例外
-
-extras可带QUERY_ARG_RELATED_URI。若关联对象与新对象顶级MIME相同且RELATIVE_PATH完全相同，允许放在关联项目录；典型用途是让衍生内容贴近原对象，同时防止用不相关URI任意穿越目录政策。
-
-## 38. 自己的Android/media目录
-
-若目的路径能解析出package owner，位于external media directory且属于calling shared packages，也可作为validPath。这里特指Android/media共享媒体目录，不是Android/data或obb私有目录。
-
-## 39. MANAGE的放置扩张
-
-前述规则都未放行时，manager可在更广外部共享路径创建文件。但路径仍要在目标volume扫描根、名称可清洗且不能穿透其他App私有data/obb隔离；“更广”不是任意系统路径。
-
-## 40. system gallery扩展
-
-system gallery可在已有目录创建image/video，也可在已有顶级目录下建子目录，但不能凭此创建非默认顶级目录。检查还调用`canAccessMediaFile(..., allowLegacy=false)`，保持媒体类型范围。
-
-## 41. 父目录可能在insert前创建
-
-路径通过后调用`mkdirs()`并确认父目录存在，随后才写row。若后续数据库insert失败，刚创建的空目录不会被SQLite自动回滚，这是第一类VFS/DB非原子窗口。
-
-## 42. raw DATA仍做卷边界检查
-
-不走路径生成时，`assertFileColumnsSane()`canonicalize实际DATA并确认它位于目标volume的允许扫描路径。拥有raw path权限也不能拿external_primary URI指向另一个卷或内部任意路径。
-
-## 43. insertFile补齐通用派生列
-
-它再次计算bucket、DATE_ADDED、title、format、MIME和media_type；目录设FORMAT_ASSOCIATION并清MIME。若目标文件已经存在，还从磁盘读取DATE_MODIFIED和缺失的SIZE。
-
-## 44. insert row不一定创建目标文件
-
-普通媒体insert主要预留路径并插入row，文件字节通常由调用者随后`openOutputStream(uri)`写入。playlist是显式例外：远端新建playlist后Provider会touch空文件，便于之后rename与成员持久化。
-
-## 45. parent row与目录缓存
-
-事务中若PARENT未给出，`getParent(db,path)`查找或建立父目录row。FORMAT_ASSOCIATION插入后还缓存path→rowId，加快大批扫描；deleteRecursive会清这个缓存防止引用陈旧目录id。
-
-## 46. double insert的受限upsert
-
-先正常insert；若DATA唯一约束冲突，Provider仅在已有row owner属于calling shared packages，或delegator代表的owner时，改为定点update并返回原id。它解决“先直接路径创建、后ContentResolver insert”的双入口重复。
-
-## 47. 冲突不是无条件覆盖
-
-路径相同但owner不匹配时重新抛SQLiteConstraintException。否则恶意App可以选择受害者已存在路径，用insert把其row字段和owner覆盖。
-
-## 48. insert完整流程
-
-```mermaid
-sequenceDiagram
-    participant A as "App"
-    participant M as "MediaProvider"
-    participant F as "FileUtils/Filesystem"
-    participant D as "DatabaseHelper"
-    A->>M: insert(collection, values)
-    M->>M: 清_id/DATE_EXPIRES/受限列并确定owner
-    M->>M: ensureFileColumns默认MIME/目录/名字
-    M->>F: sanitize、unique name、mkdirs父目录
-    M->>D: transaction insert files row
-    alt DATA唯一冲突且owner允许
-        D-->>M: SQLiteConstraintException
-        M->>D: update原row作为upsert
-    end
-    D-->>M: rowId与事务后通知
-    M-->>A: collection/item URI
-    A->>M: openOutputStream(uri)
-    M->>F: 返回FD，关闭后扫描元数据
-```
-
-## 49. 返回URI保留原请求volume语义
-
-数据库操作用resolved volume路由，但最终URI常在调用者原collection URI后追加rowId。`external`合成名写入时实际解析primary，返回形态仍兼容调用者使用方式。
-
-## 50. update先safeUncanonicalize
-
-canonical URI先还原为真实item URI，再match collection。某些旧Google Camera target Q兼容还会把image/video item URI转generic files URI；这类包名特判是历史兼容，不是通用设计模式。
-
-## 51. update也移除_id并重算expires
-
-row id不可改，DATE_EXPIRES由pending/trash状态派生。即使selection匹配多行，调用者也不能把它们迁移到另一个id空间。
-
-## 52. update的raw DATA权限更窄
-
-对sDataColumns，update只明确放行self与legacy write；与insert不同，这里没有manager分支。manager可以通过现代placement columns触发受控移动，但不能据此断言其任意raw DATA update总会保留。
-
-## 53. owner转移规则
-
-self与shell可改owner；delegator只有在当前row owner为空，或当前owner属于delegator shared package时才可转给proposed owner；其他调用者传OWNER_PACKAGE_NAME会被移除。转移权限不是普通对象写权限的附赠能力。
-
-## 54. scanner元数据列默认只读
-
-非self update遍历所有列，只有`sMutableColumns`可正常修改。扫描器控制的title、duration、宽高等列若对象已发布会被忽略并设置triggerScan，因为App改数据库却不改文件，下一次扫描也会覆盖。
-
-## 55. mutable列清单
-
-包括DATA、RELATIVE_PATH、DISPLAY_NAME、IS_PENDING、IS_TRASHED、IS_FAVORITE、OWNER_PACKAGE_NAME、部分bookmark/tags/category、playlist成员、download来源、MIME与MEDIA_TYPE。列在清单内仍需通过owner、权限和路径规则，不代表所有App可任意写。
-
-## 56. pending期间放宽元数据
-
-若单个item仍pending，非mutable列也可被生产者填写；发布前文件可能尚未具备可扫描的最终元数据。待IS_PENDING清零时Provider强制扫描，以磁盘内容成为发布后的可信索引。
-
-## 57. 发布会破坏no-op快路
-
-看到IS_PENDING列便设置triggerScan，并把DATE_MODIFIED、SIZE显式置null。这样ModernMediaScanner不会因mtime/size看似相同直接skip，能重新读取Retriever/EXIF/XMP并清理临时值。
-
-## 58. location列继续置null
-
-update传入LATITUDE/LONGITUDE会被清空，不再把位置元数据作为普通可写数据库列。原始图片位置的访问控制走ACCESS_MEDIA_LOCATION与内容redaction，而不是信任App改两列。
-
-## 59. placement columns触发移动
-
-DATA、RELATIVE_PATH、DISPLAY_NAME、MIME_TYPE、IS_PENDING、IS_TRASHED、DATE_EXPIRES属于placement。只要更新触及它们、未直接给DATA、不是thumbnail且allowMovement，就进入当前值融合与路径重算。
-
-## 60. allowMovement的默认值
-
-extras的QUERY_ARG_ALLOW_MOVEMENT默认是`!isCallingPackageSelf()`：外部App更新placement默认允许受控移动，scanner/self update默认不移动。内部扫描只应更新索引，不应因解析字段又rename用户文件。
-
-## 61. movement只支持单item集合
-
-Audio/playlist/video/image/download/files的ID URI允许；非明确定义collection或批量selection尝试移动会抛错。移动需要唯一旧路径，不能把一组不同对象融合成一个目标DATA。
-
-## 62. 先读取并融合当前列
-
-Provider以内置identity从generic Files item查询所有placement列，只用当前值补调用者未提供的键。这样只改DISPLAY_NAME时仍保留原RELATIVE_PATH、MIME、pending/trash状态，才能完整计算新路径。
-
-## 63. 禁止跨volume移动
-
-probe路径与beforePath的volume name必须相同，否则抛IllegalArgumentException。MediaStore update使用`Os.rename()`，它不是跨文件系统copy+delete API；跨卷迁移需要应用显式复制内容并删除原对象。
-
-## 64. 禁止改变路径owner域
-
-从路径提取的beforeOwner与probeOwner必须相等，避免通过改RELATIVE_PATH把公共文件塞入另一包Android/media，或把包域内容转出而绕过owner政策。
-
-## 65. 最终目标再次唯一化
-
-确认路径确实变化、卷与路径owner不变后，重新用unique模式生成afterPath。若同名已存在可能得到`(1)`等名字；数据库最终写的是实际afterPath派生的DISPLAY_NAME。
-
-## 66. 普通update先rename再改row
-
-movement分支先执行`Os.rename(beforePath, afterPath)`并invalidate两端FUSE dentry，之后才走`updateAllowingReplace()`写数据库。这里没有一个能同时覆盖VFS与SQLite的事务。
-
-## 67. 旧文件ENOENT仍继续
-
-rename返回ENOENT时只记录“Missing file; continuing anyway”，仍把DATA设为afterPath并继续数据库update。它偏向让row反映请求的新位置，后续扫描再处理实际缺失；其他errno则抛IllegalStateException。
-
-## 68. 普通移动的失败裂缝
-
-若rename成功但后续数据库constraint或进程崩溃，文件可能已在新路径而row仍在旧路径。ModernMediaScanner的旧路径clean与新路径insert是恢复手段，因此不要描述ContentProvider movement为完全原子rename。
-
-## 69. update前快照affected ids
-
-路径或metadata mutation可能使原query builder以后不再匹配，所以实际update之前查询并保存id。事务后用这些id逐项invalidate thumbnail并按需要查询新DATA扫描。
-
-## 70. update conflict replace仅给旧target
-
-DATA唯一冲突时，target R+直接抛异常；旧target只有在冲突路径真实文件存在且冲突row属于calling shared packages时，才删冲突row并重试update。兼容replace不会覆盖陌生owner。
-
-## 71. update、rename与后处理
-
-```mermaid
-sequenceDiagram
-    participant A as "App update"
-    participant M as "MediaProvider"
-    participant FS as "lower FS/FUSE cache"
-    participant DB as "files transaction"
-    participant BG as "postBlocking/postBackground"
-    A->>M: update(item, placement/meta values)
-    M->>M: 过滤列、融合当前placement、校验卷/owner
-    opt 路径变化
-        M->>FS: Os.rename before→after
-        M->>FS: invalidate两端dentry
-    end
-    M->>DB: updateAllowingReplace
-    DB-->>M: count，commit后触发通知
-    M->>BG: thumbnail invalidation
-    M->>BG: blocking scan（需要时）
-    BG->>DB: scanner重建磁盘派生元数据
-```
-
-## 72. postBlocking的“blocking”含义
-
-若当前有DatabaseHelper事务，任务收集到blockingTasks，在`db.endTransaction()`之后、发送notify之前由当前线程依次运行；无事务时立即运行。发布扫描因此能在外部update返回前完成，但不在SQLite事务内部。
-
-## 73. postBackground更晚执行
-
-backgroundTasks在事务成功后先由ForegroundThread安排，通知全部派发后再扔给BackgroundThread。缩略图、quota、URI revoke和SAF副作用不会拖慢关键数据库锁持有时间。
-
-## 74. scanner调用不会自激
-
-update后scan以self identity运行，scanner自己的update会把triggerScan强制清false，避免“扫描写row→又安排扫描”的循环。它仍可触发正常数据库通知和quota副作用。
-
-## 75. delete先处理FUSE双删兼容
-
-如果同UID刚通过直接路径删除，FUSE侧缓存了deleted row id；App随后按item URI delete时，Provider移除缓存并返回0，不再因row不存在进入权限异常。这是重复删除兼容，不是成功删除一行。
-
-## 76. delete对item可请求用户升级
-
-image/video/audio item先走`enforceCallingPermission(..., forWrite=true)`；无owner或collection写权时可通过第273章的RecoverableSecurityException/用户确认获得具体URI写授权。批量generic delete不自动等价于单项升级。
-
-## 77. 普通files删除先查实体信息
-
-Provider查询media_type、DATA、id、is_download、MIME，清calling identity的owned id缓存，然后对每一项调用`deleteIfAllowed()`尝试删文件，再按id删row并处理playlist与downloads副作用。
-
-## 78. deleteIfAllowed吞掉异常
-
-它内部checkAccess后调用`deleteAndInvalidate()`，任何异常只Log错误，不向外抛；外层随后仍执行qb.delete row。因此API删除count可能增加，即使实体删除因权限、I/O或路径问题失败。
-
-## 79. File.delete返回值也未检查
-
-`deleteAndInvalidate(File)`直接`file.delete()`后invalidate dentry，没有判断boolean。r48因此可能产生“文件仍在、row已删”的孤儿文件，之后扫描会重新插入或其他维护收敛。
-
-## 80. delete不是安全擦除保证
-
-返回1表达Provider删除了匹配数据库对象，不是已验证物理块清除，更不是不可恢复擦除。对安全/隐私需求，不能把ContentResolver.delete的count当作存储介质级证明。
-
-## 81. PARAM_DELETE_DATA=false的例外
-
-URI明确带该参数时跳过实体遍历，直接递归删row；ModernMediaScanner reconcile使用它清“磁盘未见的旧索引”。普通App不应随意使用内部语义制造有文件无row。
-
-## 82. parent row最后删除
-
-实体型files删除后给query builder追加`_id NOT IN (SELECT parent...)`，`deleteRecursive()`在一个事务内反复执行相同delete，叶子先删，父目录等不再被引用时才删，避免破坏parent关系。
-
-## 83. 为什么要循环到0
-
-第一次delete可能只删叶子，第二次原父目录才符合ID_NOT_PARENT。循环累计count直到稳定；每轮不是重试I/O，而是按数据库依赖层级逐层剥离。
-
-## 84. thumbnail集合先删文件
-
-image/video thumbnails走专门分支，查询DATA逐个`deleteIfAllowed()`后再`deleteRecursive()`。album art与普通媒体在match分派上有各自规则，不能一律套files表逻辑。
-
-## 85. 删除audio会重算playlist
-
-外部audio row删除时查询audio_playlists_map受影响的playlist id，并调用`resolvePlaylistMembers()`。playlist真实文件仍是持久来源，内部成员表按剩余可解析音频重新建立。
-
-## 86. Downloads删除异步通知DownloadManager
-
-删除过程中收集download id与MIME，事务后在BackgroundThread调用`onMediaStoreDownloadsDeleted()`。注释强调不要在FUSE调用关键路径中执行额外Binder通信。
-
-## 87. deleteRecursive清目录缓存
-
-进入事务先清`mDirectoryCache`，防止后续insert复用已删除的parent id。缓存只是性能层，任何批量层级删除都优先保证正确性。
-
-## 88. openFile先由row解析canonical路径
-
-除legacy thumbnail重定向外，Provider以self identity查询DATA、owner和pending，再将DATA转canonical File；恢复调用者identity后执行`checkAccess()`。内部查询不受调用者collection过滤干扰，真正授权仍针对原calling identity。
-
-## 89. 写模式会升级为rw位
-
-若parseMode含WRITE_ONLY，代码额外OR READ_WRITE，以便`shouldOpenWithFuse()`取得写锁语义。对App请求的高层mode而言仍是写操作，这个内部升级用于协调upper/lower cache，不表示授予了额外URI读权限。
-
-## 90. pending owner检查有FUSE例外
-
-普通隐藏文件名pending只允许owner交互；FUSE pending没有`.pending-*`文件名，open时跳过这项owner强制检查，依赖FUSE创建链的其他政策。两种pending物理表示再次影响授权路径。
-
-## 91. open仍执行对象与路径授权
-
-`checkAccess(uri, extras, file, forWrite)`结合URI grant、owner、媒体权限和路径限制。能query到row并不自动能open；反之具体URI用户授权可只开放这一对象。
-
-## 92. redaction在open时决定
-
-非owner且缺ACCESS_MEDIA_LOCATION时求EXIF redaction ranges；requireOriginal为true则直接拒绝。新FUSE通过upper FD在FUSE handler中脱敏，旧路径使用RedactingFileDescriptor。
-
-## 93. 无redaction时先开lower FD
-
-Provider先`openSafely(lower)`，再询问该卷FuseDaemon是否因已有upper VFS cache而应走FUSE。若需要便改开`/mnt/user/...` upper并关闭lower，避免upper/lower page cache不一致造成损坏。
-
-## 94. lower写入前invalidate dentry
-
-若最终使用lower FD且forWrite，先invalidate FUSE dentry，让后续upper stat/open不继续看到dirty dentry或陈旧page cache。来自FUSE线程本身则不应递归invalidate，否则会崩溃。
-
-## 95. 非pending写FD关闭后扫描
-
-Provider用`ParcelFileDescriptor.wrap()`挂OnCloseListener：无论远端writer是否声称异常，都invalidate thumbnails/dentry；普通媒体按需scanFile，thumbnail则直接更新宽高。close完成是元数据收敛触发点。
-
-## 96. pending写入不挂close listener
-
-条件是`!isPending && forWrite`才wrap。pending生产阶段可以多次写，不必每次关闭就公开扫描；当App把IS_PENDING改0发布时，update链会强制blocking scan。
-
-## 97. 只读open没有写后扫描
-
-listener虽创建，但最终只有forWrite才wrap。读操作不应改变mtime/metadata，也无需引发扫描风暴；redaction与upper/lower选择仍然执行。
-
-## 98. typed open的r48 TODO
-
-`openTypedAssetFileCommon()`源码留有“TODO: enforce that caller has access to this uri”，但缩略图和最坏情况下的underlying file最终又会进入ensureThumbnail/openFileCommon各自路径。应记录TODO边界，而非断言typed open完全无权限。
-
-## 99. FUSE rename先做路径级拒绝
-
-它先拒其他包private path，清洗newPath非法字符；database bypass UID可直接lower rename，具备双端restriction bypass者走unchecked但仍更新数据库。普通legacy请求到此若没有所需存储权会EACCES。
-
-## 100. 默认目录与Android目录保护
-
-不能rename顶级默认目录，不能把对象移到存储根，不能rename Android/media本身，也不能移动到Android下除media之外的目录。data/obb本就bind mount不经过这条FUSE rename。
-
-## 101. 新路径必须支持MIME
-
-单文件checked rename由newPath解析MIME，并根据Audio/Video/Images collection规则验证；把MP3移动到只支持图片的顶级目录会EPERM。目录rename则检查树内每个已索引非目录文件。
-
-## 102. FUSE单文件rename的顺序
-
-DatabaseHelper beginTransaction后先把旧path row更新为新DATA/MIME/media_type；发生目标DATA唯一冲突时，只有对目标有delete写权才删冲突row重试。然后执行lower `Os.rename()`，成功才`setTransactionSuccessful()`。
-
-## 103. lower rename失败会回滚row
-
-errno非0时不标成功，finally endTransaction使SQLite更新回滚。因此相比普通ContentProvider movement，它更好地保证“文件没动则row也不动”；但lower rename已经成功后若进程在标记/提交附近崩溃，VFS仍不能由SQLite反向回滚。
-
-## 104. replace目标的owner保护
-
-若目标路径已有row导致constraint，query builder delete必须允许calling identity删除目标；bypass restrictions路径若更新失败，还会尝试清目标owner，避免被替换文件的旧owner继续访问新内容。
-
-## 105. r48用字符串null的实现细节
-
-`maybeRemoveOwnerPackageForFuseRename()`把OWNER_PACKAGE_NAME写成字符串`"null"`，trigger也用`ifnull(...,'null')`序列化。阅读时要区分Java/SQL真实NULL与这个哨兵字符串；这是源码事实，不应美化为严格类型化owner状态。
-
-## 106. 目录rename先验证整棵已索引文件
-
-若调用者没有默认collection全权，源码先用普通query计数全部文件，再用TYPE_UPDATE权限query计数可写文件；数量不同即拒绝。随后逐个检查新路径是否支持原MIME，任何一项失败整个rename返回EPERM。
-
-## 107. 目录row不在批量更新列表
-
-源码注释明确只更新目录下mime_type非null文件，不更新目录row；lower目录rename成功、DB事务提交后，再扫描oldPath清陈旧目录row并扫描newPath补目录及hidden/media type变化。
-
-## 108. .nomedia改名必须额外扫描
-
-单文件rename若源或目标display name是`.nomedia`，扫描对应父目录。因为增加/移除标记会改变整目录内容是否hidden，单独更新这一个row不足以修正所有子文件media_type。
-
-## 109. SQLite trigger把row变化变成事件
-
-files表AFTER INSERT/UPDATE/DELETE trigger调用`_INSERT/_UPDATE/_DELETE`自定义函数，传volume、id、media type、download、owner和old path。DatabaseHelper的OnFilesChangeListener由此统一处理直接SQL builder、scanner与FUSE rename产生的变化。
-
-## 110. 通知会扩展到多种URI
-
-`acceptWithExpansion()`把具体media collection、generic Files、Downloads及具体volume到external合成视图展开。media type改变时update会通知旧collection，也通知新collection，观察者才知道对象“离开一处、进入另一处”。
-
-## 111. 阅读完成检查
-
-你应能说明insert为什么可能只建row不建文件、DATA与RELATIVE_PATH怎样变成唯一路径、普通update与FUSE rename的操作顺序差异、delete为何可能留下孤儿文件、open写关闭后何时扫描，以及事务成功后blocking/notify/background的先后。
-
-## 112. macOS只读练习一：手算insert路径
+在源码根目录运行；也可把源码根目录作为第一个参数，从任意目录运行。
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '2380,2735p' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
-sed -n '2970,3165p' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
-sed -n '530,675p' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private @Nullable Uri insertInternal(' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'private int updateInternal(' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'private int deleteInternal(' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'private ParcelFileDescriptor openFileCommon(' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'public int deleteFileForFuse(@NonNull String path, int uid)' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'public int renameForFuse(String oldPath, String newPath, int uid)' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'static void pf_unlink(fuse_req_t req, fuse_ino_t parent, const char* name)' packages/providers/MediaProvider/jni/FuseDaemon.cpp
+grep -n -F 'const int res = fuse->mp->Rename(old_child_path, new_child_path, req->ctx.uid);' packages/providers/MediaProvider/jni/FuseDaemon.cpp
+grep -n -F 'if (!helper.isTransactionActive()) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'final ContentProviderResult[] result = super.applyBatch(operations);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (mExceptionAllowed) {' frameworks/base/core/java/android/content/ContentProviderOperation.java
+grep -n -F 'return new ContentProviderResult(e);' frameworks/base/core/java/android/content/ContentProviderOperation.java
+grep -n -F 'return helper.runWithTransaction((db) -> {' packages/providers/MediaProvider/src/com/android/providers/media/util/SQLiteQueryBuilder.java
 ```
 
-分别推演Images插入`cat`+image/jpeg、同名冲突、IS_PENDING=1、错误audio MIME和提供raw DATA五种输入，写出最终目录、名字、owner、row与目标文件是否已经存在。
+画图时不要把箭头合并：标出 ContentProvider movement 的 FS→DB、受管 FUSE rename 的未提交 DB→FS→commit，以及 database-bypass FUSE rename 的 FS-only。
 
-## 113. macOS只读练习二：比较两种rename
+## 3. insert先收回系统列，再决定raw path、download与owner
+
+`insertInternal()` 先处理并非普通 files row 的 URI：`media_scanner` 修改扫描状态，`volumes` 调 `attachVolume()`，playlist member 写入会持久化到真实 playlist 文件。只有普通 image、video、audio、playlist、downloads、files 与 thumbnail/album-art 分支才继续走各自插入路径。
+
+普通插入会移除调用者给出的 `_id`；`DATE_EXPIRES` 也先被删除，再依据本次 `IS_PENDING` 或 `IS_TRASHED` 请求按系统时钟重算。这里还有 raw path 反推的覆盖层：获准传入的 `.pending-<秒>-名字` 或 `.trashed-<秒>-名字` 会被 `computeValuesFromData()` 再解析，文件名编码的 expiry 可覆盖刚才的派生值；FUSE 普通物理名的 pending 则会保留 pending、却清掉 expiry。
+
+非 self 调用者提供的 `IS_DOWNLOAD` 被移除。Images、Video、Audio、Files 等分支在路径生成**之前**调用 `maybeMarkAsDownload()`：只有此刻已经获准携带 raw `_data`，函数才能按 Download 路径写 1；只有现代列、`_data` 尚空时，即使稍后生成到 `Download/`，这里也不会回头重算。Downloads collection 才无条件强制写 1。经纬度被写成 SQL `NULL`，target Q 及以下残留的旧目录列被移除。
+
+raw path 权限要按操作区分。insert 中，self、legacy write 和 manager 可以保留 `sDataColumns`；普通调用者的 raw `_data` 等列被丢弃，随后从现代放置列生成路径。即使 manager 的 raw path 被接受，`assertFileColumnsSane()` 仍 canonicalize 路径并要求它属于目标 volume 的 scan roots，不能把某个卷 URI 指向另一个卷或系统任意路径。canonical file 只用于这次包含关系检查，源码没有把 canonical path 写回 values；获准的原始字符串仍可能进入 `_data`。
+
+owner 是 MediaStore 对象所有权，不是 inode 的 Linux uid。self 与 shell 可显式提供 owner，缺失时只从**此刻已有的 incoming raw path** 猜；现代列输入尚未生成 `_data`，后面生成到 `Android/media/<package>` 并不会再补猜 owner。delegator 可代表目标包，缺失时回退 Binder package；普通远端调用者不能直接控制 `OWNER_PACKAGE_NAME`，Provider 强制使用真实 calling package。这个 owner 后续参与 item 权限、pending 发布、upsert 与 replace 决策。
+
+### 练习 2：核对insert的系统列与owner矩阵
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '5200,5335p' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
-sed -n '1580,1985p' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'if (match == MEDIA_SCANNER) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (match == VOLUMES) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'initialValues.remove(MediaColumns._ID);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'FileUtils.computeDateExpires(initialValues);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (isCallingPackageSelf() || isCallingPackageLegacyWrite()) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F '} else if (isCallingPackageManager()) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'initialValues.remove(FileColumns.IS_DOWNLOAD);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'final boolean isDownload = maybeMarkAsDownload(initialValues);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'initialValues.put(FileColumns.IS_DOWNLOAD, 1);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'initialValues.putNull(ImageColumns.LATITUDE);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'ownerPackageName = extractPathOwnerPackageName(path);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F '} else if (isCallingPackageDelegator()) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'initialValues.remove(FileColumns.OWNER_PACKAGE_NAME);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'ownerPackageName = getCallingPackageOrSelf();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'final Collection<File> allowed = getVolumeScanPaths(volumeName);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F '.getCanonicalFile();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (!FileUtils.contains(allowed, actual)) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
 ```
 
-画出ContentProvider placement update与FUSE file/directory rename的“检查、改DB、改FS、提交、扫描”顺序；分别标出rename成功后数据库失败和lower rename失败时可能留下的状态。
+分别推演普通 R 应用、legacy writer、manager、scanner 与 delegator 给出 `_id`、`DATE_EXPIRES`、`IS_DOWNLOAD`、raw `_data`、owner 时，哪些值会保留、重算或移除。
 
-## 114. macOS只读练习三：审计delete返回值
+## 4. collection URI是一套放置类型系统，不只是SQL表名
+
+`ensureFileColumns()` 先由 URI match 选默认 MIME、默认 media type、默认 primary directory 与 allowed-primary 集合：
+
+| collection | 默认MIME | 默认目录 | 常规允许的顶级目录 |
+|---|---|---|---|
+| Audio | `audio/mpeg` | `Music/` | Alarms、Audiobooks、Music、Notifications、Podcasts、Ringtones |
+| Video | `video/mp4` | `Movies/` | DCIM、Movies、Pictures |
+| Images | `image/jpeg` | `Pictures/` | DCIM、Pictures |
+| Playlists | `audio/mpegurl` | `Music/` | Music、Movies |
+| Downloads | `application/octet-stream` | `Download/` | Download |
+| Files | `application/octet-stream` | `Download/` | Download、Documents；playlist/subtitle 再扩展 Music、Movies |
+
+MIME 缺失时，target R 及以上先从 `DISPLAY_NAME` 后缀推导，推不出才用 collection 默认值；旧 target 的具体媒体 collection 保留默认 MIME 行为。具体 collection 收到无受支持扩展映射的 MIME 时，会尝试使用文件名推导出的同类 MIME；仍不成立时，R+ 抛异常，旧 target 回退默认值。最终 media type 必须与 Images、Video、Audio 等 collection 一致。
+
+Files 的初始 `MEDIA_TYPE_NONE` 让它能接受一般文件，但 playlist 与 subtitle 会扩展默认目录政策。这里的“generic”不是免除路径、owner、volume 与权限检查。若 `_data` 为空且目标是 internal volume，Provider 直接拒绝创建路径；internal 数据库用于索引系统媒体，并不是普通应用的写入目标。
+
+### 练习 3：从URI还原默认MIME与目录矩阵
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '4250,4480p' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
-sed -n '6165,6205p' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'String defaultMimeType = ClipDescription.MIMETYPE_UNKNOWN;' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'String defaultPrimary = Environment.DIRECTORY_DOWNLOADS;' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'defaultMimeType = "audio/mpeg";' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'Environment.DIRECTORY_AUDIOBOOKS,' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'defaultMimeType = "video/mp4";' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'defaultMimeType = "image/jpeg";' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'defaultMimeType = "audio/mpegurl";' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'case FileColumns.MEDIA_TYPE_PLAYLIST:' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'case FileColumns.MEDIA_TYPE_SUBTITLE:' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'final String mimeTypeFromExt = TextUtils.isEmpty(displayName) ? null :' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'throw new IllegalArgumentException("Unsupported MIME type " + mimeType);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F '} else if (defaultMediaType != actualMediaType) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'Writing to internal storage is not supported.' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
 ```
 
-假设checkAccess抛异常、File.delete返回false、PARAM_DELETE_DATA=false、目录有child四种情况，逐项判断实体、row、delete count、parent cache与后续扫描会怎样变化。
+尝试解释 `photo.mp3 + image/jpeg` 与 `photo.jpg + image/*`：前者的名字后缀不一定被保留，后者在 R+ 可由扩展名纠正为受支持的 image MIME。
 
-## 115. macOS只读练习四：追事务后副作用
+## 5. 现代放置列先形成候选路径，唯一命名只看当前文件系统
+
+若允许的 raw `_data` 已存在，`computeValuesFromData()` 以路径为准，重算 volume、relative path、display name、bucket、pending、trashed 与 expiry；调用者同时给出的矛盾现代列不会胜出。若 `_data` 为空，Provider 补默认 `DISPLAY_NAME` 与 `RELATIVE_PATH`，清洗 FAT 非法字符和路径段，再由 `computeDataFromValues()` 组合 volume root、relative path 与物理文件名。
+
+非 FUSE pending 使用 `.<pending-prefix>-<expiry>-<display-name>` 物理名；trash 同样使用带过期时间的隐藏物理名。row 中保存的是逻辑 `DISPLAY_NAME`：会去掉 pending/trash 物理前缀，也可能已被清洗、补扩展名或加唯一后缀，不能笼统地说它恒等于最初输入。FUSE pending 不改物理名，数据库状态与文件名可以暂时不对称。
+
+`splitFileName()` 检查后缀与 MIME 是否一致；不一致时，原 display name 会成为 basename 的一部分，并追加 MIME 的默认扩展名。`buildUniqueFile()` 再检查真实文件是否存在：一般名字尝试原名和最多 31 个括号编号；DCIM 中的严格 DCF 名递增四位序号，日期式相机名使用 `~N`。
+
+这里有一个重要的双命名空间边界：唯一命名只调用 `File.exists()`，不会先查询 `_data UNIQUE`。如果先前 insert 只预留了 row、文件尚未创建，第二次同名 insert 仍会得到同一候选路径，随后才在 SQLite 唯一键处进入 owner 受限 upsert 或失败。
+
+### 练习 4：证明物理名字、显示名字与唯一键不是同一层
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '585,675p' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
-sed -n '450,545p' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
-sed -n '600,700p' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'public static void computeValuesFromData(@NonNull ContentValues values, boolean isForFuse) {' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'final Matcher matcher = FileUtils.PATTERN_EXPIRES_FILE.matcher(displayName);' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'values.put(MediaColumns.DISPLAY_NAME, matcher.group(3));' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'public static void computeDataFromValues(@NonNull ContentValues values,' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'if (!isForFuse && getAsBoolean(values, MediaColumns.IS_PENDING, false)) {' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F '} else if (getAsBoolean(values, MediaColumns.IS_TRASHED, false)) {' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'public static void sanitizeValues(@NonNull ContentValues values,' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'public static String[] splitFileName(String mimeType, String displayName) {' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'public static File buildUniqueFile(File parent, String mimeType, String displayName)' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'if (!file.exists()) {' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'private static final Pattern PATTERN_DCF_STRICT = Pattern' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'private static final Pattern PATTERN_DCF_RELAXED = Pattern' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F 'return i < 32;' packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java
+grep -n -F '_data TEXT UNIQUE COLLATE NOCASE' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
 ```
 
-从SQLite trigger进入OnFilesChangeListener，列出blockingTasks、notifyChanges、backgroundTasks在commit成功/回滚/无活动事务三种情况下的执行顺序，并找出quota、thumbnail、SAF和URI revoke分别在哪一层。
+用“row 已存在但 file 不存在”和“file 已存在但 row 不存在”两种初态手算同名插入；两者分别在数据库唯一键和物理唯一命名层分流。
 
-## 116. 易混点一：insert成功不等于文件已写好
+## 6. 路径准入按五层扩展；mkdir早于row事务
 
-普通MediaStore insert通常只是分配安全唯一路径、写row并返回URI；App还要打开URI写字节，再发布pending。只有目录mkdir、playlist touch等分支会在insert阶段改变具体实体。
+生成候选路径后，准入依次扩展，而不是只看一个存储权限：
 
-## 117. 易混点二：delete count不证明物理删除
+1. update 时若新旧父目录相同，允许原目录内改名；insert 没有 `currentPath`，不走这一条。
+2. 顶级目录属于当前 collection 的 `allowedPrimary`。
+3. insert extras 给出 related URI，且关联对象与新对象的 MIME 主类型、`RELATIVE_PATH` 都完全相同；这里没有额外比较 volume。关联项可见但两项不匹配会立即抛错，查询不到关联项才记录后继续尝试后面的放行层。update 会主动移除 related URI，不能借它搬动既有对象。
+4. 路径位于调用者 shared package 自己的 `Android/media` 目录。
+5. manager 在这个 ContentProvider 生成路径分支直接把 `validPath` 置 true；不要把 FUSE create 对其他包 private path 的拒绝错误移植到这里。否则，只有未请求 legacy storage、且具备最终路径所对应 image/video 写能力的调用身份才进入这层放行；它可使用已有目录或在已有顶级目录下创建子目录，但不能借此创建不存在的非默认顶级目录。
 
-r48的deleteIfAllowed吞异常，File.delete boolean也未检查，row仍可被删除。count应理解为数据库对象变化，文件/row偏差由scan最终修复，不能作为安全擦除证明。
+全部规则失败才抛 placement 异常。raw `_data` 不走这套生成分支，但仍走 volume scan-root 校验。
 
-## 118. 易混点三：两种rename的“事务”不同
+路径通过后，`res.getParentFile().mkdirs()` 会在数据库 mutation 前执行，只检查最终父目录是否存在，不记录哪些层级是本次创建的。insert 会在 row 事务前走到这里；ContentProvider movement 的 non-unique probe 和 unique 目标计算也都复用同一段逻辑，因而可在 `Os.rename()` 之前建父目录。若后续 `_data` constraint、权限 builder、rename 或进程失败，空目录不会被 SQLite 回滚。
 
-ContentProvider movement先rename文件再开数据库update事务；FUSE rename在DatabaseHelper事务内先尝试row更新、再rename lower、成功才提交。后者改善失败对齐，但任何一方都没有让VFS真正加入SQLite事务。
+### 练习 5：逐层验证placement准入与mkdir窗口
 
-## 119. 复读纠偏记录
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'final String currentDir = (currentPath != null)' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'boolean validPath = res.getParent().equals(currentDir);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'validPath = allowedPrimary.contains(primary);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'final Uri relatedUri = extras.getParcelable(QUERY_ARG_RELATED_URI);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (!Objects.equals(expectedType, actualType)) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (!Objects.equals(expectedPath, actualPath)) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'final String pathOwnerPackage = extractPathOwnerPackageName(res.getAbsolutePath());' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'validPath = isExternalMediaDirectory(res.getAbsolutePath()) &&' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'validPath = isCallingPackageManager();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'final boolean createNonDefaultTopLevelDir = primary != null &&' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'canAccessMediaFile(res.getAbsolutePath(), /*allowLegacy*/ false);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'res.getParentFile().mkdirs();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (!res.getParentFile().exists()) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'extras.remove(QUERY_ARG_RELATED_URI);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+```
 
-复读后修正十点：insert与update的raw DATA权限矩阵不同；MANAGE只在insert raw path分支明确放行；ensureFileColumns可能先mkdir后DB失败；普通insert不创建媒体字节；double insert upsert要求owner匹配；pending发布通过清mtime/size强制扫描；普通movement先FS后DB且ENOENT继续；delete可能吞I/O失败仍删row；FUSE rename以DB事务包围lower rename但非跨系统原子；`"null"`owner哨兵与SQL NULL不可混淆。
+为每一层各造一个允许样例，再造一个 `Pictures/` collection 指向不匹配顶级目录的拒绝样例；最后标出目录已建、row 未提交的失败点。
 
-## 120. 本章小结与下一章
+## 7. insert提交的是row预留；受限upsert解决双入口竞态
 
-MediaProvider写链把URI collection、owner与现代placement列翻译为受控路径，借SQLite事务维护row和通知，却只能以顺序、缓存失效与扫描来协调真实文件系统。理解insert不等于写字节、update与FUSE rename顺序不同、delete可能只成功删row，才能正确分析崩溃恢复。下一章继续研究MediaProvider query、SQLiteQueryBuilder、projection、owner/permission过滤、pending/trashed匹配与canonical URI链。
+`insertFile()` 先确保最终 path，`computeValuesFromData()` 由路径回填 bucket 等列；`DATE_ADDED` 来自当前时钟，`TITLE` 仅在未给出时才由 path 兜底，format、MIME 与 media type 还有目录、已提供值和调用身份分支。若 path 已存在，Provider 总会用磁盘 mtime 覆写 date-modified，只有 size 是缺失时才补。目录使用 association format、MIME 为 null，并写入 `mDirectoryCache`；普通媒体 insert 不 touch 目标文件，调用者要用返回 URI 打开并写字节。还有一个 r48 实现细节：普通 `insertFile()` 分支只给 `newUri` 赋值，`insertInternal()` 的局部 `rowId` 仍是 -1，末尾 `setOwned(rowId, true)` 因而没有把真实新 id 放进这条快速 owned-id cache；row 中的 owner 值本身不受影响。
+
+事务内若 `PARENT` 未给出，`getParent()` 查找或建立父目录 row；显式非 null 的 parent 会跳过推导。随后先做普通 `qb.insert()`；若 `_data` 唯一键冲突，Provider 用 generic Files update builder 查同路径 row，并要求 owner 属于 calling shared packages，或属于 delegator 被允许代表的 owner。owner allowlist 只是必要条件：Files 的 TYPE_UPDATE builder 仍保留 volume 与行权限等过滤，但 `getQueryBuilderForUpsert()` 对 pending 和 trashed 明确设为 `MATCH_INCLUDE`。查到 id 且定点 update 恰好影响 1 行才保留原 id，否则重抛 constraint。R+ 调用者最终看到异常；旧 target 的顶层 `insert()` 兼容包装会把未解决的 constraint 变成 null。
+
+parent 与 directory cache 也不是纯数据库状态：`getParent()` 在同一 transaction 中可递归插祖先 row，但目录 path→id cache 会立即写入内存。最终 insert/upsert 回滚时，SQLite 能撤销祖先 row，cache 没有相应的 transaction rollback 钩子，因而存在陈旧 parent-id cache 窗口。
+
+这不是无条件覆盖。它专门处理“应用先从直接文件路径创建，FUSE 已插 row；随后又用 ContentResolver insert”以及“前一次只预留 row”的重复入口。owner 不匹配时仍失败，阻止调用者选择受害者路径覆盖其索引。
+
+playlist 是字节层的特殊例外：远端创建 playlist row 后，Provider 再通过返回 URI 打开并关闭输出流，尝试 touch 空文件；I/O 异常被忽略，所以 playlist 的 URI 返回也不是实体创建成功证明。
+
+### 练习 6：追踪row、parent、upsert与playlist实体
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'values.put(MediaStore.MediaColumns.DATE_ADDED, System.currentTimeMillis() / 1000);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (path != null && new File(path).isDirectory()) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (file.exists()) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'rowId = insertAllowingUpsert(qb, helper, values, path);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'Long parent = values.getAsLong(FileColumns.PARENT);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'final long parentId = getParent(db, path);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'return qb.insert(helper, values);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'final String packages = getAllowedPackagesForUpsert(' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'final long rowId = getIdIfPathOwnedByPackages(qbForUpsert, helper, path, packages);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'qbForUpsert.update(helper, values, "_id=?",' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'throw e;' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'return ContentUris.withAppendedId(uri, rowId);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'mDirectoryCache.put(parentPath, id);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'mCallingIdentity.get().setOwned(rowId, true);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (getCallingPackageTargetSdkVersion() >= Build.VERSION_CODES.R) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F '.openOutputStream(newUri)) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F '} catch (IOException ignored) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+```
+
+观察同一物理名字先后由同 owner 与不同 owner 插入时的分歧，并说明为什么 `buildUniqueFile()` 没有提前消除“只有 row、没有 file”的冲突。
+
+## 8. update先过滤列；pending发布把磁盘重新设为元数据真相
+
+`updateInternal()` 同样移除 `_id`、重算 expiry、清经纬度。raw data 权限比 insert 更窄：只有 self 与 legacy write 明确保留 `sDataColumns`，没有 manager 特例。manager 仍可通过现代 placement 列进入受控 movement，但不能据此推断任意 raw `_data` update 会生效。
+
+owner transfer 也独立检查：self/shell 可改；delegator 只在当前 owner 为空或属于自己的 shared packages 时可转给 proposed owner；其他调用者给出的 owner 被移除。对象可写权并不自动附带 owner 转移权。
+
+对非 self 调用者，`sMutableColumns` 中的 placement、favorite、部分 bookmark/tags/category、playlist、download 来源等列才正常保留。scanner 控制的 duration、width、height、title 等列在已发布对象上被忽略，并把 `triggerScan` 置 true，因为可信值应来自磁盘；但若请求里只有这些被移除的列，随后 `initialValues.isEmpty()` 会直接返回 0，已经置位的 `triggerScan` 也不会执行。至少还有一个可写列留下时，后面的扫描路径才会到达。
+
+pending 放宽也不是任意 URI 的通则：它调用旧的 `isPending(uri)`，只识别 Audio、Video、Images 的 typed item ID。Files/Downloads item 或 selection 批量 update 不会靠这个方法获得同样的非 mutable 列放宽。
+
+对非 self 调用者，只要 values **出现** `IS_PENDING` 键，不论它是不是一次 1→0 发布，Provider 都要求 scan，并把 date-modified 与 size 置 null，打破扫描器的 mtime/size no-op 快路。发布后扫描重新读取 EXIF、retriever 等磁盘事实。self/scanner 不进这段过滤与置空逻辑，并会在后面强制取消其他路径设置的 `triggerScan`，避免扫描写 row 再触发自身。
+
+## 9. ContentProvider movement是“先FS、后DB”，ENOENT也不阻止row前进
+
+placement 集合包含 `_data`、relative path、display name、MIME、pending、trashed 与 expiry。只有未直接提供 `_data`、非 thumbnail、`allowMovement=true` 时才进入受控移动；默认值对外部调用者为 true，对 self 为 false。直接 raw `_data` update 只是重指 row，不执行这段 `Os.rename()`。
+
+movement 只接受明确的单 item media/files/downloads URI。Provider 以内置身份查询当前 placement 列，把调用者未提供的字段融合进去；先用 non-unique 路径计算 probe。路径未变就不移动；volume 改变或从路径提取出的 package owner 域改变则拒绝。确认真的移动后才用 unique 模式生成最终目的地。
+
+关键顺序是：两次路径计算都可先 `mkdirs()` → 尝试 `Os.rename(before, after)`。只有 rename 成功才接着失效两端 FUSE dentry；`ENOENT` 会跳过这两次失效，但仍把 after path 写回 values，再进入 `updateAllowingReplace()` 的数据库事务，因而 row 仍可能提交到新路径；其他 errno 才终止。反方向上，rename 已成功而数据库 constraint、进程终止或后续异常发生，文件可在新路径、row 仍在旧路径。unique probe 只看当时的 `File.exists()`；若目的路径只有数据库 row，或另一进程在 probe 后创建目标文件，rename 甚至可能先写入或覆盖目标，随后 DB 的 owner/constraint 检查才失败。扫描器承担恢复，不存在跨 VFS 与 SQLite 的总回滚。
+
+授权时序还有更窄的边界：Audio、Video、Images typed item 在 movement 前显式 `enforceCallingPermission()`；Files、Downloads 与 playlist item 没有这项前置 item 检查。旧 placement 的融合查询又在清除调用身份后执行，于是从这段 Java 链自身看，后几类 URI 可能先完成 `Os.rename()`，最终 TYPE_UPDATE builder 才用调用者身份把 row mutation 过滤成 count 0。此时 API 可返回 0、文件已移动、row 仍指旧路径，affected-id 快照也可能为空而没有补扫。不能把“最终数据库写权限过滤”当作“文件移动前授权屏障”。
+
+## 10. update的兼容replace与后处理顺序必须按事务上下文理解
+
+`updateAllowingReplace()` 在 `_data` constraint 时对 R+ 直接重抛。旧 target 只有在目标 path 当前存在、冲突 row 属于 calling shared packages 且可删除时，才在同一数据库事务内删冲突 row 并重试 update。对 placement movement 而言，文件已先 rename 到目标，所以“目标存在”可能只是刚移动来的源文件，不能证明冲突 row 原先拥有另一份实体。
+
+路径或 scanner metadata 变化会在 mutation 前快照 affected IDs，因为 update 后原 query builder 可能不再匹配。row 提交后，每个 id 安排 thumbnail 失效；需要 scan 时再查询更新后的 `_data` 并调用 scanner。
+
+`postBlocking` 的名称不能脱离上下文解释。独立 update 中，内部 row 事务已经在 `updateAllowingReplace()` 返回时结束，因此随后调用 `postBlocking()` 会在当前线程立即扫描；此前 transaction notification 只是已投递到 foreground executor，两者没有一个共同队列屏障。`applyBatch()` 在对应 helper 上仍有外层事务，此时 blocking scan 才真正排队；该 helper 成功结束后先逐项执行，再统一投递通知，最后提交 background tasks。若 batch 跨多个 helper，各 helper 在 `finally` 中顺序结束，前一个可以已经 commit 并启动后处理，而后一个的结束才失败。两种情况下，publish update 通常都在向调用者返回前完成 blocking scan，但通知观察者何时消费不是返回屏障。
+
+### 练习 7：比较update过滤、movement与两种后处理上下文
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'extras.remove(QUERY_ARG_RELATED_URI);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (sMutableColumns.contains(column)) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F '} else if (isPending.get()) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (initialValues.isEmpty()) return 0;' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'private boolean isPending(Uri uri) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'initialValues.putNull(MediaColumns.DATE_MODIFIED);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'initialValues.putNull(MediaColumns.SIZE);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'final boolean allowMovement = extras.getBoolean(MediaStore.QUERY_ARG_ALLOW_MOVEMENT,' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'ensureNonUniqueFileColumns(match, uri, extras, initialValues, beforePath);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'try (Cursor c = queryForSingleItem(genericUri,' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'throw new IllegalArgumentException("Changing volume from " + beforePath + " to "' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'throw new IllegalArgumentException("Changing ownership from " + beforePath + " to "' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'Os.rename(beforePath, afterPath);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (e.errno == OsConstants.ENOENT) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'count = updateAllowingReplace(qb, helper, values, userWhere, userWhereArgs);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'helper.postBackground(() -> {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'helper.postBlocking(() -> {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (getCallingPackageTargetSdkVersion() >= Build.VERSION_CODES.R) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'return qb.update(helper, values, userWhere, userWhereArgs);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+```
+
+分别画独立 `update()` 和处于 `applyBatch()` 外层事务中的 update；特别标出 notify 已提交给 executor 与 observer 已处理并不是同一件事。
+
+## 11. delete先尝试实体、再删row；count只计数据库变化
+
+普通 files mutation 的 query builder 实际指向 `files` 表。Audio、Video、Images typed item delete 会先显式执行可写权限检查，让缺权调用者有机会走具体 URI 的用户授权升级；Files、Downloads 等分支没有同样的前置升级动作，而由 query builder 的可写行过滤决定是否命中。
+
+随后 delete 查询 media type、`_data`、id、download 标志与 MIME，对每个匹配项先清 calling identity 的 owned-id cache，再调用 `deleteIfAllowed()`，最后按 id 执行 `qb.delete()`。`deleteIfAllowed()` 恢复调用者权限检查，但捕获所有异常；`deleteAndInvalidate()` 又无视 `File.delete()` 的 boolean，只继续失效 dentry。owned-id 的提前清除不会被后续数据库回滚恢复，通常造成保守的 cache miss，不是错误授权。
+
+因此 row delete 可以提交，而文件因权限、I/O、忙碌或其他原因仍存在。普通 row-backed delete 的返回 count 累计的是 `qb.delete()` row 数，不是成功 unlink 数，更不是安全擦除证明。后续扫描可能把孤儿文件重新插入；反过来，如果 unlink 已成功而 row transaction 随后失败，便得到“无文件、有 row”。多 row 的独立 delete 还可能为每个 `qb.delete()` 各开一次事务，前面的 row 已提交后，后面的异常不会自动回滚整次调用；只有同一 helper 的外层 batch 等事务会包住它们，物理删除仍不可回滚。
+
+URI 参数 `deletedata=false` 明确跳过实体遍历，直接删索引，扫描对账用它清理磁盘上已不存在的旧 row。它不表示“安静删除”：row trigger 仍可产生通知、授权撤销与 thumbnail 失效。
+
+## 12. parent循环、playlist、Downloads与FUSE delete各有独立边界
+
+`deleteRecursive()` 会在数据库事务内先清空整个 directory cache，再重复相同 delete 直到返回 0。事务回滚不会还原这个内存 cache，通常只导致后续重查。它的设计说明配合 `_id NOT IN (SELECT parent...)` 可逐层剥离叶子与父目录；但不能把设计说明误写成 r48 所有 files delete 的实际保证。
+
+在普通实体分支里，源码先遍历 cursor、逐 id 删除 row，之后才向 query builder 追加 `ID_NOT_PARENT_CLAUSE`，再调用 `deleteRecursive()`；这些前置逐 id 删除并未受 parent 谓词保护。`deletedata=false` 又完全跳过追加谓词。因而排障时要看具体 call site 和 selection，不能仅凭 helper 名称断言“父 row 一定最后删”。image/video thumbnail 表走专门的“先尝试删文件、再 recursive row delete”分支；audio album-art 的 builder 指向 `album_art`，在这个方法里落入默认 row delete，没有复用该实体删除分支。
+
+删除 external audio row 后，Provider 查询 `audio_playlists_map` 的受影响 playlist 并从 playlist 文件重新解析成员。download id 与 MIME 来自删除前 cursor：只要 `IS_DOWNLOAD=1` 就加入集合，即使该 id 的 `qb.delete()` 返回 0。循环后才把它们交给 DownloadManager。独立 delete 此时已无活动 helper transaction，`postBackground()` 直接提交任务，可与先前逐 row 事务投递的 foreground notification 竞速；只有收集在同一 `TransactionState` 的任务才受分阶段顺序约束。row trigger 还可安排 URI revoke、thumbnail 失效与 SAF 删除回调。
+
+FUSE unlink 先按身份与 row 命中分流。native wrapper 的 ROOT 直接 `unlink()`；Java 的 database-bypass caller 直接 `deleteFileUnchecked()`，两者都不改 row。普通受管路径调 Provider `delete()`，row count 大于 0 即向 FUSE 返回成功，即使内部 `File.delete()` 返回 false；若 count 为 0 但 caller 可 bypass FUSE restrictions，又回退到一次 FS-only 删除。只有受管 row-delete 分支共享 files trigger 与通知链。如果 Provider 在物理删除后抛出 Java 异常，JNI 把它转为 `EFAULT`，native 不调 `SetDeleted()`，此时 lower file 却可能已不在。另外，FUSE 路径删 row 后，同 UID 再按 item URI delete，cached deleted-row id 会让第二次调用静默返回 0；这表示没有新 row 被删。
+
+目录 `rmdir` 是另一条 native 路径：先问 Java 是否允许，再直接对 lower path 调 `rmdir()`。它不经过逐 row delete 链，也不自行请求 scan、row mutation 或 observer notification；只有未来因其他原因触发的扫描才可能收敛目录索引。
+
+### 练习 8：用反例审计delete、open与FUSE I/O
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'removeDeletedRowId(Long.parseLong(uri.getLastPathSegment()))' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (deleteparam == null || ! deleteparam.equals("false")) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'deleteIfAllowed(uri, extras, data);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'count += qb.delete(helper, BaseColumns._ID + "=" + id, null);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'appendWhereStandalone(qb, ID_NOT_PARENT_CLAUSE);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'n = qb.delete(helper, userWhere, userWhereArgs);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'file.delete();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'private void deleteIfAllowed(Uri uri, Bundle extras, String path) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'public int deleteFileForFuse(@NonNull String path, int uid) throws IOException {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'return deleteFileUnchecked(path);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (shouldBypass) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (uid == ROOT_UID) {' packages/providers/MediaProvider/jni/MediaProviderWrapper.cpp
+grep -n -F 'int MediaProviderWrapper::Rename(const string& old_path, const string& new_path, uid_t uid) {' packages/providers/MediaProvider/jni/MediaProviderWrapper.cpp
+grep -n -F 'if (delete(contentUri, where, whereArgs) == 0) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'int status = fuse->mp->DeleteFile(child_path, ctx->uid);' packages/providers/MediaProvider/jni/FuseDaemon.cpp
+grep -n -F 'child_node->SetDeleted();' packages/providers/MediaProvider/jni/FuseDaemon.cpp
+grep -n -F 'int status = fuse->mp->IsDeletingDirAllowed(child_path, req->ctx.uid);' packages/providers/MediaProvider/jni/FuseDaemon.cpp
+grep -n -F 'if (rmdir(child_path.c_str()) < 0) {' packages/providers/MediaProvider/jni/FuseDaemon.cpp
+grep -n -F 'private ParcelFileDescriptor openFileAndEnforcePathPermissionsHelper(' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'checkAccess(uri, Bundle.EMPTY, file, forWrite);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (isPending && !isPendingFromFuse(file)) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'ParcelFileDescriptor lowerFsFd = FileUtils.openSafely(file, modeBits);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'daemon.shouldOpenWithFuse(filePath, true /* forRead */, lowerFsFd.getFd());' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'fl.l_type = for_read ? F_RDLCK : F_WRLCK;' packages/providers/MediaProvider/jni/FuseDaemon.cpp
+grep -n -F 'return ParcelFileDescriptor.wrap(pfd, BackgroundThread.getHandler(), listener);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'final ParcelFileDescriptor pfd = ensureThumbnail(uri, signal);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (shouldBypassDatabaseForFuse(uid)) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'helper.beginTransaction();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (!updateDatabaseForFuseRename(helper, oldPath, newPath,' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (hasFullAccessToNewPath && hasFullAccessToOldPath) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'int errno = renameInLowerFs(oldPath, newPath);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'helper.setTransactionSuccessful();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'helper.endTransaction();' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'values.put(FileColumns.OWNER_PACKAGE_NAME, "null");' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'scanRenamedDirectoryForFuse(oldPath, newPath);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (CheckForJniException(env)) {' packages/providers/MediaProvider/jni/MediaProviderWrapper.cpp
+grep -n -F 'if (res == 0) {' packages/providers/MediaProvider/jni/FuseDaemon.cpp
+```
+
+构造 `File.delete()` 返回 false、权限检查抛异常、`deletedata=false`、有 child 的目录 row、FUSE 重复 delete 五种情况，分别记录 lower file、row、count、dentry cache 与通知。
+
+## 13. 普通openFile从row解析路径；thumbnail分支会提前短路
+
+`openFileCommon()` 的四个 legacy thumbnail redirect 直接进入 `ensureThumbnail()`，普通 item 才进入 `openFileAndEnforcePathPermissionsHelper()`。在普通路径中，Provider 暂时清调用身份查询 `_data`、owner 与 pending，把 `_data` canonicalize 成 `File`；恢复身份后才执行 `checkAccess()`。内部能查到 row 与外部有权打开文件是两个不同结论。framework transport 仍有 URI-level file-permission enforcement，但不能把它等同于 MediaProvider 内部的 row/path `checkAccess()` 链。
+
+write-only 模式会补上 read-write 位，使后续 `shouldOpenWithFuse(..., true /* forRead */, ...)` 能取得 native 的 `F_RDLCK`；它不是额外取得 write lock。非 FUSE 物理名的 pending row 还要求 item ownership；所谓“FUSE pending”并没有单独 provenance 列，而是由文件名不匹配 expiration pattern 推断，因此该分支仍要依赖前面的 URI/path 权限检查。
+
+非 owner 且缺少原始位置访问能力时，Provider 计算 EXIF/XMP redaction ranges；URI 要求 original 则拒绝。启用新 FUSE 时通过 upper path 让 FUSE handler 脱敏，旧实现使用 redacting descriptor。
+
+无需脱敏时，Provider 先用转换后的 open flags 安全打开 lower FD，这一步的 create/truncate 已可能改变 lower file；然后才询问对应 daemon 是否已有必须保持一致的 upper VFS cache。需要时改开 upper FD 并关闭 lower；否则保留 lower，且 writable lower FD 会在返给调用者前 invalidate dentry。所以 invalidation 早于调用者后续写入，却不一定早于 open-time create/truncate；这是缓存一致性选择，不是额外授予读权限。
+
+`openTypedAssetFileCommon()` 的 underlying-file fallback 最终进入 `openFileCommon()`，会执行普通权限链；但它请求 thumbnail 时直接进入 `ensureThumbnail()`，r48 源码本身标记 URI access enforcement 尚未补齐。`openFileCommon()` 的四个 legacy thumbnail redirect 也同样不进入 path helper。不能用 fallback 的内部校验替这些 thumbnail 分支作保证。
+
+## 14. close后的扫描与FUSE rename都不是一个单一同步完成点
+
+非 pending 写 FD 会用 `ParcelFileDescriptor.wrap()` 挂到 BackgroundThread handler。close listener 无论远端 writer 是否报告异常，都会失效 thumbnail 与 dentry；普通媒体按需扫描，legacy thumbnail 则直接更新宽高。因为 listener 运行在后台 handler，调用者的 `close()` 不是 metadata scan 完成屏障。
+
+pending 写 FD 不挂 listener，避免生产阶段每次 close 都扫描；发布时由 update 的 blocking scan 收敛。pending 是 open 时的快照：若 FD 尚未关闭就先发布，发布 scan 可能读到半成品，而这个早先打开的 FD 关闭时也没有 listener 再补扫。只读 open 同样不挂写后扫描。
+
+排除 native 层已拒绝/短路的 flags、parent node、路径可访问性和 no-op，以及 ROOT 在 wrapper 中直接 lower rename 的 FS-only 快路后，进入 Java `renameForFuse()` 的非 ROOT 请求才共同先过两组检查：新旧端不能进入其他包私有路径，且新路径必须等于清洗后的绝对路径。manager 等 database-bypass 身份随后就直接 lower rename，跳过数据库更新，也跳过后面默认目录、存储根与 `Android` 目录约束；这些 FS-only 调用本身不安排扫描或通知，只有其他原因触发的未来扫描才可能收敛数据库。
+
+非 database-bypass 中，新旧两端都具备 FUSE restriction bypass 的调用者立即走 unchecked 数据库协调，同样位于后续目录约束之前。普通 checked 路径先按调用身份拒绝 legacy caller，再由 old/new relative path 分别检查默认顶级目录不可改名、目标不可位于存储根；随后执行 `Android` 区域限制。该区域在 r48 以 `Environment.getExternalStorageDirectory()` 的 primary external root 构造，不能外推为对所有可移除卷的同等检查。checked file rename 还验证新路径支持 MIME。checked directory rename 的 full-access 快路按 relative-path 字符串 `startsWith(defaultDir)` 判断，并非目录段边界检查，因而默认目录的同前缀路径也可命中；命中后直接取所有已索引且 MIME 非 null 的文件。只有慢路才比较全部数与 TYPE_UPDATE 可见数，并逐项验证新路径 MIME。两条都不会审计未索引实体或 MIME 为 null 的目录 row，但 lower directory rename 会把整棵真实树一起移动。
+
+受管 rename 的共同框架是：开启 helper 事务 → 尝试协调 row → lower `Os.rename()` → 成功才 `setTransactionSuccessful()` → 结束事务。checked 单文件必须成功更新 source row；directory 必须成功更新列表中的每个 indexed file；unchecked 单文件则可在 source update 失败后走下一段兜底。constraint 处理会尝试删除 caller 可写的冲突 row 并重试。lower rename 失败会回滚 row；但 lower 已成功而进程在 commit 前终止时，文件仍可能移动而 row 回滚。
+
+unchecked 单文件还有一个不能并入上述成功路径的分支：只要 `updateDatabaseForFuseRename()` 返回 false——可以是 constraint 无法解决，也可以是源 path 没有命中一行——bypass caller 就转而调用 `maybeRemoveOwnerPackageForFuseRename()`。若 caller-filtered query 能看见目标 other-owner row，该 helper 尝试把 owner 写成字面字符串 `"null"`；查询未命中——包括 row 不存在、对 caller 不可见或 owner 已是该字符串——以及 row 本就属于 caller 时，helper 也可直接返回 true。之后仍执行 lower rename，不会重试把源 row 更新到新 path。这里的 `"null"` 不是 SQL `NULL`。目录 unchecked 没有同样的 owner-clear 兜底，任一 indexed file 更新失败就返回权限错误。
+
+目录事务只批量改已索引文件 row，不改目录 row；commit 后同步扫描 old/new path，清旧目录索引并重建 hidden/media-type 状态。单文件涉及 `.nomedia` 时则在 commit 后同步扫描对应父目录。这些扫描位于 Java rename 返回之前；若它们或其他 commit 后 Java 代码抛异常，JNI 会转为 `EFAULT`，此时 lower FS 与 DB 可能都已成功，native node 却因非零结果没有执行 `Rename()`。因此非零不能反推 lower 未移动或 DB 已回滚；反过来，返回 0 也不能证明每个扫描候选 mutation 都已完全对账。
+
+## 15. files trigger在事务内触发；只有部分副作用受commit门保护
+
+`files_insert`、`files_update`、`files_delete` 是 SQLite `AFTER` trigger，调用 `_INSERT/_UPDATE/_DELETE` 自定义函数。函数在执行 mutation 的线程、数据库事务尚未结束时进入 `mFilesListener`。这使所有 builder、scanner 与受管 FUSE rename 共用同一分发入口。
+
+listener 里的动作要再分两类：
+
+- `handleInsertedRowForFuse()`、`handleUpdatedRowForFuse()`、`handleDeletedRowForFuse()` 与 owner cache invalidation 当场执行。若 lower rename 随后失败、SQLite 回滚，这些内存 cache 变化不会随数据库回滚。
+- `notifyInsert/Update/Delete()` 在存在显式 helper `TransactionState` 时只写入 `notifyChanges`；quota、URI revoke、thumbnail、SAF 等经 `postBackground()` 收集。事务未成功时，这两组都随 transaction state 丢弃。“commit-gated”指的是这种显式事务状态，不是任意 SQLite 隐式语句事务。
+
+成功结束时，`endTransactionInternal()` 先移除 transaction state、结束 SQLite transaction 并释放 schema read lock，再同步逐项运行 blocking tasks。只有它们全部正常返回，才投递 foreground runnable；该 runnable 又要先完成所有 `notifyChange()`，才把 background tasks 逐个提交给 BackgroundThread。这里保证的是**无异常路径上的阶段顺序**，不是“DB 已提交就必然完成全部分发”：blocking task 抛错可留下已提交 row，却截断剩余 blocking task 并阻止通知/background runnable 投递；foreground 通知循环抛错则会阻止其后通知与 background submission。它更不保证远端 observer 已在后台任务开始前消费通知。
+
+URI 会扩展：audio/image/video 的 typed item URI、generic Files item URI、必要时的 Downloads item URI，以及具体外部卷对应的 synthetic external item URI。audio 还使 genre、playlist、artist、album 聚合 collection URI 失效。update 改变 media type 时，旧类型与新类型都通知；同一事务、同一 flag 下用 `ArraySet` 去重。
+
+独立于 helper 事务调用 `notifyChange()` 时，只向 ForegroundThread 投递单 URI；独立 `postBlocking()` 立即运行，独立 `postBackground()` 立即提交后台。legacy FUSE ownership transfer 是重要例外：`updateOwnerForPath()` 通过 `runWithoutTransaction()` 直接 `db.update()`，trigger 执行时没有 `TransactionState`，通知与 background work 会立即投递，可能早于该隐式语句事务提交，回滚也无法撤回。因此分析顺序前必须先问“当前线程此刻是否持有 helper transaction”。
+
+### 练习 9：证明trigger、回滚与三阶段分发的精确边界
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'db.execSQL("CREATE TRIGGER files_insert AFTER INSERT ON files"' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'db.execSQL("CREATE TRIGGER files_update AFTER UPDATE ON files"' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'db.execSQL("CREATE TRIGGER files_delete AFTER DELETE ON files"' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'mFilesListener.onUpdate(DatabaseHelper.this, volumeName, oldId,' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'handleUpdatedRowForFuse(oldPath, oldOwnerPackage, oldId, newId);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'return helper.runWithoutTransaction((db) -> {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'acceptWithExpansion(helper::notifyDelete, volumeName, id, mediaType, isDownload);' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'final TransactionState state = mTransactionState.get();' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'state.notifyChanges.put(flags, set);' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'state.blockingTasks.add(command);' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'state.backgroundTasks.add(command);' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'db.endTransaction();' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'if (state.successful) {' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'state.blockingTasks.get(i).run();' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'ForegroundThread.getExecutor().execute(() -> {' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'notifyChangeInternal(state.notifyChanges.valueAt(i),' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'BackgroundThread.getExecutor().execute(state.backgroundTasks.get(i));' packages/providers/MediaProvider/src/com/android/providers/media/DatabaseHelper.java
+grep -n -F 'acceptWithExpansion(consumer, MediaStore.VOLUME_EXTERNAL,' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+grep -n -F 'if (newMediaType != oldMediaType) {' packages/providers/MediaProvider/src/com/android/providers/media/MediaProvider.java
+```
+
+为 commit 与 rollback 各画一次时序：FUSE identity cache、SQLite row、observer URI、quota、thumbnail 与 URI revoke 分别在哪一刻生效或被丢弃。
+
+## 16. 用操作矩阵定位裂缝，再把query边界留给下一章
+
+排查“返回成功但相册不对”“改名后出现双路径”“删除后文件又回来”，先用这张矩阵，不要从单一返回值倒推全链：
+
+| 操作 | 文件系统先发生什么 | 数据库何时提交 | 元数据收敛 | 主要裂缝 |
+|---|---|---|---|---|
+| 普通 insert | 可能先 `mkdirs()`；通常无目标字节 | path/parent row 事务 | 后续写 close 或 publish scan | 空目录已建但 row 失败；row 有而 file 尚无 |
+| ContentProvider movement | 路径计算可先 `mkdirs()`，再 `Os.rename()`；ENOENT 可继续 | rename 之后 update 事务 | 按 affected id 扫描 | 空目录残留；FS 新、DB 旧；或 DB 新、file 缺失 |
+| 普通 delete | 先 best-effort `File.delete()` | 常见为逐 id row transaction | 孤儿由后续 scan 收敛 | unlink 失败仍删 row；unlink 成功后 row 失败 |
+| FUSE unlink | ROOT/database-bypass 可 FS-only；受管路径调 Provider delete；零行时可再 FS-only 兜底 | 只有受管 row-delete 改 DB | 这个调用无统一扫描阶段 | file 仍在却报成功；或 file 已无而 row 未改 |
+| 受管 FUSE rename | 先尝试协调 row，再 lower rename | lower 成功才标记事务成功 | directory 或 `.nomedia` 可在 commit 后同步扫描 | unchecked 可无 source-row update；commit 后扫描报错又可返回非零 |
+| ROOT/native 或 Java database-bypass rename | 只改 lower filesystem | 本次不改 row | 本调用不安排扫描 | 立即出现 path/row 分叉 |
+| native `rmdir` | 授权后直接删 lower 目录 | 本次不改 row | 本调用不安排扫描 | 目录实体与索引可分叉 |
+| 非pending URI写入 | open 时选择 upper/lower，调用者写字节 | 本次 open 不保证 row metadata 更新 | close listener 在后台扫描 | close 已返回，metadata/通知仍在路上 |
+
+建议采集的证据也分层：
+
+1. 调用 URI、calling package/uid、target SDK、是否 FUSE thread、是否处于 outer batch transaction；
+2. 请求与最终 `DISPLAY_NAME`、`RELATIVE_PATH`、MIME、owner、pending/trashed、canonical `_data`；
+3. rename/delete 前后两端 `stat`，不能只看 ContentProvider count；
+4. 精确 id 与 `_data` row、generation、media type、download flag；
+5. scanner 的需求原因与完成日志，写 close 和 publish 要分别观察；
+6. 具体卷与 synthetic external 的 observer URI，以及 thumbnail、quota、SAF、grant、DownloadManager 后台结果。
+
+整条链可以压成一句话：**URI collection 和调用身份决定放置政策，现代列生成候选路径，显式 helper 事务提交 row 并在无异常路径上按阶段分发副作用；真实文件却由 mkdir、FD、unlink、两种不同顺序的 rename 单独推进，扫描器负责缩短而不是消灭它们之间的窗口。**
+
+下一章转向读取面：MediaProvider query 如何选择 SQLiteQueryBuilder、校验 projection/selection、按 owner 与权限过滤 pending/trashed，canonical URI 又怎样影响 item 定位与授权。

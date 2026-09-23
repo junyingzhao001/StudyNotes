@@ -1,613 +1,398 @@
 # 262 Android PermissionManager安装后权限更新、运行时权限继承、撤销、shared UID与GID变化链
 
-## 1. 本章目标
+## 1. 更新保留的不是旧权限表，而是对新请求仍有效的旧决定
 
-第261章解释了更新如何保留`PackageSetting`和AppData。本章继续追其中最敏感的一部分：旧版本已获得的权限如何进入新版本；新Manifest删除、增加或改变权限后，PMS怎样重建状态；shared UID为什么不能按单包清空；权限带来的Linux GID变化又怎样影响运行进程。
+第261章说明更新会保留`PackageSetting`与AppData。本章继续回答更敏感的问题：新代码为什么还能使用用户此前允许的相机权限，删掉的请求何时失效，新加的危险权限为何通常仍是拒绝，以及shared UID和Linux supplementary GID为什么会让“更新时杀过进程”不再是充分证明。
 
-## 2. 先记住核心结论
+先拆开五本账：
 
-普通包替换时，PermissionManager不是把旧权限对象原样留着，而是“复制旧状态 → 清空当前状态 → 只按新Manifest请求列表重建”。仍请求的运行时权限按用户恢复原grant与flags，不再请求的权限不会进入新状态；新危险权限不会仅因更新自动授予现代App。
+| 账本 | 典型对象 | 更新时真正要问的问题 |
+|---|---|---|
+| 权限定义 | `BasePermission`、`<permission>` | 谁拥有，protection、group与GID是什么 |
+| 解析后请求 | `pkg.getRequestedPermissions()` | 新包最终请求了什么，包括兼容补入项 |
+| 授权状态 | `PermissionsState` | install/runtime grant与flags怎样投影 |
+| 策略状态 | restricted exemption、AppOps | “已grant”之后是否仍受限制 |
+| 运行进程 | UID、supplementary groups、FD | 内存中的旧能力何时退出 |
 
-## 3. 三层权限不要混用
+普通、非shared UID包替换的中心算法是“深复制旧state作为参考，reset当前state，再遍历解析后的新请求重建”。但这句话有三个限定：解析器可能把split或兼容权限补回请求列表；post-install可按安装flag显式预授；定义、group与storage范围还有跨包异步撤销。
 
-```text
-权限定义：<permission>，谁拥有、protectionLevel/group/gids是什么
-权限请求：<uses-permission>，某包声明自己想使用什么
-权限状态：某包或shared UID当前是否grant、每用户flags是什么
-```
+因此至少要区分六个完成点：新定义已入表、本包基础权限state已恢复、全局Settings已写、每用户runtime文件已写、post-install白名单与预授已完成、旧进程已真正退出。任一前点都不能替代后点。
 
-更新定义者和更新使用者会触发不同的安全动作。
+## 2. commit先发布定义，再在同一包锁内恢复本包权限状态
 
-## 4. 本章源码地图
+`installPackagesLI()`整体仍持`mInstallLock`；reconcile与`commitPackagesLocked()`另持PMS的`mLock`。对每个包，commit先调用`commitReconciledScanResultLocked()`：新`PackageSetting`、`AndroidPackage`、组件和AppsFilter入表，随后`addAllPermissionGroups()`与`addAllPermissions()`发布本包声明的定义。
 
-```text
-frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
-frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
-frameworks/base/services/core/java/com/android/server/pm/permission/PermissionsState.java
-frameworks/base/services/core/java/com/android/server/pm/permission/BasePermission.java
-frameworks/base/services/core/java/com/android/server/pm/permission/PermissionSettings.java
-frameworks/base/services/core/java/com/android/server/pm/Settings.java
-frameworks/base/data/etc/platform.xml
-```
+若旧包或定义变化需要跨包审计，这一步只调用`AsyncTask.execute()`排后台工作。外层`mLock`尚未释放，后台任务即使开始，也不能把需要该锁的state变更插进当前同步提交。
 
-## 5. 先建立对象模型
+`commitPackagesLocked()`接着在同一个外层`mLock`里调用`updateSettingsLI()`。它进入`updateSettingsInternalLI()`后执行`mPermissionManager.updatePermissions(pkgName, pkg)`，填安装结果并同步调用`mSettings.writeLPr()`。PermissionManager构造时直接令自己的`mLock = externalLock`，所以这里的“PMS锁”和“权限锁”在r48其实是同一对象的重入，而不是两把可任意交叉的锁。
 
-`BasePermission`表示系统已知的一项权限定义；`PermissionSettings`维护权限、permission tree、group和AppOp权限包集合；`PermissionsState`属于`PackageSetting`或`SharedUserSetting`，记录install permission、每用户runtime permission、flags和全局GID。
+这给包查询提供一个中心可见性边界：其他需要`mLock`的读者不会在“新Manifest已入表、本包基础state尚未恢复”的中间穿过。但它不覆盖已经排出的异步全局撤销、runtime文件落盘、post-install预授和进程退出。
 
-## 6. 更新后的权限总流程
-
-```mermaid
-flowchart TD
-    C["commitPackageSettings提交新包"] --> DEF["addAllPermissionGroups / addAllPermissions<br/>更新权限定义"]
-    DEF --> ASYNC["必要时异步检查group/定义/storage范围变化"]
-    C --> U["updateSettingsLI"]
-    U --> UP["PermissionManager.updatePermissions(pkgName, pkg)"]
-    UP --> OWN["修正permission tree与定义所有者"]
-    OWN --> R["restorePermissionState(replace=true)"]
-    R --> TYPE{"普通包还是shared UID?"}
-    TYPE -- "普通包" --> COPY["复制旧PermissionsState<br/>reset当前状态"]
-    TYPE -- "shared UID" --> UNION["保留共享状态<br/>裁掉整个UID都不再请求的权限"]
-    COPY --> REBUILD["按新uses-permission逐项重建"]
-    UNION --> REBUILD
-    REBUILD --> PERSIST["写packages.xml或每用户runtime权限状态"]
-    PERSIST --> POST["post-install先更新restricted whitelist<br/>按flag可预授runtime权限"]
-```
-
-## 7. PMS从哪里调用权限更新
-
-`commitPackagesLocked()`先提交新包，再调用`updateSettingsLI()`；其内部在`mLock`下执行：
-
-```java
-mPermissionManager.updatePermissions(pkgName, pkg);
-```
-
-随后才写包Settings并完成安装结果。
-
-## 8. 为什么不是安装结束后再算
-
-包查询一旦看见新Manifest，就必须同时看见与它相容的权限状态。若先公布新包、很久以后才裁掉已删除权限，调用者会短暂获得Manifest已经不再请求的能力。
-
-## 9. 权限定义在更早一步进入系统
-
-`commitPackageSettings()`把新包放入`mPackages`并注册组件时，还调用`addAllPermissionGroups()`和`addAllPermissions()`，让本包声明的`<permission-group>`与`<permission>`先进入权限定义表。
-
-## 10. 为什么定义要先于请求恢复
-
-恢复`<uses-permission>`时必须找到对应`BasePermission`，才能知道它是normal、dangerous、signature、restricted还是携带GID。若定义尚未更新，请求就无法正确裁决。
-
-## 11. `updatePermissions()`的两个任务
-
-源码Javadoc明确列出：先重新考虑permission ownership，再更新权限的grant和flags。它不只是遍历本包`uses-permission`。
-
-## 12. 更新与删除传参不同
-
-包更新传`packageName + 非null pkg`，flags为`UPDATE_PERMISSIONS_REPLACE_PKG`；删除传`packageName + null`，还增加`UPDATE_PERMISSIONS_ALL`，因为被删除包可能曾定义其他应用正在使用的权限。
-
-## 13. `REPLACE_PKG`不是APK replace flag
-
-这里是PermissionManager内部的更新范围位，告诉`restorePermissionState()`按“旧状态可能与新Manifest不同”重建目标包。不要与PackageInstaller的`INSTALL_REPLACE_EXISTING`混为一谈。
-
-## 14. volume为什么参与replace判断
-
-代码只在目标包volume UUID与`replaceVolumeUuid`相等时把`replace=true`传下去。全量权限恢复可按某个volume处理挂载或升级场景，避免把不相关volume都当成刚被替换。
-
-## 15. 什么时候会升级成全量重算
-
-若permission tree或普通权限定义的source package发生变化，PermissionManager把`UPDATE_PERMISSIONS_ALL`加上。权限所有者变化会影响哪些包有资格获得signature权限，不能只重算当前包。
-
-## 16. 全量重算怎样避免重复目标包
-
-遍历所有包时先跳过`pkg == changingPkg`，最后单独处理changing package。这样既能给其他包传不同的replace语义，也不重复恢复目标。
-
-## 17. background permission映射
-
-首次更新时会缓存background→foreground权限映射。源码假设background permission只由系统定义，因此该映射只构建一次。
-
-这是Android 11权限模型的版本假设，不是任意第三方动态可改的表。
-
-## 18. `restorePermissionState()`的真实含义
-
-名字叫restore，因为它同时服务两种场景：开机从磁盘状态恢复，以及应用更新时从旧版本状态恢复。它不是“全部恢复成grant”，而是根据新包重新投影旧状态。
-
-## 19. install permission是什么
-
-normal和通过策略允许的signature权限属于install permission，对所有设备用户共享；状态使用`UserHandle.USER_ALL`记录。
-
-这里的“install”描述授予时机，不代表它只存在安装器Session里。
-
-## 20. runtime permission是什么
-
-现代App请求dangerous权限时，grant与flags按Android用户分别记录。用户0允许相机，不代表用户10也允许。
-
-## 21. legacy App的危险权限为什么特殊
-
-targetSdk低于M的App不支持现代请求UI。Android 11在内部把危险权限表示为每用户runtime grant，并用`REVIEW_REQUIRED`、`REVOKED_COMPAT`等flags维持旧兼容与首次使用审查语义。
-
-## 22. `PermissionsState`保存哪些内容
-
-它用permission name映射到`PermissionData`，其中可同时表示grant与flags；还保存global GIDs、缺失状态标记和是否需要permission review的用户集合。
-
-## 23. grant与flags为什么必须分开
-
-一个runtime permission可以处于“未授予但USER_FIXED”“已授予且POLICY_FIXED”“已授予但APPLY_RESTRICTION”等状态。只存boolean无法表达用户选择和策略来源。
-
-## 24. 更新先处理missing状态
-
-若某用户运行时权限状态因回滚等原因缺失，PermissionManager为该用户生成合理默认：对平台runtime权限处理restricted upgrade豁免；legacy App还会grant并标记review/revoked compat。
-
-## 25. shared UID的missing输入
-
-shared UID会汇总该UID下所有包的requested permissions，并取这些包最小targetSdk。共享权限世界不能只看当前更新包。
-
-## 26. 普通包replace的关键四行
-
-```java
-origPermissions = new PermissionsState(permissionsState);
-permissionsState.reset();
-```
-
-前者深复制旧grant与flags作为参考，后者清空当前对象，后续只把新Manifest仍有资格的项目放回来。
-
-## 27. 为什么要“清空再重建”
-
-若在旧Map上只添加新权限，很容易遗漏新Manifest已经删除的请求、权限类型转换和旧flags清理。以新请求列表为白名单重建更容易保证最小权限。
-
-## 28. 删除一个uses-permission会发生什么
-
-该名字不会进入新包遍历，因此不会被写回已reset的`permissionsState`。无论旧状态是granted还是denied，它都不再属于新包权限状态。
-
-## 29. 仍请求的runtime grant怎样继承
-
-代码从`origPermissions.getRuntimePermissionState(perm, userId)`读取旧状态。对现代App，只有旧state存在且`isGranted()`时，才向新`permissionsState`重新grant；旧拒绝不会变成允许。
-
-## 30. flags怎样继承
-
-每个用户先从旧`permState`读取flags，处理review、compat和restriction变化后，用`updatePermissionFlags(... MASK_ALL, flags)`写入新状态。
-
-所以“更新后权限还在”同时包含grant和用户/策略flags的连续性。
-
-## 31. 新危险权限为何不会自动grant
-
-新Manifest第一次请求dangerous权限时，`origPermissions`没有已grant state。现代App走`GRANT_RUNTIME`却不调用grant，最多建立需要的flags，等待用户或受权安装器另行授予。
-
-## 32. 普通权限怎样处理
-
-`bp.isNormal()`直接选择`GRANT_INSTALL`。若旧状态中同名权限曾以runtime形态存在，代码先撤掉runtime表示和flags，再授为install permission。
-
-## 33. signature权限怎样处理
-
-它先调用`grantSignaturePermission()`检查定义者签名谱系、platform签名能力、privileged/OEM白名单、工厂系统基线等规则；允许后才进入`GRANT_INSTALL`。
-
-更新同包并不意味着所有signature权限自动保留。
-
-## 34. unknown permission怎样处理
-
-若找不到`BasePermission`或定义source setting，当前请求被跳过，只在debug条件下记录日志。Manifest写了名字不等于系统一定存在该权限。
-
-## 35. runtime-only对legacy App
-
-`runtimeOnly`权限要求应用支持M后的runtime模型。targetSdk低于M时直接拒绝，不用旧兼容自动grant兜底。
-
-## 36. `installPermissionsFixed`解决什么
-
-它表示非runtime的install权限选择已经固定，避免普通已有第三方包在非replace的重新扫描中无条件捡到新能力。replace开始时会临时清为false，重新按新包做一次合法裁决，结束再固定。
-
-## 37. 系统与updated system App的差异
-
-系统包受签名、privapp XML、OEM配置等额外规则；数据分区更新版还会参考disabled工厂包是否曾获该privileged/OEM权限，不能靠更新APK自行扩大工厂授权。
-
-## 38. pre-M升级到M+的权限迁移
-
-若旧状态把dangerous权限表示成install permission，而新targetSdk进入runtime模型，选择`GRANT_UPGRADE`：撤旧install grant，再按用户建立runtime grant并迁移flags。
-
-## 39. 为什么迁移通常给所有用户
-
-旧install permission原本对所有用户共同有效。切换表示模型时必须把这份既有能力投影到每个用户，否则升级targetSdk会无故丢失旧权限。
-
-restricted规则仍可能阻止某个用户获得hard restricted权限。
-
-## 40. modern降为legacy不应被当普通升级
-
-安装链还有targetSdk与downgrade策略门；权限恢复代码虽能处理runtime→install形态，不能据此推导任意应用都允许降低targetSdk或绕过安装降级检查。
-
-## 41. restricted permission的三组概念
-
-hard restricted通常在无豁免时不能持有；soft restricted可保留grant但以受限方式使用；system/upgrade/installer三类exempt flags共同决定是否豁免restriction。
-
-## 42. 普通包权限状态重建时序
-
-```mermaid
-sequenceDiagram
-    participant PMS as "PackageManagerService"
-    participant PM as "PermissionManagerService"
-    participant OLD as "旧PermissionsState副本"
-    participant NEW as "当前PermissionsState"
-    participant DISK as "Settings持久化"
-    PMS->>PM: updatePermissions(pkgName, newPkg)
-    PM->>OLD: copyFrom(current)
-    PM->>NEW: reset()
-    loop 新Manifest每个uses-permission
-        PM->>OLD: 查询旧grant与flags
-        PM->>PM: normal/runtime/signature/restricted裁决
-        PM->>NEW: 仅写入仍请求且合法的状态
-    end
-    PM->>DISK: install状态写全局Settings<br/>变化用户写runtime状态
-```
-
-## 43. hard restricted无豁免时
-
-在PermissionPolicy已初始化的用户上，如果旧grant存在，代码会从新state撤销，并设置`FLAG_PERMISSION_APPLY_RESTRICTION`。
-
-这说明“旧版本曾获授权”不能压过当前restricted policy。
-
-## 44. soft restricted无豁免时
-
-代码不必撤grant，但会设置APPLY_RESTRICTION。后续PermissionPolicy/AppOps可据此限制实际能力。
-
-权限grant和最终操作是否放行仍是两层。
-
-## 45. policy尚未初始化时
-
-源码暂不按restricted policy做最终剥夺，等待PermissionPolicy初始化后重新评估。安装阶段不凭一个尚未就绪的策略对象做不可逆判断。
-
-## 46. exemption恢复时
-
-若权限已不restricted或当前具有任一豁免，会清APPLY_RESTRICTION；legacy App清限制后还会重新标记REVIEW_REQUIRED。
-
-## 47. 安装器restricted whitelist何时应用
-
-post-install先调用`setWhitelistedRestrictedPermissions()`，更新installer exemption flags；若flags变化，再以`replace=false`重跑`restorePermissionState()`，让hard/soft restricted状态立即重新收敛。
-
-## 48. whitelist不是grant
-
-它只是让某项restricted权限“可被授予/可不受该限制”，并不自动把现代runtime permission设为granted。真正grant仍需用户、默认策略或受权安装器路径。
-
-## 49. 取消whitelist为何可能杀进程
-
-代码保存旧已grant restricted权限，重评后若发现能力丢失，就调用`onPermissionRevoked()`；默认callback同步写关键状态并异步kill UID，避免进程继续使用旧能力。
-
-## 50. `INSTALL_GRANT_RUNTIME_PERMISSIONS`
-
-安装flag存在时，PMS在post-install调用`grantRequestedRuntimePermissions()`。这发生在restricted whitelist更新之后、PACKAGE_ADDED广播之前。
-
-## 51. 预授范围不是任意字符串
-
-实现只遍历新包自己的requested permissions；`grantedPermissions`非null时还要求名字在该数组内。安装器不能借此给包塞入未声明权限。
-
-## 52. 预授还检查哪些门
-
-目标必须是runtime或development权限；Instant App只能获instant允许权限；legacy App不能获runtime-only；现代App的SYSTEM_FIXED和POLICY_FIXED状态不能被安装器覆盖。
-
-## 53. hard/soft restricted仍不能绕过
-
-底层`grantRuntimePermissionInternal()`再次检查hard restriction exemption和soft restriction policy。即使安装flag要求grant，也不是越过权限策略的万能开关。
-
-## 54. legacy App的“预授”语义
-
-legacy App本来以兼容方式持有危险权限。安装器请求全部grant时，代码清`REVIEW_REQUIRED`和`REVOKED_COMPAT`，而不是按现代App再次调用runtime grant。
-
-## 55. shared UID为什么不能reset
-
-同一个`PermissionsState`由多个包共同使用。若更新包A时清空整个对象，包B请求并持有的权限也会被误删。
-
-因此shared UID replace保留原对象，走并集裁剪。
-
-## 56. shared UID先计算什么
-
-`revokeUnusedSharedUserPermissionsLocked()`遍历该SharedUserSetting下所有包，把每个包仍请求且定义存在的权限加入`usedPermissions`集合。
-
-## 57. shared UID install权限怎样裁
-
-遍历共享state中的install permission；名字不在used集合时撤销，并清USER_ALL上的全部permission flags。
-
-## 58. shared UID runtime权限怎样裁
-
-对所有用户遍历runtime permission state；若整个shared UID没有任何包请求该名字，就撤grant、清flags，并把用户加入changed列表。
-
-## 59. 一个包删权限为何可能仍然保留
-
-若同shared UID的另一个包仍声明同一`uses-permission`，used集合仍包含它，共享UID继续拥有该权限。这是shared UID权限并集语义，不是撤销失败。
-
-## 60. shared UID最小targetSdk
-
-missing状态修复时取所有共享包的最小targetSdk。一个legacy包可能让整个共享权限状态继续使用更保守的兼容语义，这也是shared UID难以演进的原因之一。
-
-## 61. shared UID裁剪为何要求同步写
-
-若撤销了共享runtime权限，`runtimePermissionsRevoked=true`传给callback。源码注释要求同步持久化，避免系统崩溃后旧授权从磁盘复活。
-
-## 62. 普通变化通常怎样写
-
-`onPermissionUpdated(userIds, sync=false)`最终为这些用户安排异步runtime权限写入；200ms防抖，连续变化最多推迟约2000ms。
-
-## 63. install permission写在哪里
-
-install grant属于全局Package/SharedUser账，随`mSettings.writeLPr()`写入全局Settings。runtime grant和flags则按用户单独持久化。
-
-## 64. runtime权限文件的内容
-
-持久层按用户分别收集普通package permissions和sharedUser permissions，每项保存permission name、granted和flags，并带version/fingerprint。
-
-## 65. 为什么按用户写
-
-运行时授权是用户决策；工作资料、次用户和主用户可有不同相机、位置、联系人许可。全局packages.xml无法单独表达这些选择。
-
-## 66. 同步写为什么只用于关键撤销
-
-普通grant丢一次写入，应用最多需要再次请求；撤销若未落盘，重启后能力可能错误恢复。因此默认callback对明确revoke和shared UID裁剪使用更强持久化语义。
-
-## 67. permission listener何时收到变化
-
-显式grant/revoke callback会调用`OnPermissionChangeListeners`；restore流程对`updatedUserIds`还调用另一组runtime-permission-state监听通知。两类listener和不同更新子路径的通知粒度并不完全相同。
-
-## 68. GID从哪里来
-
-某些权限定义携带Linux supplemental GIDs。`PermissionsState.computeGids(userId)`从global GIDs开始，合并该用户所有已grant权限的GID。
-
-## 69. GID不是Android UID
-
-UID决定进程主体，supplementary GID提供对特定内核资源或文件组的附加访问。授权一个权限可能保持UID不变，却改变进程启动时的groups列表。
-
-## 70. grant/revoke怎样报告GID变化
-
-`PermissionsState.grantPermission()`和`revokePermission()`在权限含GID时比较操作前后计算结果；长度改变就返回`PERMISSION_OPERATION_SUCCESS_GIDS_CHANGED`。
-
-## 71. 默认callback怎样处理GID变化
-
-`onGidsChanged(appId, userId)`向PermissionManager Handler投递`killUid(... KILL_APP_REASON_GIDS_CHANGED)`。旧进程的supplementary groups不能原地可靠改写，重启最清晰。
-
-## 72. 权限撤销为何也杀UID
-
-显式`onPermissionRevoked()`先同步写Settings，再异步kill UID。否则进程已经拿到的Binder能力、打开的资源或旧GID可能在内存中继续存活。
-
-## 73. restore重建是否逐项触发GID callback
-
-本章这条`restorePermissionState()`路径主要通过`onPermissionUpdated()`持久化变化，没有为每次内部grant/revoke调用`onGidsChanged()`。正常替换已由PackageFreezer请求杀旧进程；DONT_KILL更新则必须认识到运行进程不会原地获得新的groups。
-
-## 74. 新进程怎样获得最新GID
-
-PMS查询PackageSetting的`permissionsState.computeGids(userId)`，AMS在后续启动进程时使用新的UID/GID参数。权限state正确不等于已经运行的Linux进程groups自动变化。
-
-## 75. 更新包自己定义权限时还有一条链
-
-如果本包声明`<permission>`，`addAllPermissions()`调用`BasePermission.createOrUpdate()`更新owner、protection、group和定义信息，并收集`permissionDefinitionChanged`的名字。
-
-## 76. 删除自定义权限定义
-
-`updatePermissionSourcePackage()`发现原owner更新后不再声明该permission，会移除定义；runtime权限会遍历所有包、所有用户尝试撤销，但helper会跳过targetSdk低于M的legacy App；非runtime install grant则从各PackageSetting撤下。
-
-## 77. owner变化为何触发全量权限恢复
-
-signature permission能否授予取决于使用者与定义者的签名关系。owner一变，已有grant的合法性也可能变化，所以只重算定义者自身不够。
-
-## 78. permission group变化为何危险
-
-系统或PermissionController可能基于“同组已有授权”给出联动体验。若危险权限从旧group迁到新group而保留grant，可能借现有授权影响新group的能力。
-
-## 79. group变化怎样撤销
-
-commit保存全部包名快照，锁外异步比较新旧定义。若新危险权限的group非null且与旧group不同，就遍历所有用户和包，尝试撤销当前持有者；底层runtime revoke对targetSdk低于M的legacy App会提前返回。
-
-## 80. 为什么异步执行
-
-撤销callback可能kill应用，而kill链又可能在其他线程需要PMS包锁。源码明确把group/definition/storage检查放入`AsyncTask.execute()`，避免持`mPackages`锁产生死锁。
-
-## 81. 异步意味着什么完成边界
-
-包commit成功和基础permission state恢复完成，不代表跨所有包的定义变化撤销已经跑完。该安全修正会在锁外继续执行，并通过revoke callback持久化和kill受影响UID。
-
-## 82. permission definition升级撤销谁
-
-当权限owner变为系统或protection升级成runtime等敏感变化时，遍历所有用户和应用包；跳过system UID范围，并保留SYSTEM_FIXED、POLICY_FIXED、GRANTED_BY_DEFAULT或GRANTED_BY_ROLE等受保护grant。
-
-## 83. 普通第三方grant怎样处理
-
-若仍granted且没有上述固定/默认/role flags，就调用`revokeRuntimePermissionInternal()`尝试撤销，记录EventLog；对支持runtime权限的应用，成功撤销后默认callback会kill对应UID，legacy App则在内部提前返回。
-
-## 84. 定义变化与使用者重建并行关系
-
-```mermaid
-flowchart LR
-    PKG["新包commit"] --> DEF["同步更新BasePermission定义"]
-    PKG --> SELF["同步重建目标包PermissionsState"]
-    DEF --> SNAP["快照allPackageNames"]
-    SNAP --> BG["AsyncTask锁外审计"]
-    BG --> GROUP["dangerous permission group变化"]
-    BG --> OWNER["permission protection/owner变化"]
-    BG --> STORAGE["请求更宽存储范围"]
-    GROUP --> REVOKE["逐包逐用户revoke"]
-    OWNER --> REVOKE
-    STORAGE --> REVOKE
-    REVOKE --> WRITE["关键状态同步写"]
-    REVOKE --> KILL["Handler异步kill UID"]
-```
-
-## 85. storage scope扩大检查
-
-若新包从未请求legacy storage变为请求，且不是因targetSdk升级产生的兼容变化；或targetSdk从Q及以上降到Q以下，代码把它视为试图获得更宽存储视图。
-
-## 86. 发生扩大时撤销什么
-
-遍历新包请求列表，对READ/WRITE等`STORAGE_PERMISSIONS`逐用户调用runtime revoke。应用必须在新模型下重新获得合法授权，不能靠更新扩大文件访问。
-
-## 87. split permission是什么
-
-平台演进会把旧权限拆成新权限。`platform.xml`例如把旧fine location映射到coarse/background location，把READ_EXTERNAL_STORAGE映射到ACCESS_MEDIA_LOCATION，并带targetSdk边界。
-
-## 88. 新隐式权限怎样识别
-
-解析器把兼容推导的新权限放入`pkg.getImplicitPermissions()`。restore发现旧state从未请求该新名字时，将它收集为`newImplicitPermissions`。
-
-## 89. 新权限怎样继承旧状态
-
-`setInitialGrantForNewImplicitPermissionsLocked()`建立new permission→source permissions映射。只要任一source原本granted，新权限就grant；flags按“最宽松grant优先”的规则合并。
-
-## 90. 为什么加`REVOKE_WHEN_REQUESTED`
-
-大多数隐式新增权限被标记此flag：当应用后来显式请求它、且没有阻断性固定flags时，系统可撤掉兼容自动grant，让它进入正常runtime请求流程。
-
-## 91. Activity Recognition为何另有特例
-
-它即使不再是parser意义的implicit permission，也会根据旧split permission的install grant尝试迁移，解决Q把活动识别从旧权限模型拆出的兼容问题。
-
-## 92. background location为何不能简单照搬
-
-源码注释明确通用继承函数“不处理foreground/background permissions”。后台位置还有专门policy和targetSdk语义，不能只凭同组或source grant推断完整结果。
-
-## 93. legacy storage AppOp同步
-
-replace且新包请求legacy external storage并声明READ/WRITE时，`checkIfLegacyStorageOpsNeedToBeUpdated()`把所有用户标为updated，促使PermissionPolicy同步`OP_LEGACY_STORAGE`。
-
-## 94. 权限grant不等于AppOp允许
-
-尤其存储、位置和soft restricted能力，还可能受AppOps模式限制。本章PermissionState重建只是授权层；PermissionPolicyService会把权限与AppOps继续同步。
-
-## 95. 安装广播前看到什么状态
-
-基础permission恢复在commit/updateSettings期间完成；installer restricted whitelist与可选runtime预授在post-install中、PACKAGE_ADDED之前完成。因此接收新增广播时通常已接近最终权限状态。
-
-## 96. 异步定义撤销例外
-
-group、definition和storage scope的跨包审计异步执行，可能晚于包commit乃至部分安装通知。源码用最终revoke+kill收敛，而不是把这类全局遍历放在核心锁区。
-
-## 97. 为什么不直接复制旧PermissionsState
-
-直接copy会错误保留不再请求的权限、旧protection形态和过期restricted flags；完全丢弃又会破坏用户选择。复制作为“参考”，再重建为“结果”，兼顾安全与连续性。
-
-## 98. 为什么新Manifest增加normal权限会生效
-
-normal permission按install grant自动授予，这是平台定义的低风险权限语义。用户不会弹runtime对话框，但它仍必须是有效定义且通过install权限固定/平台兼容规则。
-
-## 99. 为什么新Manifest增加dangerous权限不会生效
-
-modern App没有旧grant，重建只记录合法请求和flags，不产生用户同意。需要运行时请求，或受权安装器使用明确的grant flag及权限列表。
-
-## 100. 为什么删权限通常是安全收缩
-
-普通包reset后不再写回；shared UID只有其他共享包仍请求时才保留；定义者删掉权限还会从其他使用者撤销。三层分别处理“本包请求”“共享身份”“全局定义”。
-
-## 101. 更新时进程为何通常早已被杀
-
-第261章的PackageFreezer在权限重建之前已向AMS请求kill并阻止新启动。新进程启动时使用新PermissionsState和GID，降低旧能力驻留风险。
-
-## 102. DONT_KILL为什么更难推理
-
-这条特殊路径既没有真实freezer，也可能让旧进程继续运行。Java层权限检查会读取新state，但进程已持有的GID、FD或缓存能力不能原地回收；调用者必须接受较弱的一致性窗口。
-
-## 103. 锁关系
-
-PMS commit持`mLock`调用PermissionManager；PermissionManager内部也使用注入的外部锁/自身同步保护定义表和state。会引发kill的全局撤销刻意异步到锁外。
-
-## 104. 这是不是一次权限数据库事务
-
-不是单文件事务：全局install状态、每用户runtime状态、AppOps同步、listener和进程kill分属不同阶段。实现依靠同步关键撤销、异步防抖写和重启恢复来收敛。
-
-## 105. 第一次复读：修正“保留运行时权限=不处理”
-
-普通包其实先reset，再按旧state逐用户重grant和复制flags。结果看似“保留”，内部是一次基于新Manifest的重建。
-
-## 106. 第二次复读：修正“删除uses-permission就总会撤shared UID”
-
-shared UID权限属于整个UID。只有所有共享包都不再请求时才裁掉；另一个包仍请求就必须保留。
-
-## 107. 第三次复读：修正“权限变化都会同步kill”
-
-显式revoke和GID变化callback会kill；基础restore主要持久化，正常更新依赖PackageFreezer已杀旧进程；异步定义/group审计则在真正revoke时再kill。
-
-## 108. r48可疑点一：成功grant的变化标记
-
-现代`GRANT_RUNTIME`恢复旧grant时，源码在`grantRuntimePermission(...) == PERMISSION_OPERATION_FAILURE`时才把`wasChanged=true`，与常见成功判断方向相反。grant本身仍会成功写入新state，但该行对`updatedUserIds`的记账很可疑。
-
-## 109. r48可疑点二：GID比较只看长度
-
-`PermissionsState`用`oldGids.length != newGids.length`报告GID变化，没有直接比较数组内容。单项grant/revoke通常导致长度变化，但不能把返回值解释成对GID集合内容的完整等价校验。
-
-## 110. r48可疑点三：group变为null
-
-group变化撤销条件要求`newPermissionGroupName != null`。从旧group移到null不会走该分支；阅读安全注释时要以真实条件为准。
-
-## 111. 版本边界汇总
-
-- 本章基于Android 11 `android-11.0.0_r48`的`PermissionManagerService`，不是新版本PermissionManager模块化实现。
-- runtime权限按用户持久化，shared UID按共享身份持久化。
-- normal/signature是install权限；dangerous对现代App是runtime权限。
-- restricted whitelist不是grant，Permission grant也不等于AppOp允许。
-- definition/group/storage跨包撤销是commit后的异步收敛。
-
-## 112. macOS只读练习1：观察reset重建
+### 练习 1：画出定义、状态、落盘与post-install的锁边界
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '2625,3198p' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
-rg -n "origPermissions|permissionsState.reset|GRANT_RUNTIME" frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private void commitPackagesLocked(final CommitRequest request) {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'AndroidPackage pkg = commitReconciledScanResultLocked(reconciledPkg, request.mAllUsers);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mPermissionManager.addAllPermissionGroups(pkg, chatty);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mPermissionManager.addAllPermissions(pkg, chatty);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'AsyncTask.execute(() -> {' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'updateSettingsLI(pkg, reconciledPkg.installArgs, request.mAllUsers, res);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mPermissionManager.updatePermissions(pkgName, pkg);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mSettings.writeLPr();' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mLock = externalLock;' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'executePostCommitSteps(commitRequest);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
 ```
 
-画出旧grant、旧拒绝、新增dangerous、删除dangerous四种输入的结果。
+把“持`mInstallLock`”“再持`mLock`”“后台任务已排队”“runtime文件已落盘”画成四条独立时间线。指出`mSettings.writeLPr()`返回时哪些仍未完成。
 
-## 113. macOS只读练习2：比较普通包与shared UID
+## 3. updatePermissions先修owner，再决定重建一个包还是全体包
+
+目标包写入入口只要传入非null的package，就固定带`UPDATE_PERMISSIONS_REPLACE_PKG`，首次安装也不例外；删除入口传null，并额外带`UPDATE_PERMISSIONS_ALL`。这里的replace位是PermissionManager内部“重建目标状态”的范围，不是`INSTALL_REPLACE_EXISTING`，更不能单靠它判断这是不是APK替换。
+
+内部先执行`updatePermissionTreeSourcePackage()`与`updatePermissionSourcePackage()`。若tree或permission的source package可能变化，就补上`UPDATE_PERMISSIONS_ALL`，因为signature授权依赖定义者，不能只看正在更新的包。这个返回值是保守dirty信号：更新包只要命中某个当前source就可能置true，不要求先证明owner字段真的不同。随后才进入`restorePermissionState()`。
+
+全量循环会跳过changing package，先处理其他包，最后单独处理changing package。其他包只有`UPDATE_PERMISSIONS_REPLACE_ALL`存在且volume相等时才以replace方式重建；普通单包更新没有这个bit。changing package的volume UUID由同一个`pkg`同时生成比较两端，标准单包路径会相等；volume条件真正有区分力的是全量、挂载和SDK升级类调用。
+
+background→foreground permission映射在首次调用时缓存一次。源码依据是“background permission只由system定义”，这是Android 11的实现假设，不应外推成后续模块化版本的永久契约。
+
+### 练习 2：拆开replace、all与volume三个位
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '2700,2735p' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
-sed -n '4060,4140p' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'private static final int UPDATE_PERMISSIONS_ALL = 1 << 0;' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'private static final int UPDATE_PERMISSIONS_REPLACE_PKG = 1 << 1;' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'private static final int UPDATE_PERMISSIONS_REPLACE_ALL = 1 << 2;' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F '(pkg == null ? UPDATE_PERMISSIONS_ALL | UPDATE_PERMISSIONS_REPLACE_PKG' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'boolean permissionTreesSourcePackageChanged = updatePermissionTreeSourcePackage(' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'boolean permissionSourcePackageChanged = updatePermissionSourcePackage(changingPkgName,' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'flags |= UPDATE_PERMISSIONS_ALL;' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'cacheBackgroundToForegoundPermissionMapping();' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'if (pkg == changingPkg) {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'final boolean replace = replaceAll && Objects.equals(replaceVolumeUuid, volumeUuid);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F '&& Objects.equals(replaceVolumeUuid, volumeUuid);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'return StorageManager.UUID_PRIMARY_PHYSICAL;' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
 ```
 
-假设A与B共享UID，仅A删除CAMERA请求，分别推演B仍请求和B也删除两种结果。
+分别推演普通更新、包删除、`updateAllPermissions(..., false)`与SDK更新。不要把“遍历了全部包”自动等同于“全部包都reset”。
 
-## 114. macOS只读练习3：追定义变化撤销
+## 4. PermissionsState同时保存grant、flags、用户维度和GID输入
+
+`PermissionsState`用permission name定位`PermissionData`。同一个名字可以有`USER_ALL`上的install state，也可以有各userId上的runtime state；每个state又把`granted`和flags分开。未grant但`USER_FIXED`、已grant且`POLICY_FIXED`、已grant但`APPLY_RESTRICTION`是三种不同事实。
+
+normal与合法signature通常是全用户共享的install permission；现代应用的dangerous权限按用户记录runtime state。legacy应用的dangerous权限在r48也常用每用户runtime grant配合`FLAG_PERMISSION_REVIEW_REQUIRED`、`FLAG_PERMISSION_REVOKED_COMPAT`表达兼容语义，不能机械照抄方法头那段已经漂移的旧注释。
+
+`new PermissionsState(old)`会逐个构造新的`PermissionData`，复制global GIDs、missing与review集合，是深状态快照，不是Map浅别名。`reset()`则清`mPermissions`、global GIDs、missing与review账。随后`setGlobalGids()`再装回系统配置的全局GID基线。
+
+包使用shared UID时，`PackageSetting.getPermissionsState()`会委托`SharedUserSetting`；物理上每个`SettingBase`都有字段，但权限判定的权威对象是共享state。这一区别决定了下一节能否reset。
+
+## 5. 普通replace把旧state当参考，用解析后请求构造新结果
+
+`restorePermissionState()`先处理missing用户，再令`origPermissions = permissionsState`。replace时清`installPermissionsFixed`；普通包随后深复制旧state并reset当前对象，shared UID则不做这两步。
+
+重建白名单不是XML中肉眼可见的`<uses-permission>`集合，而是解析完成后的`pkg.getRequestedPermissions()`。`ParsingPackageUtils.convertNewPermissions()`与`convertSplitPermissions()`可能按targetSdk把兼容权限同时加入requested与implicit列表。因此开发者删掉一个显式声明，不代表解析后的列表一定没有这个名字。
+
+对每个解析后请求，PermissionManager先查`BasePermission`及其source setting。定义不存在就跳过；普通包已经reset，所以旧同名state不会被写回。新列表里完全没有的名字也不会被遍历。最终效果是“以新解析模型投影旧决定”，而不是旧表上增量打补丁。
+
+这不是通用数据库事务。reset后的内存变更在外层`mLock`内完成，但跨文件持久化、异步审计与进程状态仍有各自完成点；commit中途异常也没有逐字段undo。
+
+### 练习 3：验证深复制、reset与解析后白名单
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '12390,12540p' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
-sed -n '2275,2470p' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'PermissionsState origPermissions = permissionsState;' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'ps.setInstallPermissionsFixed(false);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'origPermissions = new PermissionsState(permissionsState);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'permissionsState.reset();' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'updatedUserIds = revokeUnusedSharedUserPermissionsLocked(' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'permissionsState.setGlobalGids(mGlobalGids);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'final int N = pkg.getRequestedPermissions().size();' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'if (bp == null || getSourcePackageSetting(bp) == null) {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'mPermissions.put(name, new PermissionData(permissionData));' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionsState.java
+grep -n -F 'mPermissions = null;' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionsState.java
+grep -n -F 'convertNewPermissions(pkg);' frameworks/base/core/java/android/content/pm/parsing/ParsingPackageUtils.java
+grep -n -F 'convertSplitPermissions(pkg);' frameworks/base/core/java/android/content/pm/parsing/ParsingPackageUtils.java
 ```
 
-回答：哪些检查同步发生，哪些放入AsyncTask；为什么不能在PMS包锁内直接kill所有受影响应用？
+用四个输入推演最终state：旧CAMERA已grant且仍请求、旧CAMERA已拒绝且带USER_FIXED、显式删除但split规则补回、新增未知权限。每一步都区分解析请求、grant和flags。
 
-## 115. macOS只读练习4：核对持久化与GID
+## 6. normal、runtime与signature走三套grant判定
+
+重建循环先判permission种类：
+
+| 定义与请求 | 主要分支 | replace后的典型结果 |
+|---|---|---|
+| unknown或source setting缺失 | 跳过 | 普通包旧state不回填 |
+| normal | `GRANT_INSTALL` | 作为install permission自动grant |
+| dangerous/runtime | `GRANT_RUNTIME`或`GRANT_UPGRADE` | 继承旧决定或迁移旧表示 |
+| signature | `grantSignaturePermission()` | 通过签名、privileged/OEM等规则才grant |
+| runtime-only + legacy target | 入口拒绝 | 不用legacy兼容自动grant兜底 |
+
+`installPermissionsFixed`主要阻止已有非system包在非replace重扫时随便捡到新的非runtime能力。replace已先把它清为false，所以更新后的normal权限可以重新按新Manifest裁决；signature允许仍必须经过自己的授权函数。循环末再把选择固定。
+
+`GRANT_INSTALL`还会检查旧state中是否存在同名runtime表示：若有，先从旧参考state撤销runtime并清flags，再在新state授install。这处理的是permission表示类型变化，不等于安装器允许应用任意降低targetSdk。
+
+### 练习 4：建立grant类型决策表
 
 ```bash
-cd /Users/ninebot/androidSource
-sed -n '300,380p' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
-sed -n '575,725p' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionsState.java
-sed -n '5290,5485p' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'if (bp.isRuntimeOnly() && !appSupportsRuntimePermissions) {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'if (bp.isNormal()) {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F '} else if (bp.isRuntime()) {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'origPermissions.hasInstallPermission(bp.getName())' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F '} else if (bp.isSignature()) {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'allowedSig = grantSignaturePermission(perm, pkg, ps, bp, origPermissions);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'if (!ps.isSystem() && ps.areInstallPermissionsFixed() && !bp.isRuntime()) {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'if (!allowedSig && !origPermissions.hasInstallPermission(perm)) {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'case GRANT_INSTALL: {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'case GRANT_RUNTIME: {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'case GRANT_UPGRADE: {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'ps.setInstallPermissionsFixed(true);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
 ```
 
-区分install/runtime权限的写入位置，并解释为什么GID变化需要重启UID进程。
+为新增normal、新增dangerous、合法signature、非法signature、runtime-only legacy五例写出grant枚举和最终state。不要把`allowedSig`等同于“同包名更新”。
 
-## 116. 第四次复读：一句话判断四个例子
+## 7. modern dangerous继承旧决定，legacy与GRANT_UPGRADE是另外两条路
 
-- 更新后仍请求且用户已允许CAMERA：按用户恢复grant与flags。
-- 新增RECORD_AUDIO：现代App默认不grant。
-- 删除LOCATION：普通包新state不再包含；shared UID还要看其他包。
-- 新增normal权限：定义合法且策略允许时自动成为install grant。
+现代应用走`GRANT_RUNTIME`时，从旧快照按用户取得`PermissionState`。旧state已grant且hard restriction未阻断，就向新state重新grant；旧拒绝不会翻成允许。旧flags经过review、compat和restriction调整后，以`MASK_PERMISSION_FLAGS_ALL`写入新state，所以USER_FIXED之类的拒绝决定可以连续。
 
-## 117. 自测题
+新危险权限若没有旧state，基础重建不会凭“这是一次更新”自动grant。但它可能是split产生的implicit权限，稍后继承source；也可能在post-install被受权安装器显式预授。这两个例外不应反向改写基础规则。
 
-1. 为什么普通包replace要copy旧state再reset？
-2. 新危险权限为什么不会随更新自动grant？
-3. shared UID删权限为何必须计算所有包请求并集？
-4. pre-M升级到M+时dangerous权限怎样迁移？
-5. hard restricted whitelist与grant是什么关系？
-6. permission group变化为何异步撤销所有持有者？
-7. GID变化为什么需要kill UID？
-8. install与runtime权限分别怎样持久化？
+源码中“重新grant返回`PERMISSION_OPERATION_FAILURE`时才令`wasChanged=true`”不是成功判断写反。`updatedUserIds`记录的是最终state相对旧持久状态是否变化：重新grant成功只是重建出磁盘已有的旧grant；失败才把“旧grant”变成“新拒绝”，需要写回和通知。
 
-## 118. 自测题参考答案
+legacy target会把可兼容的runtime权限按用户grant，并设置review/revoked-compat或restriction flags。`GRANT_UPGRADE`的直接条件则是旧state仍把当前runtime permission保存为install grant，或命中Activity Recognition迁移特例；它先撤旧install表示，再向各用户建立runtime表示。它不等同于“任意pre-M应用这次把targetSdk升到M+”。
 
-1. 以旧grant/flags为参考，只把新Manifest仍请求且合法的权限写回，自动丢弃过期状态。
-2. 旧state没有grant证据；现代runtime权限需要用户或受权安装器的明确授权。
-3. 权限state属于共享UID而非单包，另一个共享包仍请求时UID仍需该能力。
-4. 撤掉全局install表示，再为各用户建立runtime grant与flags，并受restricted policy约束。
-5. whitelist只提供restriction exemption，使权限具备可授条件；实际grant是另一动作。
-6. group改变可能改变同组联动授权语义；锁内revoke+kill可能与PMS包锁死锁，所以锁外审计。
-7. 已运行进程的supplementary groups不会随Java对象原地改变，重启才能使用新groups。
-8. install状态随全局Settings；runtime grant/flags按用户写runtime权限持久层，shared UID另按共享身份记录。
+## 8. restricted裁决依赖用户、策略就绪和三类exemption
 
-## 119. 本章总结
+restore最先遍历`getUserIdsIncludingPreCreated()`。若某用户state标记missing，它根据解析请求补合理默认：平台runtime restricted权限得到upgrade exemption；legacy target还会grant并加review/revoked-compat。源码只证明“state缺失时修复”，不能把缺失原因固定写成rollback。
 
-应用更新保留的是“用户对仍然有效请求作出的决定”，不是旧权限表的原样副本。PermissionManager先更新权限定义与owner，再以新Manifest重建普通包state；shared UID则按所有共享包请求并集裁剪。normal/signature走install裁决，modern dangerous沿用旧的每用户grant/flags但不自动授新权限，restricted、split permission和storage scope另做兼容与安全收敛。关键撤销会持久化并kill UID，正常替换还依靠PackageFreezer保证新进程使用新GID世界。
+正式`GRANT_RUNTIME`又按用户计算四个输入：PermissionPolicy是否initialized、hard/soft属性、system/upgrade/installer任一exemption、旧`APPLY_RESTRICTION`。结果不是一个boolean：
 
-## 120. 下一章预告
+- modern + hard restricted + 已初始化 + 无exemption：不把旧grant回填，并设置APPLY_RESTRICTION；由于新state已reset，代码里的revoke通常只是空state上的no-op。
+- modern + soft restricted + 无exemption：旧grant可以回填，但加APPLY_RESTRICTION，最终使用还要看policy与AppOps。
+- policy未初始化：暂不做最终restricted剥夺，等待后续重评。
+- 已解除restriction或已有exemption：清APPLY_RESTRICTION；legacy target还可能重新要求review。
 
-第263章继续深入运行时权限的日常控制链：App调用`requestPermissions()`后怎样进入PermissionController UI，grant/revoke Binder入口如何校验fixed flags、AppOps怎样同步，以及Android 11一次性权限与自动撤销怎样回收长期不用的能力。
+installer whitelist在POST_INSTALL才写installer-exempt flag，并以`replace=false`再跑一次restore。whitelist提供“可授/可不受限制”的条件，本身不是grant。
+
+### 练习 5：推演missing、hard、soft与exemption
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'if (permissionsState.isMissing(userId)) {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'return UserManagerService.getInstance().getUserIdsIncludingPreCreated();' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'FLAG_PERMISSION_RESTRICTION_UPGRADE_EXEMPT' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'targetSdkVersion = Math.min(targetSdkVersion,' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'final boolean permissionPolicyInitialized =' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'boolean hardRestricted = bp.isHardRestricted();' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'boolean softRestricted = bp.isSoftRestricted();' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'FLAGS_PERMISSION_RESTRICTION_ANY_EXEMPT' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'flags |= FLAG_PERMISSION_APPLY_RESTRICTION;' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'flags &= ~FLAG_PERMISSION_APPLY_RESTRICTION;' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'if (permissionsState.grantRuntimePermission(bp, userId)' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'callback.onPermissionUpdated(updatedUserIds, runtimePermissionsRevoked);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+```
+
+为两个用户分别设置policy未初始化、hard无豁免、soft无豁免和installer exemption，写出grant、APPLY_RESTRICTION、review与是否需要持久化，不只写“允许/拒绝”。
+
+## 9. shared UID不reset，而是按所有成员的解析请求并集裁剪
+
+shared UID的`PackageSetting.getPermissionsState()`委托同一个`SharedUserSetting`。更新成员A时若reset，会连成员B持有的能力一起抹掉，因此replace分支保留共享对象，只调用`revokeUnusedSharedUserPermissionsLocked()`。
+
+helper遍历`SharedUserSetting.getPackages()`的所有成员，把定义仍存在的解析后requested permission加入`usedPermissions`。它不按某用户是否安装该成员过滤：B只装在user 0，只要仍是sharedUser成员，它的请求也会阻止user 10的同名共享state被裁。
+
+随后全局install state与每用户runtime state分别倒序扫描。只有名字不在used集合且当前`BasePermission`非null时才撤grant并清全部flags；unknown或定义已经被移除的残留项不会由这个helper删除。若A删CAMERA而B仍请求，整个UID继续持有；只有所有成员都不请求，才按各用户裁掉。
+
+missing修复同样按全部成员请求并集，并取成员最小targetSdk；但这个最小值只服务missing用户的默认修复，不是整段grant算法的统一targetSdk。正常主循环仍以当前正在restore的`pkg.getTargetSdkVersion()`判断runtime支持。runtime扫描只要裁掉一个unused `PermissionState`就把该user加入同步集合，即使该项本来是denied但还带flags；所以`runtimePermissionsRevoked`在这里更准确地表示“共享runtime状态项被裁”，不只表示已grant位从true变false。callback据此触发本章唯一明确的定向同步runtime文件写。
+
+### 练习 6：手算shared UID的成员并集与用户范围
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'return (sharedUser != null)' frameworks/base/services/core/java/com/android/server/pm/PackageSetting.java
+grep -n -F '? sharedUser.getPermissionsState()' frameworks/base/services/core/java/com/android/server/pm/PackageSetting.java
+grep -n -F 'final List<AndroidPackage> pkgList = suSetting.getPackages();' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'final ArraySet<String> usedPermissions = new ArraySet<>();' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'usedPermissions.add(permission);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'if (!usedPermissions.contains(permissionState.getName())) {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'permissionsState.revokeInstallPermission(bp);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'permissionsState.revokeRuntimePermission(bp, userId);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'runtimePermissionsRevoked = true;' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'List<AndroidPackage> packages = ps.getSharedUser().getPackages();' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'targetSdkVersion = Math.min(targetSdkVersion,' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'sharedUserPermissions.put(sharedUserName, permissions);' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+```
+
+构造A、B共享UID，B只安装在user 0。分别推演“A删除CAMERA、B仍请求”“A与B都删除”“定义已不存在”三例在user 0与user 10的结果。
+
+## 10. split permission先改请求集合，随后才继承旧state
+
+解析器在restore之前已经执行`convertNewPermissions()`与`convertSplitPermissions()`：targetSdk低于split门槛且请求source permission时，新名字会同时进入requested与implicit列表。这就是为什么“删掉新权限的显式声明”仍可能保留一个隐式请求。
+
+restore先收集旧state从未见过的新implicit permission，尾部再建立new→source集合。若任一source原本以runtime或install形式granted，新权限获得runtime grant；flags按源码的宽松合并规则继承。大多数新implicit权限还加`FLAG_PERMISSION_REVOKE_WHEN_REQUESTED`：应用日后显式请求、且没有blocking flags时，系统可撤掉兼容自动grant，让它回到正常请求流程。
+
+Activity Recognition是单独兼容分支：即使不再属于parser意义的implicit列表，只要旧split source仍以install形式存在，也可进入迁移。通用继承函数明确不处理foreground/background permission；后台位置不能靠这段逻辑直接类推。
+
+另一个名字相近但不同的尾段是`checkIfLegacyStorageOpsNeedToBeUpdated()`。replace包请求legacy external storage并包含READ/WRITE时，它把全部用户标为updated，推动PermissionPolicy同步`OP_LEGACY_STORAGE`；这不是新增一个permission grant。
+
+### 练习 7：把解析补入、implicit继承与AppOp分开
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'pkg.addRequestedPermission(npi.name)' frameworks/base/core/java/android/content/pm/parsing/ParsingPackageUtils.java
+grep -n -F 'pkg.addRequestedPermission(perm)' frameworks/base/core/java/android/content/pm/parsing/ParsingPackageUtils.java
+grep -n -F '.addImplicitPermission(perm);' frameworks/base/core/java/android/content/pm/parsing/ParsingPackageUtils.java
+grep -n -F 'newImplicitPermissions.add(permName);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'if (!origPs.hasRequestedPermission(sourcePerms)' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'FLAG_PERMISSION_REVOKE_WHEN_REQUESTED' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'ps.grantRuntimePermission(mSettings.getPermissionLocked(newPerm), userId);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'Warning: This does not handle foreground / background permissions' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'permName.equals(Manifest.permission.ACTIVITY_RECOGNITION)' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'if (replace && pkg.isRequestLegacyExternalStorage() && (' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'return getAllUserIds();' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+```
+
+从一条split配置出发，写出source、新permission、targetSdk、requested列表、implicit列表、旧grant、继承flags和AppOp通知八列，避免把解析兼容与授权混成一步。
+
+## 11. packages.xml先写，runtime文件另有同步与延迟两种路径
+
+install permission随package或shared-user条目写入全局`packages.xml`。`updateSettingsInternalLI()`在包锁内同步调用`mSettings.writeLPr()`；这个函数写完全局文件后，还调用`writeAllRuntimePermissionsLPr()`，但这里只是为当前created users逐个安排runtime权限异步写。
+
+runtime持久层按用户生成两张Map：非shared包按packageName，shared UID按sharedUserName只写一次；每项保存name、granted和flags，并带version/fingerprint。异步调度默认200ms，连续修改可防抖，但从首个未写mutation起最多约2000ms。
+
+`restorePermissionState()`把updated users和`runtimePermissionsRevoked`交给default callback。普通变化走异步定向写；shared UID unused prune把sync设为true，`writePermissionSettings(userIds, false)`最终进入`writePermissionsForUserSyncLPr()`，先移除该用户待处理消息，再在当前调用中写runtime快照。
+
+显式runtime revoke的保证更弱于原稿常见说法：`onPermissionRevoked()`同步调用`writeSettings(false)`，这会同步写packages.xml，却仍只异步调度所有用户runtime文件；kill又排在PermissionManager自己的Handler。runtime写Handler与kill Handler之间没有完成顺序，不能把“回调返回”解释成撤销已同步落入runtime文件。
+
+## 12. GID变化影响下一次exec，restore本身却不发GID callback
+
+`BasePermission`可带system config提供的GID；`perUser=true`时先用`UserHandle.getUid(userId, gid)`变换。`PermissionsState.computeGids()`从global GIDs出发，把该用户全部已grant permission的GID用set-like append合并。PMS的`getPackageGids()`只提供permission-derived GIDs；ProcessList还会按`deniedPermissions`删项，并加入sharedApp、cacheApp、user、mount等GID，再把最终groups交给Zygote。因此`computeGids()`不是进程最终Linux groups的完整快照。
+
+`PermissionsState.grantPermission()`与`revokePermission()`只在当前permission含GID时比较前后数组长度。这里的长度比较不是集合等价检查写漏：单次grant只能从old集合做并集，单次revoke只能做子集差，`ArrayUtils.appendInt`还去重；在串行不变量下，长度不变就表示有效GID集合没变。
+
+显式runtime grant若收到`PERMISSION_OPERATION_SUCCESS_GIDS_CHANGED`，default callback把`killUid`排到PermissionManager Handler；显式revoke不转发这个返回值，但总会走`onPermissionRevoked()`并排kill。随后`killUidForPermissionChange()`按appId、userId且`packageName=null`选择整个UID，`evenPersistent=true`，比第261章的package-specific freezer kill更强。返回仍不等于内核已确认所有PID死亡。
+
+本章的restore循环却不把内部grant/revoke返回值转发为`onGidsChanged()`，尾部只有`onPermissionUpdated()`。普通replace通常靠PackageFreezer覆盖目标包；但freezer构造只是向AMS发出package-specific kill请求并阻止匹配进程新启动，不是restore开始前“内核已确认旧PID死亡”的屏障。`INSTALL_DONT_KILL_APP`则会直接留下旧supplementary groups、FD和缓存能力窗口。
+
+shared UID还有更尖的反例：更新A并裁掉UID级GID权限时，freezer调用的是packageName=A、shared appId。ProcessList的package-specific筛选还要求ProcessRecord的`pkgList`包含A或依赖A；只运行B的同shared-UID进程可能幸存，而restore又没有GID callback。逻辑权限state已经收缩，不等于该UID的所有旧Linux进程都换了groups。
+
+风险还不限于shared UID。定义owner变化可补上`UPDATE_PERMISSIONS_ALL`并同步重评其他消费者；这些第三方包不在owner包的freezer覆盖范围内。若它们的install permission被撤销且该permission带GID，这条restore/定义清理路径同样没有把grant/revoke返回值转成UID级kill；异步definition审计又只处理runtime permission。于是owner更新结束时，第三方内存state可以已收缩，而既有进程仍暂时保留旧supplementary group。
+
+### 练习 8：核对落盘Handler、GID集合和两种kill范围
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'writeAllRuntimePermissionsLPr();' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+grep -n -F 'private static final long WRITE_PERMISSIONS_DELAY_MILLIS = 200;' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+grep -n -F 'private static final long MAX_WRITE_PERMISSIONS_DELAY_MILLIS = 2000;' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+grep -n -F 'writePermissionsForUserSyncLPr(int userId)' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+grep -n -F 'packagePermissions.put(packageName, permissions);' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+grep -n -F 'sharedUserPermissions.put(sharedUserName, permissions);' frameworks/base/services/core/java/com/android/server/pm/Settings.java
+grep -n -F 'public int[] computeGids(int userId) {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionsState.java
+grep -n -F 'if (oldGids.length != newGids.length) {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionsState.java
+grep -n -F 'return appendInt(cur, val, false);' frameworks/base/core/java/com/android/internal/util/ArrayUtils.java
+grep -n -F 'mHandler.post(() -> killUid(appId, userId, KILL_APP_REASON_GIDS_CHANGED));' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'am.killUidForPermissionChange(appId, userId, reason);' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'true /* evenPersistent */,' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'permGids = pm.getPackageGids(app.info.packageName,' frameworks/base/services/core/java/com/android/server/am/ProcessList.java
+grep -n -F 'if (app.processInfo != null && app.processInfo.deniedPermissions != null) {' frameworks/base/services/core/java/com/android/server/am/ProcessList.java
+grep -n -F 'gids = computeGidsForProcess(mountExternal, uid, permGids);' frameworks/base/services/core/java/com/android/server/am/ProcessList.java
+grep -n -F 'killApplication(ps.name, ps.appId, userId, killReason);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'Message msg = mHandler.obtainMessage(KILL_APPLICATION_MSG);' frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+grep -n -F 'pkgList.put(_info.packageName, new ProcessStats.ProcessStateHolder(_info.longVersionCode));' frameworks/base/services/core/java/com/android/server/am/ProcessRecord.java
+grep -n -F 'if (!app.pkgList.containsKey(packageName) && !isDep) {' frameworks/base/services/core/java/com/android/server/am/ProcessList.java
+```
+
+分别推演新增GID权限、撤销GID权限、普通no-kill更新、shared A更新但仅B进程存活。为每例标出Java权限检查、runtime文件、supplementary groups和PID四个完成点。
+
+## 13. 更新权限定义者时，定义删除与使用者state恢复是同步主链
+
+包自身声明`<permission>`时，`addAllPermissions()`通过`BasePermission.createOrUpdate()`处理owner与protection；从non-runtime变成runtime或owner被system包取代时，`mPermissionDefinitionChanged`会置真，供稍后的异步安全审计使用。
+
+同步`updatePermissions()`还会扫描旧source package拥有的定义。若新包已不再声明某名字，runtime定义会立即遍历created users和当前包集合，尝试从使用者撤销；non-runtime定义则从各PackageSetting撤install state，随后把定义从表中移除。这个动作发生在本包基础restore之前、仍在外层`mLock`内。
+
+runtime helper会对targetSdk低于M的使用者提前返回。因此“定义者删除权限会同步清干净所有使用者state”并不成立。定义从表中消失后，常规permission check已无法再把它当有效定义，但legacy残留state与旧进程是另一份清理账。
+
+source/tree变化返回true时还会把restore范围扩大到所有包。其他包在这次循环中通常以replace=false重评；它们不是全部clone/reset。
+
+## 14. group、definition与storage安全审计是无join的后台任务
+
+commit在新定义入表后快照`mPackages.keySet()`，并向`AsyncTask`提交三类工作：
+
+1. 旧包存在时，比较它声明的dangerous permission group。新group非null且与旧group不同，遍历快照包名和created users撤销持有者。
+2. `mPermissionDefinitionChanged`非空时，对变成runtime或owner变化的permission遍历使用者；UID低于FIRST_APPLICATION_UID，或带SYSTEM_FIXED、POLICY_FIXED、GRANTED_BY_DEFAULT、GRANTED_BY_ROLE的grant会保留。
+3. 新包新请求legacy storage或targetSdk从Q以上降到Q以下时，逐用户尝试撤销新包请求的storage runtime permissions；它只检查新包，legacy与fixed policy仍可能使撤销跳过或失败。
+
+这三路没有Future、token或安装完成join。快照只保存包名，不保存PackageSetting代际；任务真正运行时再解析live package与state，迟到任务可能遇到卸载、重装或下一次更新。created user集合也与同步restore使用的including-pre-created集合不同。
+
+失败处理并不一致。definition审计每个revoke捕获`Exception`；storage审计捕获`IllegalStateException | SecurityException`；group审计却只捕获`IllegalArgumentException`。若遇POLICY_FIXED导致`SecurityException`，group任务可在中途退出，后续包与用户没有完成证明。
+
+group从旧值移到null不会触发这条撤销，但这不是明显的“漏判bug”：代码要防的是进入一个新group后借联动授权扩大能力；解除分组不会获得新group联动。读版本边界时应记录条件，而不是仅凭非对称就判错。
+
+### 练习 9：联合追定义删除、异步撤销与post-install覆盖
+
+```bash
+set -eu
+ROOT=${1:-.}
+cd "$ROOT"
+grep -n -F 'if (pkg == null || !hasPermission(pkg, bp.getName())) {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'revokePermissionFromPackageForUser(p.getPackageName(),' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'appInfo.targetSdkVersion < Build.VERSION_CODES.M' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'if (bp.isRuntime() && (ownerChanged || wasNonRuntime)) {' frameworks/base/services/core/java/com/android/server/pm/permission/BasePermission.java
+grep -n -F 'final ArrayList<String> allPackageNames = new ArrayList<>(mPackages.keySet());' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mPermissionManager.revokeRuntimePermissionsIfGroupChanged(pkg, oldPkg,' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mPermissionManager.revokeStoragePermissionsIfScopeExpanded(pkg, oldPkg);' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mPermissionManager.revokeRuntimePermissionsIfPermissionDefinitionChanged(' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'if (newPermissionGroupName != null' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'catch (IllegalArgumentException e) {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'catch (IllegalStateException | SecurityException e) {' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'FLAG_PERMISSION_GRANTED_BY_ROLE;' frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java
+grep -n -F 'mPermissionManager.setWhitelistedRestrictedPermissions(' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+grep -n -F 'mPermissionManager.grantRequestedRuntimePermissions(' frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java
+```
+
+分别构造group A→B、group A→null、normal→runtime定义变化、POLICY_FIXED持有者、storage scope扩大五例。写出同步基础restore、后台审计、runtime落盘和kill各自最早可证的时刻。
+
+## 15. POST_INSTALL的whitelist与预授是第二层覆盖，不属于基础restore
+
+基础restore完成并不等于安装时权限工作结束。`handlePackagePostInstall()`在标准PACKAGE_ADDED之前，先写installer restricted whitelist，再按`INSTALL_GRANT_RUNTIME_PERMISSIONS`派生的`grantPermissions`决定是否调用`grantRequestedRuntimePermissions()`。
+
+whitelist实现只遍历解析后requested permission，修改system/upgrade/installer exemption flags。只要flags实际变化，就以`replace=false`重跑restore；若此前已grant的restricted权限因此消失，再调用revocation callback排kill。它不会仅因进入白名单就自动grant。
+
+预授同样只遍历解析请求，并可再受`grantedPermissions`名单收窄。目标还必须是runtime或development；instant包只能获instant允许权限，legacy不能获runtime-only，modern的SYSTEM_FIXED或POLICY_FIXED不允许安装器改写，底层仍复查hard/soft restriction。legacy“全部预授”主要是清review/revoked-compat flags。
+
+这些步骤位于后来的POST_INSTALL消息，不在前面持`mInstallLock`的提交临界区。广播调用排在其后，所以正常控制流下receiver看到的是覆盖后的内存state；但runtime文件可能仍在200ms防抖窗口，后台definition/group/storage审计也可能尚未收敛。广播、install observer或包可查询都不是“权限世界最终完成”的ACK。
+
+## 16. 用状态矩阵识别r48的真实边界
+
+| 现场 | 应先检查 | 不能下的结论 |
+|---|---|---|
+| 新增normal立即可用 | GRANT_INSTALL与定义有效性 | 所有新增权限都会自动grant |
+| 旧CAMERA拒绝仍保留USER_FIXED | 旧PermissionState与flags回填 | reset把用户决定清空了 |
+| 删显式权限后名字仍在state | parser split/new compat补入 | restore忽略了新Manifest |
+| shared A删权限但UID仍持有 | B是否仍是成员并请求 | revoke失效 |
+| B未装某用户却阻止该用户裁剪 | shared used集合不看per-user installed | 权限是逐包拥有 |
+| 内存已撤销但runtime文件仍旧 | 200ms/2s writer与跨Handler时序 | onPermissionRevoked已同步写runtime文件 |
+| shared GID已裁但B进程仍活 | package-specific freezer的pkgList过滤 | shared appId保证全UID被杀 |
+| group审计只处理了前几个包 | POLICY_FIXED SecurityException与catch范围 | AsyncTask完成了全部快照 |
+| group移到null未撤销 | `newPermissionGroupName != null` | 单凭不对称即可认定安全bug |
+
+最后校正三个容易误判的r48细节。第一，modern旧grant重建时`== PERMISSION_OPERATION_FAILURE`才标updated，是差异记账，不是成功条件倒置。第二，单次GID集合只会单调加或减，长度比较在该不变量内足够。第三，group→null没有新组联动风险，真实风险是异步任务无join、只按包名快照及异常处理不对称。
+
+本章的最终答案是：普通包以解析后的新请求重建权限state，shared UID以全部成员请求并集裁剪；基础state、全局Settings、每用户runtime文件、AppOps、后台安全审计与进程groups分别完成。第263章将继续进入日常runtime权限入口，追PermissionController UI、Binder验权、fixed flags、一次性权限、自动撤销和AppOps同步。
