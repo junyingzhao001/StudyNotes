@@ -1,2 +1,0 @@
-larger: 7
-area: 12

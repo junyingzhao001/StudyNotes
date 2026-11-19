@@ -1,3 +1,0 @@
-Learn ownership
-old owner empty: true
-Learn ownership

@@ -1,2 +1,0 @@
-normalized: 100
-trace: raw=135, max=100

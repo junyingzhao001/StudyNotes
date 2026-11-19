@@ -1,2 +1,0 @@
-C++17 file demo
-score: 0

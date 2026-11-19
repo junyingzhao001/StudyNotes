@@ -1,5 +1,0 @@
-before scope
-open C++
-hello C++
-close C++
-after scope

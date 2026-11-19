@@ -1,2 +1,0 @@
-square: 144
-error: task failed

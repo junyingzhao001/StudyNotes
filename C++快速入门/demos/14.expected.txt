@@ -1,3 +1,0 @@
-sum: 270
-C++17 (5 bytes)
-C API view: C++17
